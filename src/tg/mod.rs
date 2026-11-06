@@ -13,6 +13,7 @@ pub mod fake;
 pub mod grammers;
 pub mod messages;
 mod pool;
+pub mod sanitise;
 mod session;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
