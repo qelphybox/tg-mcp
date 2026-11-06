@@ -1,0 +1,7 @@
+target
+.git
+.claude
+docs
+*.db
+.env
+rust-toolchain.toml

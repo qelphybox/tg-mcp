@@ -1,0 +1,25 @@
+[package]
+name = "tg-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+axum = "0.8"
+rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "macros"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13.5", default-features = false }
+rmcp = { version = "3.9.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net"] }
+tokio-util = "0.7.20"

@@ -3,6 +3,7 @@
 Issues and specs for this repo live as GitHub issues in **`qelphybox/tg-mcp`**. Locally, use the `gh` CLI as below.
 
 **Cloud sessions (claude.ai/code):** `gh` is not available for issue operations there. Use the GitHub MCP tools instead, with `owner: qelphybox`, `repo: tg-mcp`: `issue_write` (create/update, labels, close with `state_reason`), `issue_read`, `list_issues`, `add_issue_comment`, `sub_issue_write` (sub-issues). Where native blocking edges can't be set, use the `Blocked by` section in the issue body.
+`issue_write` with `method: create` refuses a label that doesn't exist yet: create the issue without it, then add it with `method: update`, which creates the label.
 
 ## Conventions
 
