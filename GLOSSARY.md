@@ -68,6 +68,14 @@ _Avoid_: archived folder, folder (unqualified)
 A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Telegram apps. A Chat can be in several Chat folders, and in none. Unrelated to the Archive.
 _Avoid_: folder (unqualified), filter, tab
 
+**Topic**:
+A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic.
+_Avoid_: thread (a thread is a chain of replies), subchat
+
+**Media link**:
+A short-lived URL that lets whoever holds it download the media of one message, without a Token.
+_Avoid_: download token, file URL
+
 **Search hit**:
 One message found by a search, together with its Chat and a snippet of its text around the match.
 _Avoid_: result, match
