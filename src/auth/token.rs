@@ -136,7 +136,7 @@ fn server_error(err: VaultError) -> Response {
     )
 }
 
-fn no_store(status: StatusCode, body: serde_json::Value) -> Response {
+pub(super) fn no_store(status: StatusCode, body: serde_json::Value) -> Response {
     let mut response = (status, Json(body)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

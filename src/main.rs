@@ -41,7 +41,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(
                 "Telegram is FAKED: every login is the same fake Account (TG_MCP_FAKE_TELEGRAM=1)"
             );
-            (Arc::new(FakeLogin::default()), Arc::new(FakeConnector))
+            (
+                Arc::new(FakeLogin::default()),
+                Arc::new(FakeConnector::default()),
+            )
         }
         (false, Some(app)) => {
             tracing::info!(api_id = app.api_id, "using Telegram app");

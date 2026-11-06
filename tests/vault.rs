@@ -192,3 +192,48 @@ async fn debug_output_never_contains_secrets() {
         "ids stay visible: {printed}"
     );
 }
+
+#[tokio::test]
+async fn either_token_opens_the_grant_for_its_own_client_only() {
+    let (vault, _dir) = vault(TokenTtl::default()).await;
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
+
+    for token in [&issued.access, &issued.refresh] {
+        let grant = vault
+            .open_for_client(token.expose(), "client")
+            .await
+            .unwrap();
+        assert_eq!(grant.grant_id, issued.grant_id);
+        assert_eq!(grant.telegram_session.as_slice(), SESSION);
+        match vault.open_for_client(token.expose(), "other-client").await {
+            Err(VaultError::WrongClient) => {}
+            other => panic!("expected WrongClient, got {other:?}"),
+        }
+    }
+    assert_invalid(vault.open_for_client("garbage", "client").await);
+    vault.delete_grant(&issued.grant_id).await.unwrap();
+    assert_invalid(
+        vault
+            .open_for_client(issued.refresh.expose(), "client")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn purge_drops_grants_left_without_tokens() {
+    let short = TokenTtl {
+        access: Duration::from_secs(1),
+        refresh: Duration::from_secs(1),
+    };
+    let (vault, _dir) = vault(short).await;
+    let expiring = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let opened = vault.open(expiring.access.expose()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let kept = vault.create_grant("client", 7, SESSION).await.unwrap();
+    let kept_opened = vault.open(kept.access.expose()).await.unwrap();
+
+    assert_eq!(vault.purge_expired().await.unwrap(), 2);
+    // The Grant row is gone too: writing its session finds nothing.
+    assert_invalid(vault.save_session(&opened, b"late write").await);
+    vault.save_session(&kept_opened, SESSION).await.unwrap();
+}

@@ -20,6 +20,9 @@ use super::{
 };
 use crate::sessions::{OpenedGrant, Vault};
 
+/// How long revocation waits for `auth.logOut` before giving up on Telegram.
+const LOG_OUT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Re-export the QR token this long before Telegram says it expires.
 const QR_REFRESH_MARGIN: i64 = 5;
 
@@ -646,6 +649,30 @@ impl Connector for GrammersConnector {
             return Err(TgError::BadSession("telegram session was revoked".into()));
         }
         Ok(live)
+    }
+
+    async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
+        // A pooled Live client may hold a newer session than the sealed one (e.g.
+        // after a DC migration); log out with that one.
+        let snapshot = match self.pool.remove(grant.grant_id.as_str()) {
+            Some(live) => live.snapshot()?,
+            None => grant.telegram_session.clone(),
+        };
+        drop(grant);
+        let Connected { client, .. } =
+            connect(&self.credentials, SessionStore::from_snapshot(&snapshot)?);
+        let result = tokio::time::timeout(
+            LOG_OUT_TIMEOUT,
+            client.invoke(&tl::functions::auth::LogOut {}),
+        )
+        .await;
+        client.disconnect();
+        match result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) if is_dead_session(&err) => Ok(()),
+            Ok(Err(err)) => Err(upstream(err)),
+            Err(_) => Err(TgError::Upstream("auth.logOut timed out".into())),
+        }
     }
 }
 

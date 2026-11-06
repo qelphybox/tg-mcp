@@ -35,6 +35,8 @@ pub const REDIRECT: &str = "http://127.0.0.1:43123/callback";
 pub struct TestServer {
     pub base: String,
     pub http: reqwest::Client,
+    /// The fake Telegram side every Grant of this server connects to.
+    pub connector: FakeConnector,
     shutdown: CancellationToken,
     _dir: TempDir,
 }
@@ -82,6 +84,7 @@ pub async fn start_with(accounts: Vec<FakeData>) -> TestServer {
 }
 
 pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
+    let connector = FakeConnector::default();
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -96,7 +99,7 @@ pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
         vault: Arc::new(Vault::new(pool.clone(), TokenTtl::default())),
         clients: ClientRegistry::new(pool),
         login,
-        connector: Arc::new(FakeConnector),
+        connector: Arc::new(connector.clone()),
     };
     let shutdown = CancellationToken::new();
     let app = tg_mcp::app(&config, deps, shutdown.clone());
@@ -114,6 +117,7 @@ pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
     TestServer {
         base,
         http,
+        connector,
         shutdown,
         _dir: dir,
     }

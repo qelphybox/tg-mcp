@@ -3,7 +3,11 @@
 //! A fake "Telegram session" is a [`FakeData`] as JSON (the Account and its Chats),
 //! so a Grant created by a fake login connects back to exactly that data.
 
-use std::{fmt, sync::Arc};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -269,15 +273,80 @@ impl LoginAttempt for FakeAttempt {
     }
 }
 
-/// Connects a Grant to the data recorded in its fake Telegram session.
+/// Connects a Grant to the data recorded in its fake Telegram session. Clones
+/// share one fake "Telegram side": which Accounts' sessions are dead, which were
+/// logged out, and whether Telegram is reachable.
 #[derive(Debug, Clone, Default)]
-pub struct FakeConnector;
+pub struct FakeConnector {
+    telegram: Arc<FakeTelegramSide>,
+}
+
+#[derive(Debug, Default)]
+struct FakeTelegramSide {
+    /// Accounts whose session Telegram considers ended.
+    dead: Mutex<HashSet<i64>>,
+    /// Accounts `auth.logOut` was called for, in order.
+    logged_out: Mutex<Vec<i64>>,
+    unreachable: std::sync::atomic::AtomicBool,
+}
+
+impl FakeConnector {
+    /// The user ended the session in Telegram (Settings → Devices → Terminate).
+    pub fn end_session_in_telegram(&self, account_id: i64) {
+        self.telegram.dead.lock().unwrap().insert(account_id);
+    }
+
+    /// Accounts whose session was logged out through [`Connector::log_out`].
+    pub fn logged_out(&self) -> Vec<i64> {
+        self.telegram.logged_out.lock().unwrap().clone()
+    }
+
+    /// Make every call to Telegram fail as if it were down.
+    pub fn set_unreachable(&self, unreachable: bool) {
+        self.telegram
+            .unreachable
+            .store(unreachable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn data(grant: &OpenedGrant) -> Result<FakeData, TgError> {
+        serde_json::from_slice(&grant.telegram_session)
+            .map_err(|e| TgError::BadSession(e.to_string()))
+    }
+
+    fn reachable(&self) -> Result<(), TgError> {
+        if self
+            .telegram
+            .unreachable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(TgError::Upstream("fake telegram is unreachable".into()));
+        }
+        Ok(())
+    }
+}
 
 #[async_trait::async_trait]
 impl Connector for FakeConnector {
     async fn connect(&self, grant: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError> {
-        let data: FakeData = serde_json::from_slice(&grant.telegram_session)
-            .map_err(|e| TgError::BadSession(e.to_string()))?;
+        let data = Self::data(&grant)?;
+        self.reachable()?;
+        if self
+            .telegram
+            .dead
+            .lock()
+            .unwrap()
+            .contains(&data.account.id)
+        {
+            return Err(TgError::BadSession("fake session was ended".into()));
+        }
         Ok(Arc::new(FakeTelegram::new(data)))
+    }
+
+    async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
+        let account_id = Self::data(&grant)?.account.id;
+        self.reachable()?;
+        self.telegram.dead.lock().unwrap().insert(account_id);
+        self.telegram.logged_out.lock().unwrap().push(account_id);
+        Ok(())
     }
 }

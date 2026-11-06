@@ -4,12 +4,14 @@
 //! Discovery: `/mcp` → 401 + `WWW-Authenticate: Bearer resource_metadata=…` →
 //! protected-resource metadata (RFC 9728) → authorization-server metadata
 //! (RFC 8414) → `/register` (RFC 7591) → `/authorize` + Login flow → `/token`.
+//! `/revoke` (RFC 7009) ends a Grant and logs its Telegram session out.
 
 mod authorize;
 pub mod clients;
 mod flows;
 mod pages;
 mod pkce;
+mod revoke;
 mod token;
 
 use std::sync::Arc;
@@ -117,6 +119,7 @@ pub fn router(auth: Arc<AuthState>) -> Router {
         )
         .route("/register", post(register))
         .route("/token", post(token::token))
+        .route("/revoke", post(revoke::revoke))
         .route("/authorize", get(authorize::authorize))
         .route("/login/{id}", get(authorize::login_page))
         .route("/login/{id}/status", get(authorize::login_status))
@@ -162,8 +165,12 @@ pub async fn require_bearer(
     let telegram = match auth.connector.connect(grant).await {
         Ok(telegram) => telegram,
         Err(err @ TgError::BadSession(_)) => {
-            // Logged out in Telegram or unusable: the client has to log in again.
-            tracing::warn!(grant_id = %grant_id, error = %err, "grant has an unusable telegram session");
+            // Ended in Telegram (Active sessions) or unreadable: that is permanent, so
+            // the Grant goes too, and the client has to log in again.
+            tracing::warn!(grant_id = %grant_id, error = %err, "grant has a dead telegram session, deleting it");
+            if let Err(err) = auth.vault.delete_grant(&grant_id).await {
+                tracing::error!(grant_id = %grant_id, error = %err, "deleting dead grant failed");
+            }
             return unauthorized(&auth, Some("invalid_token"));
         }
         Err(err) => {
@@ -214,6 +221,8 @@ async fn authorization_server(State(auth): State<Arc<AuthState>>) -> Response {
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
+        "revocation_endpoint": format!("{base}/revoke"),
+        "revocation_endpoint_auth_methods_supported": ["none"],
         "registration_endpoint": format!("{base}/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],

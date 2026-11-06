@@ -116,6 +116,9 @@ pub enum VaultError {
     /// variant: callers (and attackers) learn nothing about which check failed.
     #[error("invalid token")]
     InvalidToken,
+    /// A valid Token presented by a client it was not issued to.
+    #[error("token was issued to another client")]
+    WrongClient,
     /// The Token verified but its data does not decrypt: the database was altered.
     #[error("vault data for token {token_id} failed authentication")]
     Corrupt { token_id: String },
@@ -195,7 +198,26 @@ impl Vault {
 
     /// Verify an access Token and decrypt its Grant's Telegram session.
     pub async fn open(&self, access_token: &str) -> Result<OpenedGrant, VaultError> {
-        let verified = self.verify(access_token, Kind::Access).await?;
+        let verified = self.verify(access_token, &[Kind::Access]).await?;
+        self.decrypt(verified).await
+    }
+
+    /// Verify a Token of either kind that was issued to `client_id`, and decrypt its
+    /// Grant's Telegram session. For revocation: a client typically revokes with its
+    /// refresh Token, and only a Token can open the session to log it out (ADR-0003).
+    pub async fn open_for_client(
+        &self,
+        token: &str,
+        client_id: &str,
+    ) -> Result<OpenedGrant, VaultError> {
+        let verified = self.verify(token, &[Kind::Access, Kind::Refresh]).await?;
+        if !self.owned_by(&verified.grant_id, client_id).await? {
+            return Err(VaultError::WrongClient);
+        }
+        self.decrypt(verified).await
+    }
+
+    async fn decrypt(&self, verified: Verified) -> Result<OpenedGrant, VaultError> {
         let row: Option<(i64, Vec<u8>)> =
             sqlx::query_as("SELECT account_id, telegram_session FROM grants WHERE id = ?")
                 .bind(verified.grant_id.as_str())
@@ -246,14 +268,8 @@ impl Vault {
         refresh_token: &str,
         client_id: &str,
     ) -> Result<IssuedTokens, VaultError> {
-        let verified = self.verify(refresh_token, Kind::Refresh).await?;
-        let owner: Option<String> = sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
-            .bind(verified.grant_id.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
-        let owner_matches: bool =
-            owner.is_some_and(|owner| owner.as_bytes().ct_eq(client_id.as_bytes()).into());
-        if !owner_matches {
+        let verified = self.verify(refresh_token, &[Kind::Refresh]).await?;
+        if !self.owned_by(&verified.grant_id, client_id).await? {
             return Err(VaultError::InvalidToken);
         }
         let now = unix_now();
@@ -283,16 +299,37 @@ impl Vault {
         Ok(())
     }
 
-    /// Drop expired Tokens. Returns how many were removed.
+    /// Drop expired Tokens, then Grants left without any Token: nothing can ever
+    /// decrypt those again (ADR-0003). Returns how many Tokens were removed.
     pub async fn purge_expired(&self) -> Result<u64, VaultError> {
         let purged = sqlx::query("DELETE FROM tokens WHERE expires_at <= ?")
             .bind(unix_now())
             .execute(&self.pool)
             .await?;
+        let orphans = sqlx::query(
+            "DELETE FROM grants WHERE NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.grant_id = grants.id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        if orphans.rows_affected() > 0 {
+            tracing::info!(
+                grants = orphans.rows_affected(),
+                "grants without tokens deleted"
+            );
+        }
         Ok(purged.rows_affected())
     }
 
-    async fn verify(&self, token: &str, expected: Kind) -> Result<Verified, VaultError> {
+    /// Was this Grant issued to `client_id`? Constant-time on the id.
+    async fn owned_by(&self, grant_id: &GrantId, client_id: &str) -> Result<bool, VaultError> {
+        let owner: Option<String> = sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
+            .bind(grant_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(owner.is_some_and(|owner| owner.as_bytes().ct_eq(client_id.as_bytes()).into()))
+    }
+
+    async fn verify(&self, token: &str, accepted: &[Kind]) -> Result<Verified, VaultError> {
         let parsed = token::parse(token).ok_or(VaultError::InvalidToken)?;
         let TokenRow {
             grant_id,
@@ -310,7 +347,8 @@ impl Vault {
 
         let verifier = crypto::derive(parsed.secret.as_ref(), parsed.id.as_bytes(), VERIFIER_INFO);
         let secret_ok: bool = verifier.as_slice().ct_eq(&stored_verifier).into();
-        if !secret_ok || kind != expected.as_str() || expires_at <= unix_now() {
+        let kind_ok = accepted.iter().any(|k| k.as_str() == kind);
+        if !secret_ok || !kind_ok || expires_at <= unix_now() {
             return Err(VaultError::InvalidToken);
         }
 

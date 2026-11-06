@@ -86,6 +86,11 @@ pub trait Telegram: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait Connector: Send + Sync + 'static {
     async fn connect(&self, grant: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError>;
+
+    /// End the Grant's Telegram session (`auth.logOut`, so it leaves the Account's
+    /// Active sessions) and drop its Live client. A session Telegram already
+    /// considers dead counts as logged out.
+    async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError>;
 }
 
 /// Starts the Telegram part of a Login flow.
