@@ -76,8 +76,10 @@ pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
 
     /// One page of the Account's Chats in the main list or the Archive: pinned
-    /// first on the first page, then most recent first, each Chat once. `cursor`
-    /// is a `next_cursor` from a previous page (it also decides `archived`).
+    /// first on the first page, then most recent first, each Chat once. At most
+    /// `limit` Chats, and `next_cursor` continues right after the last one, so
+    /// callers must not cut the page. `cursor` is a `next_cursor` from a
+    /// previous page (it also decides `archived`).
     async fn list_chats(
         &self,
         limit: usize,

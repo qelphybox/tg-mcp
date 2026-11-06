@@ -175,7 +175,8 @@ instructions.",
             )
             .await
             .map_err(tool_error)?;
-        page.chats.truncate(limit);
+        // No cut here: the backend caps the page at `limit`, and only it knows
+        // where its `next_cursor` continues.
         for chat in &mut page.chats {
             chat.title = shorten(&chat.title, MAX_TITLE_CHARS);
             if let Some(last) = &mut chat.last_message {

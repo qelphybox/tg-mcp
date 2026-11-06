@@ -506,7 +506,7 @@ impl Telegram for LiveClient {
 
         self.remember(&peers);
         Ok(chats::assemble_page(
-            &dialogs, &peers, &messages, full_page, listing,
+            &dialogs, &peers, &messages, limit, full_page, listing,
         ))
     }
 

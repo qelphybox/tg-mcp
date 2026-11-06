@@ -166,5 +166,6 @@ Needs an account with pinned chats in the main list, some archived chats, and mo
 1. In each listing, rows = unique ids: no id repeats, on one page or across pages.
 2. `pinned: true` appears only on page 1 of each listing, and the pinned count matches the pinned chats in the Telegram app (main list and Archive separately).
 3. No id is in both listings (0 in common). Spot-check one archived chat in the app: it is in the `archived=true` list only.
+4. Pinned chats push nothing off page 1. Call `list_chats` with `limit=5`, then again with its `next_cursor` and `limit=5`, and the same with `archived=true`. Page 1 has at most 5 chats, and the first chat of page 2 is the next chat after the last one of page 1 by date, as the app lists them. Nothing is skipped in between. Before this was fixed, the gap was as many chats as there are pinned ones.
 
 A chat that gets a new message while you page moves to the top, above the cursor: it can be missing from the later pages, but never shows twice.

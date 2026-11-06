@@ -349,13 +349,16 @@ impl Cursor {
     }
 }
 
-/// Assemble a page. `full_page` = Telegram returned as many dialogs as asked for,
-/// so there may be more. Whatever Telegram sends, the page keeps only dialogs of
-/// the listing's folder, pinned ones only on the first page, each chat once.
+/// Assemble a page of at most `limit` chats. `full_page` = Telegram returned
+/// as many dialogs as asked for, so there may be more. Whatever Telegram sends,
+/// the page keeps only dialogs of the listing's folder, pinned ones only on the
+/// first page, each chat once. The page is cut here and nowhere else: the
+/// cursor has to know where it ends.
 pub fn assemble_page(
     dialogs: &[RawDialog],
     peers: &[RawPeer],
     messages: &[RawMessage],
+    limit: usize,
     full_page: bool,
     listing: Listing,
 ) -> ChatPage {
@@ -364,11 +367,18 @@ pub fn assemble_page(
         messages.iter().map(|m| ((m.chat, m.id), m)).collect();
 
     let mut seen = HashSet::new();
-    let chats = dialogs
+    let mut shown: Vec<&RawDialog> = dialogs
         .iter()
         .filter(|d| d.folder_id == listing.folder_id())
         .filter(|d| !(d.pinned && listing.exclude_pinned()))
         .filter(|d| seen.insert(d.chat))
+        .collect();
+    // A first page brings the pinned dialogs on top of `limit` unpinned ones.
+    let cut = shown.len() > limit;
+    shown.truncate(limit);
+
+    let chats = shown
+        .iter()
         .map(|dialog| {
             let peer = peers.get(&dialog.chat);
             let top = messages.get(&(dialog.chat, dialog.top_message));
@@ -394,8 +404,14 @@ pub fn assemble_page(
         })
         .collect();
 
-    // Offsets come from what Telegram sent, kept or not; pinned dates are out of order.
-    let last_unpinned = dialogs.iter().rev().find(|d| !d.pinned);
+    // A cut page continues right after its last shown chat. Otherwise offsets
+    // come from what Telegram sent, kept or not, so dropped dialogs aren't asked
+    // for again. Pinned dates are out of order: a pinned dialog is never one.
+    let last_unpinned = if cut {
+        shown.iter().copied().rev().find(|d| !d.pinned)
+    } else {
+        dialogs.iter().rev().find(|d| !d.pinned)
+    };
     let next = match last_unpinned {
         Some(last) => Some(Cursor {
             offset_date: messages
@@ -418,7 +434,8 @@ pub fn assemble_page(
         // A later page with nothing to go on would only repeat itself.
         None => None,
     };
-    let next_cursor = next.filter(|_| full_page).map(|c| c.encode());
+    // What was cut off is still to come.
+    let next_cursor = next.filter(|_| cut || full_page).map(|c| c.encode());
 
     ChatPage { chats, next_cursor }
 }
@@ -512,7 +529,7 @@ mod tests {
             },
         ];
         let other = peer(ChatId::User(7), "Bob", ChatKind::Private, Some(2));
-        let page = assemble_page(&dialogs, &[me.clone(), other], &[], false, MAIN_FIRST);
+        let page = assemble_page(&dialogs, &[me.clone(), other], &[], 100, false, MAIN_FIRST);
         assert!(page.chats[0].is_self);
         assert!(!page.chats[1].is_self);
         assert!(chat_info(&me, None, None).is_self);
@@ -666,7 +683,7 @@ mod tests {
             },
         ];
 
-        let page = assemble_page(&dialogs, &peers, &messages, false, MAIN_FIRST);
+        let page = assemble_page(&dialogs, &peers, &messages, 100, false, MAIN_FIRST);
         assert_eq!(page.next_cursor, None, "a short page is the last one");
         assert_eq!(
             page.chats[0].id,
@@ -709,7 +726,7 @@ mod tests {
             text: "x".into(),
         }];
 
-        let page = assemble_page(&dialogs, &peers, &messages, true, ARCHIVE_FIRST);
+        let page = assemble_page(&dialogs, &peers, &messages, 1, true, ARCHIVE_FIRST);
         let cursor = Cursor::decode(page.next_cursor.as_deref().unwrap()).unwrap();
         assert_eq!(
             cursor,
@@ -741,7 +758,7 @@ mod tests {
             date: 1,
             text: "someone else's message".into(),
         }];
-        let page = assemble_page(&dialogs, &[], &messages, false, MAIN_FIRST);
+        let page = assemble_page(&dialogs, &[], &messages, 100, false, MAIN_FIRST);
         assert_eq!(page.chats[0].last_message, None);
     }
 
@@ -755,7 +772,7 @@ mod tests {
             pinned: false,
             folder_id: 0,
         }];
-        let page = assemble_page(&dialogs, &[], &[], false, MAIN_FIRST);
+        let page = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
         assert_eq!(page.chats[0].title, "Unknown chat");
         assert_eq!(page.chats[0].kind, ChatKind::Group);
         assert_eq!(page.chats[0].last_message, None);
@@ -764,12 +781,12 @@ mod tests {
     #[test]
     fn pinned_chats_are_listed_on_the_first_page_only() {
         let dialogs = [dialog(1, true), dialog(9, false), dialog(8, false)];
-        let first = assemble_page(&dialogs, &[], &[], false, MAIN_FIRST);
+        let first = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
         assert_eq!(ids(&first), ["user:1", "user:9", "user:8"]);
         assert!(first.chats[0].pinned);
 
         // A later page drops a pinned dialog even if Telegram sends one.
-        let later = assemble_page(&dialogs, &[], &[], false, MAIN_NEXT);
+        let later = assemble_page(&dialogs, &[], &[], 100, false, MAIN_NEXT);
         assert_eq!(ids(&later), ["user:9", "user:8"]);
     }
 
@@ -784,7 +801,7 @@ mod tests {
         ];
         let messages: Vec<RawMessage> = [1, 9, 8, 2].map(message).into();
         for listing in [MAIN_FIRST, MAIN_NEXT] {
-            let page = assemble_page(&dialogs, &[], &messages, true, listing);
+            let page = assemble_page(&dialogs, &[], &messages, 4, true, listing);
             assert_eq!(
                 cursor(&page),
                 Cursor {
@@ -801,7 +818,7 @@ mod tests {
     #[test]
     fn a_first_page_of_only_pinned_chats_continues_from_the_top() {
         let dialogs = [dialog(1, true), dialog(2, true)].map(|d| RawDialog { folder_id: 1, ..d });
-        let page = assemble_page(&dialogs, &[], &[1, 2].map(message), true, ARCHIVE_FIRST);
+        let page = assemble_page(&dialogs, &[], &[1, 2].map(message), 2, true, ARCHIVE_FIRST);
         assert_eq!(page.chats.len(), 2);
         assert_eq!(
             cursor(&page),
@@ -815,9 +832,156 @@ mod tests {
         );
 
         // On a later page that would ask for the same page again: stop instead.
-        let later = assemble_page(&dialogs, &[], &[], true, MAIN_NEXT);
+        let later = assemble_page(&dialogs, &[], &[], 100, true, MAIN_NEXT);
         assert!(later.chats.is_empty());
         assert_eq!(later.next_cursor, None);
+    }
+
+    #[test]
+    fn a_cut_first_page_continues_after_its_last_shown_chat() {
+        // Telegram sends the pinned dialogs on top of `limit` unpinned ones.
+        let dialogs = [
+            dialog(5, true),
+            dialog(999, true),
+            dialog(30, false),
+            dialog(29, false),
+            dialog(28, false),
+        ];
+        let messages: Vec<RawMessage> = [5, 999, 30, 29, 28].map(message).into();
+        let page = assemble_page(&dialogs, &[], &messages, 3, true, MAIN_FIRST);
+        assert_eq!(ids(&page), ["user:5", "user:999", "user:30"]);
+        // Telegram starts strictly after the offset: user:29 comes next.
+        assert_eq!(
+            cursor(&page),
+            Cursor {
+                offset_date: 30,
+                offset_id: 30,
+                offset_peer: Some("user:30".into()),
+                offset_access_hash: None,
+                archived: false,
+            }
+        );
+
+        // A cut page has more after it, whatever the dialog count said.
+        let page = assemble_page(&dialogs, &[], &messages, 3, false, MAIN_FIRST);
+        assert_eq!(cursor(&page).offset_peer.as_deref(), Some("user:30"));
+    }
+
+    #[test]
+    fn a_first_page_cut_to_pinned_chats_continues_from_the_top() {
+        let dialogs = [
+            dialog(5, true),
+            dialog(999, true),
+            dialog(3, true),
+            dialog(30, false),
+            dialog(29, false),
+        ];
+        let messages: Vec<RawMessage> = [5, 999, 3, 30, 29].map(message).into();
+        for limit in [2, 3] {
+            let page = assemble_page(&dialogs, &[], &messages, limit, true, MAIN_FIRST);
+            assert_eq!(page.chats.len(), limit);
+            assert!(page.chats.iter().all(|c| c.pinned));
+            assert_eq!(
+                cursor(&page),
+                Cursor {
+                    offset_date: 0,
+                    offset_id: 0,
+                    offset_peer: None,
+                    offset_access_hash: None,
+                    archived: false,
+                },
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// One folder as `messages.getDialogs` serves it (as seen on production):
+    /// a first page brings every pinned dialog on top of `limit` unpinned ones,
+    /// and each page's unpinned dialogs are the newest strictly older than the
+    /// offset. `dialog(n)` is dated `n`, so `unpinned` is in descending order;
+    /// pinned dates are deliberately out of that order.
+    struct Folder {
+        archived: bool,
+        pinned: Vec<i64>,
+        unpinned: Vec<i64>,
+    }
+
+    impl Folder {
+        /// What `LiveClient::list_chats` gets from Telegram and hands on.
+        fn list_chats(&self, limit: usize, cursor: Option<&str>) -> ChatPage {
+            let cursor = cursor.map(|c| Cursor::decode(c).unwrap());
+            let listing = Listing {
+                archived: cursor.as_ref().map_or(self.archived, |c| c.archived),
+                first_page: cursor.is_none(),
+            };
+            assert_eq!(listing.archived, self.archived);
+            let older_than = cursor.map_or(i32::MAX, |c| match c.offset_date {
+                0 => i32::MAX,
+                date => date,
+            });
+            let pinned = self.pinned.iter().filter(|_| !listing.exclude_pinned());
+            let unpinned = self.unpinned.iter().filter(|&&n| (n as i32) < older_than);
+            let dialogs: Vec<RawDialog> = pinned
+                .map(|&n| dialog(n, true))
+                .chain(unpinned.take(limit).map(|&n| dialog(n, false)))
+                .map(|d| RawDialog {
+                    folder_id: listing.folder_id(),
+                    ..d
+                })
+                .collect();
+            let messages: Vec<RawMessage> = dialogs
+                .iter()
+                .map(|d| message(d.top_message.into()))
+                .collect();
+            let full_page = dialogs.len() >= limit;
+            assemble_page(&dialogs, &[], &messages, limit, full_page, listing)
+        }
+
+        /// Every page, from the first until there is no `next_cursor`.
+        fn page_through(&self, limit: usize) -> Vec<ChatPage> {
+            let mut pages = vec![self.list_chats(limit, None)];
+            while let Some(next) = pages.last().unwrap().next_cursor.clone() {
+                assert!(pages.len() < 100, "paging never ends");
+                pages.push(self.list_chats(limit, Some(&next)));
+            }
+            pages
+        }
+    }
+
+    #[test]
+    fn paging_shows_every_chat_exactly_once_in_order() {
+        let pinned_sets: [&[i64]; 4] = [&[], &[5], &[999, 3, 1000], &[5, 999, 3, 998]];
+        for archived in [false, true] {
+            for pinned in pinned_sets {
+                for unpinned in 0..=12 {
+                    for limit in 1..=9 {
+                        let folder = Folder {
+                            archived,
+                            pinned: pinned.to_vec(),
+                            unpinned: (100..100 + unpinned).rev().collect(),
+                        };
+                        let case = format!(
+                            "archived {archived}, pinned {pinned:?}, {unpinned} unpinned, \
+                             limit {limit}"
+                        );
+                        let pages = folder.page_through(limit);
+                        for page in &pages {
+                            assert!(page.chats.len() <= limit, "{case}");
+                        }
+                        let shown: Vec<String> = pages.iter().flat_map(ids).collect();
+                        // Pinned chats beyond `limit` are not shown (#37's limitation).
+                        let expected: Vec<String> = folder
+                            .pinned
+                            .iter()
+                            .take(limit)
+                            .chain(&folder.unpinned)
+                            .map(|n| format!("user:{n}"))
+                            .collect();
+                        assert_eq!(shown, expected, "{case}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -827,16 +991,16 @@ mod tests {
             ..dialog(5, false)
         };
         let dialogs = [dialog(9, false), archived, dialog(4, false)];
-        let main = assemble_page(&dialogs, &[], &[], false, MAIN_FIRST);
+        let main = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
         assert_eq!(ids(&main), ["user:9", "user:4"]);
-        let archive = assemble_page(&dialogs, &[], &[], false, ARCHIVE_FIRST);
+        let archive = assemble_page(&dialogs, &[], &[], 100, false, ARCHIVE_FIRST);
         assert_eq!(ids(&archive), ["user:5"]);
     }
 
     #[test]
     fn a_chat_appears_once_per_page() {
         let dialogs = [dialog(1, true), dialog(9, false), dialog(1, false)];
-        let page = assemble_page(&dialogs, &[], &[], false, MAIN_FIRST);
+        let page = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
         assert_eq!(ids(&page), ["user:1", "user:9"]);
         assert!(page.chats[0].pinned, "the first occurrence wins");
     }
