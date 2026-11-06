@@ -4,6 +4,8 @@ The acceptance criteria of the spec (#1), checked by hand against production bef
 
 Commands assume a local clone with `.env` from `scripts/setup-deploy.sh` loaded (`set -a; . ./.env; set +a`), so `$KAMAL_HOST` is the server. The app container is the one labelled `service=tg-mcp`.
 
+Run the shell blocks in bash. Interactive zsh (the macOS default) doesn't treat `#` as a comment unless `setopt interactivecomments` is on, so the inline `# expect …` notes fail with a parse error; type `bash` first, or run `setopt interactivecomments`.
+
 ## 1. From `claude mcp add` to the first `list_chats` in under 2 minutes
 
 With a stopwatch, from a machine where the server was never added:
