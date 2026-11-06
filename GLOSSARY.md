@@ -41,7 +41,21 @@ The Account's Telegram two-step verification password. Asked for on the login pa
 _Avoid_: 2FA code, PIN
 
 **Consent**:
-The screen where the user confirms the scope ("read-only access to all chats") before a Grant is created.
+The screen where the user chooses the Grant's Scopes (and, with `send`, its Send allow-list) before a Grant is created.
+
+## Writing on the Account's behalf
+
+**Scope**:
+A kind of access a Grant has: `read` (always), `draft`, `send`, `organize`. Chosen by the user on the Consent screen; changing Scopes means a new Grant.
+_Avoid_: permission, role, right
+
+**Send allow-list**:
+The Chats a Grant with the `send` Scope may send to, react in or mark as read, chosen on the Consent screen. Nothing outside it can be written to.
+_Avoid_: whitelist, allowed chats
+
+**Draft**:
+Unsent text in a Chat's input field of the Account, synced to all its devices. Only the user sends it.
+_Avoid_: pending message, unsent message
 
 ## Runtime
 
