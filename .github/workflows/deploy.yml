@@ -22,6 +22,9 @@ permissions:
 
 jobs:
   deploy:
+    # Pushes skip quietly until scripts/setup-deploy.sh has configured a server;
+    # a manual run always goes ahead (and fails loudly if it's not set up).
+    if: github.event_name == 'workflow_dispatch' || vars.KAMAL_HOST != ''
     runs-on: ubuntu-latest
     environment:
       name: production
