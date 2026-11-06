@@ -60,5 +60,17 @@ _Avoid_: dialog, conversation, peer (peer is the MTProto term; use it only in co
 How the tools name a Chat: `user:N~H`, `channel:N~H` or `chat:N` (basic group), where `H` is the user's or channel's access hash, so an id is resolved without a lookup. Ids without `~H`, issued before ids carried it, are still accepted and looked up in the dialog list.
 _Avoid_: peer id, chat handle
 
+**Archive**:
+Telegram's single built-in place for Chats the user moved out of the main chat list. A Chat is either archived or not.
+_Avoid_: archived folder, folder (unqualified)
+
+**Chat folder**:
+A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Telegram apps. A Chat can be in several Chat folders, and in none. Unrelated to the Archive.
+_Avoid_: folder (unqualified), filter, tab
+
+**Search hit**:
+One message found by a search, together with its Chat and a snippet of its text around the match.
+_Avoid_: result, match
+
 **MCP session**:
 The streamable-HTTP session identified by `Mcp-Session-Id`. Unrelated to the Telegram session.
