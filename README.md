@@ -31,7 +31,7 @@ Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser op
 | `get_messages` | Messages of one chat, newest first: sender, date, text, reply/forward/edit marks. Paged by `before_id`; `since`/`until` narrow by time. |
 | `get_chat_info` | Title, type, @username, bio/description and member count of one chat. |
 
-Chat ids look like `user:123`, `chat:456` (basic group) or `channel:789` (channels and supergroups), as returned by `list_chats`. Every tool is marked read-only and has bounded output: at most 100 items per call, long texts cut, media shown as `[photo]`, `[voice]`, ….
+Chat ids look like `user:123~a-MGLzhi9Ek`, `chat:456` (basic group) or `channel:789~18YMXnDF6JI` (channels and supergroups), as returned by `list_chats` and in message senders; the part after `~` is the access hash Telegram needs, so an id works without the server looking it up. Ids without it (`user:123`) are still accepted. Every tool is marked read-only and has bounded output: at most 100 items per call, long texts cut, media shown as `[photo]`, `[voice]`, ….
 
 ## Disconnecting
 

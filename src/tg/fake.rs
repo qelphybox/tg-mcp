@@ -15,7 +15,8 @@ use zeroize::Zeroizing;
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{
-        ChatId, ChatInfo, ChatKind, ChatPage, ChatSummary, MessagePreview, RawPeer, chat_info,
+        ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
+        chat_info,
     },
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
 };
@@ -25,6 +26,8 @@ use crate::sessions::OpenedGrant;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FakeData {
     pub account: Account,
+    /// The Account's Chats. Their ids may be written without access hash
+    /// (`user:101`); the fake hands them out with [`fake_access_hash`].
     #[serde(default)]
     pub chats: Vec<ChatSummary>,
     /// Each Chat's history, in any order.
@@ -90,6 +93,23 @@ impl FakeTelegram {
 
 const CURSOR_PREFIX: &str = "fake:";
 
+/// The access hash the fake Telegram gives a user or channel: fixed per id (and
+/// often negative, like real ones), so tests can predict the ids it issues.
+/// Basic groups have none.
+pub fn fake_access_hash(chat: ChatId) -> Option<i64> {
+    match chat {
+        ChatId::User(id) | ChatId::Channel(id) => {
+            Some((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64)
+        }
+        ChatId::Chat(_) => None,
+    }
+}
+
+/// The id the fake hands out for `chat`, access hash included.
+pub fn fake_issued_id(chat: ChatId) -> String {
+    ChatRef::new(chat, fake_access_hash(chat)).to_string()
+}
+
 #[async_trait::async_trait]
 impl Telegram for FakeTelegram {
     async fn whoami(&self) -> Result<Account, TgError> {
@@ -126,7 +146,13 @@ impl Telegram for FakeTelegram {
             .iter()
             .skip(start)
             .take(limit)
-            .cloned()
+            .map(|c| ChatSummary {
+                id: c
+                    .id
+                    .parse::<ChatRef>()
+                    .map_or_else(|_| c.id.clone(), |id| fake_issued_id(id.chat())),
+                ..c.clone()
+            })
             .collect();
         let end = start + chats.len();
         Ok(ChatPage {
@@ -136,12 +162,10 @@ impl Telegram for FakeTelegram {
     }
 
     /// Emulates getHistory: `before_id` and `until` are applied before `limit`.
-    async fn get_messages(
-        &self,
-        chat: ChatId,
-        query: HistoryQuery,
-    ) -> Result<MessagePage, TgError> {
+    async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
         self.flood()?;
+        self.check_hash(id)?;
+        let chat = id.chat();
         if !self.knows(chat) {
             return Err(TgError::InvalidInput(format!(
                 "{chat} is not one of your chats; chat ids come from list_chats"
@@ -156,11 +180,13 @@ impl Telegram for FakeTelegram {
             .take(query.limit)
             .collect();
         let full = window.len() == query.limit;
-        Ok(assemble_history(chat, &window, &self.peers(), &query, full))
+        Ok(assemble_history(id, &window, &self.peers(), &query, full))
     }
 
-    async fn get_chat_info(&self, chat: ChatId) -> Result<ChatInfo, TgError> {
+    async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
         self.flood()?;
+        self.check_hash(id)?;
+        let chat = id.chat();
         let peer = self
             .peers()
             .into_iter()
@@ -183,10 +209,25 @@ impl FakeTelegram {
         }
     }
 
+    /// Like Telegram: an id with a wrong access hash is `CHANNEL_INVALID` /
+    /// `PEER_ID_INVALID`, which the Live client reports this way.
+    fn check_hash(&self, chat: ChatRef) -> Result<(), TgError> {
+        match chat.access_hash() {
+            Some(hash) if Some(hash) != fake_access_hash(chat.chat()) => Err(
+                TgError::InvalidInput(format!("{} can't be read by this account", chat.chat())),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// The fake knows a Chat if it lists it or has history for it.
     fn knows(&self, chat: ChatId) -> bool {
-        let id = chat.to_string();
-        self.data.messages.contains_key(&chat) || self.data.chats.iter().any(|c| c.id == id)
+        self.data.messages.contains_key(&chat)
+            || self
+                .data
+                .chats
+                .iter()
+                .any(|c| c.id.parse::<ChatRef>().is_ok_and(|id| id.chat() == chat))
     }
 
     fn peers(&self) -> Vec<RawPeer> {
@@ -195,12 +236,13 @@ impl FakeTelegram {
             .chats
             .iter()
             .filter_map(|c| {
+                let id = c.id.parse::<ChatRef>().ok()?.chat();
                 Some(RawPeer {
-                    id: c.id.parse().ok()?,
+                    id,
                     title: c.title.clone(),
                     kind: c.kind,
                     username: c.username.clone(),
-                    access_hash: None,
+                    access_hash: fake_access_hash(id),
                     is_self: c.is_self,
                 })
             })
@@ -209,7 +251,7 @@ impl FakeTelegram {
                 title: me.display_name(),
                 kind: ChatKind::Private,
                 username: me.username.clone(),
-                access_hash: None,
+                access_hash: fake_access_hash(ChatId::User(me.id)),
                 is_self: true,
             }))
             .collect()

@@ -95,3 +95,14 @@ done
 ```
 
 Then `kamal app logs | grep -e 'rate limited' -e 'login flow refused'`: the lines carry `route=` and `client_ip=` **your public IP**. If `client_ip` is a Docker address (`172.x`) instead, every client shares one bucket: check `TG_MCP_TRUST_FORWARDED_FOR` and the proxy.
+
+## 8. Chat ids work on a cold Live client, however deep the chat
+
+In Claude Code with the server connected:
+
+1. Ask "list my Telegram chats, then page on until you reach chat number ~600" (or use the Archive). Ids look like `user:123~xxxxxxxxxxx` / `channel:123~xxxxxxxxxxx` (11 characters after `~`); basic groups stay `chat:456`. Message senders in `get_messages` carry the same form. Note one id from the first page and one from far down.
+2. Make the Live client cold: `ssh deploy@$KAMAL_HOST 'docker restart $(docker ps -qf label=service=tg-mcp)'` (or wait 11 minutes without calls).
+3. Ask for the last messages and the chat info of both noted ids, quoting them exactly. Both answer at once, including the deep one (before, it said "is not one of your chats").
+4. Legacy id: ask for messages of the first id without its `~…` part. It still answers (it may take a few seconds: the old path pages through the dialog list), and the answer's `chat_id` carries the hash again.
+5. Tampered hash: change a character in the middle of the part after `~` and ask again. The tool answers "… can't be read by this account", not an internal error.
+6. `kamal app logs | grep -F '<the 11 characters after ~ of a noted id>'` finds nothing: access hashes are never logged.

@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use super::TgError;
 
-/// A Chat's stable id, shared by every tool: `user:<id>`, `chat:<id>` (basic group)
-/// or `channel:<id>` (channels and supergroups).
+/// Which Chat: `user:<id>`, `chat:<id>` (basic group) or `channel:<id>` (channels
+/// and supergroups). The tools hand out and take [`ChatRef`]s, which add the
+/// access hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatId {
     User(i64),
@@ -54,6 +55,9 @@ impl FromStr for ChatId {
             ))
         };
         let (kind, id) = s.split_once(':').ok_or_else(invalid)?;
+        if !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
         let id: i64 = id.parse().map_err(|_| invalid())?;
         if id <= 0 {
             return Err(invalid());
@@ -65,6 +69,92 @@ impl FromStr for ChatId {
             _ => Err(invalid()),
         }
     }
+}
+
+/// A chat id as the tools hand it out and take it back: the Chat, plus the
+/// access hash Telegram needs to address a user or channel, so resolving an id
+/// takes no lookup. Written `user:N~H`, `channel:N~H` (H: the hash as 11
+/// base64url characters) and `chat:N` (basic groups need no hash). Ids without
+/// `~H`, as issued before hashes were added, are still accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChatRef {
+    chat: ChatId,
+    access_hash: Option<i64>,
+}
+
+/// Longest chat id we issue: `channel:` + 19 digits + `~` + 11 hash characters.
+pub const CHAT_REF_MAX_LEN: usize = 39;
+
+/// What a chat id looks like (for input schemas).
+pub const CHAT_REF_PATTERN: &str =
+    r"^(chat:[1-9][0-9]{0,18}|(user|channel):[1-9][0-9]{0,18}(~[A-Za-z0-9_-]{11})?)$";
+
+/// Base64url characters of an encoded access hash (8 bytes, no padding).
+const HASH_CHARS: usize = 11;
+
+impl ChatRef {
+    /// A basic group's hash is dropped: it has none.
+    pub fn new(chat: ChatId, access_hash: Option<i64>) -> Self {
+        let access_hash = access_hash.filter(|_| !matches!(chat, ChatId::Chat(_)));
+        Self { chat, access_hash }
+    }
+
+    pub fn chat(&self) -> ChatId {
+        self.chat
+    }
+
+    pub fn access_hash(&self) -> Option<i64> {
+        self.access_hash
+    }
+}
+
+/// An id without a hash: resolved through the Live client's peer cache.
+impl From<ChatId> for ChatRef {
+    fn from(chat: ChatId) -> Self {
+        Self::new(chat, None)
+    }
+}
+
+impl fmt::Display for ChatRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.chat)?;
+        if let Some(hash) = self.access_hash {
+            write!(f, "~{}", URL_SAFE_NO_PAD.encode(hash.to_be_bytes()))?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for ChatRef {
+    type Err = TgError;
+
+    fn from_str(s: &str) -> Result<Self, TgError> {
+        let invalid = || {
+            TgError::InvalidInput(format!(
+                "'{s}' is not a chat id (expected user:N, chat:N or channel:N, \
+                 optionally followed by ~ and an access hash, as list_chats returns them)"
+            ))
+        };
+        let (chat, hash) = match s.split_once('~') {
+            Some((chat, hash)) => (chat, Some(hash)),
+            None => (s, None),
+        };
+        let chat: ChatId = chat.parse().map_err(|_| invalid())?;
+        let access_hash = match hash {
+            None => None,
+            Some(_) if matches!(chat, ChatId::Chat(_)) => return Err(invalid()),
+            Some(hash) => Some(decode_hash(hash).ok_or_else(invalid)?),
+        };
+        Ok(Self { chat, access_hash })
+    }
+}
+
+fn decode_hash(s: &str) -> Option<i64> {
+    if s.len() != HASH_CHARS {
+        return None;
+    }
+    let bytes: [u8; 8] = URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -151,7 +241,7 @@ pub fn chat_info(
         _ => member_count.filter(|n| *n > 0),
     };
     ChatInfo {
-        id: peer.id.to_string(),
+        id: peer.chat_ref().to_string(),
         title: peer.title.clone(),
         kind: peer.kind,
         username: peer.username.clone(),
@@ -174,6 +264,13 @@ pub struct RawPeer {
     pub access_hash: Option<i64>,
     /// The connected Account itself (its chat is Telegram's Saved Messages).
     pub is_self: bool,
+}
+
+impl RawPeer {
+    /// The id to hand out for this peer, with its access hash if it has one.
+    pub fn chat_ref(&self) -> ChatRef {
+        ChatRef::new(self.id, self.access_hash)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,7 +341,7 @@ pub fn assemble_page(
             let peer = peers.get(&dialog.chat);
             let top = messages.get(&(dialog.chat, dialog.top_message));
             ChatSummary {
-                id: dialog.chat.to_string(),
+                id: ChatRef::new(dialog.chat, peer.and_then(|p| p.access_hash)).to_string(),
                 title: peer
                     .map(|p| p.title.clone())
                     .unwrap_or_else(|| "Unknown chat".into()),
@@ -363,9 +460,76 @@ mod tests {
             assert_eq!(id.to_string().parse::<ChatId>().unwrap(), id);
         }
         for bad in [
-            "42", "user:", "user:-1", "user:0", "group:5", "user:abc", "",
+            "42", "user:", "user:-1", "user:0", "group:5", "user:abc", "", "user:+5",
         ] {
             assert!(bad.parse::<ChatId>().is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn issued_ids_carry_the_access_hash_and_round_trip() {
+        for hash in [0, 1, -1, 42, -5_000_000_000, i64::MAX, i64::MIN] {
+            for chat in [ChatId::User(42), ChatId::Channel(1_234_567_890_123)] {
+                let id = ChatRef::new(chat, Some(hash));
+                let text = id.to_string();
+                let parsed: ChatRef = text.parse().unwrap();
+                assert_eq!(parsed, id, "{text}");
+                assert_eq!(parsed.access_hash(), Some(hash), "{text}");
+                assert_eq!(parsed.to_string(), text);
+                assert!(
+                    text.starts_with(&format!("{chat}~")),
+                    "kind and number stay readable: {text}"
+                );
+                assert!(
+                    text.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-:~".contains(&b)),
+                    "URL-safe: {text}"
+                );
+            }
+        }
+        assert_eq!(
+            ChatRef::new(ChatId::User(101), Some(-2)).to_string(),
+            "user:101~__________4"
+        );
+        assert_eq!(
+            ChatRef::new(ChatId::Channel(5), Some(0x1234_5678_9abc_def0)).to_string(),
+            "channel:5~EjRWeJq83vA"
+        );
+        let longest = ChatRef::new(ChatId::Channel(i64::MAX), Some(i64::MIN)).to_string();
+        assert_eq!(longest.len(), CHAT_REF_MAX_LEN, "{longest}");
+    }
+
+    #[test]
+    fn hashless_ids_still_parse_and_basic_groups_never_carry_a_hash() {
+        let legacy: ChatRef = "channel:7".parse().unwrap();
+        assert_eq!(legacy, ChatRef::from(ChatId::Channel(7)));
+        assert_eq!(legacy.access_hash(), None);
+        assert_eq!(legacy.to_string(), "channel:7");
+
+        let group = ChatRef::new(ChatId::Chat(4), Some(99));
+        assert_eq!(group.access_hash(), None);
+        assert_eq!(group.to_string(), "chat:4");
+        assert_eq!("chat:4".parse::<ChatRef>().unwrap(), group);
+    }
+
+    #[test]
+    fn malformed_or_misplaced_hashes_are_rejected() {
+        let hash = ChatRef::new(ChatId::User(1), Some(-5)).to_string();
+        let hash = hash.split_once('~').unwrap().1;
+        for bad in [
+            format!("chat:4~{hash}"),
+            "user:1~".into(),
+            "user:1~AAAA".into(),
+            format!("user:1~{hash}A"),
+            format!("user:1~{hash}~{hash}"),
+            "user:1~AAAAAAAAAA!".into(),
+            // Non-canonical: the last character carries bits beyond the 8 bytes.
+            "user:1~AAAAAAAAAAB".into(),
+            format!("user:-1~{hash}"),
+            format!("group:1~{hash}"),
+            format!("~{hash}"),
+        ] {
+            assert!(bad.parse::<ChatRef>().is_err(), "accepted {bad:?}");
         }
     }
 
@@ -415,7 +579,15 @@ mod tests {
 
         let page = assemble_page(&dialogs, &peers, &messages, false, false);
         assert_eq!(page.next_cursor, None, "a short page is the last one");
-        assert_eq!(page.chats[0].id, "channel:2");
+        assert_eq!(
+            page.chats[0].id,
+            ChatRef::new(team, Some(222)).to_string(),
+            "ids carry the access hash"
+        );
+        assert_eq!(
+            page.chats[0].id.parse::<ChatRef>().unwrap().access_hash(),
+            Some(222)
+        );
         assert_eq!(page.chats[0].kind, ChatKind::Supergroup);
         assert!(page.chats[0].pinned);
         assert_eq!(page.chats[0].unread_count, 3);

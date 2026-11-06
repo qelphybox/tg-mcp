@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::chats::{ChatId, RawPeer, rfc3339};
+use super::chats::{ChatId, ChatRef, RawPeer, rfc3339};
 
 /// What to fetch. Messages come newest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub struct HistoryQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Sender {
-    /// A chat id (`user:N` or `channel:N`), usable with the other tools.
+    /// A chat id (`user:N~H` or `channel:N~H`), usable with the other tools.
     pub id: String,
     pub name: String,
 }
@@ -86,13 +86,20 @@ pub struct RawHistoryMessage {
 /// Build a page from what Telegram returned for `query` (newest first).
 /// `full_page` = Telegram returned as many messages as asked for.
 pub fn assemble_history(
-    chat: ChatId,
+    chat: ChatRef,
     raw: &[RawHistoryMessage],
     peers: &[RawPeer],
     query: &HistoryQuery,
     full_page: bool,
 ) -> MessagePage {
-    let names: HashMap<ChatId, &str> = peers.iter().map(|p| (p.id, p.title.as_str())).collect();
+    let peers: HashMap<ChatId, &RawPeer> = peers.iter().map(|p| (p.id, p)).collect();
+    // Ids handed out carry the access hash Telegram just sent along; the chat
+    // itself keeps the one it was asked with if Telegram didn't describe it.
+    let issue = |id: ChatId| match peers.get(&id).and_then(|p| p.access_hash) {
+        Some(hash) => ChatRef::new(id, Some(hash)),
+        None if id == chat.chat() => chat,
+        None => ChatRef::from(id),
+    };
     let mut reached_since = false;
     let mut messages = Vec::new();
     for m in raw {
@@ -105,12 +112,12 @@ pub fn assemble_history(
             break;
         }
         let sender = (!m.out).then(|| {
-            let id = m.from.unwrap_or(chat);
+            let id = m.from.unwrap_or(chat.chat());
             Sender {
-                id: id.to_string(),
-                name: names
+                id: issue(id).to_string(),
+                name: peers
                     .get(&id)
-                    .map(|n| n.to_string())
+                    .map(|p| p.title.clone())
                     .unwrap_or_else(|| id.to_string()),
             }
         });
@@ -129,7 +136,7 @@ pub fn assemble_history(
         .then(|| raw.last().map(|m| m.id))
         .flatten();
     MessagePage {
-        chat_id: chat.to_string(),
+        chat_id: issue(chat.chat()).to_string(),
         messages,
         next_before_id,
     }
@@ -203,7 +210,7 @@ mod tests {
             ..msg(2, 100)
         };
         let page = assemble_history(
-            alice,
+            alice.into(),
             &[mine, msg(1, 90)],
             &[peer(alice, "Alice")],
             &query(10),
@@ -229,7 +236,7 @@ mod tests {
             ..msg(4, 40)
         };
         let page = assemble_history(
-            group,
+            group.into(),
             &[from_bob, from_ghost],
             &[peer(bob, "Bob")],
             &query(10),
@@ -240,15 +247,48 @@ mod tests {
     }
 
     #[test]
+    fn issued_ids_carry_the_access_hash_telegram_sent_along() {
+        let group = ChatId::Channel(9);
+        let bob = ChatId::User(2);
+        let with_hash = |id, hash| RawPeer {
+            access_hash: Some(hash),
+            ..peer(id, "x")
+        };
+        let raw = [
+            RawHistoryMessage {
+                from: Some(bob),
+                ..msg(2, 20)
+            },
+            RawHistoryMessage {
+                from: Some(ChatId::User(3)),
+                ..msg(1, 10)
+            },
+        ];
+        let peers = [with_hash(bob, -7), with_hash(group, 99)];
+
+        // Asked with a legacy id: the answer hands out hashed ids.
+        let page = assemble_history(group.into(), &raw, &peers, &query(10), false);
+        assert_eq!(page.chat_id, ChatRef::new(group, Some(99)).to_string());
+        let sender = |i: usize| page.messages[i].sender.as_ref().unwrap().id.clone();
+        assert_eq!(sender(0), ChatRef::new(bob, Some(-7)).to_string());
+        assert_eq!(sender(1), "user:3", "no hash known, none invented");
+
+        // Telegram didn't describe the chat: its id stays as it was asked.
+        let asked = ChatRef::new(group, Some(5));
+        let page = assemble_history(asked, &raw, &[], &query(10), false);
+        assert_eq!(page.chat_id, asked.to_string());
+    }
+
+    #[test]
     fn next_page_starts_below_the_oldest_message() {
         let chat = ChatId::User(1);
         let raw = [msg(30, 300), msg(20, 200), msg(10, 100)];
         assert_eq!(
-            assemble_history(chat, &raw, &[], &query(3), true).next_before_id,
+            assemble_history(chat.into(), &raw, &[], &query(3), true).next_before_id,
             Some(10)
         );
         assert_eq!(
-            assemble_history(chat, &raw, &[], &query(5), false).next_before_id,
+            assemble_history(chat.into(), &raw, &[], &query(5), false).next_before_id,
             None
         );
     }
@@ -262,7 +302,7 @@ mod tests {
             until: Some(300),
             ..query(4)
         };
-        let page = assemble_history(chat, &raw, &[], &q, true);
+        let page = assemble_history(chat.into(), &raw, &[], &q, true);
         let ids: Vec<i32> = page.messages.iter().map(|m| m.id).collect();
         assert_eq!(ids, [30, 20]);
         assert_eq!(

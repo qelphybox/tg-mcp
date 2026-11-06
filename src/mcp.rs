@@ -16,7 +16,7 @@ use crate::{
     auth::Caller,
     tg::{
         Account, TgError,
-        chats::{ChatId, ChatInfo, ChatPage},
+        chats::{CHAT_REF_MAX_LEN, CHAT_REF_PATTERN, ChatInfo, ChatPage, ChatRef},
         messages::{self, HistoryQuery, MessagePage},
     },
 };
@@ -77,15 +77,17 @@ fn caller(parts: &http::request::Parts) -> Result<&Caller, ErrorData> {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetChatInfoParams {
-    /// A chat id from list_chats: `user:N`, `chat:N` or `channel:N`.
-    #[schemars(length(max = 32))]
+    /// A chat id exactly as list_chats (or a message sender) gave it, e.g.
+    /// `user:N~H`, `channel:N~H` or `chat:N`.
+    #[schemars(length(max = CHAT_REF_MAX_LEN), regex(pattern = CHAT_REF_PATTERN))]
     pub chat_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetMessagesParams {
-    /// A chat id from list_chats: `user:N`, `chat:N` or `channel:N`.
-    #[schemars(length(max = 32))]
+    /// A chat id exactly as list_chats (or a message sender) gave it, e.g.
+    /// `user:N~H`, `channel:N~H` or `chat:N`.
+    #[schemars(length(max = CHAT_REF_MAX_LEN), regex(pattern = CHAT_REF_PATTERN))]
     pub chat_id: String,
     /// How many messages to return (1-100, default 30).
     #[schemars(range(min = 1, max = 100))]
@@ -129,8 +131,9 @@ impl TgMcp {
     #[tool(
         title = "List chats",
         description = "List the account's Telegram chats, most recent first: private chats, bots, \
-groups, supergroups and channels. Each has an `id` (user:N, chat:N or channel:N) to pass to the \
-other tools, a title, its type, the unread count and a short preview of the last message (media \
+groups, supergroups and channels. Each has an `id` to pass verbatim to the other tools \
+(`user:N~H`, `channel:N~H` or `chat:N`; the part after `~` lets Telegram find the chat \
+directly), a title, its type, the unread count and a short preview of the last message (media \
 shown as [photo], [voice], ...). Paginated: pass `next_cursor` back as `cursor` for the next page; \
 no `next_cursor` means this was the last page. Previews are cut to 100 characters. \
 `is_self: true` marks the account's own chat (Telegram's Saved Messages), not another person.",
@@ -176,11 +179,12 @@ no `next_cursor` means this was the last page. Previews are cut to 100 character
     #[tool(
         title = "Get messages",
         description = "Read messages of one chat, newest first. `chat_id` comes from list_chats \
-(user:N, chat:N or channel:N). Each message has an id, date (UTC), sender (id + name; absent \
-and `outgoing: true` for messages the account itself sent), text (media and service messages \
-as [photo], [voice], ...; cut to 1000 characters), the id it replies to, and forwarded/edited \
-flags. Page with `before_id` = the previous `next_before_id`; no `next_before_id` means there \
-is nothing older (within `since`). Narrow by time with `since`/`until`.",
+or a message sender, passed verbatim (`user:N~H`, `channel:N~H` or `chat:N`). Each message \
+has an id, date (UTC), sender (id + name; absent and `outgoing: true` for messages the account \
+itself sent), text (media and service messages as [photo], [voice], ...; cut to 1000 \
+characters), the id it replies to, and forwarded/edited flags. Page with `before_id` = the \
+previous `next_before_id`; no `next_before_id` means there is nothing older (within `since`). \
+Narrow by time with `since`/`until`.",
         annotations(
             title = "Get messages",
             read_only_hint = true,
@@ -206,10 +210,11 @@ is nothing older (within `since`). Narrow by time with `since`/`until`.",
     #[tool(
         title = "Get chat info",
         description = "Details of one chat, user, group or channel by `chat_id` from list_chats \
-(user:N, chat:N or channel:N): title, type, @username, the bio or description (cut to 1000 \
-characters) and the number of members or subscribers when Telegram shows it. A missing \
-description doesn't mean there is none: people can hide their bio from this account in their \
-privacy settings. `is_self: true` is the account itself (Saved Messages).",
+or a message sender, passed verbatim (`user:N~H`, `channel:N~H` or `chat:N`): title, type, \
+@username, the bio or description (cut to 1000 characters) and the number of members or \
+subscribers when Telegram shows it. A missing description doesn't mean there is none: people \
+can hide their bio from this account in their privacy settings. `is_self: true` is the account \
+itself (Saved Messages).",
         annotations(
             title = "Get chat info",
             read_only_hint = true,
@@ -223,7 +228,7 @@ privacy settings. `is_self: true` is the account itself (Saved Messages).",
         Extension(parts): Extension<http::request::Parts>,
         Parameters(params): Parameters<GetChatInfoParams>,
     ) -> Result<Json<ChatInfo>, ErrorData> {
-        let chat: ChatId = params
+        let chat: ChatRef = params
             .chat_id
             .parse()
             .map_err(|e: TgError| ErrorData::invalid_params(e.to_string(), None))?;
@@ -241,9 +246,9 @@ privacy settings. `is_self: true` is the account itself (Saved Messages).",
 }
 
 impl TgMcp {
-    fn history_query(params: &GetMessagesParams) -> Result<(ChatId, HistoryQuery), ErrorData> {
+    fn history_query(params: &GetMessagesParams) -> Result<(ChatRef, HistoryQuery), ErrorData> {
         let invalid = |msg: String| ErrorData::invalid_params(msg, None);
-        let chat: ChatId = params
+        let chat: ChatRef = params
             .chat_id
             .parse()
             .map_err(|e: TgError| invalid(e.to_string()))?;

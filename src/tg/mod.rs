@@ -86,12 +86,12 @@ pub trait Telegram: Send + Sync + 'static {
     /// Messages of one Chat, newest first, within `query`'s bounds.
     async fn get_messages(
         &self,
-        chat: chats::ChatId,
+        chat: chats::ChatRef,
         query: messages::HistoryQuery,
     ) -> Result<messages::MessagePage, TgError>;
 
     /// Details of one Chat: title, type, @username, description/bio, member count.
-    async fn get_chat_info(&self, chat: chats::ChatId) -> Result<chats::ChatInfo, TgError>;
+    async fn get_chat_info(&self, chat: chats::ChatRef) -> Result<chats::ChatInfo, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

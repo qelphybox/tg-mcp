@@ -7,11 +7,16 @@ use rmcp::model::{CallToolRequestParams, ErrorCode};
 use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary},
-    fake::FakeData,
+    fake::{FakeData, fake_issued_id},
     messages::RawHistoryMessage,
 };
 
 const ALICE: ChatId = ChatId::User(101);
+
+/// Alice's id as list_chats hands it out, access hash included.
+fn alice_id() -> String {
+    fake_issued_id(ALICE)
+}
 /// 2026-11-06T00:00:00Z
 const DAY: i32 = 1_793_923_200;
 
@@ -87,7 +92,7 @@ async fn pages_walk_back_through_history_without_gaps() {
     let mut seen = Vec::new();
     let mut before: Option<i64> = None;
     for _ in 0..10 {
-        let mut args = json!({ "chat_id": "user:101", "limit": 3 });
+        let mut args = json!({ "chat_id": alice_id(), "limit": 3 });
         if let Some(b) = before {
             args["before_id"] = json!(b);
         }
@@ -108,21 +113,45 @@ async fn messages_say_who_wrote_them() {
     reply.edited = true;
     let (_server, client) = client_with(vec![message(1, "hi"), message(2, "hello"), reply]).await;
 
-    let page = call(&client, json!({ "chat_id": "user:101" }))
+    let page = call(&client, json!({ "chat_id": alice_id() }))
         .await
         .unwrap();
-    assert_eq!(page["chat_id"], "user:101");
+    assert_eq!(page["chat_id"], alice_id());
     assert_eq!(page.get("next_before_id"), None);
     assert_eq!(
         page["messages"],
         json!([
-            { "id": 3, "date": "2026-11-06T03:00:00Z", "sender": { "id": "user:101", "name": "Alice" },
+            { "id": 3, "date": "2026-11-06T03:00:00Z", "sender": { "id": alice_id(), "name": "Alice" },
               "text": "re: hi", "reply_to": 1, "edited": true },
             { "id": 2, "date": "2026-11-06T02:00:00Z", "outgoing": true, "text": "hello" },
-            { "id": 1, "date": "2026-11-06T01:00:00Z", "sender": { "id": "user:101", "name": "Alice" },
+            { "id": 1, "date": "2026-11-06T01:00:00Z", "sender": { "id": alice_id(), "name": "Alice" },
               "text": "hi" },
         ])
     );
+}
+
+#[tokio::test]
+async fn ids_from_list_chats_and_legacy_ids_both_work() {
+    let (_server, client) = client_with(vec![message(1, "hi")]).await;
+    let listed = client
+        .call_tool(CallToolRequestParams::new("list_chats"))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    let issued = listed["chats"][0]["id"].as_str().unwrap();
+    assert!(issued.starts_with("user:101~"), "{issued}");
+
+    let page = call(&client, json!({ "chat_id": issued })).await.unwrap();
+    assert_eq!(ids(&page), [1]);
+    assert_eq!(page["chat_id"], issued);
+
+    // An id from before ids carried the hash, still in some AI client's context.
+    let page = call(&client, json!({ "chat_id": "user:101" }))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), [1]);
+    assert_eq!(page["chat_id"], issued, "answers hand out the hashed id");
 }
 
 #[tokio::test]
@@ -131,7 +160,7 @@ async fn since_and_until_narrow_the_window() {
 
     let page = call(
         &client,
-        json!({ "chat_id": "user:101", "since": "2026-11-06T03:00:00Z", "until": "2026-11-06T06:30:00+00:00" }),
+        json!({ "chat_id": alice_id(), "since": "2026-11-06T03:00:00Z", "until": "2026-11-06T06:30:00+00:00" }),
     )
     .await
     .unwrap();
@@ -141,7 +170,7 @@ async fn since_and_until_narrow_the_window() {
     // A plain date as `until` means the whole day.
     let page = call(
         &client,
-        json!({ "chat_id": "user:101", "until": "2026-11-06" }),
+        json!({ "chat_id": alice_id(), "until": "2026-11-06" }),
     )
     .await
     .unwrap();
@@ -153,7 +182,7 @@ async fn the_page_budget_ends_a_page_early_without_losing_messages() {
     let long = "y".repeat(5000);
     let (_server, client) = client_with((1..=100).map(|i| message(i, &long)).collect()).await;
 
-    let first = call(&client, json!({ "chat_id": "user:101", "limit": 100 }))
+    let first = call(&client, json!({ "chat_id": alice_id(), "limit": 100 }))
         .await
         .unwrap();
     let first_ids = ids(&first);
@@ -174,7 +203,7 @@ async fn the_page_budget_ends_a_page_early_without_losing_messages() {
 
     let second = call(
         &client,
-        json!({ "chat_id": "user:101", "limit": 100, "before_id": next }),
+        json!({ "chat_id": alice_id(), "limit": 100, "before_id": next }),
     )
     .await
     .unwrap();
@@ -191,11 +220,14 @@ async fn bad_arguments_are_invalid_params() {
     for bad in [
         json!({ "chat_id": "alice" }),
         json!({ "chat_id": "user:999" }),
-        json!({ "chat_id": "user:101", "limit": 0 }),
-        json!({ "chat_id": "user:101", "limit": 101 }),
-        json!({ "chat_id": "user:101", "before_id": 0 }),
-        json!({ "chat_id": "user:101", "since": "yesterday" }),
-        json!({ "chat_id": "user:101", "since": "2026-11-07", "until": "2026-11-06" }),
+        // A tampered access hash: Telegram refuses it, the tool says so.
+        json!({ "chat_id": "user:101~AAAAAAAAAAA" }),
+        json!({ "chat_id": format!("{}x", alice_id()) }),
+        json!({ "chat_id": alice_id(), "limit": 0 }),
+        json!({ "chat_id": alice_id(), "limit": 101 }),
+        json!({ "chat_id": alice_id(), "before_id": 0 }),
+        json!({ "chat_id": alice_id(), "since": "yesterday" }),
+        json!({ "chat_id": alice_id(), "since": "2026-11-07", "until": "2026-11-06" }),
     ] {
         match call(&client, bad.clone()).await {
             Err(rmcp::ServiceError::McpError(err)) => {

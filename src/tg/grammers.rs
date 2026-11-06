@@ -16,7 +16,9 @@ use crate::limits::{AccountLimiter, Limits};
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
-    chats::{self, ChatId, ChatInfo, ChatKind, ChatPage, Cursor, RawDialog, RawMessage, RawPeer},
+    chats::{
+        self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, RawDialog, RawMessage, RawPeer,
+    },
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
     pool::{Live, Pool},
     session::SessionStore,
@@ -369,13 +371,17 @@ pub struct LiveClient {
     client: Client,
     store: Arc<SessionStore>,
     grant: OpenedGrant,
-    /// Access hashes of Chats seen so far, to address them again. In memory only,
-    /// and only as long as this Live client lives.
-    peers: std::sync::Mutex<std::collections::HashMap<ChatId, Option<i64>>>,
+    /// Access hashes of users and channels seen so far, for ids handed out
+    /// without one (before ids carried it). In memory only, and only as long as
+    /// this Live client lives.
+    peers: std::sync::Mutex<std::collections::HashMap<ChatId, i64>>,
     /// Telegram said this session is gone (logged out / revoked from the app).
     dead: std::sync::atomic::AtomicBool,
     /// The Account's budget and FLOOD_WAIT state, shared with its other Grants.
     limiter: Arc<AccountLimiter>,
+    /// Every request sent, serialized, so tests can see what reached Telegram.
+    #[cfg(test)]
+    sent: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl Live for LiveClient {
@@ -406,6 +412,11 @@ impl LiveClient {
         request: &R,
         chat: Option<ChatId>,
     ) -> Result<R::Return, TgError> {
+        #[cfg(test)]
+        self.sent
+            .lock()
+            .unwrap()
+            .push(tl::Serializable::to_bytes(request));
         self.limiter
             .run(|| async {
                 self.client.invoke(request).await.map_err(|err| match chat {
@@ -489,12 +500,9 @@ impl Telegram for LiveClient {
         ))
     }
 
-    async fn get_messages(
-        &self,
-        chat: ChatId,
-        query: HistoryQuery,
-    ) -> Result<MessagePage, TgError> {
-        let peer = self.resolve(chat).await?;
+    async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
         let answer = self
             .call(
                 &tl::functions::messages::GetHistory {
@@ -531,11 +539,12 @@ impl Telegram for LiveClient {
             .chain(chats.into_iter().filter_map(raw_chat))
             .collect();
         self.remember(&peers);
-        Ok(assemble_history(chat, &raw, &peers, &query, full_page))
+        Ok(assemble_history(id, &raw, &peers, &query, full_page))
     }
 
-    async fn get_chat_info(&self, chat: ChatId) -> Result<ChatInfo, TgError> {
-        let peer = self.resolve(chat).await?;
+    async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
         let (description, members, users, chats) = match peer {
             tl::enums::InputPeer::User(u) => {
                 let tl::enums::users::UserFull::Full(full) = self
@@ -607,10 +616,10 @@ impl LiveClient {
         self.peers
             .lock()
             .expect("peer cache lock")
-            .extend(peers.iter().map(|p| (p.id, p.access_hash)));
+            .extend(peers.iter().filter_map(|p| Some((p.id, p.access_hash?))));
     }
 
-    fn cached(&self, chat: ChatId) -> Option<Option<i64>> {
+    fn cached(&self, chat: ChatId) -> Option<i64> {
         self.peers
             .lock()
             .expect("peer cache lock")
@@ -618,22 +627,24 @@ impl LiveClient {
             .copied()
     }
 
-    /// The InputPeer for a chat id. Basic groups need no access hash; users and
-    /// channels come from the peer cache, refilled from the dialog list if this
-    /// Live client hasn't seen them yet (e.g. right after a restart).
-    async fn resolve(&self, chat: ChatId) -> Result<tl::enums::InputPeer, TgError> {
-        if let ChatId::Chat(_) = chat {
-            return Ok(input_peer(chat, None));
+    /// The InputPeer for a chat id. Ids we issue carry everything needed (basic
+    /// groups need no access hash). Ids without a hash, issued before ids carried
+    /// it, come from the peer cache, refilled from the dialog list if this Live
+    /// client hasn't seen them yet (e.g. right after a restart).
+    async fn resolve(&self, id: ChatRef) -> Result<tl::enums::InputPeer, TgError> {
+        if let Some(peer) = direct_input_peer(id) {
+            return Ok(peer);
         }
+        let chat = id.chat();
         if let Some(hash) = self.cached(chat) {
-            return Ok(input_peer(chat, hash));
+            return Ok(input_peer(chat, Some(hash)));
         }
         for archived in [false, true] {
             let mut cursor: Option<String> = None;
             for _ in 0..RESOLVE_MAX_PAGES {
                 let page = self.list_chats(100, cursor.as_deref(), archived).await?;
                 if let Some(hash) = self.cached(chat) {
-                    return Ok(input_peer(chat, hash));
+                    return Ok(input_peer(chat, Some(hash)));
                 }
                 match page.next_cursor {
                     Some(next) => cursor = Some(next),
@@ -729,6 +740,16 @@ fn chat_id(peer: &tl::enums::Peer) -> ChatId {
     }
 }
 
+/// The InputPeer for an id that needs no lookup: a basic group, or a user or
+/// channel whose id carries its access hash. `None`: look the hash up.
+fn direct_input_peer(id: ChatRef) -> Option<tl::enums::InputPeer> {
+    match (id.chat(), id.access_hash()) {
+        (chat @ ChatId::Chat(_), _) => Some(input_peer(chat, None)),
+        (chat, Some(hash)) => Some(input_peer(chat, Some(hash))),
+        (_, None) => None,
+    }
+}
+
 fn input_peer(id: ChatId, access_hash: Option<i64>) -> tl::enums::InputPeer {
     let access_hash = access_hash.unwrap_or(0);
     match id {
@@ -780,7 +801,8 @@ fn raw_user(user: tl::enums::User) -> Option<RawPeer> {
             ChatKind::Private
         },
         username: u.username,
-        access_hash: u.access_hash,
+        // A "min" user's hash only works in the message it came with: never hand it out.
+        access_hash: u.access_hash.filter(|_| !u.min),
         is_self: u.is_self,
     })
 }
@@ -815,7 +837,7 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
             title: c.title,
             kind: channel_kind(c.megagroup),
             username: c.username,
-            access_hash: c.access_hash,
+            access_hash: c.access_hash.filter(|_| !c.min),
             is_self: false,
         }),
         tl::enums::Chat::ChannelForbidden(c) => Some(RawPeer {
@@ -924,6 +946,8 @@ impl GrammersConnector {
             peers: Default::default(),
             dead: Default::default(),
             limiter: self.limits.for_account(grant_account),
+            #[cfg(test)]
+            sent: Default::default(),
         };
         match live.whoami().await {
             Ok(_) => Ok(live),
@@ -999,6 +1023,51 @@ async fn sweep(connector: Weak<GrammersConnector>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user or channel 7 with access hash 99, as Telegram would send it (only
+    /// the fields that aren't optional; the TL structs have 50 of them).
+    fn tl_peers(min: bool) -> (tl::enums::User, tl::enums::Chat) {
+        use grammers_client::tl::{Deserializable, Identifiable, Serializable};
+        let user_flags: u32 = 1 | if min { 1 << 20 } else { 0 };
+        let mut user = tl::types::User::CONSTRUCTOR_ID.to_le_bytes().to_vec();
+        for part in [
+            user_flags.to_bytes(),
+            0u32.to_bytes(),
+            7i64.to_bytes(),
+            99i64.to_bytes(),
+        ] {
+            user.extend(part);
+        }
+        let channel_flags: u32 = (1 << 13) | if min { 1 << 12 } else { 0 };
+        let mut channel = tl::types::Channel::CONSTRUCTOR_ID.to_le_bytes().to_vec();
+        for part in [
+            channel_flags.to_bytes(),
+            0u32.to_bytes(),
+            7i64.to_bytes(),
+            99i64.to_bytes(),
+            String::new().to_bytes(),
+            tl::enums::ChatPhoto::Empty.to_bytes(),
+            0i32.to_bytes(),
+        ] {
+            channel.extend(part);
+        }
+        (
+            tl::enums::User::from_bytes(&user).unwrap(),
+            tl::enums::Chat::from_bytes(&channel).unwrap(),
+        )
+    }
+
+    #[test]
+    fn min_peers_hashes_are_never_handed_out() {
+        // A "min" hash only works inside the message it came with.
+        let (user, channel) = tl_peers(true);
+        assert_eq!(raw_user(user).unwrap().access_hash, None);
+        assert_eq!(raw_chat(channel).unwrap().access_hash, None);
+
+        let (user, channel) = tl_peers(false);
+        assert_eq!(raw_user(user).unwrap().access_hash, Some(99));
+        assert_eq!(raw_chat(channel).unwrap().access_hash, Some(99));
+    }
 
     #[test]
     fn qr_url_is_tg_login_with_base64url_token() {
@@ -1107,5 +1176,170 @@ mod live_tests {
                 .is_some()
         );
         conn.client.disconnect();
+    }
+}
+
+/// What `get_messages` / `get_chat_info` send to Telegram for each kind of id,
+/// on a fresh Live client (empty peer cache) whose connection is never started:
+/// every request is recorded, then fails at once, so nothing leaves the machine.
+#[cfg(test)]
+mod resolve_tests {
+    use grammers_client::tl::{Identifiable, Serializable};
+
+    use super::*;
+    use crate::{
+        limits::LimitsConfig,
+        sessions::{TokenTtl, Vault},
+    };
+
+    const ACCOUNT: i64 = 42;
+
+    async fn cold_client() -> (LiveClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let issued = vault.create_grant("client", ACCOUNT, b"").await.unwrap();
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        let store = Arc::new(SessionStore::new());
+        // The runner is dropped: no connection, every request fails right away.
+        let SenderPool { handle, .. } = SenderPool::new(store.clone(), 0);
+        let live = LiveClient {
+            client: Client::new(handle),
+            store,
+            grant,
+            peers: Default::default(),
+            dead: Default::default(),
+            limiter: Arc::new(AccountLimiter::new(LimitsConfig::default())),
+            sent: Default::default(),
+        };
+        (live, dir)
+    }
+
+    fn sent(live: &LiveClient) -> Vec<Vec<u8>> {
+        live.sent.lock().unwrap().clone()
+    }
+
+    fn constructor(request: &[u8]) -> u32 {
+        u32::from_le_bytes(request[..4].try_into().unwrap())
+    }
+
+    fn query() -> HistoryQuery {
+        HistoryQuery {
+            limit: 30,
+            before_id: None,
+            since: None,
+            until: None,
+        }
+    }
+
+    fn get_history(peer: tl::enums::InputPeer) -> Vec<u8> {
+        tl::functions::messages::GetHistory {
+            peer,
+            offset_id: 0,
+            offset_date: 0,
+            add_offset: 0,
+            limit: 30,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        }
+        .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn issued_ids_go_straight_to_telegram_with_their_hash() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(-1_234_567_890_123));
+        let user = ChatRef::new(ChatId::User(7), Some(i64::MAX));
+
+        assert!(live.get_messages(channel, query()).await.is_err());
+        assert!(live.get_chat_info(channel).await.is_err());
+        assert!(live.get_messages(user, query()).await.is_err());
+        assert!(live.get_chat_info(user).await.is_err());
+
+        // One request per call, the real one: no messages.getDialogs scan.
+        assert_eq!(
+            sent(&live),
+            [
+                get_history(tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                    channel_id: 5,
+                    access_hash: -1_234_567_890_123,
+                })),
+                tl::functions::channels::GetFullChannel {
+                    channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: 5,
+                        access_hash: -1_234_567_890_123,
+                    }),
+                }
+                .to_bytes(),
+                get_history(tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                    user_id: 7,
+                    access_hash: i64::MAX,
+                })),
+                tl::functions::users::GetFullUser {
+                    id: tl::enums::InputUser::User(tl::types::InputUser {
+                        user_id: 7,
+                        access_hash: i64::MAX,
+                    }),
+                }
+                .to_bytes(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_groups_need_no_lookup() {
+        let (live, _dir) = cold_client().await;
+        assert!(
+            live.get_messages(ChatId::Chat(4).into(), query())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sent(&live),
+            [get_history(tl::enums::InputPeer::Chat(
+                tl::types::InputPeerChat { chat_id: 4 }
+            ))]
+        );
+    }
+
+    #[tokio::test]
+    async fn hashless_ids_use_the_peer_cache_then_the_dialog_list() {
+        let (live, _dir) = cold_client().await;
+        let legacy = ChatRef::from(ChatId::Channel(5));
+
+        // Cold cache: the old path scans the dialog list first.
+        assert!(live.get_messages(legacy, query()).await.is_err());
+        assert!(live.get_chat_info(ChatId::User(7).into()).await.is_err());
+        let first: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
+        assert_eq!(
+            first,
+            [
+                tl::functions::messages::GetDialogs::CONSTRUCTOR_ID,
+                tl::functions::messages::GetDialogs::CONSTRUCTOR_ID,
+            ]
+        );
+
+        // Seen before (e.g. listed): the cached hash is used, no scan.
+        live.sent.lock().unwrap().clear();
+        live.remember(&[RawPeer {
+            id: ChatId::Channel(5),
+            title: "News".into(),
+            kind: ChatKind::Channel,
+            username: None,
+            access_hash: Some(99),
+            is_self: false,
+        }]);
+        assert!(live.get_messages(legacy, query()).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [get_history(tl::enums::InputPeer::Channel(
+                tl::types::InputPeerChannel {
+                    channel_id: 5,
+                    access_hash: 99,
+                }
+            ))]
+        );
     }
 }

@@ -6,8 +6,8 @@ use common::{account, start_with};
 use rmcp::model::{CallToolRequestParams, ErrorCode};
 use serde_json::{Value, json};
 use tg_mcp::tg::{
-    chats::{ChatKind, ChatSummary, MessagePreview},
-    fake::FakeData,
+    chats::{ChatId, ChatKind, ChatSummary, MessagePreview},
+    fake::{FakeData, fake_issued_id},
 };
 
 fn chat(n: usize) -> ChatSummary {
@@ -69,7 +69,9 @@ async fn pages_cover_every_chat_exactly_once() {
     assert_eq!(pages, 3);
     assert_eq!(
         seen,
-        (1..=7).map(|n| format!("user:{n}")).collect::<Vec<_>>()
+        (1..=7)
+            .map(|n| fake_issued_id(ChatId::User(n)))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -86,7 +88,8 @@ async fn first_page_has_the_documented_shape() {
     assert_eq!(
         page,
         json!({ "chats": [{
-            "id": "user:1",
+            // The fake's access hash for user 1 is -7046029254386353131.
+            "id": "user:1~njd5uX9KfBU",
             "title": "Friend 1",
             "type": "private",
             "unread_count": 1,
