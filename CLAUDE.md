@@ -11,6 +11,7 @@ Rust (latest stable), tokio, axum, rmcp (MCP), grammers (Telegram, version pinne
 - `cargo fmt --all` / `cargo clippy --all-targets -- -D warnings` / `cargo test`: all three must pass before a commit.
 - `cargo run`: starts the server; config comes from env vars (see `.env.example`).
 - Deploy: push to `main` → Kamal rollout to `https://tgmcp.qelphybox.space`. Setup, rollback and what a deploy loses: `docs/deploy.md`.
+- Release (for self-hosters): tag `vX.Y.Z` matching `Cargo.toml` → multi-arch image on GHCR + GitHub Release. Checklist: `docs/acceptance.md`.
 
 ## Rules that are not visible in the code
 

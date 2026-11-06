@@ -59,3 +59,15 @@ kamal rollback <sha>     # switch back to a previous image (kamal app containers
 ```
 
 The image is distroless (no shell), so `kamal app exec` with a shell does not work, by design.
+
+## Releases
+
+Production follows `main`; releases are for self-hosters. Bump `version` in `Cargo.toml`, merge, then tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` checks the tag matches `Cargo.toml`, builds `linux/amd64` and `linux/arm64` (the Dockerfile cross-compiles, no emulation), pushes `ghcr.io/qelphybox/tg-mcp:{0.1.0,0.1,latest}` and creates a GitHub Release with generated notes. Run [the acceptance checks](acceptance.md) before tagging and put the memory numbers in the release notes.
+
+The GHCR package is private until its visibility is set to public once (GitHub → Packages → tg-mcp → Package settings).
