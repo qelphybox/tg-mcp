@@ -121,6 +121,10 @@ pub fn router(auth: Arc<AuthState>) -> Router {
         .route("/login/{id}", get(authorize::login_page))
         .route("/login/{id}/status", get(authorize::login_status))
         .route(
+            "/login/{id}/password",
+            get(authorize::password_page).post(authorize::password_submit),
+        )
+        .route(
             "/login/{id}/consent",
             get(authorize::consent_page).post(authorize::consent_submit),
         )

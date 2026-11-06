@@ -36,6 +36,10 @@ _Avoid_: signup, auth (unqualified)
 **QR login**:
 Telegram login by scanning a `tg://login` QR code (`auth.exportLoginToken` / `updateLoginToken`) from an already-logged-in Telegram app.
 
+**Cloud password**:
+The Account's Telegram two-step verification password. Asked for on the login page after QR login when the Account has one, checked once via SRP (`account.getPassword` + `auth.checkPassword`), never stored or logged.
+_Avoid_: 2FA code, PIN
+
 **Consent**:
 The screen where the user confirms the scope ("read-only access to all chats") before a Grant is created.
 

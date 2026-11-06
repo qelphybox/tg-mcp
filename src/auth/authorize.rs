@@ -2,9 +2,12 @@
 //!
 //! Every `/login/{id}` request must carry the `tgm_login` cookie set by `/authorize`
 //! in the same browser. SameSite=Lax keeps it off cross-site POSTs, which is the
-//! CSRF protection of the Consent form.
+//! CSRF protection of the Consent and Cloud password forms.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
@@ -15,15 +18,21 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use url::Url;
+use zeroize::Zeroizing;
 
 use super::{
     AuthState,
-    flows::{AuthRequest, Progress},
+    flows::{AuthRequest, PendingLogin, Progress},
     pages, pkce,
 };
 use crate::tg::{LoginState, TgError};
 
 const COOKIE: &str = "tgm_login";
+/// Wrong Cloud passwords per Login flow before it is dropped (Telegram has its own,
+/// stricter-over-time limits on top, answered as `FLOOD_WAIT`).
+const MAX_WRONG_PASSWORDS: u32 = 5;
+/// Longer than any real Cloud password; such a value never goes to Telegram.
+const MAX_PASSWORD_BYTES: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
@@ -171,37 +180,212 @@ pub async fn login_status(
         Err(response) => return response,
     };
     let mut progress = login.progress.lock().await;
-    if let Progress::InProgress(attempt) = &mut *progress {
-        match attempt.poll().await {
-            Ok(LoginState::WaitingForScan { qr_url }) => {
-                return Json(json!({ "state": "waiting", "qr_url": qr_url, "qr_svg": qr_svg_base64(&qr_url) }))
-                    .into_response();
-            }
-            Ok(LoginState::LoggedIn(logged_in)) => {
-                tracing::info!(account_id = logged_in.account.id, "telegram login finished");
-                *progress = Progress::LoggedIn(logged_in);
-            }
-            Err(TgError::TwoFactorRequired) => {
-                let message = "This account has two-step verification enabled. \
-                               Logging in with a cloud password isn't supported yet.";
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "state": "error", "message": message })),
-                )
-                    .into_response();
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "telegram login poll failed");
-                let message = "Telegram didn't answer. Start again from your app.";
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "state": "error", "message": message })),
-                )
-                    .into_response();
-            }
+    match advance(&mut progress).await {
+        Ok(Step::Waiting { qr_url }) => {
+            Json(json!({ "state": "waiting", "qr_url": qr_url, "qr_svg": qr_svg_base64(&qr_url) }))
+                .into_response()
+        }
+        Ok(Step::Password { .. }) => {
+            Json(json!({ "state": "password", "next": format!("/login/{id}/password") }))
+                .into_response()
+        }
+        Ok(Step::LoggedIn) => {
+            Json(json!({ "state": "logged_in", "next": format!("/login/{id}/consent") }))
+                .into_response()
+        }
+        Err(err) => {
+            let (status, title, message) = telegram_failure(&err);
+            (
+                status,
+                Json(json!({ "state": "error", "message": format!("{title}. {message}") })),
+            )
+                .into_response()
         }
     }
-    Json(json!({ "state": "logged_in", "next": format!("/login/{id}/consent") })).into_response()
+}
+
+/// The Cloud password form, shown once the QR was scanned on a 2FA Account.
+pub async fn password_page(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    State(auth): State<Arc<AuthState>>,
+) -> Response {
+    let login = match owned_login(&auth, &headers, &id) {
+        Ok(login) => login,
+        Err(response) => return response,
+    };
+    let mut progress = login.progress.lock().await;
+    match advance(&mut progress).await {
+        Ok(Step::Password { hint }) => pages::password(StatusCode::OK, &id, hint.as_deref(), None),
+        Ok(Step::Waiting { .. }) => Redirect::to(&format!("/login/{id}")).into_response(),
+        Ok(Step::LoggedIn) => Redirect::to(&format!("/login/{id}/consent")).into_response(),
+        Err(err) => telegram_failure_page(&err),
+    }
+}
+
+/// No `Debug`: the password must never reach a log.
+#[derive(Deserialize)]
+pub struct PasswordForm {
+    password: String,
+}
+
+/// Check the Cloud password with Telegram (SRP). The password lives only for the
+/// duration of this request: it is wiped on drop and never stored or logged.
+pub async fn password_submit(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    State(auth): State<Arc<AuthState>>,
+    Form(form): Form<PasswordForm>,
+) -> Response {
+    let password = Zeroizing::new(form.password);
+    let login = match owned_login(&auth, &headers, &id) {
+        Ok(login) => login,
+        Err(response) => return response,
+    };
+    let mut progress = login.progress.lock().await;
+    let hint = match advance(&mut progress).await {
+        Ok(Step::Password { hint }) => hint,
+        Ok(Step::Waiting { .. }) => return Redirect::to(&format!("/login/{id}")).into_response(),
+        Ok(Step::LoggedIn) => {
+            return Redirect::to(&format!("/login/{id}/consent")).into_response();
+        }
+        Err(err) => return telegram_failure_page(&err),
+    };
+    let retry = |status: StatusCode, error: &str| {
+        pages::password(status, &id, hint.as_deref(), Some(error))
+    };
+    if let Some(left) = flood_wait_left(&login) {
+        return retry(
+            StatusCode::TOO_MANY_REQUESTS,
+            &wait_message("password attempts", left),
+        );
+    }
+    if password.is_empty() || password.len() > MAX_PASSWORD_BYTES {
+        return retry(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter your cloud password.",
+        );
+    }
+    let Progress::InProgress(attempt) = &mut *progress else {
+        return Redirect::to(&format!("/login/{id}/consent")).into_response();
+    };
+    match attempt.submit_password(password).await {
+        Ok(logged_in) => {
+            tracing::info!(
+                account_id = logged_in.account.id,
+                "telegram login finished with cloud password"
+            );
+            *progress = Progress::LoggedIn(logged_in);
+            Redirect::to(&format!("/login/{id}/consent")).into_response()
+        }
+        Err(TgError::WrongPassword) => {
+            let wrong = {
+                let mut gate = login.password_gate.lock().expect("password gate lock");
+                gate.wrong += 1;
+                gate.wrong
+            };
+            tracing::info!(wrong, "wrong cloud password");
+            if wrong >= MAX_WRONG_PASSWORDS {
+                // The connection (and the half-logged-in auth key) goes with the login.
+                drop(progress);
+                auth.flows.take_login(&id);
+                return pages::error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many attempts",
+                    "The cloud password was wrong too many times. Start again from your app.",
+                );
+            }
+            let left = MAX_WRONG_PASSWORDS - wrong;
+            let attempts = if left == 1 { "attempt" } else { "attempts" };
+            retry(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("Wrong password. {left} {attempts} left."),
+            )
+        }
+        Err(TgError::FloodWait { seconds }) => {
+            tracing::warn!(seconds, "telegram flood wait on cloud password");
+            login
+                .password_gate
+                .lock()
+                .expect("password gate lock")
+                .retry_at = Some(Instant::now() + Duration::from_secs(seconds.into()));
+            retry(
+                StatusCode::TOO_MANY_REQUESTS,
+                &wait_message("password attempts", seconds.into()),
+            )
+        }
+        Err(err) => telegram_failure_page(&err),
+    }
+}
+
+/// Where a login stands after advancing it as far as possible without the user.
+enum Step {
+    Waiting { qr_url: String },
+    Password { hint: Option<String> },
+    LoggedIn,
+}
+
+/// Poll an unfinished login; a login that just finished is stored as such.
+async fn advance(progress: &mut Progress) -> Result<Step, TgError> {
+    let Progress::InProgress(attempt) = progress else {
+        return Ok(Step::LoggedIn);
+    };
+    match attempt.poll().await? {
+        LoginState::WaitingForScan { qr_url } => Ok(Step::Waiting { qr_url }),
+        LoginState::PasswordNeeded { hint } => Ok(Step::Password { hint }),
+        LoginState::LoggedIn(logged_in) => {
+            tracing::info!(account_id = logged_in.account.id, "telegram login finished");
+            *progress = Progress::LoggedIn(logged_in);
+            Ok(Step::LoggedIn)
+        }
+    }
+}
+
+/// Seconds left of a `FLOOD_WAIT` Telegram gave this login, if any.
+fn flood_wait_left(login: &PendingLogin) -> Option<u64> {
+    let mut gate = login.password_gate.lock().expect("password gate lock");
+    let left = gate.retry_at?.checked_duration_since(Instant::now());
+    if left.is_none() {
+        gate.retry_at = None;
+    }
+    // Round up: "0 seconds" would invite an immediate retry.
+    left.map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0))
+}
+
+fn wait_message(what: &str, seconds: u64) -> String {
+    let wait = match seconds {
+        0..=90 => format!("{seconds} seconds"),
+        91..=5400 => format!("{} minutes", seconds.div_ceil(60)),
+        _ => format!("{} hours", seconds.div_ceil(3600)),
+    };
+    format!("Telegram limits {what}. Try again in {wait}.")
+}
+
+/// Status, title and message for a Telegram error during the Login flow.
+fn telegram_failure(err: &TgError) -> (StatusCode, &'static str, String) {
+    match err {
+        TgError::FloodWait { seconds } => {
+            tracing::warn!(seconds, "telegram flood wait during login");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Telegram asks to slow down",
+                wait_message("logins", u64::from(*seconds)),
+            )
+        }
+        err => {
+            tracing::warn!(error = %err, "telegram login step failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Telegram didn't answer",
+                "Start again from your app.".into(),
+            )
+        }
+    }
+}
+
+fn telegram_failure_page(err: &TgError) -> Response {
+    let (status, title, message) = telegram_failure(err);
+    pages::error(status, title, &message)
 }
 
 pub async fn consent_page(
@@ -292,7 +476,7 @@ fn owned_login(
     auth: &AuthState,
     headers: &HeaderMap,
     id: &str,
-) -> Result<Arc<super::flows::PendingLogin>, Response> {
+) -> Result<Arc<PendingLogin>, Response> {
     let cookie_matches = headers
         .get_all(header::COOKIE)
         .iter()

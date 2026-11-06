@@ -33,7 +33,17 @@ pub enum Progress {
 pub struct PendingLogin {
     pub request: AuthRequest,
     pub progress: tokio::sync::Mutex<Progress>,
+    /// Only touched while `progress` is locked.
+    pub password_gate: Mutex<PasswordGate>,
     created: Instant,
+}
+
+/// Limits on Cloud password attempts within one Login flow.
+#[derive(Debug, Default)]
+pub struct PasswordGate {
+    pub wrong: u32,
+    /// Telegram's `FLOOD_WAIT`: nothing goes to Telegram before this.
+    pub retry_at: Option<Instant>,
 }
 
 pub struct IssuedCode {
@@ -71,6 +81,7 @@ impl Flows {
             Arc::new(PendingLogin {
                 request,
                 progress: tokio::sync::Mutex::new(Progress::InProgress(attempt)),
+                password_gate: Mutex::default(),
                 created: Instant::now(),
             }),
         );

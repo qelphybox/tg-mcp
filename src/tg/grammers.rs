@@ -6,10 +6,11 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use grammers_client::{Client, InvocationError, tl};
+use grammers_client::{Client, InvocationError, SignInError, client::PasswordToken, tl};
 use grammers_mtsender::{ConnectionParams, SenderPool};
 use grammers_session::{Session, updates::UpdatesLike};
 use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
@@ -72,6 +73,18 @@ fn connect(credentials: &AppCredentials, store: SessionStore) -> Connected {
 
 fn upstream(err: InvocationError) -> TgError {
     TgError::Upstream(err.to_string())
+}
+
+/// Like [`upstream`], but surfaces `FLOOD_WAIT_X` so the Login flow can honour it.
+fn login_error(err: InvocationError) -> TgError {
+    match &err {
+        InvocationError::Rpc(rpc) if rpc.code == 420 && rpc.name == "FLOOD_WAIT" => {
+            TgError::FloodWait {
+                seconds: rpc.value.unwrap_or(60),
+            }
+        }
+        _ => upstream(err),
+    }
 }
 
 /// Errors meaning "this Telegram session is gone": logged out, revoked, banned.
@@ -137,6 +150,7 @@ impl Login for GrammersLogin {
             credentials: self.credentials.clone(),
             conn: connect(&self.credentials, SessionStore::new()),
             current: None,
+            password_hint: None,
         }))
     }
 }
@@ -146,6 +160,8 @@ struct QrAttempt {
     conn: Connected,
     /// The QR currently shown and when Telegram expires it.
     current: Option<(String, i64)>,
+    /// Set once Telegram said the Account has a Cloud password: its hint, if any.
+    password_hint: Option<Option<String>>,
 }
 
 impl Drop for QrAttempt {
@@ -159,6 +175,9 @@ impl Drop for QrAttempt {
 #[async_trait::async_trait]
 impl LoginAttempt for QrAttempt {
     async fn poll(&mut self) -> Result<LoginState, TgError> {
+        if let Some(hint) = &self.password_hint {
+            return Ok(LoginState::PasswordNeeded { hint: hint.clone() });
+        }
         let mut scanned = false;
         while let Ok(update) = self.conn.updates.try_recv() {
             scanned |= has_login_token_update(&update);
@@ -183,12 +202,36 @@ impl LoginAttempt for QrAttempt {
             .await;
         let token = match exported {
             Ok(token) => token,
-            Err(err) if err.is("SESSION_PASSWORD_NEEDED") => {
-                return Err(TgError::TwoFactorRequired);
-            }
-            Err(err) => return Err(upstream(err)),
+            Err(err) if err.is("SESSION_PASSWORD_NEEDED") => return self.need_password().await,
+            Err(err) => return Err(login_error(err)),
         };
         self.handle(token).await
+    }
+
+    async fn submit_password(&mut self, password: Zeroizing<String>) -> Result<LoggedIn, TgError> {
+        if self.password_hint.is_none() {
+            return Err(TgError::Upstream("not waiting for a cloud password".into()));
+        }
+        // A fresh SRP challenge per attempt, so a retry never reuses a spent srp_id.
+        let info = self.password_info().await?;
+        // check_password unwraps these; a malformed answer must not panic the request.
+        if info.current_algo.is_none() || info.srp_b.is_none() || info.srp_id.is_none() {
+            return Err(TgError::Upstream(
+                "telegram sent no SRP parameters for the cloud password".into(),
+            ));
+        }
+        let checked = self
+            .conn
+            .client
+            .check_password(PasswordToken::new(info), password.as_bytes())
+            .await;
+        drop(password);
+        match checked {
+            Ok(user) => self.logged_in(user.raw),
+            Err(SignInError::InvalidPassword(_)) => Err(TgError::WrongPassword),
+            Err(SignInError::Other(err)) => Err(login_error(err)),
+            Err(other) => Err(TgError::Upstream(other.to_string())),
+        }
     }
 }
 
@@ -226,10 +269,8 @@ impl QrAttempt {
                     Ok(_) => Err(TgError::Upstream(
                         "unexpected answer to importLoginToken".into(),
                     )),
-                    Err(err) if err.is("SESSION_PASSWORD_NEEDED") => {
-                        Err(TgError::TwoFactorRequired)
-                    }
-                    Err(err) => Err(upstream(err)),
+                    Err(err) if err.is("SESSION_PASSWORD_NEEDED") => self.need_password().await,
+                    Err(err) => Err(login_error(err)),
                 }
             }
             tl::enums::auth::LoginToken::Success(s) => self.finish(s.authorization),
@@ -245,12 +286,35 @@ impl QrAttempt {
                 "this Telegram account needs to be signed up first".into(),
             ));
         };
-        let account = account_from(auth.user)?;
+        self.logged_in(auth.user).map(LoginState::LoggedIn)
+    }
+
+    fn logged_in(&self, user: tl::enums::User) -> Result<LoggedIn, TgError> {
+        let account = account_from(user)?;
         let telegram_session = self.conn.store.snapshot()?;
-        Ok(LoginState::LoggedIn(LoggedIn {
+        Ok(LoggedIn {
             account,
             telegram_session,
-        }))
+        })
+    }
+
+    /// The QR was accepted but the Account has a Cloud password: remember its hint.
+    async fn need_password(&mut self) -> Result<LoginState, TgError> {
+        let hint = self.password_info().await?.hint;
+        tracing::info!("qr login needs the cloud password");
+        self.password_hint = Some(hint.clone());
+        Ok(LoginState::PasswordNeeded { hint })
+    }
+
+    /// `account.getPassword`: the hint and a fresh SRP challenge.
+    async fn password_info(&self) -> Result<tl::types::account::Password, TgError> {
+        let tl::enums::account::Password::Password(info) = self
+            .conn
+            .client
+            .invoke(&tl::functions::account::GetPassword {})
+            .await
+            .map_err(login_error)?;
+        Ok(info)
     }
 }
 
@@ -407,6 +471,27 @@ mod tests {
         assert!(!has_login_token_update(&UpdatesLike::Updates(
             tl::enums::Updates::TooLong
         )));
+    }
+
+    #[test]
+    fn flood_wait_is_surfaced_with_its_seconds() {
+        let rpc = |code, message: &str| {
+            InvocationError::Rpc(
+                tl::types::RpcError {
+                    error_code: code,
+                    error_message: message.into(),
+                }
+                .into(),
+            )
+        };
+        assert!(matches!(
+            login_error(rpc(420, "FLOOD_WAIT_31")),
+            TgError::FloodWait { seconds: 31 }
+        ));
+        assert!(matches!(
+            login_error(rpc(400, "PASSWORD_HASH_INVALID")),
+            TgError::Upstream(_)
+        ));
     }
 
     #[test]

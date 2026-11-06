@@ -69,6 +69,14 @@ impl Login for SequenceLogin {
 }
 
 pub async fn start(accounts: Vec<Account>) -> TestServer {
+    start_with_login(Arc::new(SequenceLogin {
+        accounts,
+        next: AtomicUsize::new(0),
+    }))
+    .await
+}
+
+pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -82,10 +90,7 @@ pub async fn start(accounts: Vec<Account>) -> TestServer {
     let deps = Deps {
         vault: Arc::new(Vault::new(pool.clone(), TokenTtl::default())),
         clients: ClientRegistry::new(pool),
-        login: Arc::new(SequenceLogin {
-            accounts,
-            next: AtomicUsize::new(0),
-        }),
+        login,
         connector: Arc::new(FakeConnector),
     };
     let shutdown = CancellationToken::new();

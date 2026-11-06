@@ -50,6 +50,9 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
   .row {{ display:flex; gap:10px; margin-top:20px; }}
   button {{ flex:1; font:inherit; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--fg); cursor:pointer; }}
   button.primary {{ background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }}
+  label {{ display:block; font-weight:600; margin:0 0 6px; }}
+  input {{ width:100%; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--fg); }}
+  .error {{ color:#d93a3a; font-weight:600; }}
   footer {{ margin-top:22px; font-size:12px; color:var(--muted); }}
 </style>
 </head>
@@ -99,6 +102,39 @@ pub fn login(login_id: &str) -> Response {
 <div class="qr" id="qr" data-login="{id}"><span class="muted">Preparing a login code…</span></div>
 <p class="muted" id="status">The code refreshes by itself. Keep this page open.</p>
 <script src="/login/assets/login.js"></script>"#,
+            id = esc(login_id),
+        ),
+    )
+}
+
+/// The Cloud password step. `error` is shown inline after a failed attempt.
+pub fn password(
+    status: StatusCode,
+    login_id: &str,
+    hint: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    let hint = hint
+        .filter(|h| !h.is_empty())
+        .map(|h| format!(r#"<p class="muted">Hint: <b>{}</b></p>"#, esc(h)))
+        .unwrap_or_default();
+    let error = error
+        .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, esc(e)))
+        .unwrap_or_default();
+    page(
+        status,
+        "Two-step verification",
+        &format!(
+            r#"<h1>Two-step verification</h1>
+<p>This account has a cloud password. Enter it to finish logging in.</p>
+{error}<form method="post" action="/login/{id}/password">
+  <label for="password">Cloud password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required autofocus>
+  {hint}<p class="muted">It is checked with Telegram once and never stored.</p>
+  <div class="row">
+    <button type="submit" class="primary">Continue</button>
+  </div>
+</form>"#,
             id = esc(login_id),
         ),
     )
@@ -163,6 +199,11 @@ pub const LOGIN_JS: &str = r#""use strict";
     }
     if (s.state === "logged_in") {
       status.textContent = "Logged in. One more step…";
+      window.location.assign(s.next);
+      return;
+    }
+    if (s.state === "password") {
+      status.textContent = "Scanned. This account has a cloud password…";
       window.location.assign(s.next);
       return;
     }

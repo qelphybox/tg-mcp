@@ -1,6 +1,7 @@
 //! The `tg` boundary: everything the server needs from Telegram, behind traits.
 //!
-//! - [`Login`] / [`LoginAttempt`]: the Telegram part of the Login flow (QR, later 2FA).
+//! - [`Login`] / [`LoginAttempt`]: the Telegram part of the Login flow (QR login, then
+//!   the Cloud password if the Account has one).
 //! - [`Connector`]: turns an opened Grant into a Live client.
 //! - [`Telegram`]: read-only calls on one Account.
 //!
@@ -12,7 +13,7 @@ pub mod grammers;
 mod pool;
 mod session;
 
-pub use fake::{FakeConnector, FakeLogin, FakeTelegram};
+pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
 
 use std::{fmt, sync::Arc};
 
@@ -52,9 +53,12 @@ pub enum TgError {
     /// The stored Telegram session can't be used (corrupt, or logged out elsewhere).
     #[error("telegram session is not usable: {0}")]
     BadSession(String),
-    /// The Account has a cloud password; the Login flow can't finish without it yet.
-    #[error("two-step verification is enabled on this account")]
-    TwoFactorRequired,
+    /// The Cloud password didn't match.
+    #[error("the cloud password is wrong")]
+    WrongPassword,
+    /// Telegram's `FLOOD_WAIT`: nothing may be retried before `seconds` pass.
+    #[error("telegram asks to wait {seconds} s")]
+    FloodWait { seconds: u32 },
 }
 
 /// Read-only access to one Account.
@@ -82,11 +86,18 @@ pub trait Login: Send + Sync + 'static {
 pub trait LoginAttempt: Send + 'static {
     /// Advance as far as possible without user input and report where we are.
     async fn poll(&mut self) -> Result<LoginState, TgError>;
+
+    /// Check the Cloud password once [`LoginState::PasswordNeeded`] was reported.
+    /// Takes the password so it is wiped as soon as the check is over; it is never
+    /// stored or logged. A wrong one is [`TgError::WrongPassword`] and may be retried.
+    async fn submit_password(&mut self, password: Zeroizing<String>) -> Result<LoggedIn, TgError>;
 }
 
 pub enum LoginState {
     /// Show this `tg://login?token=…` URL as a QR code and keep polling.
     WaitingForScan { qr_url: String },
+    /// Scanned, but the Account has a Cloud password: ask for it (with its hint).
+    PasswordNeeded { hint: Option<String> },
     /// Done: the Account and its fresh Telegram session.
     LoggedIn(LoggedIn),
 }
