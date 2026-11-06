@@ -17,7 +17,8 @@ use crate::limits::{AccountLimiter, Limits};
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{
-        self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, RawDialog, RawMessage, RawPeer,
+        self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, Listing, RawDialog,
+        RawMessage, RawPeer,
     },
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
     pool::{Evicted, Live, Pool},
@@ -456,20 +457,29 @@ impl Telegram for LiveClient {
         archived: bool,
     ) -> Result<ChatPage, TgError> {
         let cursor = cursor.map(Cursor::decode).transpose()?;
-        let archived = cursor.as_ref().map_or(archived, |c| c.archived);
+        let listing = Listing {
+            archived: cursor.as_ref().map_or(archived, |c| c.archived),
+            first_page: cursor.is_none(),
+        };
         let (offset_date, offset_id, offset_peer) = match &cursor {
-            Some(c) => (
-                c.offset_date,
-                c.offset_id,
-                input_peer(c.offset_peer.parse()?, c.offset_access_hash),
+            Some(Cursor {
+                offset_date,
+                offset_id,
+                offset_peer: Some(peer),
+                offset_access_hash,
+                ..
+            }) => (
+                *offset_date,
+                *offset_id,
+                input_peer(peer.parse()?, *offset_access_hash),
             ),
-            None => (0, 0, tl::enums::InputPeer::Empty),
+            _ => (0, 0, tl::enums::InputPeer::Empty),
         };
         let answer = self
             .call(
                 &tl::functions::messages::GetDialogs {
-                    exclude_pinned: false,
-                    folder_id: archived.then_some(1),
+                    exclude_pinned: listing.exclude_pinned(),
+                    folder_id: Some(listing.folder_id()),
                     offset_date,
                     offset_id,
                     offset_peer,
@@ -496,7 +506,7 @@ impl Telegram for LiveClient {
 
         self.remember(&peers);
         Ok(chats::assemble_page(
-            &dialogs, &peers, &messages, full_page, archived,
+            &dialogs, &peers, &messages, full_page, listing,
         ))
     }
 
@@ -772,6 +782,7 @@ fn raw_dialog(dialog: tl::enums::Dialog) -> Option<RawDialog> {
             top_message: d.top_message,
             unread_count: d.unread_count,
             pinned: d.pinned,
+            folder_id: d.folder_id.unwrap_or(0),
         }),
         // The archive folder entry and communities aren't Chats.
         _ => None,
@@ -1082,6 +1093,47 @@ mod tests {
     }
 
     #[test]
+    fn dialogs_keep_their_folder_and_pin() {
+        use grammers_client::tl::{Deserializable, Identifiable, Serializable};
+        let mut no_settings = tl::types::PeerNotifySettings::CONSTRUCTOR_ID.to_bytes();
+        no_settings.extend(0u32.to_bytes());
+        let dialog = |folder_id, pinned| {
+            tl::enums::Dialog::Dialog(tl::types::Dialog {
+                pinned,
+                unread_mark: false,
+                view_forum_as_messages: false,
+                peer: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 7 }),
+                top_message: 55,
+                read_inbox_max_id: 0,
+                read_outbox_max_id: 0,
+                unread_count: 3,
+                unread_mentions_count: 0,
+                unread_reactions_count: 0,
+                unread_poll_votes_count: 0,
+                notify_settings: tl::enums::PeerNotifySettings::from_bytes(&no_settings).unwrap(),
+                pts: None,
+                draft: None,
+                folder_id,
+                ttl_period: None,
+            })
+        };
+        let archived = raw_dialog(dialog(Some(1), true)).unwrap();
+        assert_eq!(
+            archived,
+            RawDialog {
+                chat: ChatId::Channel(7),
+                top_message: 55,
+                unread_count: 3,
+                pinned: true,
+                folder_id: 1,
+            }
+        );
+        // Telegram leaves the flag out for the main list.
+        let main = raw_dialog(dialog(None, false)).unwrap();
+        assert_eq!((main.folder_id, main.pinned), (0, false));
+    }
+
+    #[test]
     fn min_peers_hashes_are_never_handed_out() {
         // A "min" hash only works inside the message it came with.
         let (user, channel) = tl_peers(true);
@@ -1273,8 +1325,8 @@ mod shutdown_tests {
     }
 }
 
-/// What `get_messages` / `get_chat_info` send to Telegram for each kind of id,
-/// on a fresh Live client (empty peer cache) whose connection is never started:
+/// What `list_chats` sends for each listing and page, and what `get_messages` /
+/// `get_chat_info` send for each kind of id, on a fresh Live client (empty peer cache) whose connection is never started:
 /// every request is recorded, then fails at once, so nothing leaves the machine.
 #[cfg(test)]
 mod resolve_tests {
@@ -1419,6 +1471,65 @@ mod resolve_tests {
                     access_hash: 99,
                 }
             ))]
+        );
+    }
+
+    fn get_dialogs(
+        exclude_pinned: bool,
+        folder_id: i32,
+        offset: (i32, i32, tl::enums::InputPeer),
+    ) -> Vec<u8> {
+        tl::functions::messages::GetDialogs {
+            exclude_pinned,
+            folder_id: Some(folder_id),
+            offset_date: offset.0,
+            offset_id: offset.1,
+            offset_peer: offset.2,
+            limit: 30,
+            hash: 0,
+        }
+        .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn listings_name_their_folder_and_later_pages_skip_pinned_chats() {
+        let (live, _dir) = cold_client().await;
+        let top = || (0, 0, tl::enums::InputPeer::Empty);
+        let after_channel = Cursor {
+            offset_date: 1_700_000_000,
+            offset_id: 55,
+            offset_peer: Some("channel:5".into()),
+            offset_access_hash: Some(-9),
+            archived: false,
+        };
+        let archive_top = Cursor {
+            offset_date: 0,
+            offset_id: 0,
+            offset_peer: None,
+            offset_access_hash: None,
+            archived: true,
+        };
+
+        assert!(live.list_chats(30, None, false).await.is_err());
+        assert!(live.list_chats(30, None, true).await.is_err());
+        // The cursor decides the folder, whatever `archived` says.
+        let next = after_channel.encode();
+        assert!(live.list_chats(30, Some(&next), true).await.is_err());
+        let next = archive_top.encode();
+        assert!(live.list_chats(30, Some(&next), false).await.is_err());
+
+        let channel = tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: -9,
+        });
+        assert_eq!(
+            sent(&live),
+            [
+                get_dialogs(false, 0, top()),
+                get_dialogs(false, 1, top()),
+                get_dialogs(true, 0, (1_700_000_000, 55, channel)),
+                get_dialogs(true, 1, top()),
+            ]
         );
     }
 }

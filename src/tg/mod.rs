@@ -75,8 +75,9 @@ pub enum TgError {
 pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
 
-    /// One page of the Account's Chats, most recent first. `cursor` is a
-    /// `next_cursor` from a previous page (it also decides `archived`).
+    /// One page of the Account's Chats in the main list or the Archive: pinned
+    /// first on the first page, then most recent first, each Chat once. `cursor`
+    /// is a `next_cursor` from a previous page (it also decides `archived`).
     async fn list_chats(
         &self,
         limit: usize,

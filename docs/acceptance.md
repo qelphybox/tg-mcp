@@ -154,3 +154,17 @@ If Telegram itself already drops a character from a title or name, that field's 
    ```
 
    Scan the QR: the heading names **example.com**; the grey line reads `The app calls itself "<b>Claude</b>evil" (not verified).` with the tags shown literally, nothing bold and nothing reversed. Deny.
+
+## 12. The main list and the Archive are disjoint, and paging never repeats a chat
+
+Needs an account with pinned chats in the main list, some archived chats, and more than one page of chats (the more the better: the bug of #37 showed with 1000+). In Claude Code, with the server added as in §1:
+
+```text
+Через Telegram MCP пролистай list_chats с limit=100 до конца (передавай next_cursor как cursor, пока он есть), потом так же list_chats с archived=true и limit=100. Не пересказывай чаты и не выводи названия. Для каждого из двух списков напиши: число страниц, число строк, число уникальных id, какие id повторяются (и на каких страницах), сколько чатов с pinned=true и на каких страницах они были. Потом напиши, сколько id есть в обоих списках сразу, и перечисли их. Сравнивай id целиком, вместе с частью после ~.
+```
+
+1. In each listing, rows = unique ids: no id repeats, on one page or across pages.
+2. `pinned: true` appears only on page 1 of each listing, and the pinned count matches the pinned chats in the Telegram app (main list and Archive separately).
+3. No id is in both listings (0 in common). Spot-check one archived chat in the app: it is in the `archived=true` list only.
+
+A chat that gets a new message while you page moves to the top, above the cursor: it can be missing from the later pages, but never shows twice.
