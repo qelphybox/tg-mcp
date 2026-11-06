@@ -8,3 +8,4 @@ A database dump must not give access to any Telegram session, yet a server resta
 - The authorization code is short-lived and held in memory only (with the Session key); a restart mid-login means logging in again.
 - Revoking a Grant (and calling `auth.logOut`) needs a live Token, since only a Token can decrypt the Telegram session.
 - Losing every Token of a Grant makes its Telegram session unrecoverable by design; the user logs in again.
+- A Media link is downloaded without a Token (an agent's shell has none). Like the authorization code, it is issued from a Token-authenticated call and keeps what the download needs (a reference to the Grant's Live client) in memory only, for a few minutes and a few downloads; a restart kills it. Nothing about it is persisted.
