@@ -154,11 +154,13 @@ pub const LOGIN_JS: &str = r#""use strict";
       status.textContent = "Connection lost, retrying…";
       return setTimeout(tick, 3000);
     }
-    if (!res.ok) {
-      status.textContent = "This login expired. Start again from your app.";
+    let s = null;
+    try { s = await res.json(); } catch (_) {}
+    if (!res.ok || !s) {
+      status.textContent = (s && s.message) || "This login expired. Start again from your app.";
+      box.replaceChildren();
       return;
     }
-    const s = await res.json();
     if (s.state === "logged_in") {
       status.textContent = "Logged in. One more step…";
       window.location.assign(s.next);

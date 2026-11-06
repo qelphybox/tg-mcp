@@ -10,8 +10,13 @@ axum = "0.8"
 base64 = "0.23.1"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
+grammers-client = { version = "=0.11.0", default-features = false }
+grammers-mtsender = "=0.11.0"
+grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
+grammers-tl-types = "=0.11.0"
 hkdf = "0.13.0"
 http = "1"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "macros"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

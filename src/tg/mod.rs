@@ -4,10 +4,13 @@
 //! - [`Connector`]: turns an opened Grant into a Live client.
 //! - [`Telegram`]: read-only calls on one Account.
 //!
-//! Tests drive the whole server through the fakes in [`fake`]; the grammers-backed
-//! implementations arrive with real QR login.
+//! Tests drive the whole server through the fakes in [`fake`]; [`grammers`] is the
+//! real Telegram (QR login + Client pool).
 
 pub mod fake;
+pub mod grammers;
+mod pool;
+mod session;
 
 pub use fake::{FakeConnector, FakeLogin, FakeTelegram};
 
@@ -49,6 +52,9 @@ pub enum TgError {
     /// The stored Telegram session can't be used (corrupt, or logged out elsewhere).
     #[error("telegram session is not usable: {0}")]
     BadSession(String),
+    /// The Account has a cloud password; the Login flow can't finish without it yet.
+    #[error("two-step verification is enabled on this account")]
+    TwoFactorRequired,
 }
 
 /// Read-only access to one Account.
@@ -58,9 +64,11 @@ pub trait Telegram: Send + Sync + 'static {
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.
+/// Takes the Grant: a new Live client keeps it (and its Session key) for as long
+/// as it lives, to re-seal the Telegram session if it changes.
 #[async_trait::async_trait]
 pub trait Connector: Send + Sync + 'static {
-    async fn connect(&self, grant: &OpenedGrant) -> Result<Arc<dyn Telegram>, TgError>;
+    async fn connect(&self, grant: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError>;
 }
 
 /// Starts the Telegram part of a Login flow.

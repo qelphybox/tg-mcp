@@ -93,7 +93,7 @@ pub struct FakeConnector;
 
 #[async_trait::async_trait]
 impl Connector for FakeConnector {
-    async fn connect(&self, grant: &OpenedGrant) -> Result<Arc<dyn Telegram>, TgError> {
+    async fn connect(&self, grant: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError> {
         let account: Account = serde_json::from_slice(&grant.telegram_session)
             .map_err(|e| TgError::BadSession(e.to_string()))?;
         Ok(Arc::new(FakeTelegram::new(account)))

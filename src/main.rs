@@ -8,7 +8,10 @@ use tg_mcp::{
     config::Config,
     db,
     sessions::{TokenTtl, Vault},
-    tg::{FakeConnector, FakeLogin},
+    tg::{
+        Connector, FakeConnector, FakeLogin, Login,
+        grammers::{GrammersConnector, GrammersLogin},
+    },
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -22,12 +25,6 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = Config::from_env()?;
-    if !config.fake_telegram {
-        bail!("real Telegram login is not implemented yet; set TG_MCP_FAKE_TELEGRAM=1");
-    }
-    tracing::warn!(
-        "Telegram is FAKED: every login is the same fake Account (TG_MCP_FAKE_TELEGRAM=1)"
-    );
 
     let pool = db::open(&config.db_path)
         .await
@@ -36,11 +33,30 @@ async fn main() -> anyhow::Result<()> {
     let vault = Arc::new(Vault::new(pool.clone(), TokenTtl::default()));
     tokio::spawn(purge_expired_tokens(vault.clone()));
 
+    let (login, connector): (Arc<dyn Login>, Arc<dyn Connector>) = match (
+        config.fake_telegram,
+        config.telegram_app.clone(),
+    ) {
+        (true, _) => {
+            tracing::warn!(
+                "Telegram is FAKED: every login is the same fake Account (TG_MCP_FAKE_TELEGRAM=1)"
+            );
+            (Arc::new(FakeLogin::default()), Arc::new(FakeConnector))
+        }
+        (false, Some(app)) => {
+            tracing::info!(api_id = app.api_id, "using Telegram app");
+            (
+                Arc::new(GrammersLogin::new(app.clone())),
+                GrammersConnector::new(app, vault.clone(), config.live_client_idle_ttl),
+            )
+        }
+        (false, None) => bail!("Telegram app credentials are missing"),
+    };
     let deps = Deps {
         vault,
         clients: ClientRegistry::new(pool),
-        login: Arc::new(FakeLogin::default()),
-        connector: Arc::new(FakeConnector),
+        login,
+        connector,
     };
     let shutdown = CancellationToken::new();
     let app = tg_mcp::app(&config, deps, shutdown.clone());

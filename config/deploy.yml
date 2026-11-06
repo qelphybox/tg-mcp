@@ -38,8 +38,6 @@ env:
     TG_MCP_BIND: 0.0.0.0:8080
     TG_MCP_DB_PATH: /data/tg-mcp.db
     RUST_LOG: info
-    # Until real QR login lands (#5) the server answers with a fake Account.
-    TG_MCP_FAKE_TELEGRAM: "1"
   secret:
     - TG_MCP_API_ID
     - TG_MCP_API_HASH

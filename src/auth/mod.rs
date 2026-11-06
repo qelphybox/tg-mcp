@@ -77,6 +77,22 @@ impl AuthState {
     }
 }
 
+/// Sweep expired Login flows every minute, for as long as the server lives.
+pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
+    let auth = Arc::downgrade(auth);
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            every.tick().await;
+            let Some(auth) = auth.upgrade() else { return };
+            let swept = auth.flows.sweep();
+            if swept > 0 {
+                tracing::info!(swept, "abandoned logins dropped");
+            }
+        }
+    });
+}
+
 /// Who is calling `/mcp`: set by [`require_bearer`] on every request, read by tools.
 #[derive(Clone)]
 pub struct Caller {
@@ -138,22 +154,22 @@ pub async fn require_bearer(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let telegram = match auth.connector.connect(&grant).await {
+    let grant_id = grant.grant_id.clone();
+    let telegram = match auth.connector.connect(grant).await {
         Ok(telegram) => telegram,
         Err(err @ TgError::BadSession(_)) => {
             // Logged out in Telegram or unusable: the client has to log in again.
-            tracing::warn!(grant_id = %grant.grant_id, error = %err, "grant has an unusable telegram session");
+            tracing::warn!(grant_id = %grant_id, error = %err, "grant has an unusable telegram session");
             return unauthorized(&auth, Some("invalid_token"));
         }
         Err(err) => {
-            tracing::warn!(grant_id = %grant.grant_id, error = %err, "connecting to telegram failed");
+            tracing::warn!(grant_id = %grant_id, error = %err, "connecting to telegram failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    request.extensions_mut().insert(Caller {
-        grant_id: grant.grant_id.clone(),
-        telegram,
-    });
+    request
+        .extensions_mut()
+        .insert(Caller { grant_id, telegram });
     next.run(request).await
 }
 

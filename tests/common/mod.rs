@@ -72,8 +72,12 @@ pub async fn start(accounts: Vec<Account>) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let config =
-        Config::from_lookup(|key| (key == "TG_MCP_PUBLIC_URL").then(|| base.clone())).unwrap();
+    let config = Config::from_lookup(|key| match key {
+        "TG_MCP_PUBLIC_URL" => Some(base.clone()),
+        "TG_MCP_FAKE_TELEGRAM" => Some("1".into()),
+        _ => None,
+    })
+    .unwrap();
     let pool = db::open(&dir.path().join("test.db")).await.unwrap();
     let deps = Deps {
         vault: Arc::new(Vault::new(pool.clone(), TokenTtl::default())),

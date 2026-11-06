@@ -108,6 +108,21 @@ impl Flows {
         code
     }
 
+    /// Drop expired logins and codes. An abandoned login holds an open Telegram
+    /// connection until it is dropped, so this runs periodically.
+    pub fn sweep(&self) -> usize {
+        let mut logins = self.logins.lock().expect("flows lock");
+        let before = logins.len();
+        logins.retain(|_, l| l.created.elapsed() < LOGIN_TTL);
+        let swept = before - logins.len();
+        drop(logins);
+        self.codes
+            .lock()
+            .expect("flows lock")
+            .retain(|_, c| c.expires > Instant::now());
+        swept
+    }
+
     /// Single use: the code is gone after this, whether or not the exchange succeeds.
     pub fn take_code(&self, code: &str) -> Option<IssuedCode> {
         let mut codes = self.codes.lock().expect("flows lock");

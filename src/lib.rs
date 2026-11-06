@@ -41,6 +41,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         deps.login,
         deps.connector,
     ));
+    auth::spawn_flow_sweeper(&auth);
 
     let mcp = StreamableHttpService::new(
         || Ok(TgMcp::new()),

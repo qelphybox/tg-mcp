@@ -21,7 +21,7 @@ use super::{
     flows::{AuthRequest, Progress},
     pages, pkce,
 };
-use crate::tg::LoginState;
+use crate::tg::{LoginState, TgError};
 
 const COOKIE: &str = "tgm_login";
 
@@ -181,9 +181,22 @@ pub async fn login_status(
                 tracing::info!(account_id = logged_in.account.id, "telegram login finished");
                 *progress = Progress::LoggedIn(logged_in);
             }
+            Err(TgError::TwoFactorRequired) => {
+                let message = "This account has two-step verification enabled. \
+                               Logging in with a cloud password isn't supported yet.";
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "state": "error", "message": message })),
+                )
+                    .into_response();
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "telegram login poll failed");
-                return (StatusCode::BAD_GATEWAY, Json(json!({ "state": "error" })))
+                let message = "Telegram didn't answer. Start again from your app.";
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "state": "error", "message": message })),
+                )
                     .into_response();
             }
         }
@@ -344,7 +357,15 @@ fn redirect_target(redirect_uri: &str) -> String {
     }
 }
 
-/// QR codes are rendered in #5 (real Telegram login); the fake login has none.
-fn qr_svg_base64(_qr_url: &str) -> Option<String> {
-    None
+/// The `tg://login` URL as an SVG QR code, base64 for a `data:` URL. The fake
+/// login's URL is rendered too; only an unencodable URL yields `None`.
+fn qr_svg_base64(qr_url: &str) -> Option<String> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let code = qrcode::QrCode::with_error_correction_level(qr_url, qrcode::EcLevel::M).ok()?;
+    let svg = code
+        .render::<qrcode::render::svg::Color<'_>>()
+        .min_dimensions(240, 240)
+        .quiet_zone(true)
+        .build();
+    Some(STANDARD.encode(svg))
 }
