@@ -1,0 +1,56 @@
+# Kamal 2 deploy config. See docs/deploy.md.
+# Host and SSH user come from the environment (GitHub repo variables in CI).
+service: tg-mcp
+image: qelphybox/tg-mcp
+
+servers:
+  web:
+    hosts:
+      - <%= ENV.fetch("KAMAL_HOST") %>
+
+ssh:
+  user: <%= ENV.fetch("KAMAL_SSH_USER", "root") %>
+
+registry:
+  server: ghcr.io
+  username: qelphybox
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: amd64
+
+proxy:
+  host: tgmcp.qelphybox.space
+  ssl: true
+  app_port: 8080
+  healthcheck:
+    path: /healthz
+    interval: 2
+    timeout: 3
+  # Only bounds the wait for response headers. MCP streams are text/event-stream,
+  # which kamal-proxy switches to unbuffered pass-through on its own.
+  response_timeout: 30
+
+env:
+  clear:
+    TG_MCP_PUBLIC_URL: https://tgmcp.qelphybox.space
+    TG_MCP_BIND: 0.0.0.0:8080
+    TG_MCP_DB_PATH: /data/tg-mcp.db
+    RUST_LOG: info
+    # Until real QR login lands (#5) the server answers with a fake Account.
+    TG_MCP_FAKE_TELEGRAM: "1"
+  secret:
+    - TG_MCP_API_ID
+    - TG_MCP_API_HASH
+
+volumes:
+  - tg-mcp-data:/data
+
+# Old container gets this long to finish in-flight requests before SIGTERM.
+drain_timeout: 30
+
+logging:
+  options:
+    max-size: 20m
+    max-file: "5"

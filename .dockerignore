@@ -5,3 +5,7 @@ docs
 *.db
 .env
 rust-toolchain.toml
+.kamal
+config/deploy.yml
+scripts
+.github
