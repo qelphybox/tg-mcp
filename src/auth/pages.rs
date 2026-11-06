@@ -6,6 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::tg::sanitise::sanitise;
+
 /// Applied to every page. No framing (the Consent button must not be clickjackable),
 /// scripts only from us. No `form-action`: Chrome applies it to the redirect after
 /// the Consent POST, which goes to the client's own redirect_uri.
@@ -43,6 +45,8 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
          font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--fg); background:var(--bg); }}
   main {{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:28px; }}
   h1 {{ font-size:20px; margin:0 0 8px; }}
+  h1.ask {{ font-weight:400; line-height:1.4; }}
+  h1.ask b {{ font-weight:700; overflow-wrap:anywhere; }}
   p {{ margin:0 0 14px; }}
   .muted {{ color:var(--muted); font-size:14px; }}
   .qr {{ display:grid; place-items:center; min-height:240px; margin:16px 0; border:1px dashed var(--line); border-radius:12px; padding:12px; word-break:break-all; text-align:center; }}
@@ -142,38 +146,53 @@ pub fn password(
 
 pub struct ConsentView<'a> {
     pub login_id: &'a str,
+    /// Self-declared at registration: anyone can call themselves "Claude".
     pub client_name: &'a str,
+    /// Where the authorization code goes, the one fact the server can vouch for.
     pub redirect_target: &'a str,
+    /// The code goes to a loopback host, which names no one.
+    pub redirect_is_loopback: bool,
     pub account_name: &'a str,
     pub account_username: Option<&'a str>,
 }
 
-pub fn consent(view: &ConsentView<'_>) -> Response {
+/// The redirect host leads, in the heading; the client name follows, muted and
+/// marked unverified. Names lose hidden characters (a right-to-left override
+/// could reverse the sentence) before they are escaped.
+fn consent_body(view: &ConsentView<'_>) -> String {
+    let recipient = if view.redirect_is_loopback {
+        "an app on this computer (localhost)".to_string()
+    } else {
+        esc(view.redirect_target)
+    };
     let username = view
         .account_username
-        .map(|u| format!(" (@{})", esc(u)))
+        .map(|u| format!(" (@{})", esc(&sanitise(u))))
         .unwrap_or_default();
-    page(
-        StatusCode::OK,
-        "Allow access",
-        &format!(
-            r#"<h1>Allow access?</h1>
-<p><b>{client}</b> will get <b>read-only access to all chats</b> of <b>{account}</b>{username}.</p>
+    let client_name = sanitise(view.client_name);
+    let client = match client_name.trim() {
+        "" => "The app gave no name.".to_string(),
+        name => format!("The app calls itself “{}” (not verified).", esc(name)),
+    };
+    format!(
+        r#"<h1 class="ask">Allow <b>{recipient}</b> read-only access to all chats of <b>{account}</b>{username}?</h1>
+<p class="muted">{client}</p>
 <p class="muted">It can read chats and messages. It can't send, edit or delete anything.</p>
-<p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in {client} alone does not end that session.</p>
-<p class="muted">After you allow, you'll be sent to <b>{target}</b>. If you don't recognise it, deny.</p>
+<p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in the app alone does not end that session.</p>
+<p class="muted">If you didn't just connect an app to this Telegram account, deny.</p>
 <form method="post" action="/login/{id}/consent">
   <div class="row">
     <button type="submit" name="decision" value="deny">Deny</button>
     <button type="submit" name="decision" value="allow" class="primary">Allow</button>
   </div>
 </form>"#,
-            client = esc(view.client_name),
-            account = esc(view.account_name),
-            target = esc(view.redirect_target),
-            id = esc(view.login_id),
-        ),
+        account = esc(&sanitise(view.account_name)),
+        id = esc(view.login_id),
     )
+}
+
+pub fn consent(view: &ConsentView<'_>) -> Response {
+    page(StatusCode::OK, "Allow access", &consent_body(view))
 }
 
 /// Polls the login status and swaps the QR; moves on to Consent when logged in.
@@ -228,3 +247,123 @@ pub const LOGIN_JS: &str = r#""use strict";
   tick();
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view<'a>(client_name: &'a str, target: &'a str, loopback: bool) -> ConsentView<'a> {
+        ConsentView {
+            login_id: "L",
+            client_name,
+            redirect_target: target,
+            redirect_is_loopback: loopback,
+            account_name: "Alice",
+            account_username: Some("alice"),
+        }
+    }
+
+    fn heading(html: &str) -> &str {
+        let start = html.find("<h1").expect("an h1");
+        let end = html[start..].find("</h1>").expect("a closed h1") + start;
+        &html[start..end]
+    }
+
+    /// The text of the element with `class="muted"` that contains `needle`.
+    fn muted_containing<'h>(html: &'h str, needle: &str) -> Option<&'h str> {
+        html.split(r#"<p class="muted">"#)
+            .skip(1)
+            .map(|rest| &rest[..rest.find("</p>").unwrap_or(rest.len())])
+            .find(|p| p.contains(needle))
+    }
+
+    #[test]
+    fn the_heading_names_the_redirect_host_and_not_the_client() {
+        let html = consent_body(&view("Claude", "claude.ai", false));
+        let h1 = heading(&html);
+        assert!(h1.contains("<b>claude.ai</b>"), "{h1}");
+        assert!(h1.contains("read-only access to all chats"), "{h1}");
+        assert!(h1.contains("<b>Alice</b> (@alice)"), "{h1}");
+        assert!(!h1.contains("Claude"), "{h1}");
+        assert!(html.find("claude.ai").unwrap() < html.find("Claude").unwrap());
+    }
+
+    #[test]
+    fn the_client_name_is_muted_and_marked_unverified() {
+        let html = consent_body(&view("Claude", "evil.example", false));
+        let line = muted_containing(&html, "Claude").expect("client name in a muted line");
+        assert!(line.contains("calls itself"), "{line}");
+        assert!(line.contains("(not verified)"), "{line}");
+        assert_eq!(html.matches("Claude").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_loopback_redirect_is_an_app_on_this_computer() {
+        let html = consent_body(&view("Claude Code", "127.0.0.1", true));
+        let h1 = heading(&html);
+        assert!(
+            h1.contains("<b>an app on this computer (localhost)</b>"),
+            "{h1}"
+        );
+        assert!(!h1.contains("127.0.0.1"), "{h1}");
+
+        let html = consent_body(&view(
+            "Cursor",
+            "cursor://anysphere.cursor-retrieval",
+            false,
+        ));
+        assert!(
+            heading(&html).contains("<b>cursor://anysphere.cursor-retrieval</b>"),
+            "{html}"
+        );
+        assert!(!html.contains("this computer"), "{html}");
+    }
+
+    #[test]
+    fn everything_interpolated_is_escaped() {
+        let html = consent_body(&ConsentView {
+            login_id: "L\"><x",
+            client_name: "<script>alert(1)</script>",
+            redirect_target: "a<b>.example",
+            redirect_is_loopback: false,
+            account_name: "<i>Mallory</i>",
+            account_username: Some("m&m"),
+        });
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("a&lt;b&gt;.example"), "{html}");
+        assert!(html.contains("&lt;i&gt;Mallory&lt;/i&gt;"), "{html}");
+        assert!(html.contains("(@m&amp;m)"), "{html}");
+        assert!(html.contains("/login/L&quot;&gt;&lt;x/consent"), "{html}");
+    }
+
+    #[test]
+    fn hidden_characters_are_stripped_from_names() {
+        // A right-to-left override could reverse the rest of the sentence visually.
+        let html = consent_body(&ConsentView {
+            login_id: "L",
+            client_name: "Cla\u{200B}ude\u{202E}edoC",
+            redirect_target: "claude.ai",
+            redirect_is_loopback: false,
+            account_name: "Al\u{202E}ice\u{2066}",
+            account_username: Some("ali\u{200F}ce"),
+        });
+        assert!(html.contains("Claude"), "{html}");
+        assert!(html.contains("edoC"), "{html}");
+        assert!(html.contains("<b>Alice</b> (@alice)"), "{html}");
+        assert!(
+            !html.chars().any(crate::tg::sanitise::is_format),
+            "hidden characters left in {html:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_only_hidden_characters_reads_as_no_name() {
+        let html = consent_body(&view("\u{202E}\u{200B}", "claude.ai", false));
+        assert!(!html.contains("“”"), "{html}");
+        assert!(muted_containing(&html, "gave no name").is_some(), "{html}");
+    }
+}

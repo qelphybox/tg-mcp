@@ -140,3 +140,17 @@ If Telegram itself already drops a character from a title or name, that field's 
 
    Expect `shutting down` followed by `client pool flushed live_clients=1 resealed=0 failed=0` (one per active Grant; `resealed` counts sessions that changed while live, usually 0). No `re-sealing telegram session failed` or `timed out` line. After a deploy, run the same `docker logs` on the old container (`docker ps -af label=service=tg-mcp`, the newest exited one).
 3. Call `whoami` again: it answers without a browser opening.
+
+## 11. Consent leads with where the login goes, not the self-declared name
+
+1. Claude Code (§1, `/mcp` → Authenticate): after the QR the heading reads "Allow **an app on this computer (localhost)** read-only access to all chats of **{your name}**?", and below it, small and grey, "The app calls itself "Claude Code" (not verified)." (or whatever name the client registered).
+2. claude.ai → Settings → Connectors → add `https://tgmcp.qelphybox.space/mcp` → Connect: the heading names **claude.ai**.
+3. A hostile name, by hand:
+
+   ```sh
+   id=$(curl -s https://tgmcp.qelphybox.space/register -H 'content-type: application/json' \
+     -d "$(python3 -c 'import json; print(json.dumps({"client_name": "<b>Claude</b>\u202e\u200bevil", "redirect_uris": ["https://example.com/cb"]}))')" | jq -r .client_id)
+   open "https://tgmcp.qelphybox.space/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&resource=https%3A%2F%2Ftgmcp.qelphybox.space%2Fmcp"
+   ```
+
+   Scan the QR: the heading names **example.com**; the grey line reads `The app calls itself "<b>Claude</b>evil" (not verified).` with the tags shown literally, nothing bold and nothing reversed. Deny.

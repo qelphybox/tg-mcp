@@ -21,7 +21,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::{
-    AuthState,
+    AuthState, clients,
     flows::{AuthRequest, PendingLogin, Progress},
     pages, pkce,
     rate_limit::ClientIp,
@@ -415,6 +415,7 @@ pub async fn consent_page(
         login_id: &id,
         client_name: &login.request.client_name,
         redirect_target: &target,
+        redirect_is_loopback: redirect_is_loopback(&login.request.redirect_uri),
         account_name: &account_name,
         account_username: logged_in.account.username.as_deref(),
     })
@@ -549,6 +550,14 @@ fn redirect_target(redirect_uri: &str) -> String {
     }
 }
 
+/// An `http(s)` redirect to this computer. A private-use scheme
+/// (`myapp://localhost/…`) keeps its name, which says more than "this computer".
+fn redirect_is_loopback(redirect_uri: &str) -> bool {
+    Url::parse(redirect_uri).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https") && clients::is_loopback_host(&url)
+    })
+}
+
 /// The `tg://login` URL as an SVG QR code, base64 for a `data:` URL. The fake
 /// login's URL is rendered too; only an unencodable URL yields `None`.
 fn qr_svg_base64(qr_url: &str) -> Option<String> {
@@ -560,4 +569,44 @@ fn qr_svg_base64(qr_url: &str) -> Option<String> {
         .quiet_zone(true)
         .build();
     Some(STANDARD.encode(svg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_redirects_are_told_apart() {
+        for uri in [
+            "http://localhost:33418/callback",
+            "http://LOCALHOST/cb",
+            "http://127.0.0.1:43123/callback",
+            "http://127.1.2.3/cb",
+            "http://[::1]:8080/cb",
+            "https://localhost/cb",
+        ] {
+            assert!(redirect_is_loopback(uri), "{uri}");
+        }
+        for uri in [
+            "https://claude.ai/api/mcp/auth_callback",
+            "http://localhost.evil.example/cb",
+            "cursor://anysphere.cursor-retrieval/oauth/callback",
+            "myapp://localhost/cb",
+            "not a uri",
+        ] {
+            assert!(!redirect_is_loopback(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn redirect_targets_read_as_hosts() {
+        assert_eq!(
+            redirect_target("https://claude.ai/api/mcp/auth_callback"),
+            "claude.ai"
+        );
+        assert_eq!(
+            redirect_target("cursor://anysphere.cursor-retrieval/oauth/callback"),
+            "cursor://anysphere.cursor-retrieval"
+        );
+    }
 }
