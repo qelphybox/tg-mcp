@@ -25,7 +25,7 @@ fn assert_invalid<T: std::fmt::Debug>(result: Result<T, VaultError>) {
 #[tokio::test]
 async fn access_token_opens_the_grant() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let issued = vault.create_grant(42, SESSION).await.unwrap();
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
 
     let grant = vault.open(issued.access.expose()).await.unwrap();
     assert_eq!(grant.grant_id, issued.grant_id);
@@ -36,7 +36,7 @@ async fn access_token_opens_the_grant() {
 #[tokio::test]
 async fn bad_tokens_are_all_the_same_invalid_token() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let issued = vault.create_grant(42, SESSION).await.unwrap();
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
     let access = issued.access.expose();
     let (id, secret) = access.split_once('.').unwrap();
 
@@ -58,7 +58,7 @@ async fn bad_tokens_are_all_the_same_invalid_token() {
     // A refresh Token is not an access Token.
     assert_invalid(vault.open(issued.refresh.expose()).await);
     // An access Token can't refresh.
-    assert_invalid(vault.refresh(access).await);
+    assert_invalid(vault.refresh(access, "client").await);
 }
 
 #[tokio::test]
@@ -68,19 +68,22 @@ async fn expired_tokens_are_rejected() {
         refresh: Duration::ZERO,
     };
     let (vault, _dir) = vault(ttl).await;
-    let issued = vault.create_grant(42, SESSION).await.unwrap();
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
 
     assert_invalid(vault.open(issued.access.expose()).await);
-    assert_invalid(vault.refresh(issued.refresh.expose()).await);
+    assert_invalid(vault.refresh(issued.refresh.expose(), "client").await);
     assert_eq!(vault.purge_expired().await.unwrap(), 2);
 }
 
 #[tokio::test]
 async fn refresh_rotates_and_the_old_refresh_token_dies() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let first = vault.create_grant(42, SESSION).await.unwrap();
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
 
-    let second = vault.refresh(first.refresh.expose()).await.unwrap();
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
     assert_eq!(second.grant_id, first.grant_id);
     assert_ne!(second.access.expose(), first.access.expose());
     assert_ne!(second.refresh.expose(), first.refresh.expose());
@@ -88,18 +91,26 @@ async fn refresh_rotates_and_the_old_refresh_token_dies() {
     let grant = vault.open(second.access.expose()).await.unwrap();
     assert_eq!(grant.telegram_session.as_slice(), SESSION);
 
-    assert_invalid(vault.refresh(first.refresh.expose()).await);
+    assert_invalid(vault.refresh(first.refresh.expose(), "client").await);
+    // Another client can't use this Grant's refresh Token.
+    assert_invalid(vault.refresh(second.refresh.expose(), "other-client").await);
     // The new refresh Token keeps the chain going.
-    vault.refresh(second.refresh.expose()).await.unwrap();
+    vault
+        .refresh(second.refresh.expose(), "client")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn concurrent_refresh_with_one_token_has_one_winner() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let issued = vault.create_grant(42, SESSION).await.unwrap();
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
     let token = issued.refresh.expose();
 
-    let (a, b) = tokio::join!(vault.refresh(token), vault.refresh(token));
+    let (a, b) = tokio::join!(
+        vault.refresh(token, "client"),
+        vault.refresh(token, "client")
+    );
     assert_eq!(
         [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
         1,
@@ -110,8 +121,11 @@ async fn concurrent_refresh_with_one_token_has_one_winner() {
 #[tokio::test]
 async fn updated_session_is_visible_through_every_live_token() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let first = vault.create_grant(42, SESSION).await.unwrap();
-    let second = vault.refresh(first.refresh.expose()).await.unwrap();
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
 
     let grant = vault.open(first.access.expose()).await.unwrap();
     vault
@@ -131,14 +145,17 @@ async fn updated_session_is_visible_through_every_live_token() {
 #[tokio::test]
 async fn deleting_a_grant_kills_its_tokens() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let issued = vault.create_grant(42, SESSION).await.unwrap();
-    let other = vault.create_grant(7, b"someone else").await.unwrap();
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let other = vault
+        .create_grant("client", 7, b"someone else")
+        .await
+        .unwrap();
     let grant = vault.open(issued.access.expose()).await.unwrap();
 
     vault.delete_grant(&issued.grant_id).await.unwrap();
 
     assert_invalid(vault.open(issued.access.expose()).await);
-    assert_invalid(vault.refresh(issued.refresh.expose()).await);
+    assert_invalid(vault.refresh(issued.refresh.expose(), "client").await);
     assert_invalid(vault.save_session(&grant, b"late write").await);
     vault.open(other.access.expose()).await.unwrap();
 }
@@ -149,7 +166,7 @@ async fn grants_survive_reopening_the_database() {
     let path = dir.path().join("vault.db");
     let issued = {
         let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
-        let issued = vault.create_grant(42, SESSION).await.unwrap();
+        let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
         vault.close().await;
         issued
     };
@@ -163,7 +180,7 @@ async fn grants_survive_reopening_the_database() {
 #[tokio::test]
 async fn debug_output_never_contains_secrets() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
-    let issued = vault.create_grant(42, SESSION).await.unwrap();
+    let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
     let grant = vault.open(issued.access.expose()).await.unwrap();
 
     let printed = format!("{issued:?} {grant:?}");

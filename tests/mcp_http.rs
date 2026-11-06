@@ -1,103 +1,122 @@
-//! Drives the server through its real HTTP surface with rmcp's own client.
+//! `/mcp` as an MCP client sees it: discovery, then authenticated tool calls.
 
-use std::sync::Arc;
+mod common;
 
-use rmcp::{
-    ServiceExt,
-    model::{CallToolRequestParams, ClientConfig},
-    transport::StreamableHttpClientTransport,
-};
+use common::{account, json, start};
+use reqwest::{StatusCode, header};
+use rmcp::model::CallToolRequestParams;
 use serde_json::json;
-use tg_mcp::{
-    config::Config,
-    tg::{Account, FakeTelegram},
-};
-use tokio_util::sync::CancellationToken;
-
-struct TestServer {
-    base: String,
-    shutdown: CancellationToken,
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
-}
-
-async fn start(account: Account) -> TestServer {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let config = Config::from_lookup(|key| (key == "TG_MCP_PUBLIC_URL").then(|| base.clone()))
-        .expect("config");
-    let shutdown = CancellationToken::new();
-    let app = tg_mcp::app(
-        &config,
-        Arc::new(FakeTelegram::new(account)),
-        shutdown.clone(),
-    );
-    let stop = shutdown.clone();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(stop.cancelled_owned())
-            .await
-            .unwrap();
-    });
-    TestServer { base, shutdown }
-}
-
-fn alice() -> Account {
-    Account {
-        id: 42,
-        first_name: "Alice".into(),
-        last_name: None,
-        username: Some("alice".into()),
-    }
-}
 
 #[tokio::test]
 async fn healthz_is_ok() {
-    let server = start(alice()).await;
-    let res = reqwest::get(format!("{}/healthz", server.base))
+    let server = start(vec![account(42, "Alice")]).await;
+    assert_eq!(server.get("/healthz", None).await.status(), StatusCode::OK);
+}
+
+/// The path `claude mcp add` takes before it ever shows a browser.
+#[tokio::test]
+async fn unauthenticated_mcp_points_to_oauth_discovery() {
+    let server = start(vec![account(42, "Alice")]).await;
+    let res = server
+        .http
+        .post(server.url("/mcp"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let challenge = res.headers()[header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let metadata_url = challenge
+        .split("resource_metadata=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("resource_metadata in WWW-Authenticate");
+    assert_eq!(
+        metadata_url,
+        server.url("/.well-known/oauth-protected-resource/mcp")
+    );
+
+    let (_, resource) = json(server.http.get(metadata_url).send().await.unwrap()).await;
+    assert_eq!(resource["resource"], server.url("/mcp"));
+    let issuer = resource["authorization_servers"][0].as_str().unwrap();
+    assert_eq!(issuer, server.base);
+
+    let (_, as_meta) = json(
+        server
+            .get("/.well-known/oauth-authorization-server", None)
+            .await,
+    )
+    .await;
+    assert_eq!(as_meta["issuer"], server.base);
+    assert_eq!(as_meta["registration_endpoint"], server.url("/register"));
+    assert_eq!(as_meta["code_challenge_methods_supported"], json!(["S256"]));
+    assert_eq!(
+        as_meta["token_endpoint_auth_methods_supported"],
+        json!(["none"])
+    );
 }
 
 #[tokio::test]
-async fn whoami_over_streamable_http() {
-    let server = start(alice()).await;
-    let transport = StreamableHttpClientTransport::from_uri(format!("{}/mcp", server.base));
-    let client = ClientConfig::default()
-        .serve(transport)
+async fn invalid_token_is_rejected_with_invalid_token() {
+    let server = start(vec![account(42, "Alice")]).await;
+    let res = server
+        .http
+        .post(server.url("/mcp"))
+        .header(
+            header::AUTHORIZATION,
+            "Bearer tgm_AAAAAAAAAAAAAAAAAAAAAA.nope",
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
         .await
-        .expect("initialize");
-
-    let info = client.peer_info().expect("server info");
-    assert_eq!(
-        info.server_info.as_ref().map(|s| s.name.as_str()),
-        Some("tg-mcp")
-    );
-
-    let tools = client.list_all_tools().await.expect("tools/list");
-    let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names, ["whoami"]);
-    let annotations = tools[0].annotations.as_ref().expect("annotations");
-    assert_eq!(annotations.read_only_hint, Some(true));
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let challenge = res.headers()[header::WWW_AUTHENTICATE].to_str().unwrap();
     assert!(
-        tools[0].output_schema.is_some(),
-        "whoami declares its output"
+        challenge.contains(r#"error="invalid_token""#),
+        "{challenge}"
     );
+}
 
-    let result = client
-        .call_tool(CallToolRequestParams::new("whoami"))
-        .await
-        .expect("tools/call");
-    assert_eq!(result.is_error, Some(false));
-    assert_eq!(
-        result.structured_content,
-        Some(json!({"id": 42, "first_name": "Alice", "username": "alice"}))
-    );
+#[tokio::test]
+async fn whoami_answers_for_the_callers_own_grant() {
+    let server = start(vec![account(42, "Alice"), account(7, "Bob")]).await;
+    let (_, alice_tokens) = server.login().await;
+    let (_, bob_tokens) = server.login().await;
 
-    client.cancel().await.unwrap();
+    for (tokens, expected) in [
+        (
+            &alice_tokens,
+            json!({"id": 42, "first_name": "Alice", "username": "alice"}),
+        ),
+        (
+            &bob_tokens,
+            json!({"id": 7, "first_name": "Bob", "username": "bob"}),
+        ),
+    ] {
+        let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+        let tools = client.list_all_tools().await.unwrap();
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+            ["whoami"]
+        );
+        assert_eq!(
+            tools[0].annotations.as_ref().unwrap().read_only_hint,
+            Some(true)
+        );
+
+        let result = client
+            .call_tool(CallToolRequestParams::new("whoami"))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.structured_content, Some(expected));
+        client.cancel().await.unwrap();
+    }
 }

@@ -11,6 +11,7 @@ base64 = "0.23.1"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
 hkdf = "0.13.0"
+http = "1"
 rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "macros"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,15 +22,22 @@ subtle = "2.6.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tokio-util = "0.7.20"
+tower-http = { version = "0.7.1", features = ["cors", "set-header"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
 uuid = { version = "1.29.0", features = ["v4"] }
 zeroize = "1.9.1"
 
 [dev-dependencies]
+async-trait = "0.1.92"
+base64 = "0.23.1"
+getrandom = "0.4.3"
 reqwest = { version = "0.13.5", default-features = false }
 rmcp = { version = "3.9.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net"] }
 tokio-util = "0.7.20"
+url = "2.5.8"

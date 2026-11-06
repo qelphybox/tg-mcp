@@ -11,17 +11,15 @@
 mod crypto;
 mod token;
 
+pub(crate) use crypto::random as random_bytes;
+
 use std::{
     fmt,
     path::Path,
-    str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-};
+use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -123,8 +121,6 @@ pub enum VaultError {
     Corrupt { token_id: String },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("migration error: {0}")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,19 +146,12 @@ pub struct Vault {
 impl Vault {
     /// Open (creating if missing) the SQLite database at `path` and run migrations.
     pub async fn open_path(path: &Path, ttl: TokenTtl) -> Result<Self, VaultError> {
-        let options = SqliteConnectOptions::from_str("sqlite:")?
-            .filename(path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(options)
-            .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool, ttl })
+        Ok(Self::new(crate::db::open(path).await?, ttl))
+    }
+
+    /// A vault over an already migrated pool (see [`crate::db::open`]).
+    pub fn new(pool: SqlitePool, ttl: TokenTtl) -> Self {
+        Self { pool, ttl }
     }
 
     /// Close the pool, checkpointing the WAL into the main database file.
@@ -170,10 +159,12 @@ impl Vault {
         self.pool.close().await;
     }
 
-    /// Store a freshly logged-in Telegram session as a new Grant and issue its first
-    /// Token pair. The Session key exists only inside the returned Tokens from now on.
+    /// Store a freshly logged-in Telegram session as a new Grant of `client_id` and
+    /// issue its first Token pair. The Session key exists only inside the returned
+    /// Tokens from now on.
     pub async fn create_grant(
         &self,
+        client_id: &str,
         account_id: i64,
         telegram_session: &[u8],
     ) -> Result<IssuedTokens, VaultError> {
@@ -184,10 +175,11 @@ impl Vault {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO grants (id, account_id, telegram_session, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO grants (id, client_id, account_id, telegram_session, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(grant_id.as_str())
+        .bind(client_id)
         .bind(account_id)
         .bind(sealed)
         .bind(now)
@@ -246,10 +238,24 @@ impl Vault {
         Ok(())
     }
 
-    /// Exchange a refresh Token for a new pair. The old refresh Token is consumed;
-    /// presenting it again (or racing it) fails.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<IssuedTokens, VaultError> {
+    /// Exchange a refresh Token for a new pair. Only the client the Grant was issued
+    /// to may do this. The old refresh Token is consumed; presenting it again (or
+    /// racing it) fails.
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+    ) -> Result<IssuedTokens, VaultError> {
         let verified = self.verify(refresh_token, Kind::Refresh).await?;
+        let owner: Option<String> = sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
+            .bind(verified.grant_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        let owner_matches: bool =
+            owner.is_some_and(|owner| owner.as_bytes().ct_eq(client_id.as_bytes()).into());
+        if !owner_matches {
+            return Err(VaultError::InvalidToken);
+        }
         let now = unix_now();
         let mut tx = self.pool.begin().await?;
         let consumed = sqlx::query("DELETE FROM tokens WHERE id = ?")
@@ -434,8 +440,11 @@ mod tests {
         let session = crypto::random::<256>();
 
         let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
-        let issued = vault.create_grant(42, &session).await.unwrap();
-        let rotated = vault.refresh(issued.refresh.expose()).await.unwrap();
+        let issued = vault.create_grant("client", 42, &session).await.unwrap();
+        let rotated = vault
+            .refresh(issued.refresh.expose(), "client")
+            .await
+            .unwrap();
         let opened = vault.open(rotated.access.expose()).await.unwrap();
         let real_key = *opened.key;
         vault.close().await;
@@ -448,9 +457,10 @@ mod tests {
             }
         }
         let sealed: Vec<u8> = {
-            let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-                .await
-                .unwrap();
+            let pool =
+                SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+                    .await
+                    .unwrap();
             sqlx::query_scalar("SELECT telegram_session FROM grants")
                 .fetch_one(&pool)
                 .await

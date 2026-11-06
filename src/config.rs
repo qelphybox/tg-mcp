@@ -50,6 +50,17 @@ impl Config {
         })
     }
 
+    /// `scheme://host[:port]` of the public URL: the OAuth issuer and resource base.
+    pub fn base_url(&self) -> String {
+        let scheme = self.public_url.scheme_str().unwrap_or("https");
+        let authority = self
+            .public_url
+            .authority()
+            .map(|a| a.as_str())
+            .unwrap_or("localhost");
+        format!("{scheme}://{authority}")
+    }
+
     /// Host header values the MCP endpoint accepts (DNS-rebinding protection).
     pub fn allowed_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]

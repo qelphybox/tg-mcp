@@ -1,12 +1,14 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
-use std::time::Duration;
 
 use tg_mcp::{
+    Deps,
+    auth::clients::ClientRegistry,
     config::Config,
+    db,
     sessions::{TokenTtl, Vault},
-    tg::FakeTelegram,
+    tg::{FakeConnector, FakeLogin},
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -23,18 +25,25 @@ async fn main() -> anyhow::Result<()> {
     if !config.fake_telegram {
         bail!("real Telegram login is not implemented yet; set TG_MCP_FAKE_TELEGRAM=1");
     }
-    tracing::warn!("serving a FAKE Telegram account (TG_MCP_FAKE_TELEGRAM=1)");
-
-    let vault = Arc::new(
-        Vault::open_path(&config.db_path, TokenTtl::default())
-            .await
-            .with_context(|| format!("opening the vault at {}", config.db_path.display()))?,
+    tracing::warn!(
+        "Telegram is FAKED: every login is the same fake Account (TG_MCP_FAKE_TELEGRAM=1)"
     );
-    tracing::info!(db = %config.db_path.display(), "vault ready");
+
+    let pool = db::open(&config.db_path)
+        .await
+        .with_context(|| format!("opening the database at {}", config.db_path.display()))?;
+    tracing::info!(db = %config.db_path.display(), "database ready");
+    let vault = Arc::new(Vault::new(pool.clone(), TokenTtl::default()));
     tokio::spawn(purge_expired_tokens(vault.clone()));
 
+    let deps = Deps {
+        vault,
+        clients: ClientRegistry::new(pool),
+        login: Arc::new(FakeLogin::default()),
+        connector: Arc::new(FakeConnector),
+    };
     let shutdown = CancellationToken::new();
-    let app = tg_mcp::app(&config, Arc::new(FakeTelegram::default()), shutdown.clone());
+    let app = tg_mcp::app(&config, deps, shutdown.clone());
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
