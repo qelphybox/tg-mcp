@@ -12,7 +12,7 @@ use grammers_session::{Session, updates::UpdatesLike};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
-use crate::limits::{AccountLimiter, Limits};
+use crate::limits::{AccountLimiter, Limits, MethodClass};
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
@@ -50,7 +50,8 @@ impl std::fmt::Debug for AppCredentials {
 
 /// Retry policy of Live clients: one retry after a network error, nothing else.
 /// FLOOD_WAIT goes up to the Account's limiter (crate::limits), which blocks the
-/// whole Account; grammers' default would sleep inside one call, unseen.
+/// request's method class for the whole Account; grammers' default would sleep
+/// inside one call, unseen.
 struct RetryIoOnce;
 
 impl grammers_mtsender::RetryPolicy for RetryIoOnce {
@@ -121,16 +122,37 @@ fn upstream(err: InvocationError) -> TgError {
     TgError::Upstream(err.to_string())
 }
 
+/// The seconds Telegram asks to wait, if `err` is a flood of the Account.
+///
+/// grammers splits `FLOOD_WAIT_31` into name `FLOOD_WAIT` and value 31. Both
+/// `FLOOD_WAIT_X` and `FLOOD_PREMIUM_WAIT_X` (a non-Premium Account's file transfer
+/// limit) are code 420 floods. `SLOWMODE_WAIT_X`, also 420, is not: it limits sending
+/// to one Chat, not the Account, so it must not block a whole class.
+fn flood_seconds(err: &InvocationError) -> Option<u32> {
+    match err {
+        InvocationError::Rpc(rpc) if rpc.code == 420 && rpc.name.starts_with("FLOOD_") => {
+            Some(rpc.value.unwrap_or(60))
+        }
+        _ => None,
+    }
+}
+
 /// Like [`upstream`], but surfaces `FLOOD_WAIT_X` so the Login flow can honour it.
 fn login_error(err: InvocationError) -> TgError {
-    match &err {
-        InvocationError::Rpc(rpc) if rpc.code == 420 && rpc.name == "FLOOD_WAIT" => {
-            TgError::FloodWait {
-                seconds: rpc.value.unwrap_or(60),
-            }
-        }
-        _ => upstream(err),
+    flood_error(err, MethodClass::Default)
+}
+
+/// A flood as [`TgError::FloodWait`] of `class`; anything else is upstream.
+fn flood_error(err: InvocationError, class: MethodClass) -> TgError {
+    match flood_seconds(&err) {
+        Some(seconds) => TgError::FloodWait { seconds, class },
+        None => upstream(err),
     }
+}
+
+/// The FLOOD_WAIT window a request falls in, by its TL method name.
+fn method_class<R: tl::Identifiable>() -> MethodClass {
+    MethodClass::of(tl::name_for_id(R::CONSTRUCTOR_ID))
 }
 
 /// Errors meaning "this Telegram session is gone": logged out, revoked, banned.
@@ -380,7 +402,8 @@ pub struct LiveClient {
     dead: std::sync::atomic::AtomicBool,
     /// The Account's budget and FLOOD_WAIT state, shared with its other Grants.
     limiter: Arc<AccountLimiter>,
-    /// Every request sent, serialized, so tests can see what reached Telegram.
+    /// Every request handed to grammers (past the limiter), serialized, so tests can
+    /// see what reached Telegram.
     #[cfg(test)]
     sent: std::sync::Mutex<Vec<Vec<u8>>>,
 }
@@ -396,33 +419,36 @@ impl Live for LiveClient {
 }
 
 impl LiveClient {
-    fn classify(&self, err: InvocationError) -> TgError {
+    fn classify(&self, err: InvocationError, class: MethodClass) -> TgError {
         if is_dead_session(&err) {
             self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
             TgError::BadSession(err.to_string())
         } else {
             // FLOOD_WAIT surfaces as TgError::FloodWait for the limiter; the rest is upstream.
-            login_error(err)
+            flood_error(err, class)
         }
     }
 
-    /// One request to Telegram, under the Account's limiter. `chat` gives
-    /// "can't read this chat" errors a caller-facing meaning.
-    async fn call<R: tl::RemoteCall>(
+    /// One request to Telegram, under the Account's limiter, in the FLOOD_WAIT
+    /// window of its [`MethodClass`] (derived from the TL method, so a new request
+    /// needs no tagging). `chat` gives "can't read this chat" errors a
+    /// caller-facing meaning.
+    async fn call<R: tl::RemoteCall + tl::Identifiable>(
         &self,
         request: &R,
         chat: Option<ChatId>,
     ) -> Result<R::Return, TgError> {
-        #[cfg(test)]
-        self.sent
-            .lock()
-            .unwrap()
-            .push(tl::Serializable::to_bytes(request));
+        let class = method_class::<R>();
         self.limiter
-            .run(|| async {
+            .run(class, || async {
+                #[cfg(test)]
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .push(tl::Serializable::to_bytes(request));
                 self.client.invoke(request).await.map_err(|err| match chat {
-                    Some(chat) => self.classify_chat_error(err, chat),
-                    None => self.classify(err),
+                    Some(chat) => self.classify_chat_error(err, chat, class),
+                    None => self.classify(err, class),
                 })
             })
             .await
@@ -668,7 +694,12 @@ impl LiveClient {
     }
 
     /// Like `classify`, but "you can't read this chat" is the caller's problem.
-    fn classify_chat_error(&self, err: InvocationError, chat: ChatId) -> TgError {
+    fn classify_chat_error(
+        &self,
+        err: InvocationError,
+        chat: ChatId,
+        class: MethodClass,
+    ) -> TgError {
         let inaccessible = [
             "CHANNEL_PRIVATE",
             "CHANNEL_INVALID",
@@ -679,7 +710,7 @@ impl LiveClient {
         if inaccessible.iter().any(|code| err.is(code)) {
             return TgError::InvalidInput(format!("{chat} can't be read by this account"));
         }
-        self.classify(err)
+        self.classify(err, class)
     }
 }
 
@@ -1055,6 +1086,20 @@ async fn sweep(connector: Weak<GrammersConnector>) {
     }
 }
 
+/// An RPC error the way grammers hands it over: parsed from Telegram's
+/// `rpc_error` (`FLOOD_WAIT_31` → name `FLOOD_WAIT`, value 31) and tagged with the
+/// request that caused it.
+#[cfg(test)]
+fn rpc<R: tl::Identifiable>(code: i32, message: &str) -> InvocationError {
+    InvocationError::Rpc(
+        grammers_mtsender::RpcError::from(tl::types::RpcError {
+            error_code: code,
+            error_message: message.into(),
+        })
+        .with_caused_by(R::CONSTRUCTOR_ID),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,23 +1217,82 @@ mod tests {
 
     #[test]
     fn flood_wait_is_surfaced_with_its_seconds() {
-        let rpc = |code, message: &str| {
-            InvocationError::Rpc(
-                tl::types::RpcError {
-                    error_code: code,
-                    error_message: message.into(),
-                }
-                .into(),
-            )
-        };
         assert!(matches!(
-            login_error(rpc(420, "FLOOD_WAIT_31")),
-            TgError::FloodWait { seconds: 31 }
+            login_error(rpc::<tl::functions::auth::ExportLoginToken>(
+                420,
+                "FLOOD_WAIT_31"
+            )),
+            TgError::FloodWait {
+                seconds: 31,
+                class: MethodClass::Default
+            }
         ));
         assert!(matches!(
-            login_error(rpc(400, "PASSWORD_HASH_INVALID")),
+            login_error(rpc::<tl::functions::auth::CheckPassword>(
+                400,
+                "PASSWORD_HASH_INVALID"
+            )),
             TgError::Upstream(_)
         ));
+    }
+
+    #[test]
+    fn account_floods_are_flood_waits_of_the_requests_class() {
+        type GetFile = tl::functions::upload::GetFile;
+        let floods = [
+            ("FLOOD_WAIT_31", MethodClass::Search, 31),
+            ("FLOOD_WAIT_7", MethodClass::Default, 7),
+            ("FLOOD_PREMIUM_WAIT_5", MethodClass::Files, 5),
+        ];
+        for (message, class, seconds) in floods {
+            match flood_error(rpc::<GetFile>(420, message), class) {
+                TgError::FloodWait {
+                    seconds: s,
+                    class: c,
+                } => assert_eq!((s, c), (seconds, class), "{message}"),
+                other => panic!("{message} must be a flood, got {other:?}"),
+            }
+        }
+        // Slow mode limits one Chat, not the Account: never a class-wide window.
+        for not_a_flood in [(420, "SLOWMODE_WAIT_10"), (400, "FILE_REFERENCE_EXPIRED")] {
+            assert!(matches!(
+                flood_error(
+                    rpc::<GetFile>(not_a_flood.0, not_a_flood.1),
+                    MethodClass::Files
+                ),
+                TgError::Upstream(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn each_request_type_falls_in_its_flood_wait_class() {
+        use tl::functions::{channels, contacts, messages, upload, users};
+        let search = [
+            method_class::<messages::SearchGlobal>(),
+            method_class::<messages::Search>(),
+            method_class::<contacts::Search>(),
+        ];
+        assert_eq!(search, [MethodClass::Search; 3]);
+        let files = [
+            method_class::<upload::GetFile>(),
+            method_class::<upload::GetCdnFile>(),
+            method_class::<upload::GetFileHashes>(),
+            method_class::<upload::GetCdnFileHashes>(),
+            method_class::<upload::GetWebFile>(),
+            method_class::<upload::ReuploadCdnFile>(),
+        ];
+        assert_eq!(files, [MethodClass::Files; 6]);
+        // What the reading tools send today.
+        let default = [
+            method_class::<users::GetUsers>(),
+            method_class::<messages::GetDialogs>(),
+            method_class::<messages::GetHistory>(),
+            method_class::<users::GetFullUser>(),
+            method_class::<messages::GetFullChat>(),
+            method_class::<channels::GetFullChannel>(),
+        ];
+        assert_eq!(default, [MethodClass::Default; 6]);
     }
 
     #[test]
@@ -1529,6 +1633,119 @@ mod resolve_tests {
                 get_dialogs(false, 1, top()),
                 get_dialogs(true, 0, (1_700_000_000, 55, channel)),
                 get_dialogs(true, 1, top()),
+            ]
+        );
+    }
+
+    /// Telegram floods `request` once with `FLOOD_WAIT_300`, reported the way the
+    /// Live client reports it, which leaves its class blocked for the Account.
+    async fn flood_once<R: tl::RemoteCall + tl::Identifiable>(live: &LiveClient) {
+        let class = method_class::<R>();
+        let flooded = live
+            .limiter
+            .run(class, || async {
+                Err::<(), _>(live.classify(rpc::<R>(420, "FLOOD_WAIT_300"), class))
+            })
+            .await;
+        assert!(matches!(
+            flooded,
+            Err(TgError::FloodWait { seconds: 300, .. })
+        ));
+        assert!(sent(live).is_empty(), "the flood itself bypassed `call`");
+    }
+
+    fn search() -> tl::functions::contacts::Search {
+        tl::functions::contacts::Search {
+            broadcasts: false,
+            bots: false,
+            q: "alice".into(),
+            limit: 10,
+        }
+    }
+
+    fn download() -> tl::functions::upload::GetCdnFile {
+        tl::functions::upload::GetCdnFile {
+            file_token: vec![1, 2, 3],
+            offset: 0,
+            limit: 4096,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_flood_holds_back_searches_but_reading_still_reaches_telegram() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(7));
+        flood_once::<tl::functions::contacts::Search>(&live).await;
+
+        match live.call(&search(), None).await {
+            Err(TgError::FloodWait {
+                class: MethodClass::Search,
+                ..
+            }) => {}
+            other => panic!("expected the search to fail fast, got {other:?}"),
+        }
+        // The offline connection fails them, but they went out: not held back.
+        assert!(!matches!(
+            live.get_messages(channel, query()).await,
+            Err(TgError::FloodWait { .. })
+        ));
+        assert!(!matches!(
+            live.list_chats(30, None, false).await,
+            Err(TgError::FloodWait { .. })
+        ));
+        assert!(!matches!(
+            live.call(&download(), None).await,
+            Err(TgError::FloodWait { .. })
+        ));
+        let reached: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
+        assert_eq!(
+            reached,
+            [
+                // Not the search: it never reached Telegram.
+                tl::functions::messages::GetHistory::CONSTRUCTOR_ID,
+                tl::functions::messages::GetDialogs::CONSTRUCTOR_ID,
+                tl::functions::upload::GetCdnFile::CONSTRUCTOR_ID,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reading_flood_holds_back_reading_but_not_search_or_files() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(7));
+        flood_once::<tl::functions::messages::GetHistory>(&live).await;
+
+        for result in [
+            live.get_messages(channel, query()).await.map(|_| ()),
+            live.get_chat_info(channel).await.map(|_| ()),
+            live.list_chats(30, None, false).await.map(|_| ()),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(TgError::FloodWait {
+                        class: MethodClass::Default,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+        assert!(!matches!(
+            live.call(&search(), None).await,
+            Err(TgError::FloodWait { .. })
+        ));
+        assert!(!matches!(
+            live.call(&download(), None).await,
+            Err(TgError::FloodWait { .. })
+        ));
+        let reached: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
+        assert_eq!(
+            reached,
+            [
+                // None of the reads: they never reached Telegram.
+                tl::functions::contacts::Search::CONSTRUCTOR_ID,
+                tl::functions::upload::GetCdnFile::CONSTRUCTOR_ID,
             ]
         );
     }

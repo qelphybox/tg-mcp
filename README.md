@@ -46,7 +46,7 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 - **No messages on disk.** Chats and messages pass through memory only; the session at rest is just the auth keys and home datacenter. Logs carry ids and sizes, never message content or tokens.
 - **Your password never reaches the AI.** QR login and the cloud password happen on this server's own pages.
 - **OAuth 2.1** with PKCE (S256), dynamic client registration, single-use authorization codes, rotating refresh tokens bound to their client, and a consent screen that leads with where the login is sent, names the account, and shows the self-declared client name as unverified.
-- **Telegram limits are respected.** Requests per account are rate-limited, and Telegram's `FLOOD_WAIT` blocks that account's calls until it passes instead of being retried around.
+- **Telegram limits are respected.** Requests per account are rate-limited, and Telegram's `FLOOD_WAIT` blocks that account's calls of the same kind (reading, search or file downloads) until it passes instead of being retried around.
 - **Anonymous callers can't make it flood Telegram.** The OAuth endpoints are rate-limited per client IP, and only a few logins (each one a Telegram connection) can be in progress at once, server-wide and per IP.
 
 ## Self-hosting

@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::{
     auth::Caller,
+    limits::MethodClass,
     tg::{
         Account, Telegram, TgError,
         chats::{CHAT_REF_MAX_LEN, CHAT_REF_PATTERN, ChatInfo, ChatPage, ChatRef},
@@ -362,15 +363,25 @@ fn tool_error(err: TgError) -> ErrorData {
     // Messages are ours, never Telegram payload, so they are safe to return and log.
     match err {
         TgError::InvalidInput(msg) => ErrorData::invalid_params(msg, None),
-        TgError::FloodWait { seconds } => {
-            tracing::warn!(seconds, "tool call hit FLOOD_WAIT");
-            ErrorData::internal_error(
-                format!(
+        TgError::FloodWait { seconds, class } => {
+            tracing::warn!(seconds, class = class.name(), "tool call hit FLOOD_WAIT");
+            let message = match class {
+                MethodClass::Default => format!(
                     "Telegram asks this account to wait {seconds} s before more requests \
                      (FLOOD_WAIT). Don't retry before then."
                 ),
-                None,
-            )
+                MethodClass::Search => format!(
+                    "Telegram asks this account to wait {seconds} s before more searches \
+                     (FLOOD_WAIT). Don't search again before then; reading tools \
+                     (list_chats, get_messages, get_chat_info) still work."
+                ),
+                MethodClass::Files => format!(
+                    "Telegram asks this account to wait {seconds} s before more file \
+                     downloads (FLOOD_WAIT). Don't download again before then; reading tools \
+                     (list_chats, get_messages, get_chat_info) still work."
+                ),
+            };
+            ErrorData::internal_error(message, None)
         }
         TgError::RateLimited { seconds } => ErrorData::internal_error(
             format!("Too many requests for this account right now; retry in {seconds} s."),
@@ -385,7 +396,40 @@ fn tool_error(err: TgError) -> ErrorData {
 
 #[cfg(test)]
 mod tests {
-    use super::shorten;
+    use super::{MethodClass, TgError, shorten, tool_error};
+
+    fn flood_message(class: MethodClass) -> String {
+        tool_error(TgError::FloodWait {
+            seconds: 120,
+            class,
+        })
+        .message
+        .to_string()
+    }
+
+    #[test]
+    fn a_flood_says_how_long_to_wait_and_what_still_works() {
+        let read = flood_message(MethodClass::Default);
+        assert!(
+            read.contains("wait 120 s") && read.contains("FLOOD_WAIT"),
+            "{read}"
+        );
+        assert!(!read.contains("still work"), "{read}");
+
+        for class in [MethodClass::Search, MethodClass::Files] {
+            let message = flood_message(class);
+            assert!(
+                message.contains("wait 120 s") && message.contains("FLOOD_WAIT"),
+                "{message}"
+            );
+            assert!(
+                message.contains("reading tools") && message.contains("still work"),
+                "{message}"
+            );
+        }
+        assert!(flood_message(MethodClass::Search).contains("searches"));
+        assert!(flood_message(MethodClass::Files).contains("file downloads"));
+    }
 
     #[test]
     fn shorten_counts_characters_and_flattens_lines() {

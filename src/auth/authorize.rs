@@ -310,7 +310,7 @@ pub async fn password_submit(
                 &format!("Wrong password. {left} {attempts} left."),
             )
         }
-        Err(TgError::FloodWait { seconds }) => {
+        Err(TgError::FloodWait { seconds, .. }) => {
             tracing::warn!(seconds, "telegram flood wait on cloud password");
             login
                 .password_gate
@@ -372,7 +372,7 @@ fn wait_message(what: &str, seconds: u64) -> String {
 /// Status, title and message for a Telegram error during the Login flow.
 fn telegram_failure(err: &TgError) -> (StatusCode, &'static str, String) {
     match err {
-        TgError::FloodWait { seconds } => {
+        TgError::FloodWait { seconds, .. } => {
             tracing::warn!(seconds, "telegram flood wait during login");
             (
                 StatusCode::TOO_MANY_REQUESTS,

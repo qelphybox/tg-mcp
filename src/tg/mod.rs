@@ -24,7 +24,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::sessions::OpenedGrant;
+use crate::{limits::MethodClass, sessions::OpenedGrant};
 
 /// The Telegram Account a Grant reads on behalf of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -59,9 +59,10 @@ pub enum TgError {
     /// The Cloud password didn't match.
     #[error("the cloud password is wrong")]
     WrongPassword,
-    /// Telegram's `FLOOD_WAIT`: nothing may be retried before `seconds` pass.
+    /// Telegram's `FLOOD_WAIT`: nothing of `class` may be retried before `seconds`
+    /// pass. Other classes of the same Account are not blocked by it.
     #[error("telegram asks to wait {seconds} s")]
-    FloodWait { seconds: u32 },
+    FloodWait { seconds: u32, class: MethodClass },
     /// Our own per-Account request budget is used up; retry after `seconds`.
     #[error("this account's request budget is used up; retry in {seconds} s")]
     RateLimited { seconds: u32 },

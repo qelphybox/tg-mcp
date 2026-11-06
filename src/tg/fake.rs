@@ -20,7 +20,7 @@ use super::{
     },
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
 };
-use crate::sessions::OpenedGrant;
+use crate::{limits::MethodClass, sessions::OpenedGrant};
 
 /// Everything a fake Account has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +204,10 @@ impl Telegram for FakeTelegram {
 impl FakeTelegram {
     fn flood(&self) -> Result<(), TgError> {
         match self.data.flood_wait {
-            Some(seconds) => Err(TgError::FloodWait { seconds }),
+            Some(seconds) => Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Default,
+            }),
             None => Ok(()),
         }
     }
@@ -418,6 +421,7 @@ impl LoginAttempt for FakeAttempt {
             self.flooded = true;
             return Err(TgError::FloodWait {
                 seconds: FAKE_FLOOD_WAIT,
+                class: MethodClass::Default,
             });
         }
         if *password != expected.password {
