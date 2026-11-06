@@ -14,7 +14,9 @@ use zeroize::Zeroizing;
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
-    chats::{ChatId, ChatKind, ChatPage, ChatSummary, MessagePreview, RawPeer},
+    chats::{
+        ChatId, ChatInfo, ChatKind, ChatPage, ChatSummary, MessagePreview, RawPeer, chat_info,
+    },
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
 };
 use crate::sessions::OpenedGrant;
@@ -28,6 +30,15 @@ pub struct FakeData {
     /// Each Chat's history, in any order.
     #[serde(default)]
     pub messages: std::collections::HashMap<ChatId, Vec<RawHistoryMessage>>,
+    /// Descriptions and member counts, for get_chat_info.
+    #[serde(default)]
+    pub details: std::collections::HashMap<ChatId, FakeDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FakeDetails {
+    pub description: Option<String>,
+    pub member_count: Option<i32>,
 }
 
 impl From<Account> for FakeData {
@@ -42,7 +53,13 @@ impl FakeData {
             account,
             chats: Vec::new(),
             messages: Default::default(),
+            details: Default::default(),
         }
+    }
+
+    pub fn with_details(mut self, chat: ChatId, details: FakeDetails) -> Self {
+        self.details.insert(chat, details);
+        self
     }
 
     pub fn with_messages(mut self, chat: ChatId, messages: Vec<RawHistoryMessage>) -> Self {
@@ -133,6 +150,20 @@ impl Telegram for FakeTelegram {
             .collect();
         let full = window.len() == query.limit;
         Ok(assemble_history(chat, &window, &self.peers(), &query, full))
+    }
+
+    async fn get_chat_info(&self, chat: ChatId) -> Result<ChatInfo, TgError> {
+        let peer = self
+            .peers()
+            .into_iter()
+            .find(|p| p.id == chat)
+            .ok_or_else(|| {
+                TgError::InvalidInput(format!(
+                    "{chat} is not one of your chats; chat ids come from list_chats"
+                ))
+            })?;
+        let details = self.data.details.get(&chat).cloned().unwrap_or_default();
+        Ok(chat_info(&peer, details.description, details.member_count))
     }
 }
 

@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
-    chats::{self, ChatId, ChatKind, ChatPage, Cursor, RawDialog, RawMessage, RawPeer},
+    chats::{self, ChatId, ChatInfo, ChatKind, ChatPage, Cursor, RawDialog, RawMessage, RawPeer},
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
     pool::{Live, Pool},
     session::SessionStore,
@@ -472,6 +472,61 @@ impl Telegram for LiveClient {
         self.remember(&peers);
         Ok(assemble_history(chat, &raw, &peers, &query, full_page))
     }
+
+    async fn get_chat_info(&self, chat: ChatId) -> Result<ChatInfo, TgError> {
+        let peer = self.resolve(chat).await?;
+        let (description, members, users, chats) = match peer {
+            tl::enums::InputPeer::User(u) => {
+                let tl::enums::users::UserFull::Full(full) = self
+                    .client
+                    .invoke(&tl::functions::users::GetFullUser {
+                        id: tl::enums::InputUser::User(tl::types::InputUser {
+                            user_id: u.user_id,
+                            access_hash: u.access_hash,
+                        }),
+                    })
+                    .await
+                    .map_err(|err| self.classify_chat_error(err, chat))?;
+                let tl::enums::UserFull::Full(user) = full.full_user;
+                (user.about, None, full.users, full.chats)
+            }
+            tl::enums::InputPeer::Chat(c) => {
+                let tl::enums::messages::ChatFull::Full(full) = self
+                    .client
+                    .invoke(&tl::functions::messages::GetFullChat { chat_id: c.chat_id })
+                    .await
+                    .map_err(|err| self.classify_chat_error(err, chat))?;
+                let (about, members) = full_chat_details(full.full_chat);
+                (about, members, full.users, full.chats)
+            }
+            tl::enums::InputPeer::Channel(c) => {
+                let tl::enums::messages::ChatFull::Full(full) = self
+                    .client
+                    .invoke(&tl::functions::channels::GetFullChannel {
+                        channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                            channel_id: c.channel_id,
+                            access_hash: c.access_hash,
+                        }),
+                    })
+                    .await
+                    .map_err(|err| self.classify_chat_error(err, chat))?;
+                let (about, members) = full_chat_details(full.full_chat);
+                (about, members, full.users, full.chats)
+            }
+            _ => return Err(TgError::InvalidInput(format!("{chat} can't be looked up"))),
+        };
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        self.remember(&peers);
+        let peer = peers
+            .iter()
+            .find(|p| p.id == chat)
+            .ok_or_else(|| TgError::Upstream(format!("Telegram didn't describe {chat}")))?;
+        Ok(chats::chat_info(peer, description, members))
+    }
 }
 
 /// How far `resolve` pages through the dialogs (per folder) looking for an unknown Chat.
@@ -574,6 +629,23 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
             edited: false,
         }),
         tl::enums::Message::Empty(_) => None,
+    }
+}
+
+/// Description and member count from a group's or channel's full info.
+fn full_chat_details(full: tl::enums::ChatFull) -> (Option<String>, Option<i32>) {
+    match full {
+        tl::enums::ChatFull::Full(c) => {
+            let members = match c.participants {
+                tl::enums::ChatParticipants::Participants(p) => {
+                    i32::try_from(p.participants.len()).ok()
+                }
+                tl::enums::ChatParticipants::Forbidden(_) => None,
+            };
+            (Some(c.about), members)
+        }
+        tl::enums::ChatFull::ChannelFull(c) => (Some(c.about), c.participants_count),
+        _ => (None, None),
     }
 }
 

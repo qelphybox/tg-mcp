@@ -112,6 +112,47 @@ pub struct ChatPage {
     pub next_cursor: Option<String>,
 }
 
+/// Details of one Chat (`get_chat_info`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ChatInfo {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub kind: ChatKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Bio of a user, or the description of a group/channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Members of a group, subscribers of a channel; absent when Telegram hides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<i32>,
+}
+
+/// Normalise what Telegram returns: empty descriptions are none, counts are
+/// only shown for groups and channels.
+pub fn chat_info(
+    peer: &RawPeer,
+    description: Option<String>,
+    member_count: Option<i32>,
+) -> ChatInfo {
+    let description = description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    let member_count = match peer.kind {
+        ChatKind::Private | ChatKind::Bot => None,
+        _ => member_count.filter(|n| *n > 0),
+    };
+    ChatInfo {
+        id: peer.id.to_string(),
+        title: peer.title.clone(),
+        kind: peer.kind,
+        username: peer.username.clone(),
+        description,
+        member_count,
+    }
+}
+
 // ── What the adapter extracts from TL ───────────────────────────────────────
 
 /// A user, basic group or channel from a response, with what's needed to name it
@@ -252,6 +293,25 @@ mod tests {
             username: None,
             access_hash: hash,
         }
+    }
+
+    #[test]
+    fn chat_info_drops_empty_descriptions_and_person_counts() {
+        let team = peer(ChatId::Channel(2), "Team", ChatKind::Supergroup, Some(1));
+        let info = chat_info(&team, Some("  Our team chat \n".into()), Some(12));
+        assert_eq!(info.description.as_deref(), Some("Our team chat"));
+        assert_eq!(info.member_count, Some(12));
+        assert_eq!(
+            chat_info(&team, Some("   ".into()), Some(0)).description,
+            None
+        );
+        assert_eq!(chat_info(&team, None, Some(0)).member_count, None);
+
+        let alice = peer(ChatId::User(1), "Alice", ChatKind::Private, Some(1));
+        assert_eq!(
+            chat_info(&alice, Some("bio".into()), Some(2)).member_count,
+            None
+        );
     }
 
     #[test]

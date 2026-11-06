@@ -16,7 +16,7 @@ use crate::{
     auth::Caller,
     tg::{
         Account, TgError,
-        chats::{ChatId, ChatPage},
+        chats::{ChatId, ChatInfo, ChatPage},
         messages::{self, HistoryQuery, MessagePage},
     },
 };
@@ -29,6 +29,7 @@ const MAX_PREVIEW_CHARS: usize = 100;
 const MAX_MESSAGES_PER_PAGE: usize = 100;
 const DEFAULT_MESSAGES_PER_PAGE: usize = 30;
 const MAX_MESSAGE_CHARS: usize = 1000;
+const MAX_DESCRIPTION_CHARS: usize = 1000;
 /// Rough cap on the characters of message text in one get_messages answer.
 const MESSAGE_PAGE_BUDGET_CHARS: usize = 40_000;
 
@@ -72,6 +73,13 @@ fn caller(parts: &http::request::Parts) -> Result<&Caller, ErrorData> {
     parts.extensions.get::<Caller>().ok_or_else(|| {
         ErrorData::internal_error("request reached a tool without authentication", None)
     })
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetChatInfoParams {
+    /// A chat id from list_chats: `user:N`, `chat:N` or `channel:N`.
+    #[schemars(length(max = 32))]
+    pub chat_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -193,6 +201,40 @@ is nothing older (within `since`). Narrow by time with `since`/`until`.",
             .map_err(tool_error)?;
         Ok(Json(bound_history(page)))
     }
+
+    #[tool(
+        title = "Get chat info",
+        description = "Details of one chat, user, group or channel by `chat_id` from list_chats \
+(user:N, chat:N or channel:N): title, type, @username, the bio or description (cut to 1000 \
+characters) and the number of members or subscribers when Telegram shows it.",
+        annotations(
+            title = "Get chat info",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_chat_info(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(params): Parameters<GetChatInfoParams>,
+    ) -> Result<Json<ChatInfo>, ErrorData> {
+        let chat: ChatId = params
+            .chat_id
+            .parse()
+            .map_err(|e: TgError| ErrorData::invalid_params(e.to_string(), None))?;
+        let mut info = caller(&parts)?
+            .telegram
+            .get_chat_info(chat)
+            .await
+            .map_err(tool_error)?;
+        info.title = shorten(&info.title, MAX_TITLE_CHARS);
+        info.description = info
+            .description
+            .map(|d| shorten_keeping_lines(&d, MAX_DESCRIPTION_CHARS));
+        Ok(Json(info))
+    }
 }
 
 impl TgMcp {
@@ -261,6 +303,17 @@ fn bound_history(mut page: MessagePage) -> MessagePage {
         page.next_before_id = page.messages.last().map(|m| m.id);
     }
     page
+}
+
+/// Cut to `max` characters, keeping line breaks (descriptions are multi-line prose).
+fn shorten_keeping_lines(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// Cut to `max` characters (not bytes), single line, marking the cut with `…`.
