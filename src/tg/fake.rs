@@ -33,6 +33,9 @@ pub struct FakeData {
     /// Descriptions and member counts, for get_chat_info.
     #[serde(default)]
     pub details: std::collections::HashMap<ChatId, FakeDetails>,
+    /// When set, every call answers like Telegram's FLOOD_WAIT_<seconds>.
+    #[serde(default)]
+    pub flood_wait: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ impl FakeData {
             chats: Vec::new(),
             messages: Default::default(),
             details: Default::default(),
+            flood_wait: None,
         }
     }
 
@@ -89,6 +93,7 @@ const CURSOR_PREFIX: &str = "fake:";
 #[async_trait::async_trait]
 impl Telegram for FakeTelegram {
     async fn whoami(&self) -> Result<Account, TgError> {
+        self.flood()?;
         Ok(self.data.account.clone())
     }
 
@@ -99,6 +104,7 @@ impl Telegram for FakeTelegram {
         cursor: Option<&str>,
         archived: bool,
     ) -> Result<ChatPage, TgError> {
+        self.flood()?;
         let start = match cursor {
             None => 0,
             Some(c) => c
@@ -135,6 +141,7 @@ impl Telegram for FakeTelegram {
         chat: ChatId,
         query: HistoryQuery,
     ) -> Result<MessagePage, TgError> {
+        self.flood()?;
         if !self.knows(chat) {
             return Err(TgError::InvalidInput(format!(
                 "{chat} is not one of your chats; chat ids come from list_chats"
@@ -153,6 +160,7 @@ impl Telegram for FakeTelegram {
     }
 
     async fn get_chat_info(&self, chat: ChatId) -> Result<ChatInfo, TgError> {
+        self.flood()?;
         let peer = self
             .peers()
             .into_iter()
@@ -168,6 +176,13 @@ impl Telegram for FakeTelegram {
 }
 
 impl FakeTelegram {
+    fn flood(&self) -> Result<(), TgError> {
+        match self.data.flood_wait {
+            Some(seconds) => Err(TgError::FloodWait { seconds }),
+            None => Ok(()),
+        }
+    }
+
     /// The fake knows a Chat if it lists it or has history for it.
     fn knows(&self, chat: ChatId) -> bool {
         let id = chat.to_string();

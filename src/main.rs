@@ -7,6 +7,7 @@ use tg_mcp::{
     auth::clients::ClientRegistry,
     config::Config,
     db,
+    limits::Limits,
     sessions::{TokenTtl, Vault},
     tg::{
         Connector, FakeConnector, FakeLogin, Login,
@@ -50,7 +51,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(api_id = app.api_id, "using Telegram app");
             (
                 Arc::new(GrammersLogin::new(app.clone())),
-                GrammersConnector::new(app, vault.clone(), config.live_client_idle_ttl),
+                GrammersConnector::new(
+                    app,
+                    vault.clone(),
+                    Arc::new(Limits::new(config.limits)),
+                    config.live_client_idle_ttl,
+                ),
             )
         }
         (false, None) => bail!("Telegram app credentials are missing"),

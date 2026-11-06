@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod limits;
 pub mod mcp;
 pub mod sessions;
 pub mod tg;

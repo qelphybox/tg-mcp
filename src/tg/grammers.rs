@@ -12,6 +12,8 @@ use grammers_session::{Session, updates::UpdatesLike};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use crate::limits::{AccountLimiter, Limits};
+
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{self, ChatId, ChatInfo, ChatKind, ChatPage, Cursor, RawDialog, RawMessage, RawPeer},
@@ -43,9 +45,41 @@ impl std::fmt::Debug for AppCredentials {
     }
 }
 
+/// Retry policy of Live clients: one retry after a network error, nothing else.
+/// FLOOD_WAIT goes up to the Account's limiter (crate::limits), which blocks the
+/// whole Account; grammers' default would sleep inside one call, unseen.
+struct RetryIoOnce;
+
+impl grammers_mtsender::RetryPolicy for RetryIoOnce {
+    fn should_retry(
+        &self,
+        ctx: &grammers_mtsender::RetryContext,
+    ) -> std::ops::ControlFlow<(), Duration> {
+        match ctx.error {
+            InvocationError::Io(_) if ctx.fail_count.get() <= 1 => {
+                std::ops::ControlFlow::Continue(Duration::from_secs(1))
+            }
+            _ => std::ops::ControlFlow::Break(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Purpose {
+    /// QR login: grammers' default (short FLOOD_WAITs slept through), proven on prod.
+    Login,
+    /// Live clients: requests go through the Account's limiter.
+    Live,
+}
+
 /// How this server shows up in the user's Telegram "Active sessions".
-fn connection_params() -> ConnectionParams {
+fn connection_params(purpose: Purpose) -> ConnectionParams {
+    let retry_policy: Box<dyn grammers_mtsender::RetryPolicy> = match purpose {
+        Purpose::Login => Box::new(grammers_mtsender::AutoSleep::default()),
+        Purpose::Live => Box::new(RetryIoOnce),
+    };
     ConnectionParams {
+        retry_policy,
         device_model: "Unofficial MCP Server".into(),
         system_version: "tg-mcp".into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
@@ -60,13 +94,17 @@ struct Connected {
     updates: mpsc::Receiver<UpdatesLike>,
 }
 
-fn connect(credentials: &AppCredentials, store: SessionStore) -> Connected {
+fn connect(credentials: &AppCredentials, store: SessionStore, purpose: Purpose) -> Connected {
     let store = Arc::new(store);
     let SenderPool {
         runner,
         handle,
         updates,
-    } = SenderPool::with_configuration(store.clone(), credentials.api_id, connection_params());
+    } = SenderPool::with_configuration(
+        store.clone(),
+        credentials.api_id,
+        connection_params(purpose),
+    );
     let client = Client::new(handle);
     tokio::spawn(runner.run());
     Connected {
@@ -153,7 +191,7 @@ impl Login for GrammersLogin {
     async fn start(&self) -> Result<Box<dyn LoginAttempt>, TgError> {
         Ok(Box::new(QrAttempt {
             credentials: self.credentials.clone(),
-            conn: connect(&self.credentials, SessionStore::new()),
+            conn: connect(&self.credentials, SessionStore::new(), Purpose::Login),
             current: None,
             password_hint: None,
         }))
@@ -336,6 +374,8 @@ pub struct LiveClient {
     peers: std::sync::Mutex<std::collections::HashMap<ChatId, Option<i64>>>,
     /// Telegram said this session is gone (logged out / revoked from the app).
     dead: std::sync::atomic::AtomicBool,
+    /// The Account's budget and FLOOD_WAIT state, shared with its other Grants.
+    limiter: Arc<AccountLimiter>,
 }
 
 impl Live for LiveClient {
@@ -354,8 +394,26 @@ impl LiveClient {
             self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
             TgError::BadSession(err.to_string())
         } else {
-            upstream(err)
+            // FLOOD_WAIT surfaces as TgError::FloodWait for the limiter; the rest is upstream.
+            login_error(err)
         }
+    }
+
+    /// One request to Telegram, under the Account's limiter. `chat` gives
+    /// "can't read this chat" errors a caller-facing meaning.
+    async fn call<R: tl::RemoteCall>(
+        &self,
+        request: &R,
+        chat: Option<ChatId>,
+    ) -> Result<R::Return, TgError> {
+        self.limiter
+            .run(|| async {
+                self.client.invoke(request).await.map_err(|err| match chat {
+                    Some(chat) => self.classify_chat_error(err, chat),
+                    None => self.classify(err),
+                })
+            })
+            .await
     }
 
     fn is_dead(&self) -> bool {
@@ -367,12 +425,13 @@ impl LiveClient {
 impl Telegram for LiveClient {
     async fn whoami(&self) -> Result<Account, TgError> {
         let me = self
-            .client
-            .invoke(&tl::functions::users::GetUsers {
-                id: vec![tl::enums::InputUser::UserSelf],
-            })
-            .await
-            .map_err(|err| self.classify(err))?;
+            .call(
+                &tl::functions::users::GetUsers {
+                    id: vec![tl::enums::InputUser::UserSelf],
+                },
+                None,
+            )
+            .await?;
         account_from(
             me.into_iter()
                 .next()
@@ -396,18 +455,19 @@ impl Telegram for LiveClient {
             None => (0, 0, tl::enums::InputPeer::Empty),
         };
         let answer = self
-            .client
-            .invoke(&tl::functions::messages::GetDialogs {
-                exclude_pinned: false,
-                folder_id: archived.then_some(1),
-                offset_date,
-                offset_id,
-                offset_peer,
-                limit: limit as i32,
-                hash: 0,
-            })
-            .await
-            .map_err(|err| self.classify(err))?;
+            .call(
+                &tl::functions::messages::GetDialogs {
+                    exclude_pinned: false,
+                    folder_id: archived.then_some(1),
+                    offset_date,
+                    offset_id,
+                    offset_peer,
+                    limit: limit as i32,
+                    hash: 0,
+                },
+                None,
+            )
+            .await?;
         let (dialogs, messages, chats, users) = match answer {
             tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users),
             tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users),
@@ -436,23 +496,24 @@ impl Telegram for LiveClient {
     ) -> Result<MessagePage, TgError> {
         let peer = self.resolve(chat).await?;
         let answer = self
-            .client
-            .invoke(&tl::functions::messages::GetHistory {
-                peer,
-                offset_id: query.before_id.unwrap_or(0),
-                // getHistory returns messages strictly before offset_date.
-                offset_date: query
-                    .until
-                    .map(|until| i32::try_from(until.saturating_add(1)).unwrap_or(i32::MAX))
-                    .unwrap_or(0),
-                add_offset: 0,
-                limit: query.limit as i32,
-                max_id: 0,
-                min_id: 0,
-                hash: 0,
-            })
-            .await
-            .map_err(|err| self.classify_chat_error(err, chat))?;
+            .call(
+                &tl::functions::messages::GetHistory {
+                    peer,
+                    offset_id: query.before_id.unwrap_or(0),
+                    // getHistory returns messages strictly before offset_date.
+                    offset_date: query
+                        .until
+                        .map(|until| i32::try_from(until.saturating_add(1)).unwrap_or(i32::MAX))
+                        .unwrap_or(0),
+                    add_offset: 0,
+                    limit: query.limit as i32,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                },
+                Some(chat),
+            )
+            .await?;
         let (messages, chats, users) = match answer {
             tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
             tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
@@ -478,38 +539,41 @@ impl Telegram for LiveClient {
         let (description, members, users, chats) = match peer {
             tl::enums::InputPeer::User(u) => {
                 let tl::enums::users::UserFull::Full(full) = self
-                    .client
-                    .invoke(&tl::functions::users::GetFullUser {
-                        id: tl::enums::InputUser::User(tl::types::InputUser {
-                            user_id: u.user_id,
-                            access_hash: u.access_hash,
-                        }),
-                    })
-                    .await
-                    .map_err(|err| self.classify_chat_error(err, chat))?;
+                    .call(
+                        &tl::functions::users::GetFullUser {
+                            id: tl::enums::InputUser::User(tl::types::InputUser {
+                                user_id: u.user_id,
+                                access_hash: u.access_hash,
+                            }),
+                        },
+                        Some(chat),
+                    )
+                    .await?;
                 let tl::enums::UserFull::Full(user) = full.full_user;
                 (user.about, None, full.users, full.chats)
             }
             tl::enums::InputPeer::Chat(c) => {
                 let tl::enums::messages::ChatFull::Full(full) = self
-                    .client
-                    .invoke(&tl::functions::messages::GetFullChat { chat_id: c.chat_id })
-                    .await
-                    .map_err(|err| self.classify_chat_error(err, chat))?;
+                    .call(
+                        &tl::functions::messages::GetFullChat { chat_id: c.chat_id },
+                        Some(chat),
+                    )
+                    .await?;
                 let (about, members) = full_chat_details(full.full_chat);
                 (about, members, full.users, full.chats)
             }
             tl::enums::InputPeer::Channel(c) => {
                 let tl::enums::messages::ChatFull::Full(full) = self
-                    .client
-                    .invoke(&tl::functions::channels::GetFullChannel {
-                        channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
-                            channel_id: c.channel_id,
-                            access_hash: c.access_hash,
-                        }),
-                    })
-                    .await
-                    .map_err(|err| self.classify_chat_error(err, chat))?;
+                    .call(
+                        &tl::functions::channels::GetFullChannel {
+                            channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                                channel_id: c.channel_id,
+                                access_hash: c.access_hash,
+                            }),
+                        },
+                        Some(chat),
+                    )
+                    .await?;
                 let (about, members) = full_chat_details(full.full_chat);
                 (about, members, full.users, full.chats)
             }
@@ -816,14 +880,21 @@ fn media_placeholder(media: Option<&tl::enums::MessageMedia>) -> &'static str {
 pub struct GrammersConnector {
     credentials: AppCredentials,
     vault: Arc<Vault>,
+    limits: Arc<Limits>,
     pool: Pool<LiveClient>,
 }
 
 impl GrammersConnector {
-    pub fn new(credentials: AppCredentials, vault: Arc<Vault>, idle_ttl: Duration) -> Arc<Self> {
+    pub fn new(
+        credentials: AppCredentials,
+        vault: Arc<Vault>,
+        limits: Arc<Limits>,
+        idle_ttl: Duration,
+    ) -> Arc<Self> {
         let connector = Arc::new(Self {
             credentials,
             vault,
+            limits,
             pool: Pool::new(idle_ttl),
         });
         tokio::spawn(sweep(Arc::downgrade(&connector)));
@@ -831,8 +902,9 @@ impl GrammersConnector {
     }
 
     async fn open(&self, grant: OpenedGrant) -> Result<LiveClient, TgError> {
+        let grant_account = grant.account_id;
         let store = SessionStore::from_snapshot(&grant.telegram_session)?;
-        let Connected { client, store, .. } = connect(&self.credentials, store);
+        let Connected { client, store, .. } = connect(&self.credentials, store, Purpose::Live);
         // Prove the session still works before handing it out.
         let live = LiveClient {
             client,
@@ -840,6 +912,7 @@ impl GrammersConnector {
             grant,
             peers: Default::default(),
             dead: Default::default(),
+            limiter: self.limits.for_account(grant_account),
         };
         match live.whoami().await {
             Ok(_) => Ok(live),
@@ -876,8 +949,11 @@ impl Connector for GrammersConnector {
             None => grant.telegram_session.clone(),
         };
         drop(grant);
-        let Connected { client, .. } =
-            connect(&self.credentials, SessionStore::from_snapshot(&snapshot)?);
+        let Connected { client, .. } = connect(
+            &self.credentials,
+            SessionStore::from_snapshot(&snapshot)?,
+            Purpose::Live,
+        );
         let result = tokio::time::timeout(
             LOG_OUT_TIMEOUT,
             client.invoke(&tl::functions::auth::LogOut {}),
@@ -985,7 +1061,7 @@ mod live_tests {
             api_id: 0,
             api_hash: "invalid".into(),
         };
-        let conn = connect(&creds, SessionStore::new());
+        let conn = connect(&creds, SessionStore::new(), Purpose::Login);
         let home = conn.store.home_dc_id().unwrap();
         assert!(
             conn.store

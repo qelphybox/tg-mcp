@@ -344,6 +344,20 @@ fn tool_error(err: TgError) -> ErrorData {
     // Messages are ours, never Telegram payload, so they are safe to return and log.
     match err {
         TgError::InvalidInput(msg) => ErrorData::invalid_params(msg, None),
+        TgError::FloodWait { seconds } => {
+            tracing::warn!(seconds, "tool call hit FLOOD_WAIT");
+            ErrorData::internal_error(
+                format!(
+                    "Telegram asks this account to wait {seconds} s before more requests \
+                     (FLOOD_WAIT). Don't retry before then."
+                ),
+                None,
+            )
+        }
+        TgError::RateLimited { seconds } => ErrorData::internal_error(
+            format!("Too many requests for this account right now; retry in {seconds} s."),
+            None,
+        ),
         err => {
             tracing::warn!(error = %err, "tool call failed");
             ErrorData::internal_error(err.to_string(), None)

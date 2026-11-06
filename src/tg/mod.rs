@@ -61,6 +61,9 @@ pub enum TgError {
     /// Telegram's `FLOOD_WAIT`: nothing may be retried before `seconds` pass.
     #[error("telegram asks to wait {seconds} s")]
     FloodWait { seconds: u32 },
+    /// Our own per-Account request budget is used up; retry after `seconds`.
+    #[error("this account's request budget is used up; retry in {seconds} s")]
+    RateLimited { seconds: u32 },
     /// The caller passed something malformed (bad chat id, foreign cursor).
     #[error("{0}")]
     InvalidInput(String),

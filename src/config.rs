@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{Context, bail};
 use axum::http::Uri;
 
-use crate::tg::grammers::AppCredentials;
+use crate::{limits::LimitsConfig, tg::grammers::AppCredentials};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,6 +21,8 @@ pub struct Config {
     pub telegram_app: Option<AppCredentials>,
     /// How long an unused Live client stays connected.
     pub live_client_idle_ttl: Duration,
+    /// Per-Account request budget and FLOOD_WAIT handling.
+    pub limits: LimitsConfig,
 }
 
 impl Config {
@@ -69,6 +71,28 @@ impl Config {
                 .unwrap_or(600),
         );
 
+        let number = |key: &str, default: u32| -> anyhow::Result<u32> {
+            get(key)
+                .map(|v| v.trim().parse::<u32>())
+                .transpose()
+                .with_context(|| format!("{key} must be a whole number"))?
+                .map_or(Ok(default), |v| {
+                    if v == 0 {
+                        bail!("{key} must be at least 1")
+                    } else {
+                        Ok(v)
+                    }
+                })
+        };
+        let defaults = LimitsConfig::default();
+        let limits = LimitsConfig {
+            per_minute: number("TG_MCP_ACCOUNT_REQUESTS_PER_MINUTE", defaults.per_minute)?,
+            burst: number("TG_MCP_ACCOUNT_BURST", defaults.burst)?,
+            max_wait: Duration::from_secs(
+                number("TG_MCP_MAX_WAIT_SECS", defaults.max_wait.as_secs() as u32)?.into(),
+            ),
+        };
+
         Ok(Self {
             bind,
             public_url,
@@ -76,6 +100,7 @@ impl Config {
             db_path,
             telegram_app,
             live_client_idle_ttl,
+            limits,
         })
     }
 
@@ -129,6 +154,24 @@ mod tests {
         assert_eq!(config.telegram_app.unwrap().api_id, 12345);
         assert!(
             Config::from_lookup(env(&[("TG_MCP_API_ID", "x"), ("TG_MCP_API_HASH", "y")])).is_err()
+        );
+    }
+
+    #[test]
+    fn limits_come_from_env_and_reject_zero() {
+        let config = Config::from_lookup(env(&[
+            ("TG_MCP_FAKE_TELEGRAM", "1"),
+            ("TG_MCP_ACCOUNT_REQUESTS_PER_MINUTE", "30"),
+        ]))
+        .unwrap();
+        assert_eq!(config.limits.per_minute, 30);
+        assert_eq!(config.limits.burst, LimitsConfig::default().burst);
+        assert!(
+            Config::from_lookup(env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_ACCOUNT_BURST", "0")
+            ]))
+            .is_err()
         );
     }
 
