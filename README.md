@@ -47,6 +47,7 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 - **Your password never reaches the AI.** QR login and the cloud password happen on this server's own pages.
 - **OAuth 2.1** with PKCE (S256), dynamic client registration, single-use authorization codes, rotating refresh tokens bound to their client, and a consent screen that names the client, the account and where the login is sent.
 - **Telegram limits are respected.** Requests per account are rate-limited, and Telegram's `FLOOD_WAIT` blocks that account's calls until it passes instead of being retried around.
+- **Anonymous callers can't make it flood Telegram.** The OAuth endpoints are rate-limited per client IP, and only a few logins (each one a Telegram connection) can be in progress at once, server-wide and per IP.
 
 ## Self-hosting
 
@@ -65,6 +66,8 @@ docker run -d --name tg-mcp --restart unless-stopped \
   -e TG_MCP_API_HASH=your_api_hash \
   ghcr.io/qelphybox/tg-mcp:latest
 ```
+
+If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's.
 
 Images are published for `linux/amd64` and `linux/arm64` on every release tag. All settings are environment variables, documented in [`.env.example`](.env.example).
 

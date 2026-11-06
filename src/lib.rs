@@ -34,6 +34,9 @@ pub struct Deps {
 }
 
 /// Build the whole HTTP surface. `shutdown` ends open MCP streams on graceful shutdown.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()`: the rate
+/// limits of the OAuth endpoints need the peer address.
 pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     let auth = Arc::new(AuthState::new(
         config.base_url(),
@@ -41,6 +44,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         deps.clients,
         deps.login,
         deps.connector,
+        config.oauth_limits,
     ));
     auth::spawn_flow_sweeper(&auth);
 

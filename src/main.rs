@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 
@@ -75,12 +75,15 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(bind = %config.bind, public_url = %config.public_url, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown.cancel();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown.cancel();
+    })
+    .await?;
     Ok(())
 }
 

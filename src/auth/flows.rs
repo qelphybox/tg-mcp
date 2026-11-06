@@ -8,12 +8,11 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
+use super::rate_limit::ClientIp;
 use crate::tg::{LoggedIn, LoginAttempt};
 
 const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const CODE_TTL: Duration = Duration::from_secs(60);
-/// Bounds memory if someone opens /authorize in a loop.
-const MAX_PENDING: usize = 10_000;
 
 /// What the client asked for at /authorize, already validated.
 #[derive(Debug, Clone)]
@@ -35,6 +34,7 @@ pub struct PendingLogin {
     pub progress: tokio::sync::Mutex<Progress>,
     /// Only touched while `progress` is locked.
     pub password_gate: Mutex<PasswordGate>,
+    client: ClientIp,
     created: Instant,
 }
 
@@ -52,45 +52,132 @@ pub struct IssuedCode {
     expires: Instant,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("too many logins in progress")]
-pub struct Full;
+/// No room for another Login flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Full {
+    #[error("too many logins in progress")]
+    Server,
+    #[error("too many logins in progress from this client")]
+    Client,
+}
 
+/// Pending Login flows, plus slots reserved for ones whose Telegram login is
+/// still being started. Both count against the caps.
 #[derive(Default)]
+struct Logins {
+    pending: HashMap<String, Arc<PendingLogin>>,
+    starting: HashMap<ClientIp, usize>,
+}
+
+impl Logins {
+    fn count(&self, client: ClientIp) -> (usize, usize) {
+        let starting_total: usize = self.starting.values().sum();
+        let pending_client = self.pending.values().filter(|l| l.client == client).count();
+        let starting_client = self.starting.get(&client).copied().unwrap_or(0);
+        (
+            self.pending.len() + starting_total,
+            pending_client + starting_client,
+        )
+    }
+
+    fn release(&mut self, client: ClientIp) {
+        if let Some(n) = self.starting.get_mut(&client) {
+            *n -= 1;
+            if *n == 0 {
+                self.starting.remove(&client);
+            }
+        }
+    }
+}
+
+/// A slot for one Login flow, taken before Telegram is asked to start a login.
+/// Dropping it unused frees the slot.
+pub struct Reservation<'a> {
+    flows: &'a Flows,
+    client: ClientIp,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.flows
+            .logins
+            .lock()
+            .expect("flows lock")
+            .release(self.client);
+    }
+}
+
 pub struct Flows {
-    logins: Mutex<HashMap<String, Arc<PendingLogin>>>,
+    max_pending: usize,
+    max_pending_per_client: usize,
+    logins: Mutex<Logins>,
     codes: Mutex<HashMap<String, IssuedCode>>,
 }
 
 impl Flows {
+    pub fn new(max_pending: usize, max_pending_per_client: usize) -> Self {
+        Self {
+            max_pending,
+            max_pending_per_client,
+            logins: Mutex::default(),
+            codes: Mutex::default(),
+        }
+    }
+
+    /// Reserve a slot for a Login flow from `client`, within both caps.
+    pub fn reserve(&self, client: ClientIp) -> Result<Reservation<'_>, Full> {
+        let mut logins = self.logins.lock().expect("flows lock");
+        let (mut total, mut from_client) = logins.count(client);
+        if total >= self.max_pending || from_client >= self.max_pending_per_client {
+            logins
+                .pending
+                .retain(|_, l| l.created.elapsed() < LOGIN_TTL);
+            (total, from_client) = logins.count(client);
+        }
+        if total >= self.max_pending {
+            return Err(Full::Server);
+        }
+        if from_client >= self.max_pending_per_client {
+            return Err(Full::Client);
+        }
+        *logins.starting.entry(client).or_default() += 1;
+        Ok(Reservation {
+            flows: self,
+            client,
+        })
+    }
+
+    /// Turn a reserved slot into a pending Login flow.
     pub fn start_login(
         &self,
+        reservation: Reservation<'_>,
         request: AuthRequest,
         attempt: Box<dyn LoginAttempt>,
-    ) -> Result<String, Full> {
-        let mut logins = self.logins.lock().expect("flows lock");
-        if logins.len() >= MAX_PENDING {
-            logins.retain(|_, l| l.created.elapsed() < LOGIN_TTL);
-            if logins.len() >= MAX_PENDING {
-                return Err(Full);
-            }
-        }
+    ) -> String {
+        let client = reservation.client;
         let id = new_id();
-        logins.insert(
+        let mut logins = self.logins.lock().expect("flows lock");
+        logins.pending.insert(
             id.clone(),
             Arc::new(PendingLogin {
                 request,
                 progress: tokio::sync::Mutex::new(Progress::InProgress(attempt)),
                 password_gate: Mutex::default(),
+                client,
                 created: Instant::now(),
             }),
         );
-        Ok(id)
+        // The slot now belongs to the pending login.
+        logins.release(client);
+        drop(logins);
+        std::mem::forget(reservation);
+        id
     }
 
     pub fn login(&self, id: &str) -> Option<Arc<PendingLogin>> {
         let logins = self.logins.lock().expect("flows lock");
         logins
+            .pending
             .get(id)
             .filter(|l| l.created.elapsed() < LOGIN_TTL)
             .cloned()
@@ -100,6 +187,7 @@ impl Flows {
     pub fn take_login(&self, id: &str) -> Option<Arc<PendingLogin>> {
         let mut logins = self.logins.lock().expect("flows lock");
         logins
+            .pending
             .remove(id)
             .filter(|l| l.created.elapsed() < LOGIN_TTL)
     }
@@ -123,9 +211,11 @@ impl Flows {
     /// connection until it is dropped, so this runs periodically.
     pub fn sweep(&self) -> usize {
         let mut logins = self.logins.lock().expect("flows lock");
-        let before = logins.len();
-        logins.retain(|_, l| l.created.elapsed() < LOGIN_TTL);
-        let swept = before - logins.len();
+        let before = logins.pending.len();
+        logins
+            .pending
+            .retain(|_, l| l.created.elapsed() < LOGIN_TTL);
+        let swept = before - logins.pending.len();
         drop(logins);
         self.codes
             .lock()
@@ -143,4 +233,66 @@ impl Flows {
 
 fn new_id() -> String {
     URL_SAFE_NO_PAD.encode(crate::sessions::random_bytes::<32>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tg::{FakeLogin, Login};
+
+    fn client(last: u8) -> ClientIp {
+        ClientIp::new([203, 0, 113, last].into())
+    }
+
+    fn request() -> AuthRequest {
+        AuthRequest {
+            client_id: "tgmc_test".into(),
+            client_name: "Test".into(),
+            redirect_uri: "http://127.0.0.1/cb".into(),
+            code_challenge: "x".into(),
+            state: None,
+        }
+    }
+
+    async fn start(flows: &Flows, from: ClientIp) -> Result<String, Full> {
+        let slot = flows.reserve(from)?;
+        let attempt = FakeLogin::default().start().await.unwrap();
+        Ok(flows.start_login(slot, request(), attempt))
+    }
+
+    #[tokio::test]
+    async fn the_server_wide_cap_counts_every_client() {
+        let flows = Flows::new(2, 10);
+        start(&flows, client(1)).await.unwrap();
+        start(&flows, client(2)).await.unwrap();
+        assert_eq!(start(&flows, client(3)).await, Err(Full::Server));
+    }
+
+    #[tokio::test]
+    async fn the_per_client_cap_leaves_room_for_others() {
+        let flows = Flows::new(10, 2);
+        start(&flows, client(1)).await.unwrap();
+        start(&flows, client(1)).await.unwrap();
+        assert_eq!(start(&flows, client(1)).await, Err(Full::Client));
+        start(&flows, client(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slots_being_started_count_and_an_unused_one_is_freed() {
+        let flows = Flows::new(10, 1);
+        let slot = flows.reserve(client(1)).unwrap();
+        assert!(matches!(flows.reserve(client(1)), Err(Full::Client)));
+        drop(slot); // e.g. Telegram failed to start the login
+        start(&flows, client(1)).await.unwrap();
+        assert!(matches!(flows.reserve(client(1)), Err(Full::Client)));
+    }
+
+    #[tokio::test]
+    async fn a_finished_login_frees_its_slot() {
+        let flows = Flows::new(1, 1);
+        let id = start(&flows, client(1)).await.unwrap();
+        assert!(flows.reserve(client(2)).is_err());
+        flows.take_login(&id).unwrap();
+        start(&flows, client(2)).await.unwrap();
+    }
 }

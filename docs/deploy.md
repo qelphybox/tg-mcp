@@ -12,10 +12,12 @@ Triggers: every push to `main`, or **Actions → Deploy → Run workflow** (pick
 
 kamal-proxy terminates TLS with a Let's Encrypt certificate for the host. `text/event-stream` responses (MCP streams) pass through unbuffered; `response_timeout` only bounds the wait for response headers.
 
+Client IPs: the app only sees kamal-proxy as its TCP peer. kamal-proxy (with `ssl: true` and `forward_headers` unset, so false) drops any `X-Forwarded-For` the client sent and sets it to the address it accepted the connection from; with `forward_headers: true` it would append that address instead. Either way the right-most entry is the real client, and `TG_MCP_TRUST_FORWARDED_FOR=1` makes the app read it for the per-IP limits on `/register`, `/authorize`, `/token`, `/revoke` and on pending logins. Don't set kamal-proxy's `client_ip_header`: it would copy a client-controlled header into `X-Forwarded-For`.
+
 ## What survives a deploy
 
 - **Survives:** everything in SQLite (Grants, Tokens, encrypted Telegram sessions) on the `tg-mcp-data` volume, mounted at `/data`.
-- **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call), authorization codes and logins in progress (the user starts the browser flow again).
+- **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call), authorization codes and logins in progress (the user starts the browser flow again), rate-limit counters (they start full again).
 
 ## First deploy
 

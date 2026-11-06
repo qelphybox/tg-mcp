@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Form, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
@@ -24,6 +24,7 @@ use super::{
     AuthState,
     flows::{AuthRequest, PendingLogin, Progress},
     pages, pkce,
+    rate_limit::ClientIp,
 };
 use crate::tg::{LoginState, TgError};
 
@@ -47,6 +48,7 @@ pub struct AuthorizeQuery {
 
 pub async fn authorize(
     State(auth): State<Arc<AuthState>>,
+    Extension(client_ip): Extension<ClientIp>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Response {
     // Until client and redirect_uri check out, errors are shown, never redirected.
@@ -123,6 +125,14 @@ pub async fn authorize(
         );
     }
 
+    // Each Login flow holds a Telegram connection: take a slot before opening one.
+    let slot = match auth.flows.reserve(client_ip) {
+        Ok(slot) => slot,
+        Err(full) => {
+            tracing::warn!(client_ip = %client_ip, reason = %full, "login flow refused");
+            return fail("temporarily_unavailable", "too many logins in progress");
+        }
+    };
     let attempt = match auth.login.start().await {
         Ok(attempt) => attempt,
         Err(err) => {
@@ -140,9 +150,7 @@ pub async fn authorize(
         code_challenge,
         state: q.state.clone(),
     };
-    let Ok(login_id) = auth.flows.start_login(request, attempt) else {
-        return fail("temporarily_unavailable", "too many logins in progress");
-    };
+    let login_id = auth.flows.start_login(slot, request, attempt);
 
     let mut response = Redirect::to(&format!("/login/{login_id}")).into_response();
     let secure = if auth.base_url.starts_with("https://") {
