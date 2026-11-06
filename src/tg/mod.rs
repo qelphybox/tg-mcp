@@ -11,6 +11,7 @@
 pub mod chats;
 pub mod fake;
 pub mod grammers;
+pub mod messages;
 mod pool;
 mod session;
 
@@ -78,6 +79,13 @@ pub trait Telegram: Send + Sync + 'static {
         cursor: Option<&str>,
         archived: bool,
     ) -> Result<chats::ChatPage, TgError>;
+
+    /// Messages of one Chat, newest first, within `query`'s bounds.
+    async fn get_messages(
+        &self,
+        chat: chats::ChatId,
+        query: messages::HistoryQuery,
+    ) -> Result<messages::MessagePage, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

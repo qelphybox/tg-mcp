@@ -14,7 +14,8 @@ use zeroize::Zeroizing;
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
-    chats::{ChatKind, ChatPage, ChatSummary, MessagePreview},
+    chats::{ChatId, ChatKind, ChatPage, ChatSummary, MessagePreview, RawPeer},
+    messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
 };
 use crate::sessions::OpenedGrant;
 
@@ -24,6 +25,9 @@ pub struct FakeData {
     pub account: Account,
     #[serde(default)]
     pub chats: Vec<ChatSummary>,
+    /// Each Chat's history, in any order.
+    #[serde(default)]
+    pub messages: std::collections::HashMap<ChatId, Vec<RawHistoryMessage>>,
 }
 
 impl From<Account> for FakeData {
@@ -37,7 +41,13 @@ impl FakeData {
         Self {
             account,
             chats: Vec::new(),
+            messages: Default::default(),
         }
+    }
+
+    pub fn with_messages(mut self, chat: ChatId, messages: Vec<RawHistoryMessage>) -> Self {
+        self.messages.insert(chat, messages);
+        self
     }
 
     pub fn with_chats(mut self, chats: Vec<ChatSummary>) -> Self {
@@ -100,6 +110,61 @@ impl Telegram for FakeTelegram {
             next_cursor: (end < self.data.chats.len()).then(|| format!("{CURSOR_PREFIX}{end}")),
             chats,
         })
+    }
+
+    /// Emulates getHistory: `before_id` and `until` are applied before `limit`.
+    async fn get_messages(
+        &self,
+        chat: ChatId,
+        query: HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        if !self.knows(chat) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        let mut history = self.data.messages.get(&chat).cloned().unwrap_or_default();
+        history.sort_by_key(|m| std::cmp::Reverse(m.id));
+        let window: Vec<RawHistoryMessage> = history
+            .into_iter()
+            .filter(|m| query.before_id.is_none_or(|before| m.id < before))
+            .filter(|m| query.until.is_none_or(|until| i64::from(m.date) <= until))
+            .take(query.limit)
+            .collect();
+        let full = window.len() == query.limit;
+        Ok(assemble_history(chat, &window, &self.peers(), &query, full))
+    }
+}
+
+impl FakeTelegram {
+    /// The fake knows a Chat if it lists it or has history for it.
+    fn knows(&self, chat: ChatId) -> bool {
+        let id = chat.to_string();
+        self.data.messages.contains_key(&chat) || self.data.chats.iter().any(|c| c.id == id)
+    }
+
+    fn peers(&self) -> Vec<RawPeer> {
+        let me = &self.data.account;
+        self.data
+            .chats
+            .iter()
+            .filter_map(|c| {
+                Some(RawPeer {
+                    id: c.id.parse().ok()?,
+                    title: c.title.clone(),
+                    kind: c.kind,
+                    username: c.username.clone(),
+                    access_hash: None,
+                })
+            })
+            .chain(std::iter::once(RawPeer {
+                id: ChatId::User(me.id),
+                title: me.display_name(),
+                kind: ChatKind::Private,
+                username: me.username.clone(),
+                access_hash: None,
+            }))
+            .collect()
     }
 }
 

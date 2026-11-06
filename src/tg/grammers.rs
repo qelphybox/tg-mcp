@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{self, ChatId, ChatKind, ChatPage, Cursor, RawDialog, RawMessage, RawPeer},
+    messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
     pool::{Live, Pool},
     session::SessionStore,
 };
@@ -422,13 +423,157 @@ impl Telegram for LiveClient {
             .collect();
         let messages: Vec<RawMessage> = messages.into_iter().filter_map(raw_message).collect();
 
+        self.remember(&peers);
+        Ok(chats::assemble_page(
+            &dialogs, &peers, &messages, full_page, archived,
+        ))
+    }
+
+    async fn get_messages(
+        &self,
+        chat: ChatId,
+        query: HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        let peer = self.resolve(chat).await?;
+        let answer = self
+            .client
+            .invoke(&tl::functions::messages::GetHistory {
+                peer,
+                offset_id: query.before_id.unwrap_or(0),
+                // getHistory returns messages strictly before offset_date.
+                offset_date: query
+                    .until
+                    .map(|until| i32::try_from(until.saturating_add(1)).unwrap_or(i32::MAX))
+                    .unwrap_or(0),
+                add_offset: 0,
+                limit: query.limit as i32,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await
+            .map_err(|err| self.classify_chat_error(err, chat))?;
+        let (messages, chats, users) = match answer {
+            tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
+        };
+        let full_page = messages.len() >= query.limit;
+        let raw: Vec<RawHistoryMessage> = messages
+            .into_iter()
+            .filter_map(raw_history_message)
+            .collect();
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        self.remember(&peers);
+        Ok(assemble_history(chat, &raw, &peers, &query, full_page))
+    }
+}
+
+/// How far `resolve` pages through the dialogs (per folder) looking for an unknown Chat.
+const RESOLVE_MAX_PAGES: usize = 5;
+
+impl LiveClient {
+    fn remember(&self, peers: &[RawPeer]) {
         self.peers
             .lock()
             .expect("peer cache lock")
             .extend(peers.iter().map(|p| (p.id, p.access_hash)));
-        Ok(chats::assemble_page(
-            &dialogs, &peers, &messages, full_page, archived,
-        ))
+    }
+
+    fn cached(&self, chat: ChatId) -> Option<Option<i64>> {
+        self.peers
+            .lock()
+            .expect("peer cache lock")
+            .get(&chat)
+            .copied()
+    }
+
+    /// The InputPeer for a chat id. Basic groups need no access hash; users and
+    /// channels come from the peer cache, refilled from the dialog list if this
+    /// Live client hasn't seen them yet (e.g. right after a restart).
+    async fn resolve(&self, chat: ChatId) -> Result<tl::enums::InputPeer, TgError> {
+        if let ChatId::Chat(_) = chat {
+            return Ok(input_peer(chat, None));
+        }
+        if let Some(hash) = self.cached(chat) {
+            return Ok(input_peer(chat, hash));
+        }
+        for archived in [false, true] {
+            let mut cursor: Option<String> = None;
+            for _ in 0..RESOLVE_MAX_PAGES {
+                let page = self.list_chats(100, cursor.as_deref(), archived).await?;
+                if let Some(hash) = self.cached(chat) {
+                    return Ok(input_peer(chat, hash));
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+        }
+        Err(TgError::InvalidInput(format!(
+            "{chat} is not one of your chats; chat ids come from list_chats"
+        )))
+    }
+
+    /// Like `classify`, but "you can't read this chat" is the caller's problem.
+    fn classify_chat_error(&self, err: InvocationError, chat: ChatId) -> TgError {
+        let inaccessible = [
+            "CHANNEL_PRIVATE",
+            "CHANNEL_INVALID",
+            "PEER_ID_INVALID",
+            "CHAT_ID_INVALID",
+            "USER_ID_INVALID",
+        ];
+        if inaccessible.iter().any(|code| err.is(code)) {
+            return TgError::InvalidInput(format!("{chat} can't be read by this account"));
+        }
+        self.classify(err)
+    }
+}
+
+fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage> {
+    match message {
+        tl::enums::Message::Message(m) => {
+            let text = if m.message.is_empty() {
+                media_placeholder(m.media.as_ref()).to_string()
+            } else {
+                m.message
+            };
+            let reply_to = match m.reply_to {
+                // Replies into another chat aren't addressable here.
+                Some(tl::enums::MessageReplyHeader::Header(h)) if h.reply_to_peer_id.is_none() => {
+                    h.reply_to_msg_id
+                }
+                _ => None,
+            };
+            Some(RawHistoryMessage {
+                id: m.id,
+                date: m.date,
+                from: m.from_id.as_ref().map(chat_id),
+                out: m.out,
+                text,
+                reply_to,
+                forwarded: m.fwd_from.is_some(),
+                edited: m.edit_date.is_some(),
+            })
+        }
+        tl::enums::Message::Service(m) => Some(RawHistoryMessage {
+            id: m.id,
+            date: m.date,
+            from: m.from_id.as_ref().map(chat_id),
+            out: m.out,
+            text: "[service message]".into(),
+            reply_to: None,
+            forwarded: false,
+            edited: false,
+        }),
+        tl::enums::Message::Empty(_) => None,
     }
 }
 

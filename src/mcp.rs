@@ -14,7 +14,11 @@ use serde::Deserialize;
 
 use crate::{
     auth::Caller,
-    tg::{Account, TgError, chats::ChatPage},
+    tg::{
+        Account, TgError,
+        chats::{ChatId, ChatPage},
+        messages::{self, HistoryQuery, MessagePage},
+    },
 };
 
 /// Output bounds, so one call can't flood the model's context.
@@ -22,6 +26,11 @@ const MAX_CHATS_PER_PAGE: usize = 100;
 const DEFAULT_CHATS_PER_PAGE: usize = 30;
 const MAX_TITLE_CHARS: usize = 128;
 const MAX_PREVIEW_CHARS: usize = 100;
+const MAX_MESSAGES_PER_PAGE: usize = 100;
+const DEFAULT_MESSAGES_PER_PAGE: usize = 30;
+const MAX_MESSAGE_CHARS: usize = 1000;
+/// Rough cap on the characters of message text in one get_messages answer.
+const MESSAGE_PAGE_BUDGET_CHARS: usize = 40_000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListChatsParams {
@@ -63,6 +72,25 @@ fn caller(parts: &http::request::Parts) -> Result<&Caller, ErrorData> {
     parts.extensions.get::<Caller>().ok_or_else(|| {
         ErrorData::internal_error("request reached a tool without authentication", None)
     })
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetMessagesParams {
+    /// A chat id from list_chats: `user:N`, `chat:N` or `channel:N`.
+    #[schemars(length(max = 32))]
+    pub chat_id: String,
+    /// How many messages to return (1-100, default 30).
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<u32>,
+    /// Only messages older than this message id: the previous page's `next_before_id`.
+    #[schemars(range(min = 1))]
+    pub before_id: Option<i32>,
+    /// Only messages at or after this time: RFC 3339 (`2026-11-06T09:00:00Z`) or a date (`2026-11-06`).
+    #[schemars(length(max = 40))]
+    pub since: Option<String>,
+    /// Only messages at or before this time: RFC 3339 or a date (inclusive, whole day).
+    #[schemars(length(max = 40))]
+    pub until: Option<String>,
 }
 
 #[tool_router]
@@ -135,6 +163,104 @@ no `next_cursor` means this was the last page. Previews are cut to 100 character
         }
         Ok(Json(page))
     }
+
+    #[tool(
+        title = "Get messages",
+        description = "Read messages of one chat, newest first. `chat_id` comes from list_chats \
+(user:N, chat:N or channel:N). Each message has an id, date (UTC), sender (id + name; absent \
+and `outgoing: true` for messages the account itself sent), text (media and service messages \
+as [photo], [voice], ...; cut to 1000 characters), the id it replies to, and forwarded/edited \
+flags. Page with `before_id` = the previous `next_before_id`; no `next_before_id` means there \
+is nothing older (within `since`). Narrow by time with `since`/`until`.",
+        annotations(
+            title = "Get messages",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_messages(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(params): Parameters<GetMessagesParams>,
+    ) -> Result<Json<MessagePage>, ErrorData> {
+        let (chat, query) = Self::history_query(&params)?;
+        let page = caller(&parts)?
+            .telegram
+            .get_messages(chat, query)
+            .await
+            .map_err(tool_error)?;
+        Ok(Json(bound_history(page)))
+    }
+}
+
+impl TgMcp {
+    fn history_query(params: &GetMessagesParams) -> Result<(ChatId, HistoryQuery), ErrorData> {
+        let invalid = |msg: String| ErrorData::invalid_params(msg, None);
+        let chat: ChatId = params
+            .chat_id
+            .parse()
+            .map_err(|e: TgError| invalid(e.to_string()))?;
+        let limit = params
+            .limit
+            .map_or(DEFAULT_MESSAGES_PER_PAGE, |l| l as usize);
+        if !(1..=MAX_MESSAGES_PER_PAGE).contains(&limit) {
+            return Err(invalid(format!(
+                "limit must be between 1 and {MAX_MESSAGES_PER_PAGE}"
+            )));
+        }
+        if params.before_id.is_some_and(|id| id < 1) {
+            return Err(invalid("before_id must be a positive message id".into()));
+        }
+        let bound = |value: &Option<String>, name: &str, end_of_day| {
+            value
+                .as_deref()
+                .map(|v| {
+                    messages::parse_bound(v, end_of_day).ok_or_else(|| {
+                        invalid(format!("{name} must be RFC 3339 or YYYY-MM-DD, got {v:?}"))
+                    })
+                })
+                .transpose()
+        };
+        let since = bound(&params.since, "since", false)?;
+        let until = bound(&params.until, "until", true)?;
+        if let (Some(since), Some(until)) = (since, until)
+            && since > until
+        {
+            return Err(invalid("since is after until".into()));
+        }
+        Ok((
+            chat,
+            HistoryQuery {
+                limit,
+                before_id: params.before_id,
+                since,
+                until,
+            },
+        ))
+    }
+}
+
+/// Apply the per-message and per-page caps. If the page budget runs out, the
+/// page ends early and `next_before_id` continues right after the last message kept.
+fn bound_history(mut page: MessagePage) -> MessagePage {
+    let mut budget = MESSAGE_PAGE_BUDGET_CHARS;
+    let mut kept = 0;
+    for message in &mut page.messages {
+        message.text = shorten(&message.text, MAX_MESSAGE_CHARS);
+        let cost = message.text.chars().count() + 64;
+        if cost > budget && kept > 0 {
+            break;
+        }
+        budget = budget.saturating_sub(cost);
+        kept += 1;
+    }
+    if kept < page.messages.len() {
+        page.messages.truncate(kept);
+        page.next_before_id = page.messages.last().map(|m| m.id);
+    }
+    page
 }
 
 /// Cut to `max` characters (not bytes), single line, marking the cut with `…`.
