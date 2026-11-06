@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
+    chats::{self, ChatId, ChatKind, ChatPage, Cursor, RawDialog, RawMessage, RawPeer},
     pool::{Live, Pool},
     session::SessionStore,
 };
@@ -326,6 +327,9 @@ pub struct LiveClient {
     client: Client,
     store: Arc<SessionStore>,
     grant: OpenedGrant,
+    /// Access hashes of Chats seen so far, to address them again. In memory only,
+    /// and only as long as this Live client lives.
+    peers: std::sync::Mutex<std::collections::HashMap<ChatId, Option<i64>>>,
     /// Telegram said this session is gone (logged out / revoked from the app).
     dead: std::sync::atomic::AtomicBool,
 }
@@ -371,6 +375,222 @@ impl Telegram for LiveClient {
                 .ok_or_else(|| TgError::Upstream("no self user".into()))?,
         )
     }
+    async fn list_chats(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        archived: bool,
+    ) -> Result<ChatPage, TgError> {
+        let cursor = cursor.map(Cursor::decode).transpose()?;
+        let archived = cursor.as_ref().map_or(archived, |c| c.archived);
+        let (offset_date, offset_id, offset_peer) = match &cursor {
+            Some(c) => (
+                c.offset_date,
+                c.offset_id,
+                input_peer(c.offset_peer.parse()?, c.offset_access_hash),
+            ),
+            None => (0, 0, tl::enums::InputPeer::Empty),
+        };
+        let answer = self
+            .client
+            .invoke(&tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: archived.then_some(1),
+                offset_date,
+                offset_id,
+                offset_peer,
+                limit: limit as i32,
+                hash: 0,
+            })
+            .await
+            .map_err(|err| self.classify(err))?;
+        let (dialogs, messages, chats, users) = match answer {
+            tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users),
+            tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users),
+            tl::enums::messages::Dialogs::NotModified(_) => (vec![], vec![], vec![], vec![]),
+        };
+        // A full page may have more after it; a short one is the end.
+        let full_page = dialogs.len() >= limit;
+        let dialogs: Vec<RawDialog> = dialogs.into_iter().filter_map(raw_dialog).collect();
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        let messages: Vec<RawMessage> = messages.into_iter().filter_map(raw_message).collect();
+
+        self.peers
+            .lock()
+            .expect("peer cache lock")
+            .extend(peers.iter().map(|p| (p.id, p.access_hash)));
+        Ok(chats::assemble_page(
+            &dialogs, &peers, &messages, full_page, archived,
+        ))
+    }
+}
+
+// ── TL → plain values ───────────────────────────────────────────────────────
+
+fn chat_id(peer: &tl::enums::Peer) -> ChatId {
+    match peer {
+        tl::enums::Peer::User(p) => ChatId::User(p.user_id),
+        tl::enums::Peer::Chat(p) => ChatId::Chat(p.chat_id),
+        tl::enums::Peer::Channel(p) => ChatId::Channel(p.channel_id),
+    }
+}
+
+fn input_peer(id: ChatId, access_hash: Option<i64>) -> tl::enums::InputPeer {
+    let access_hash = access_hash.unwrap_or(0);
+    match id {
+        ChatId::User(user_id) => tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id,
+            access_hash,
+        }),
+        ChatId::Chat(chat_id) => tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id }),
+        ChatId::Channel(channel_id) => tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id,
+            access_hash,
+        }),
+    }
+}
+
+fn raw_dialog(dialog: tl::enums::Dialog) -> Option<RawDialog> {
+    match dialog {
+        tl::enums::Dialog::Dialog(d) => Some(RawDialog {
+            chat: chat_id(&d.peer),
+            top_message: d.top_message,
+            unread_count: d.unread_count,
+            pinned: d.pinned,
+        }),
+        // The archive folder entry and communities aren't Chats.
+        _ => None,
+    }
+}
+
+fn raw_user(user: tl::enums::User) -> Option<RawPeer> {
+    let tl::enums::User::User(u) = user else {
+        return None;
+    };
+    let title = if u.deleted {
+        "Deleted Account".to_string()
+    } else {
+        [u.first_name.as_deref(), u.last_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some(RawPeer {
+        id: ChatId::User(u.id),
+        title,
+        kind: if u.bot {
+            ChatKind::Bot
+        } else {
+            ChatKind::Private
+        },
+        username: u.username,
+        access_hash: u.access_hash,
+    })
+}
+
+fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
+    let channel_kind = |megagroup| {
+        if megagroup {
+            ChatKind::Supergroup
+        } else {
+            ChatKind::Channel
+        }
+    };
+    match chat {
+        tl::enums::Chat::Chat(c) => Some(RawPeer {
+            id: ChatId::Chat(c.id),
+            title: c.title,
+            kind: ChatKind::Group,
+            username: None,
+            access_hash: None,
+        }),
+        tl::enums::Chat::Forbidden(c) => Some(RawPeer {
+            id: ChatId::Chat(c.id),
+            title: c.title,
+            kind: ChatKind::Group,
+            username: None,
+            access_hash: None,
+        }),
+        tl::enums::Chat::Channel(c) => Some(RawPeer {
+            id: ChatId::Channel(c.id),
+            title: c.title,
+            kind: channel_kind(c.megagroup),
+            username: c.username,
+            access_hash: c.access_hash,
+        }),
+        tl::enums::Chat::ChannelForbidden(c) => Some(RawPeer {
+            id: ChatId::Channel(c.id),
+            title: c.title,
+            kind: channel_kind(c.megagroup),
+            username: None,
+            access_hash: Some(c.access_hash),
+        }),
+        _ => None,
+    }
+}
+
+fn raw_message(message: tl::enums::Message) -> Option<RawMessage> {
+    match message {
+        tl::enums::Message::Message(m) => {
+            let text = if m.message.is_empty() {
+                media_placeholder(m.media.as_ref()).to_string()
+            } else {
+                m.message
+            };
+            Some(RawMessage {
+                chat: chat_id(&m.peer_id),
+                id: m.id,
+                date: m.date,
+                text,
+            })
+        }
+        tl::enums::Message::Service(m) => Some(RawMessage {
+            chat: chat_id(&m.peer_id),
+            id: m.id,
+            date: m.date,
+            text: "[service message]".into(),
+        }),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
+/// What to show instead of an empty text. Never includes media content.
+fn media_placeholder(media: Option<&tl::enums::MessageMedia>) -> &'static str {
+    use tl::enums::MessageMedia as M;
+    match media {
+        None | Some(M::Empty) => "",
+        Some(M::Photo(_)) => "[photo]",
+        Some(M::Document(d)) => match &d.document {
+            Some(tl::enums::Document::Document(doc)) => doc
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    tl::enums::DocumentAttribute::Audio(a) if a.voice => Some("[voice]"),
+                    tl::enums::DocumentAttribute::Audio(_) => Some("[audio]"),
+                    tl::enums::DocumentAttribute::Video(v) if v.round_message => {
+                        Some("[video message]")
+                    }
+                    tl::enums::DocumentAttribute::Video(_) => Some("[video]"),
+                    tl::enums::DocumentAttribute::Sticker(_) => Some("[sticker]"),
+                    tl::enums::DocumentAttribute::Animated => Some("[gif]"),
+                    _ => None,
+                })
+                .unwrap_or("[file]"),
+            _ => "[file]",
+        },
+        Some(M::Geo(_) | M::GeoLive(_) | M::Venue(_)) => "[location]",
+        Some(M::Contact(_)) => "[contact]",
+        Some(M::Poll(_)) => "[poll]",
+        Some(M::Dice(_)) => "[dice]",
+        Some(M::Story(_)) => "[story]",
+        Some(_) => "[media]",
+    }
 }
 
 pub struct GrammersConnector {
@@ -398,6 +618,7 @@ impl GrammersConnector {
             client,
             store,
             grant,
+            peers: Default::default(),
             dead: Default::default(),
         };
         match live.whoami().await {

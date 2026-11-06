@@ -25,7 +25,7 @@ use tg_mcp::{
     config::Config,
     db,
     sessions::{TokenTtl, Vault},
-    tg::{Account, FakeConnector, FakeLogin, Login, LoginAttempt, TgError},
+    tg::{Account, FakeConnector, FakeLogin, Login, LoginAttempt, TgError, fake::FakeData},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -56,7 +56,7 @@ pub fn account(id: i64, name: &str) -> Account {
 
 /// Logs in as each Account in turn: one per started login.
 pub struct SequenceLogin {
-    accounts: Vec<Account>,
+    accounts: Vec<FakeData>,
     next: AtomicUsize,
 }
 
@@ -69,6 +69,11 @@ impl Login for SequenceLogin {
 }
 
 pub async fn start(accounts: Vec<Account>) -> TestServer {
+    start_with(accounts.into_iter().map(FakeData::new).collect()).await
+}
+
+/// Logs in as each [`FakeData`] in turn.
+pub async fn start_with(accounts: Vec<FakeData>) -> TestServer {
     start_with_login(Arc::new(SequenceLogin {
         accounts,
         next: AtomicUsize::new(0),

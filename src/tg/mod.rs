@@ -8,6 +8,7 @@
 //! Tests drive the whole server through the fakes in [`fake`]; [`grammers`] is the
 //! real Telegram (QR login + Client pool).
 
+pub mod chats;
 pub mod fake;
 pub mod grammers;
 mod pool;
@@ -59,12 +60,24 @@ pub enum TgError {
     /// Telegram's `FLOOD_WAIT`: nothing may be retried before `seconds` pass.
     #[error("telegram asks to wait {seconds} s")]
     FloodWait { seconds: u32 },
+    /// The caller passed something malformed (bad chat id, foreign cursor).
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 /// Read-only access to one Account.
 #[async_trait::async_trait]
 pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
+
+    /// One page of the Account's Chats, most recent first. `cursor` is a
+    /// `next_cursor` from a previous page (it also decides `archived`).
+    async fn list_chats(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        archived: bool,
+    ) -> Result<chats::ChatPage, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

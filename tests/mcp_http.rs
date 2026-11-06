@@ -102,14 +102,16 @@ async fn whoami_answers_for_the_callers_own_grant() {
     ] {
         let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(
-            tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
-            ["whoami"]
-        );
-        assert_eq!(
-            tools[0].annotations.as_ref().unwrap().read_only_hint,
-            Some(true)
-        );
+        assert!(tools.iter().any(|t| t.name == "whoami"));
+        // The spec: every tool is read-only.
+        for tool in &tools {
+            assert_eq!(
+                tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+                Some(true),
+                "{} is not marked read-only",
+                tool.name
+            );
+        }
 
         let result = client
             .call_tool(CallToolRequestParams::new("whoami"))
