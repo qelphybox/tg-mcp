@@ -19,22 +19,35 @@ kamal-proxy terminates TLS with a Let's Encrypt certificate for the host. `text/
 
 ## First deploy
 
-Run the wizard from a local clone and follow it:
+Run the wizard from a local clone (needs `gh` logged in) and follow it:
 
 ```sh
 scripts/setup-deploy.sh
 ```
 
-It collects the Telegram api_id/api_hash, server IP and SSH user, waits for the DNS A record, installs a dedicated deploy key, pins the server's SSH host key and triggers `kamal setup`. It writes these to GitHub (and the same values to your local, git-ignored `.env`):
+It collects the Telegram api_id/api_hash, makes sure your personal key opens `root@<server>`, waits for the DNS A record, generates a dedicated deploy key, hardens the server with `scripts/harden-server.sh` (see below), pins the server's SSH host key and triggers the first deploy. It writes these to GitHub (and the same values to your local, git-ignored `.env`):
 
 | Name | Kind | What |
 | --- | --- | --- |
 | `TG_MCP_API_ID`, `TG_MCP_API_HASH` | secret | Telegram app credentials (my.telegram.org) |
 | `SSH_PRIVATE_KEY` | secret | Deploy key, `~/.ssh/tg-mcp-deploy` |
-| `KAMAL_HOST`, `KAMAL_SSH_USER` | variable | Server IP and SSH user |
+| `KAMAL_HOST`, `KAMAL_SSH_USER` | variable | Server IP and `deploy` |
 | `SSH_KNOWN_HOSTS` | variable | Pinned host key; CI refuses any other |
 
-The registry password is the workflow's own `GITHUB_TOKEN`; nothing to set.
+The registry password is the workflow's own `GITHUB_TOKEN`; nothing to set. Re-running the wizard is safe: it keeps saved values and the hardening script is idempotent.
+
+## Server baseline
+
+`scripts/harden-server.sh` (Debian/Ubuntu, run as root, idempotent) leaves the server like this:
+
+- **SSH:** public keys only (passwords and keyboard-interactive off), root allowed with a key only, `AllowUsers root deploy`, 3 attempts per connection. The config is a drop-in named `00-tg-mcp.conf` so it beats cloud-init's `50-cloud-init.conf` (sshd keeps the first value it reads), and it is checked with `sshd -t` before the reload. The script refuses to run if root has no key, so it can't lock you out.
+- **`deploy` user:** what Kamal and CI log in as. Member of `docker`, password locked, only the CI deploy key. Note that `docker` group membership is root-equivalent: the point is a separate, revocable key, not a sandbox. You keep administering as root with your personal key.
+- **Firewall (ufw):** incoming denied except 22 (rate-limited), 80 and 443.
+- **fail2ban:** sshd jail, 5 failures in 10 min → 1 h ban.
+- **Updates:** unattended-upgrades for the distro security pocket and Docker CE; reboots at 04:30 UTC when an update needs it. Containers come back on their own (`--restart unless-stopped`); in-memory state is lost as on a deploy.
+- **Docker CE** from download.docker.com, daemon with `live-restore` (containers survive a dockerd upgrade), `no-new-privileges`, and log rotation.
+
+Caveat: Docker writes its own iptables rules, so a port published with `-p` bypasses ufw. Kamal publishes only kamal-proxy's 80/443 and keeps the app on the internal Docker network, so nothing else is exposed. Don't add `publish`/`-p` options without a firewall rule in mind.
 
 ## Day-to-day
 

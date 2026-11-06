@@ -9,7 +9,7 @@ servers:
       - <%= ENV.fetch("KAMAL_HOST") %>
 
 ssh:
-  user: <%= ENV.fetch("KAMAL_SSH_USER", "root") %>
+  user: <%= ENV.fetch("KAMAL_SSH_USER", "deploy") %>
 
 registry:
   server: ghcr.io

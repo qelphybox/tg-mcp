@@ -203,11 +203,12 @@ run_wizard() {
 TOTAL_STAGES=6
 DOMAIN="tgmcp.qelphybox.space"
 DEPLOY_KEY="$HOME/.ssh/tg-mcp-deploy"
+KAMAL_SSH_USER=deploy   # created by scripts/harden-server.sh
 
 # gh infers the repo from the checkout, and .env belongs at the repo root.
 cd "$(git rev-parse --show-toplevel)"
 
-banner "tg-mcp: deploy setup (Kamal → $DOMAIN)"
+banner "tg-mcp: server + deploy setup (Kamal → $DOMAIN)"
 
 stage "Telegram app credentials"
 say "The server logs in to Telegram as your own registered app."
@@ -221,22 +222,28 @@ write_env TG_MCP_API_HASH "$TG_MCP_API_HASH"
 set_secret TG_MCP_API_ID "$TG_MCP_API_ID"
 set_secret TG_MCP_API_HASH "$TG_MCP_API_HASH"
 
-stage "Server address"
-say "The VPS Kamal deploys to. Any Linux with SSH; Kamal installs Docker itself when the user is root."
+stage "Server address and root access"
+say "A fresh Debian 12/13 or Ubuntu 22.04/24.04 VPS. We need root over SSH once, to harden it."
 ask KAMAL_HOST "Server public IPv4:"
-ask KAMAL_SSH_USER "SSH user (root unless you know otherwise):"
-[[ -n "$KAMAL_SSH_USER" ]] || KAMAL_SSH_USER=root
-if [[ "$KAMAL_SSH_USER" != root ]]; then
-  warn "Non-root user: install Docker on the server yourself and add $KAMAL_SSH_USER to the docker group first."
-fi
 write_env KAMAL_HOST "$KAMAL_HOST"
 write_env KAMAL_SSH_USER "$KAMAL_SSH_USER"
 set_var KAMAL_HOST "$KAMAL_HOST"
 set_var KAMAL_SSH_USER "$KAMAL_SSH_USER"
+until ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$KAMAL_HOST" true 2>/dev/null; do
+  warn "root@$KAMAL_HOST doesn't accept your SSH key yet."
+  note "If ssh asks to confirm the host fingerprint, compare it with your VPS provider's console."
+  if confirm "Install your personal key with ssh-copy-id (asks for the root password once)?"; then
+    ssh-copy-id "root@$KAMAL_HOST" || true
+  else
+    pause "Add your key to /root/.ssh/authorized_keys another way, then press Enter to retry."
+  fi
+done
+printf '  %s✓%s root@%s accepts your key\n' "$GREEN" "$RESET" "$KAMAL_HOST"
 
 stage "DNS: point $DOMAIN at the server"
 say "Let's Encrypt only issues the certificate once the name resolves to this server."
 step "At the DNS provider for qelphybox.space, create:  A  tgmcp  →  $KAMAL_HOST  (TTL 300, no CDN proxying)."
+step "If your VPS provider has its own cloud firewall, allow inbound TCP 22, 80 and 443 there too."
 pause "Press Enter once the record is saved."
 while true; do
   resolved=$( (command -v dig >/dev/null && dig +short A "$DOMAIN") || getent hosts "$DOMAIN" | awk '{print $1}' || true)
@@ -247,26 +254,31 @@ while true; do
   warn "$DOMAIN resolves to '${resolved:-nothing}' yet, not $KAMAL_HOST."
   confirm "Check again? (No skips; the first deploy will fail until DNS is right)" || break
 done
-step "Make sure the server's firewall allows inbound TCP 22, 80 and 443."
-pause "Press Enter when the ports are open."
 
-stage "SSH deploy key"
-say "CI deploys with its own key, so you can revoke it without touching your personal one."
+stage "Harden the server"
+say "Runs scripts/harden-server.sh as root: key-only SSH, ufw (22/80/443), fail2ban,"
+say "automatic security updates (reboot 04:30 UTC if needed), Docker CE, and a '$KAMAL_SSH_USER' user for CI."
+note "Safe to re-run. Your current root key keeps working; password logins stop working."
 if [[ -f "$DEPLOY_KEY" ]]; then
-  note "Reusing existing key $DEPLOY_KEY"
+  note "Reusing deploy key $DEPLOY_KEY"
 else
   ssh-keygen -q -t ed25519 -N "" -C "tg-mcp-deploy" -f "$DEPLOY_KEY"
-  printf '  %s✓ generated%s %s\n' "$GREEN" "$RESET" "$DEPLOY_KEY"
+  printf '  %s✓ generated%s deploy key %s\n' "$GREEN" "$RESET" "$DEPLOY_KEY"
 fi
-say "Next we install the public key on $KAMAL_SSH_USER@$KAMAL_HOST (asks for your usual SSH login once)."
-note "If ssh asks you to confirm the host fingerprint, compare it with your VPS provider's console."
-if confirm "Run ssh-copy-id now?"; then
-  ssh-copy-id -i "$DEPLOY_KEY.pub" "$KAMAL_SSH_USER@$KAMAL_HOST"
+if confirm "Harden root@$KAMAL_HOST now?"; then
+  # shellcheck disable=SC2029 # the key is meant to expand locally, quoted for the remote shell
+  ssh "root@$KAMAL_HOST" "bash -s -- $(printf '%q' "$(cat "$DEPLOY_KEY.pub")")" < scripts/harden-server.sh
 fi
-if ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o IdentitiesOnly=yes "$KAMAL_SSH_USER@$KAMAL_HOST" true; then
-  printf '  %s✓%s deploy key logs in\n' "$GREEN" "$RESET"
+if ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o IdentitiesOnly=yes "$KAMAL_SSH_USER@$KAMAL_HOST" docker ps >/dev/null; then
+  printf '  %s✓%s %s@%s logs in with the deploy key and can run docker\n' "$GREEN" "$RESET" "$KAMAL_SSH_USER" "$KAMAL_HOST"
 else
-  warn "deploy key can't log in yet; add $DEPLOY_KEY.pub to ~$KAMAL_SSH_USER/.ssh/authorized_keys by hand"
+  warn "the deploy key can't run docker as $KAMAL_SSH_USER yet; re-run this wizard after fixing it"
+  pause
+fi
+if ssh -o BatchMode=yes "root@$KAMAL_HOST" true; then
+  printf '  %s✓%s your root login still works\n' "$GREEN" "$RESET"
+else
+  warn "root login with your key failed: use the provider's web console to check /etc/ssh/sshd_config.d/00-tg-mcp.conf"
   pause
 fi
 set_secret SSH_PRIVATE_KEY "$(cat "$DEPLOY_KEY")"
@@ -286,18 +298,18 @@ if [[ -n "$SSH_KNOWN_HOSTS" ]]; then
 fi
 
 stage "First deploy"
-say "The first run is 'kamal setup': installs Docker if needed, boots kamal-proxy, gets the TLS certificate, deploys."
-note "The Deploy workflow must be on main for this (GitHub only runs manual workflows from the default branch)."
-if confirm "Trigger 'kamal setup' on main now?"; then
-  if gh workflow run deploy.yml --ref main -f command=setup; then
+say "Docker is already on the server, so a plain 'kamal deploy' does it: boots kamal-proxy, gets the TLS certificate, starts the app."
+note "The Deploy workflow must be on main (GitHub only runs manual workflows from the default branch); a push to main deploys by itself."
+if confirm "Trigger the Deploy workflow on main now?"; then
+  if gh workflow run deploy.yml --ref main -f command=deploy; then
     printf '  %s✓%s started; watching the run (Ctrl-C stops watching, not the deploy)\n' "$GREEN" "$RESET"
     sleep 5
     gh run watch "$(gh run list --workflow deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')" || true
   else
-    SKIPPED+=("first deploy: merge to main, then: gh workflow run deploy.yml --ref main -f command=setup")
+    SKIPPED+=("first deploy: merge to main (the push deploys), or: gh workflow run deploy.yml --ref main")
   fi
 else
-  SKIPPED+=("first deploy: gh workflow run deploy.yml --ref main -f command=setup")
+  SKIPPED+=("first deploy: merge to main (the push deploys), or: gh workflow run deploy.yml --ref main")
 fi
 say "Then check:  curl https://$DOMAIN/healthz"
 
