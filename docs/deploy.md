@@ -6,7 +6,7 @@ Production runs at `https://tgmcp.qelphybox.space` on one VPS, deployed with [Ka
 
 1. GitHub Actions builds the image from `Dockerfile` and pushes it to `ghcr.io/qelphybox/tg-mcp:<git sha>`.
 2. Kamal SSHes into the server, pulls the image and starts the new container next to the old one.
-3. kamal-proxy polls `/healthz` on the new container; once it answers, traffic switches over. The old container drains for up to `drain_timeout` (30 s), then gets SIGTERM.
+3. kamal-proxy polls `/healthz` on the new container; once it answers, traffic switches over. The old container drains for up to `drain_timeout` (30 s), then gets SIGTERM and has `stop_timeout` (30 s) to exit before SIGKILL. On SIGTERM it closes MCP streams, waits for in-flight requests, then closes every Live client and re-seals each Telegram session that changed while live (bounded to 10 s; logged as `client pool flushed` with counts).
 
 Triggers: every push to `main`, or **Actions → Deploy → Run workflow** (pick `setup` for a fresh server, `deploy` otherwise). Manual runs only appear once the workflow is on `main`.
 
@@ -17,7 +17,7 @@ Client IPs: the app only sees kamal-proxy as its TCP peer. kamal-proxy (with `ss
 ## What survives a deploy
 
 - **Survives:** everything in SQLite (Grants, Tokens, encrypted Telegram sessions) on the `tg-mcp-data` volume, mounted at `/data`.
-- **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call), authorization codes and logins in progress (the user starts the browser flow again), rate-limit counters (they start full again).
+- **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call; Telegram session changes they held, such as a DC migration, are re-sealed on a graceful shutdown, but lost on SIGKILL or a crash), authorization codes and logins in progress (the user starts the browser flow again), rate-limit counters (they start full again).
 
 ## First deploy
 

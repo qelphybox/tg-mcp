@@ -10,7 +10,7 @@ use tg_mcp::{
     limits::Limits,
     sessions::{TokenTtl, Vault},
     tg::{
-        Connector, FakeConnector, FakeLogin, Login,
+        self, Connector, FakeConnector, FakeLogin, Login,
         grammers::{GrammersConnector, GrammersLogin},
     },
 };
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         vault,
         clients: ClientRegistry::new(pool),
         login,
-        connector,
+        connector: connector.clone(),
     };
     let shutdown = CancellationToken::new();
     let app = tg_mcp::app(&config, deps, shutdown.clone());
@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         shutdown.cancel();
     })
     .await?;
+
+    // Every connection is closed by now, so no request can open a Live client
+    // while the pool is drained.
+    tg::shut_down(connector.as_ref(), tg::SHUTDOWN_TIMEOUT).await;
     Ok(())
 }
 

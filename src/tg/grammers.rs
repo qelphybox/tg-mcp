@@ -20,7 +20,7 @@ use super::{
         self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, RawDialog, RawMessage, RawPeer,
     },
     messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
-    pool::{Live, Pool},
+    pool::{Evicted, Live, Pool},
     session::SessionStore,
 };
 use crate::sessions::{OpenedGrant, Vault};
@@ -915,6 +915,9 @@ pub struct GrammersConnector {
     vault: Arc<Vault>,
     limits: Arc<Limits>,
     pool: Pool<LiveClient>,
+    /// Held while Live clients taken out of the pool are re-sealed, so shutdown
+    /// waits for a sweep's in-flight saves instead of exiting under them.
+    resealing: tokio::sync::Mutex<()>,
 }
 
 impl GrammersConnector {
@@ -929,6 +932,7 @@ impl GrammersConnector {
             vault,
             limits,
             pool: Pool::new(idle_ttl),
+            resealing: tokio::sync::Mutex::new(()),
         });
         tokio::spawn(sweep(Arc::downgrade(&connector)));
         connector
@@ -956,6 +960,22 @@ impl GrammersConnector {
                 Err(err)
             }
         }
+    }
+
+    /// Seal each changed Telegram session back into its Grant. Returns how many
+    /// were saved and how many failed.
+    async fn reseal(&self, changed: Vec<Evicted<LiveClient>>) -> (usize, usize) {
+        let (mut saved, mut failed) = (0, 0);
+        for (_, live, snapshot) in changed {
+            match self.vault.save_session(&live.grant, &snapshot).await {
+                Ok(()) => saved += 1,
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(grant_id = %live.grant.grant_id, error = %err, "re-sealing telegram session failed");
+                }
+            }
+        }
+        (saved, failed)
     }
 }
 
@@ -1002,6 +1022,13 @@ impl Connector for GrammersConnector {
             Err(_) => Err(TgError::Upstream("auth.logOut timed out".into())),
         }
     }
+
+    async fn shutdown(&self) {
+        let _resealing = self.resealing.lock().await;
+        let live_clients = self.pool.len();
+        let (resealed, failed) = self.reseal(self.pool.drain()).await;
+        tracing::info!(live_clients, resealed, failed, "client pool flushed");
+    }
 }
 
 /// Every minute: evict idle Live clients and re-seal sessions that changed.
@@ -1012,11 +1039,8 @@ async fn sweep(connector: Weak<GrammersConnector>) {
         let Some(connector) = connector.upgrade() else {
             return;
         };
-        for (_, live, snapshot) in connector.pool.evict_idle() {
-            if let Err(err) = connector.vault.save_session(&live.grant, &snapshot).await {
-                tracing::warn!(grant_id = %live.grant.grant_id, error = %err, "re-sealing telegram session failed");
-            }
-        }
+        let _resealing = connector.resealing.lock().await;
+        connector.reseal(connector.pool.evict_idle()).await;
     }
 }
 
@@ -1179,6 +1203,76 @@ mod live_tests {
     }
 }
 
+/// A Live client for `grant` whose connection is never started: the runner is
+/// dropped, so every request fails right away and nothing leaves the machine.
+#[cfg(test)]
+fn offline_live(grant: OpenedGrant, store: Arc<SessionStore>) -> LiveClient {
+    let SenderPool { handle, .. } = SenderPool::new(store.clone(), 0);
+    LiveClient {
+        client: Client::new(handle),
+        store,
+        grant,
+        peers: Default::default(),
+        dead: Default::default(),
+        limiter: Arc::new(AccountLimiter::new(crate::limits::LimitsConfig::default())),
+        sent: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use grammers_session::Session;
+
+    use super::*;
+    use crate::{
+        limits::LimitsConfig,
+        sessions::{TokenTtl, Vault},
+        tg::{SHUTDOWN_TIMEOUT, shut_down},
+    };
+
+    #[tokio::test]
+    async fn shutdown_reseals_a_session_that_changed_while_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(
+            Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+                .await
+                .unwrap(),
+        );
+        let sealed = SessionStore::new().snapshot().unwrap();
+        let issued = vault.create_grant("client", 42, &sealed).await.unwrap();
+        let connector = GrammersConnector::new(
+            AppCredentials {
+                api_id: 0,
+                api_hash: "unused".into(),
+            },
+            vault.clone(),
+            Arc::new(Limits::new(LimitsConfig::default())),
+            Duration::from_secs(3600),
+        );
+
+        // A Live client, just used (an idle sweep would keep it)...
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        let key = grant.grant_id.as_str().to_string();
+        let store = Arc::new(SessionStore::from_snapshot(&grant.telegram_session).unwrap());
+        let live = offline_live(grant, store.clone());
+        connector
+            .pool
+            .get_or_open(&key, &sealed, || async { Ok(live) })
+            .await
+            .unwrap();
+        // ...whose session moved to another DC while live.
+        let home = store.home_dc_id().unwrap();
+        store.set_home_dc_id(home % 5 + 1).await.unwrap();
+        let moved = store.snapshot().unwrap();
+        assert_ne!(moved.as_slice(), sealed.as_slice());
+
+        assert!(shut_down(connector.as_ref(), SHUTDOWN_TIMEOUT).await);
+        assert_eq!(connector.pool.len(), 0, "no Live client survives shutdown");
+        let reopened = vault.open(issued.access.expose()).await.unwrap();
+        assert_eq!(reopened.telegram_session.as_slice(), moved.as_slice());
+    }
+}
+
 /// What `get_messages` / `get_chat_info` send to Telegram for each kind of id,
 /// on a fresh Live client (empty peer cache) whose connection is never started:
 /// every request is recorded, then fails at once, so nothing leaves the machine.
@@ -1187,10 +1281,7 @@ mod resolve_tests {
     use grammers_client::tl::{Identifiable, Serializable};
 
     use super::*;
-    use crate::{
-        limits::LimitsConfig,
-        sessions::{TokenTtl, Vault},
-    };
+    use crate::sessions::{TokenTtl, Vault};
 
     const ACCOUNT: i64 = 42;
 
@@ -1201,19 +1292,7 @@ mod resolve_tests {
             .unwrap();
         let issued = vault.create_grant("client", ACCOUNT, b"").await.unwrap();
         let grant = vault.open(issued.access.expose()).await.unwrap();
-        let store = Arc::new(SessionStore::new());
-        // The runner is dropped: no connection, every request fails right away.
-        let SenderPool { handle, .. } = SenderPool::new(store.clone(), 0);
-        let live = LiveClient {
-            client: Client::new(handle),
-            store,
-            grant,
-            peers: Default::default(),
-            dead: Default::default(),
-            limiter: Arc::new(AccountLimiter::new(LimitsConfig::default())),
-            sent: Default::default(),
-        };
-        (live, dir)
+        (offline_live(grant, Arc::new(SessionStore::new())), dir)
     }
 
     fn sent(live: &LiveClient) -> Vec<Vec<u8>> {

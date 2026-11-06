@@ -444,6 +444,8 @@ struct FakeTelegramSide {
     /// Accounts `auth.logOut` was called for, in order.
     logged_out: Mutex<Vec<i64>>,
     unreachable: std::sync::atomic::AtomicBool,
+    /// How many times [`Connector::shutdown`] was called.
+    shutdowns: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeConnector {
@@ -455,6 +457,13 @@ impl FakeConnector {
     /// Accounts whose session was logged out through [`Connector::log_out`].
     pub fn logged_out(&self) -> Vec<i64> {
         self.telegram.logged_out.lock().unwrap().clone()
+    }
+
+    /// How many times the server shut this connector down.
+    pub fn shutdowns(&self) -> usize {
+        self.telegram
+            .shutdowns
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Make every call to Telegram fail as if it were down.
@@ -504,5 +513,12 @@ impl Connector for FakeConnector {
         self.telegram.dead.lock().unwrap().insert(account_id);
         self.telegram.logged_out.lock().unwrap().push(account_id);
         Ok(())
+    }
+
+    /// Nothing is held open, so there is nothing to flush; only counted.
+    async fn shutdown(&self) {
+        self.telegram
+            .shutdowns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }

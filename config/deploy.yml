@@ -53,6 +53,9 @@ volumes:
 
 # Old container gets this long to finish in-flight requests before SIGTERM.
 drain_timeout: 30
+# Then this long to exit after SIGTERM before SIGKILL (Docker's default is 10 s
+# for proxied roles); shutdown re-seals changed Telegram sessions in this window.
+stop_timeout: 30
 
 logging:
   options:

@@ -18,7 +18,7 @@ mod session;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,32 @@ pub trait Connector: Send + Sync + 'static {
     /// Active sessions) and drop its Live client. A session Telegram already
     /// considers dead counts as logged out.
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError>;
+
+    /// Graceful shutdown, once the HTTP server has stopped: close every Live client
+    /// and re-seal each Telegram session that changed while it was live. Failures
+    /// are logged (Grant ids only), not returned: the process is exiting anyway.
+    /// Call it through [`shut_down`], which bounds how long it may take.
+    async fn shutdown(&self);
+}
+
+/// How long graceful shutdown waits for [`Connector::shutdown`]. Docker gives a
+/// container 10 s between SIGTERM and SIGKILL unless told otherwise (Kamal's
+/// `stop_timeout`); re-sealing normally takes milliseconds.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run [`Connector::shutdown`], giving up after `within` so a hung save can't
+/// block exit. Returns whether it finished in time.
+pub async fn shut_down(connector: &dyn Connector, within: Duration) -> bool {
+    let finished = tokio::time::timeout(within, connector.shutdown())
+        .await
+        .is_ok();
+    if !finished {
+        tracing::warn!(
+            timeout_s = within.as_secs(),
+            "flushing the client pool timed out; unsaved telegram session changes are lost"
+        );
+    }
+    finished
 }
 
 /// Starts the Telegram part of a Login flow.
@@ -150,5 +176,44 @@ impl fmt::Debug for LoggedIn {
                 &format_args!("<{} bytes>", self.telegram_session.len()),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connector whose shutdown never finishes (e.g. the database hangs).
+    struct Hung;
+
+    #[async_trait::async_trait]
+    impl Connector for Hung {
+        async fn connect(&self, _: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError> {
+            unreachable!()
+        }
+        async fn log_out(&self, _: OpenedGrant) -> Result<(), TgError> {
+            unreachable!()
+        }
+        async fn shutdown(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_shutdown_is_cut_off() {
+        let started = tokio::time::Instant::now();
+        let finished =
+            tokio::time::timeout(2 * SHUTDOWN_TIMEOUT, shut_down(&Hung, SHUTDOWN_TIMEOUT))
+                .await
+                .expect("shut_down gives up on its own");
+        assert!(!finished);
+        assert_eq!(started.elapsed(), SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_finished_shutdown_is_reported() {
+        let connector = FakeConnector::default();
+        assert!(shut_down(&connector, SHUTDOWN_TIMEOUT).await);
+        assert_eq!(connector.shutdowns(), 1);
     }
 }
