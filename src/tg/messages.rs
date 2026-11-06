@@ -187,6 +187,7 @@ mod tests {
             kind: ChatKind::Private,
             username: None,
             access_hash: None,
+            is_self: false,
         }
     }
 

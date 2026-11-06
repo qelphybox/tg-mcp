@@ -16,6 +16,7 @@ fn summary(id: ChatId, title: &str, kind: ChatKind, username: Option<&str>) -> C
         title: title.into(),
         kind,
         username: username.map(str::to_string),
+        is_self: false,
         unread_count: 0,
         pinned: false,
         last_message: None,
@@ -57,6 +58,13 @@ async fn client() -> (
             FakeDetails {
                 description: Some("   ".into()),
                 member_count: Some(5),
+            },
+        )
+        .with_details(
+            ChatId::User(42),
+            FakeDetails {
+                description: Some("my own bio".into()),
+                member_count: None,
             },
         );
     let server = start_with(vec![data]).await;
@@ -104,8 +112,16 @@ async fn describes_channels_people_and_groups() {
         json!({ "id": "chat:404", "title": "Family", "type": "group", "member_count": 5 }),
         "a blank description is left out"
     );
-    // The account itself is a valid chat ("Saved Messages").
-    assert_eq!(info(&client, "user:42").await.unwrap()["title"], "Me");
+    // The account itself ("Saved Messages") is marked, with its own bio.
+    let me = info(&client, "user:42").await.unwrap();
+    assert_eq!(me["title"], "Me");
+    assert_eq!(me["is_self"], true);
+    assert_eq!(me["description"], "my own bio");
+    assert_eq!(
+        channel.get("is_self"),
+        None,
+        "only the account itself is marked"
+    );
 }
 
 #[tokio::test]

@@ -541,10 +541,16 @@ impl Telegram for LiveClient {
                 let tl::enums::users::UserFull::Full(full) = self
                     .call(
                         &tl::functions::users::GetFullUser {
-                            id: tl::enums::InputUser::User(tl::types::InputUser {
-                                user_id: u.user_id,
-                                access_hash: u.access_hash,
-                            }),
+                            // The Account itself: inputUserSelf always works and
+                            // returns its own bio.
+                            id: if u.user_id == self.grant.account_id {
+                                tl::enums::InputUser::UserSelf
+                            } else {
+                                tl::enums::InputUser::User(tl::types::InputUser {
+                                    user_id: u.user_id,
+                                    access_hash: u.access_hash,
+                                })
+                            },
                         },
                         Some(chat),
                     )
@@ -775,6 +781,7 @@ fn raw_user(user: tl::enums::User) -> Option<RawPeer> {
         },
         username: u.username,
         access_hash: u.access_hash,
+        is_self: u.is_self,
     })
 }
 
@@ -793,6 +800,7 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
             kind: ChatKind::Group,
             username: None,
             access_hash: None,
+            is_self: false,
         }),
         tl::enums::Chat::Forbidden(c) => Some(RawPeer {
             id: ChatId::Chat(c.id),
@@ -800,6 +808,7 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
             kind: ChatKind::Group,
             username: None,
             access_hash: None,
+            is_self: false,
         }),
         tl::enums::Chat::Channel(c) => Some(RawPeer {
             id: ChatId::Channel(c.id),
@@ -807,6 +816,7 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
             kind: channel_kind(c.megagroup),
             username: c.username,
             access_hash: c.access_hash,
+            is_self: false,
         }),
         tl::enums::Chat::ChannelForbidden(c) => Some(RawPeer {
             id: ChatId::Channel(c.id),
@@ -814,6 +824,7 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
             kind: channel_kind(c.megagroup),
             username: None,
             access_hash: Some(c.access_hash),
+            is_self: false,
         }),
         _ => None,
     }

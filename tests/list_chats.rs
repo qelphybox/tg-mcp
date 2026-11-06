@@ -16,6 +16,7 @@ fn chat(n: usize) -> ChatSummary {
         title: format!("Friend {n}"),
         kind: ChatKind::Private,
         username: None,
+        is_self: false,
         unread_count: n as i32,
         pinned: false,
         last_message: Some(MessagePreview {

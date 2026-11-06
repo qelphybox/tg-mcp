@@ -201,6 +201,7 @@ impl FakeTelegram {
                     kind: c.kind,
                     username: c.username.clone(),
                     access_hash: None,
+                    is_self: c.is_self,
                 })
             })
             .chain(std::iter::once(RawPeer {
@@ -209,6 +210,7 @@ impl FakeTelegram {
                 kind: ChatKind::Private,
                 username: me.username.clone(),
                 access_hash: None,
+                is_self: true,
             }))
             .collect()
     }
@@ -230,6 +232,7 @@ pub fn sample_chats() -> Vec<ChatSummary> {
         title: title.into(),
         kind,
         username: None,
+        is_self: false,
         unread_count: unread,
         pinned: false,
         last_message: Some(MessagePreview {

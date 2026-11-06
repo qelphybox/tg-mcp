@@ -97,6 +97,9 @@ pub struct ChatSummary {
     pub kind: ChatKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// The connected account itself: this chat is Telegram's "Saved Messages".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
     pub unread_count: i32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
@@ -121,7 +124,11 @@ pub struct ChatInfo {
     pub kind: ChatKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Bio of a user, or the description of a group/channel.
+    /// The connected account itself: this chat is Telegram's "Saved Messages".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
+    /// Bio of a user, or the description of a group/channel. Absent if there is
+    /// none, or if the person hides it from this account (privacy settings).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Members of a group, subscribers of a channel; absent when Telegram hides it.
@@ -148,6 +155,7 @@ pub fn chat_info(
         title: peer.title.clone(),
         kind: peer.kind,
         username: peer.username.clone(),
+        is_self: peer.is_self,
         description,
         member_count,
     }
@@ -164,6 +172,8 @@ pub struct RawPeer {
     pub kind: ChatKind,
     pub username: Option<String>,
     pub access_hash: Option<i64>,
+    /// The connected Account itself (its chat is Telegram's Saved Messages).
+    pub is_self: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +254,7 @@ pub fn assemble_page(
                     ChatId::Channel(_) => ChatKind::Channel,
                 }),
                 username: peer.and_then(|p| p.username.clone()),
+                is_self: peer.is_some_and(|p| p.is_self),
                 unread_count: dialog.unread_count,
                 pinned: dialog.pinned,
                 last_message: top.map(|m| MessagePreview {
@@ -292,7 +303,35 @@ mod tests {
             kind,
             username: None,
             access_hash: hash,
+            is_self: false,
         }
+    }
+
+    #[test]
+    fn the_accounts_own_chat_is_marked_self() {
+        let me = RawPeer {
+            is_self: true,
+            ..peer(ChatId::User(42), "Me", ChatKind::Private, Some(1))
+        };
+        let dialogs = [
+            RawDialog {
+                chat: ChatId::User(42),
+                top_message: 1,
+                unread_count: 0,
+                pinned: false,
+            },
+            RawDialog {
+                chat: ChatId::User(7),
+                top_message: 2,
+                unread_count: 0,
+                pinned: false,
+            },
+        ];
+        let other = peer(ChatId::User(7), "Bob", ChatKind::Private, Some(2));
+        let page = assemble_page(&dialogs, &[me.clone(), other], &[], false, false);
+        assert!(page.chats[0].is_self);
+        assert!(!page.chats[1].is_self);
+        assert!(chat_info(&me, None, None).is_self);
     }
 
     #[test]

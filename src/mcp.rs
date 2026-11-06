@@ -132,7 +132,8 @@ impl TgMcp {
 groups, supergroups and channels. Each has an `id` (user:N, chat:N or channel:N) to pass to the \
 other tools, a title, its type, the unread count and a short preview of the last message (media \
 shown as [photo], [voice], ...). Paginated: pass `next_cursor` back as `cursor` for the next page; \
-no `next_cursor` means this was the last page. Previews are cut to 100 characters.",
+no `next_cursor` means this was the last page. Previews are cut to 100 characters. \
+`is_self: true` marks the account's own chat (Telegram's Saved Messages), not another person.",
         annotations(
             title = "List chats",
             read_only_hint = true,
@@ -206,7 +207,9 @@ is nothing older (within `since`). Narrow by time with `since`/`until`.",
         title = "Get chat info",
         description = "Details of one chat, user, group or channel by `chat_id` from list_chats \
 (user:N, chat:N or channel:N): title, type, @username, the bio or description (cut to 1000 \
-characters) and the number of members or subscribers when Telegram shows it.",
+characters) and the number of members or subscribers when Telegram shows it. A missing \
+description doesn't mean there is none: people can hide their bio from this account in their \
+privacy settings. `is_self: true` is the account itself (Saved Messages).",
         annotations(
             title = "Get chat info",
             read_only_hint = true,

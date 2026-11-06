@@ -21,6 +21,7 @@ fn alice_chat() -> ChatSummary {
         title: "Alice".into(),
         kind: ChatKind::Private,
         username: None,
+        is_self: false,
         unread_count: 0,
         pinned: false,
         last_message: None,
