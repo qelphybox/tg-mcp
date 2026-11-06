@@ -160,7 +160,7 @@ pub fn consent(view: &ConsentView<'_>) -> Response {
             r#"<h1>Allow access?</h1>
 <p><b>{client}</b> will get <b>read-only access to all chats</b> of <b>{account}</b>{username}.</p>
 <p class="muted">It can read chats and messages. It can't send, edit or delete anything.</p>
-<p class="muted">To disconnect later, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices.</p>
+<p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in {client} alone does not end that session.</p>
 <p class="muted">After you allow, you'll be sent to <b>{target}</b>. If you don't recognise it, deny.</p>
 <form method="post" action="/login/{id}/consent">
   <div class="row">

@@ -188,6 +188,8 @@ async fn consent_page_shows_who_gets_what_and_cannot_be_framed() {
         "Alice",
         "@alice",
         "127.0.0.1",
+        "Settings → Devices",
+        "in Test Client alone does not end that session",
     ] {
         assert!(html.contains(needle), "consent page lacks {needle:?}");
     }
