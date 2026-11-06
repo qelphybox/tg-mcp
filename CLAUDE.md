@@ -15,7 +15,7 @@ Rust (latest stable), tokio, axum, rmcp (MCP), grammers (Telegram, version pinne
 ## Rules that are not visible in the code
 
 - Never log message content, Tokens, Session keys or Telegram sessions. Log ids and sizes only.
-- Every MCP tool is read-only (`readOnlyHint: true`), has bounded input/output schemas and a capped response size.
+- Read tools are read-only (`readOnlyHint: true`). Write tools act only within their Scope and the Send allow-list, go through the writes budget and never forward (ADR-0005). Every tool has bounded input/output schemas and a capped response size.
 - Telegram's `FLOOD_WAIT` is honoured, never retried around.
 - The Session key is never persisted in plaintext (ADR-0003). Anything that would need it without a Token is a design bug.
 - Repo artifacts (code, comments, issues, docs) are in English.
