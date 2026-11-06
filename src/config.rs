@@ -1,6 +1,6 @@
 //! Configuration from environment variables. Every variable is documented in `.env.example`.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, bail};
 use axum::http::Uri;
@@ -13,6 +13,8 @@ pub struct Config {
     pub public_url: Uri,
     /// Serve a fixed fake Account instead of Telegram. Development only.
     pub fake_telegram: bool,
+    /// SQLite database file of the Session vault.
+    pub db_path: PathBuf,
 }
 
 impl Config {
@@ -36,11 +38,15 @@ impl Config {
         }
 
         let fake_telegram = matches!(get("TG_MCP_FAKE_TELEGRAM").as_deref(), Some("1" | "true"));
+        let db_path = get("TG_MCP_DB_PATH")
+            .unwrap_or_else(|| "tg-mcp.db".into())
+            .into();
 
         Ok(Self {
             bind,
             public_url,
             fake_telegram,
+            db_path,
         })
     }
 
@@ -78,6 +84,7 @@ mod tests {
         assert_eq!(config.bind.to_string(), "0.0.0.0:8080");
         assert_eq!(config.public_url.to_string(), "http://localhost:8080/");
         assert!(!config.fake_telegram);
+        assert_eq!(config.db_path, PathBuf::from("tg-mcp.db"));
     }
 
     #[test]

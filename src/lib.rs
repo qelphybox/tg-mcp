@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod mcp;
+pub mod sessions;
 pub mod tg;
 
 use std::sync::Arc;

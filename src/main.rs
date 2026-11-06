@@ -1,7 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use tg_mcp::{config::Config, tg::FakeTelegram};
+use std::time::Duration;
+
+use tg_mcp::{
+    config::Config,
+    sessions::{TokenTtl, Vault},
+    tg::FakeTelegram,
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -19,6 +25,14 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::warn!("serving a FAKE Telegram account (TG_MCP_FAKE_TELEGRAM=1)");
 
+    let vault = Arc::new(
+        Vault::open_path(&config.db_path, TokenTtl::default())
+            .await
+            .with_context(|| format!("opening the vault at {}", config.db_path.display()))?,
+    );
+    tracing::info!(db = %config.db_path.display(), "vault ready");
+    tokio::spawn(purge_expired_tokens(vault.clone()));
+
     let shutdown = CancellationToken::new();
     let app = tg_mcp::app(&config, Arc::new(FakeTelegram::default()), shutdown.clone());
 
@@ -34,6 +48,18 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+async fn purge_expired_tokens(vault: Arc<Vault>) {
+    let mut every = tokio::time::interval(Duration::from_secs(60 * 60));
+    loop {
+        every.tick().await;
+        match vault.purge_expired().await {
+            Ok(0) => {}
+            Ok(purged) => tracing::info!(purged, "expired tokens purged"),
+            Err(err) => tracing::warn!(error = %err, "purging expired tokens failed"),
+        }
+    }
 }
 
 async fn shutdown_signal() {

@@ -7,19 +7,29 @@ edition = "2024"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 axum = "0.8"
+base64 = "0.23.1"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+getrandom = "0.4.3"
+hkdf = "0.13.0"
 rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "macros"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite-bundled", "runtime-tokio", "migrate", "macros"] }
+subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.0", features = ["v4"] }
+zeroize = "1.9.1"
 
 [dev-dependencies]
 reqwest = { version = "0.13.5", default-features = false }
 rmcp = { version = "3.9.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net"] }
 tokio-util = "0.7.20"
