@@ -120,9 +120,60 @@ fn assemble(answer: FoundAnswer, known: KnownHashes<'_>, limit: usize) -> FoundC
     FoundChats { chats }
 }
 
+/// How many common chats `messages.getCommonChats` is asked for: get_chat_info
+/// shows at most this many.
+pub const MAX_COMMON_CHATS: usize = 20;
+
+/// The groups and channels the Account shares with a user, from a
+/// `messages.getCommonChats` answer's chats: in Telegram's order, each once,
+/// at most `limit`, with issued ids (a hash seen before when the answer gives
+/// none).
+pub fn common_chats(peers: &[RawPeer], known: KnownHashes<'_>, limit: usize) -> FoundChats {
+    let issuer = Issuer::new(peers, known);
+    let mut seen = HashSet::new();
+    let chats = peers
+        .iter()
+        .filter(|p| seen.insert(p.id))
+        .take(limit)
+        .map(|p| FoundChat {
+            id: issuer.issue(p.id, ChatRef::from(p.id)).to_string(),
+            title: p.title.clone(),
+            kind: p.kind,
+            username: p.username.clone(),
+        })
+        .collect();
+    FoundChats { chats }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_chats_are_each_shown_once_with_issued_ids() {
+        let group = ChatId::Chat(1);
+        let channel = ChatId::Channel(2);
+        let min = ChatId::Channel(3);
+        let peers = [
+            peer(group, "Family", None),
+            peer(channel, "Team", Some(20)),
+            peer(group, "Family", None),
+            peer(min, "Min", None),
+        ];
+        let known = |chat: ChatId| (chat == min).then_some(30);
+        let found = common_chats(&peers, &known, 20);
+        assert_eq!(
+            ids(&found),
+            [
+                "chat:1".to_string(),
+                ChatRef::new(channel, Some(20)).to_string(),
+                ChatRef::new(min, Some(30)).to_string(),
+            ]
+        );
+        assert_eq!(found.chats[1].title, "Team");
+        assert_eq!(found.chats[1].kind, ChatKind::Channel);
+        assert_eq!(common_chats(&peers, &unknown, 1).chats.len(), 1);
+    }
 
     /// No hash seen before: what a cold Live client knows.
     fn unknown(_: ChatId) -> Option<i64> {

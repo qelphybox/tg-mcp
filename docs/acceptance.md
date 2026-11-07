@@ -363,3 +363,25 @@ Then run:
 5. `<T>`: a tool error saying the thumbnail isn't an image clients can show (or that Telegram has no thumbnail for it), or, if Telegram gives the animated sticker a WebP thumbnail, one `image/webp` image; any of these is fine, a mislabelled or broken image is not. `<P>`: a tool error saying the file has no thumbnail and to use mode `download`. `<V>`: a tool error saying it is audio with no picture. `download` with `size`: an invalid-params error `size only applies to mode view`.
 
 Then on the server: `kamal app logs | grep 'media view served'` shows one line per successful view with `message_id`, `images` and `bytes` only; nothing else of the images (no base64, no file names) is in the logs.
+
+## 40. get_chat_info on a user shows the profile Telegram shows the account, and common chats on request
+
+Needs, in `list_chats` or found with `find_chats`: a contact `<C>` who shows you their bio and phone number (a mutual contact with default privacy settings; ideally also a birthday), a bot `<B>` (e.g. `@BotFather`), a person `<H>` who hides their phone number from you (someone who isn't your contact; check in the app: their profile shows no number), and a group `<G>`. Write down beforehand, from the Telegram app: `<C>`'s bio, phone, birthday and "last seen" line, the number of "Groups in common" in `<C>`'s profile, and `<H>`'s "last seen" line. In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), replace the `<…>` and run:
+
+```text
+Через Telegram MCP проверь get_chat_info для пользователей. Телефоны и био не пересказывай: для них пиши только «есть, совпадает с приложением / не совпадает / нет».
+1. get_chat_info для <C> (id из list_chats или find_chats). Выведи все поля ответа, кроме bio и phone (для них — есть/нет), и phone только в формате: начинается ли с «+», сколько цифр.
+2. get_chat_info для <B>. Выведи type, bot, есть ли bio, первые 40 символов bot_description, есть ли status и common_chats_count.
+3. get_chat_info для <H>. Выведи все поля ответа; есть ли phone, birthday, bio.
+4. get_chat_info для <C> с common_chats=true. Выведи common_chats_count и для каждого чата из common_chats id и type (названия не выводи). Потом get_messages с limit=1 для первого id из common_chats: работает ли (да/нет, текст не выводи)?
+5. get_chat_info для <G> с common_chats=true и для своего аккаунта (is_self: true в list_chats) с common_chats=true. Выведи текст ошибки или common_chats.
+Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: `type: "private"`, `bio` the same as in the app, no `description` and no `member_count`; `status` matches the app's "last seen" line (`online`; `last_seen` with `last_seen_at` in UTC, the app's local time converted; or `recently` / `last_week` / `last_month` / `long_ago` for "last seen recently / within a week / within a month / a long time ago"); `phone` starts with `+` and is the number the app shows; `birthday` = `{ day, month, year }` as the app shows it (no `year` if the app shows none), absent if the app shows none; `verified`/`premium` only if true; `common_chats_count` = the app's "Groups in common" (0 when there are none, never absent).
+2. Step 2: `type: "bot"`, `bot: true`, `bot_description` = the bot's "What can this bot do?" text; no `status`.
+3. Step 3: no `phone` field at all (not empty, not null), no `birthday` or `bio` unless the app shows them; `status` matches the app (usually an approximate one), `common_chats_count` present.
+4. Step 4: `common_chats` lists the groups and channels of the app's "Groups in common" (at most 20; `common_chats_count` may be larger), each with an `id` (`chat:N`, or `channel:N~H` with an 11-character `~` part) and a `type`; the first id works with get_messages.
+5. Step 5: the group is an `invalid_params` error `common_chats is only for users …`; the account itself gives `common_chats: []`.
+
+`kamal app logs | grep -F '<the last 4 digits of C's phone>'` and `kamal app logs | grep -iF '<a word of C's bio>'` find nothing: profile content is never logged.
