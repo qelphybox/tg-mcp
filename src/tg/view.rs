@@ -236,6 +236,14 @@ pub fn choices(item: &AlbumItem, want: ViewSize) -> Result<Vec<&PictureSize>, St
         .filter(|s| s.fetchable())
         .collect();
     let Some(preferred) = preferred(&fetchable, want) else {
+        // What Telegram did send, to tell "no thumbnail" from one in a form
+        // we don't take: Telegram's size names, forms and sizes only.
+        tracing::info!(
+            message_id = id,
+            kind = item.media.kind.name(),
+            sizes = %sizes_summary(item),
+            "media view found no fetchable picture size"
+        );
         return Err(match item.media.kind {
             MediaKind::Photo => format!(
                 "message {id}'s photo is no longer available (e.g. a self-destructing one that \
@@ -255,6 +263,30 @@ pub fn choices(item: &AlbumItem, want: ViewSize) -> Result<Vec<&PictureSize>, St
         .collect();
     smaller.sort_by_key(|s| std::cmp::Reverse(s.bytes));
     Ok(std::iter::once(preferred).chain(smaller).collect())
+}
+
+/// `item`'s picture sizes for a log line, e.g. `i:Stripped:0x0:41b,m:File:320x180:0b`,
+/// or `none` when its media has no picture at all. Size names are cut to
+/// what Telegram uses (a few ASCII letters), so nothing else can get in.
+fn sizes_summary(item: &AlbumItem) -> String {
+    let Some(picture) = &item.picture else {
+        return "none".into();
+    };
+    picture
+        .sizes
+        .iter()
+        .take(12)
+        .map(|s| {
+            let name: String = s
+                .r#type
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(4)
+                .collect();
+            format!("{name}:{:?}:{}x{}:{}b", s.form, s.w, s.h, s.bytes)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The size `want` asks for: `y` for a large view when there is one, else
@@ -558,6 +590,23 @@ mod tests {
             size("y", SizeForm::Progressive, 1280, 960, 150_000),
         ];
         assert_eq!(pick(huge, ViewSize::Standard), ["y"]);
+    }
+
+    #[test]
+    fn a_missing_picture_is_logged_as_telegrams_sizes_only() {
+        let gif = item(
+            MediaKind::Gif,
+            vec![
+                size("i", SizeForm::Stripped, 0, 0, 41),
+                size("m\u{202e}<x>", SizeForm::File, 320, 180, 0),
+            ],
+        );
+        assert_eq!(sizes_summary(&gif), "i:Stripped:0x0:41b,mx:File:320x180:0b");
+        let bare = AlbumItem {
+            picture: None,
+            ..item(MediaKind::Gif, vec![])
+        };
+        assert_eq!(sizes_summary(&bare), "none");
     }
 
     #[test]
