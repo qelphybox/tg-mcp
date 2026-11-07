@@ -21,6 +21,7 @@ pub mod rich;
 pub mod sanitise;
 pub mod search;
 mod session;
+pub mod topics;
 pub mod view;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};

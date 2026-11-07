@@ -36,9 +36,10 @@ use super::{
     rich::message_text,
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
-        SearchFrom, SearchPage, SearchQuery, SearchRequest,
+        SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
     session::SessionStore,
+    topics::{self, RawForums, RawTopic},
     view::{self, Album, RawViewMessage},
 };
 use crate::sessions::{OpenedGrant, Vault};
@@ -415,6 +416,9 @@ pub struct LiveClient {
     /// without one (before ids carried it). In memory only, and only as long as
     /// this Live client lives.
     peers: std::sync::Mutex<std::collections::HashMap<ChatId, i64>>,
+    /// Whether each channel seen so far is a forum (`channel.forum`), so
+    /// `topic` on a known Chat needs no lookup. In memory only, like `peers`.
+    forums: std::sync::Mutex<std::collections::HashMap<ChatId, bool>>,
     /// Telegram said this session is gone (logged out / revoked from the app).
     dead: std::sync::atomic::AtomicBool,
     /// The Account's budget and FLOOD_WAIT state, shared with its other Grants.
@@ -626,14 +630,19 @@ impl Telegram for LiveClient {
     async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
         let peer = self.resolve(id).await?;
         let peer = &peer;
-        read_history(
+        if query.topic.is_some() {
+            self.require_forum(id).await?;
+        }
+        let mut page = read_history(
             id,
             &query,
             &|chat| self.cached(chat),
             |request| self.get_history(peer, id.chat(), request),
             |request| self.get_message(peer, id.chat(), request),
         )
-        .await
+        .await?;
+        topics::complete(&mut page, |ids| self.topics_by_id(peer, id.chat(), ids)).await?;
+        Ok(page)
     }
 
     async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
@@ -715,14 +724,19 @@ impl Telegram for LiveClient {
             .iter()
             .find(|p| p.id == chat)
             .ok_or_else(|| TgError::Upstream(format!("Telegram didn't describe {chat}")))?;
-        Ok(match profile {
+        let mut info = match profile {
             Some(profile) => chats::user_info(
                 peer,
                 profile,
                 time::OffsetDateTime::now_utc().unix_timestamp(),
             ),
             None => chats::chat_info(peer, description, members),
-        })
+        };
+        // A forum's Topics (#28): the full channel's answer said it is one.
+        if self.known_forum(chat) == Some(true) {
+            (info.topics, info.topics_truncated) = self.list_topics(id).await?;
+        }
+        Ok(info)
     }
 
     async fn common_chats(&self, id: ChatRef, limit: usize) -> Result<FoundChats, TgError> {
@@ -756,10 +770,32 @@ impl Telegram for LiveClient {
     }
 
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
-        search::search(&query, &|chat| self.cached(chat), |request| {
+        if let SearchScope::Chat {
+            chat,
+            topic: Some(_),
+            ..
+        } = query.scope
+        {
+            self.require_forum(chat).await?;
+        }
+        let mut page = search::search(&query, &|chat| self.cached(chat), |request| {
             self.search(request)
         })
-        .await
+        .await?;
+        topics::complete_search(&mut page, |chat, ids| async move {
+            // Only a forum this client can address right away: a title is
+            // not worth a walk through the dialog list.
+            let hash = chat.access_hash().or_else(|| self.cached(chat.chat()));
+            match hash {
+                Some(hash) => {
+                    let peer = input_peer(chat.chat(), Some(hash));
+                    self.topics_by_id(&peer, chat.chat(), ids).await
+                }
+                None => Ok(Vec::new()),
+            }
+        })
+        .await?;
+        Ok(page)
     }
 
     async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
@@ -871,16 +907,19 @@ impl LiveClient {
             max_id,
             min_id,
             pinned,
+            topic,
         } = request;
+        let unknown_topic =
+            |err: &InvocationError| topic_refusal((topic != 0).then_some(topic), err);
         let answer = if pinned {
-            self.call(
+            self.call_refusing(
                 &tl::functions::messages::Search {
                     peer: peer.clone(),
                     q: String::new(),
                     from_id: None,
                     saved_peer_id: None,
                     saved_reaction: None,
-                    top_msg_id: None,
+                    top_msg_id: (topic != 0).then_some(topic),
                     filter: tl::enums::MessagesFilter::InputMessagesFilterPinned,
                     min_date: 0,
                     max_date: 0,
@@ -892,6 +931,25 @@ impl LiveClient {
                     hash: 0,
                 },
                 Some(chat),
+                unknown_topic,
+            )
+            .await?
+        } else if topic != 0 {
+            // A Topic is the thread of its first message (General: of 1).
+            self.call_refusing(
+                &tl::functions::messages::GetReplies {
+                    peer: peer.clone(),
+                    msg_id: topic,
+                    offset_id,
+                    offset_date,
+                    add_offset,
+                    limit,
+                    max_id,
+                    min_id,
+                    hash: 0,
+                },
+                Some(chat),
+                unknown_topic,
             )
             .await?
         } else {
@@ -910,22 +968,26 @@ impl LiveClient {
             )
             .await?
         };
-        let (messages, chats, users) = match answer {
-            tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
+        let (messages, topics, chats, users) = match answer {
+            tl::enums::messages::Messages::Messages(m) => (m.messages, m.topics, m.chats, m.users),
+            tl::enums::messages::Messages::Slice(m) => (m.messages, m.topics, m.chats, m.users),
+            tl::enums::messages::Messages::ChannelMessages(m) => {
+                (m.messages, m.topics, m.chats, m.users)
+            }
+            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![], vec![]),
         };
         let returned = messages.len();
         let messages: Vec<RawHistoryMessage> = messages
             .into_iter()
             .filter_map(raw_history_message)
             .collect();
+        let forums = raw_forums(&chats, topics);
         let peers = self.described(users, chats);
         Ok(HistoryAnswer {
             messages,
             returned,
             peers,
+            forums,
         })
     }
 
@@ -939,10 +1001,12 @@ impl LiveClient {
         request: MessageRequest,
     ) -> Result<MessageAnswer, TgError> {
         let (messages, users, chats) = self.fetch_messages(peer, chat, vec![request.id]).await?;
+        let forums = raw_forums(&chats, Vec::new());
         let peers = self.described(users, chats);
         Ok(MessageAnswer {
             messages: messages.into_iter().filter_map(raw_found_message).collect(),
             peers,
+            forums,
         })
     }
 
@@ -1068,6 +1132,7 @@ impl LiveClient {
             RequestScope::Chat {
                 chat,
                 from,
+                topic,
                 offset_id,
             } => {
                 let peer = self.resolve(chat).await?;
@@ -1076,14 +1141,14 @@ impl LiveClient {
                     Some(SearchFrom::Me) => Some(tl::enums::InputPeer::PeerSelf),
                     Some(SearchFrom::Peer(sender)) => Some(self.resolve(sender).await?),
                 };
-                self.call(
+                self.call_refusing(
                     &tl::functions::messages::Search {
                         peer,
                         q,
                         from_id,
                         saved_peer_id: None,
                         saved_reaction: None,
-                        top_msg_id: None,
+                        top_msg_id: topic,
                         filter,
                         min_date,
                         max_date,
@@ -1095,23 +1160,27 @@ impl LiveClient {
                         hash: 0,
                     },
                     Some(chat.chat()),
+                    |err| topic_refusal(topic, err),
                 )
                 .await?
             }
         };
-        let (messages, chats, users, complete, next_rate) = match answer {
+        let (messages, topics, chats, users, complete, next_rate) = match answer {
             tl::enums::messages::Messages::Messages(m) => {
-                (m.messages, m.chats, m.users, true, None)
+                (m.messages, m.topics, m.chats, m.users, true, None)
             }
             tl::enums::messages::Messages::Slice(m) => {
-                (m.messages, m.chats, m.users, false, m.next_rate)
+                (m.messages, m.topics, m.chats, m.users, false, m.next_rate)
             }
             tl::enums::messages::Messages::ChannelMessages(m) => {
-                (m.messages, m.chats, m.users, false, None)
+                (m.messages, m.topics, m.chats, m.users, false, None)
             }
-            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![], true, None),
+            tl::enums::messages::Messages::NotModified(_) => {
+                (vec![], vec![], vec![], vec![], true, None)
+            }
         };
         let returned = messages.len();
+        let forums = raw_forums(&chats, topics);
         let peers = self.described(users, chats);
         Ok(SearchAnswer {
             messages: messages.into_iter().filter_map(raw_found_message).collect(),
@@ -1119,6 +1188,7 @@ impl LiveClient {
             complete,
             next_rate,
             peers,
+            forums,
         })
     }
 
@@ -1143,6 +1213,10 @@ impl LiveClient {
     /// The peers an answer describes (its `users` and `chats`), remembered:
     /// every answer that describes peers goes through here (or `remember`).
     fn described(&self, users: Vec<tl::enums::User>, chats: Vec<tl::enums::Chat>) -> Vec<RawPeer> {
+        self.forums
+            .lock()
+            .expect("forum cache lock")
+            .extend(chats.iter().filter_map(forum_flag));
         let peers: Vec<RawPeer> = users
             .into_iter()
             .filter_map(raw_user)
@@ -1157,6 +1231,90 @@ impl LiveClient {
             .lock()
             .expect("peer cache lock")
             .extend(peers.iter().filter_map(|p| Some((p.id, p.access_hash?))));
+    }
+
+    /// Whether a Chat is a forum, as the last answer that described it said.
+    fn known_forum(&self, chat: ChatId) -> Option<bool> {
+        self.forums
+            .lock()
+            .expect("forum cache lock")
+            .get(&chat)
+            .copied()
+    }
+
+    /// `topic` needs a forum: a user or basic group never is one; a channel
+    /// is one if an answer said so, else one `channels.getChannels` asks.
+    async fn require_forum(&self, id: ChatRef) -> Result<(), TgError> {
+        let chat = id.chat();
+        if !matches!(chat, ChatId::Channel(_)) {
+            return Err(topics::not_a_forum(chat));
+        }
+        if self.known_forum(chat).is_none() {
+            let channel = self.input_channel(id).await?;
+            let chats = match self
+                .call(
+                    &tl::functions::channels::GetChannels { id: vec![channel] },
+                    Some(chat),
+                )
+                .await?
+            {
+                tl::enums::messages::Chats::Chats(c) => c.chats,
+                tl::enums::messages::Chats::Slice(c) => c.chats,
+            };
+            self.described(Vec::new(), chats);
+        }
+        match self.known_forum(chat) {
+            Some(true) => Ok(()),
+            _ => Err(topics::not_a_forum(chat)),
+        }
+    }
+
+    /// One `messages.getForumTopicsByID` call: the Topics `ids` of a forum
+    /// that still exist.
+    async fn topics_by_id(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        ids: Vec<i32>,
+    ) -> Result<Vec<RawTopic>, TgError> {
+        let tl::enums::messages::ForumTopics::Topics(answer) = self
+            .call(
+                &tl::functions::messages::GetForumTopicsById {
+                    peer: peer.clone(),
+                    topics: ids,
+                },
+                Some(chat),
+            )
+            .await?;
+        self.described(answer.users, answer.chats);
+        Ok(answer.topics.into_iter().filter_map(raw_topic).collect())
+    }
+
+    /// A forum's first [`topics::MAX_LISTED_TOPICS`] Topics, in Telegram's
+    /// order (one `messages.getForumTopics` call), and whether it has more.
+    async fn list_topics(
+        &self,
+        id: ChatRef,
+    ) -> Result<(Option<Vec<topics::Topic>>, bool), TgError> {
+        let peer = self.resolve(id).await?;
+        let tl::enums::messages::ForumTopics::Topics(answer) = self
+            .call(
+                &tl::functions::messages::GetForumTopics {
+                    peer,
+                    q: None,
+                    offset_date: 0,
+                    offset_id: 0,
+                    offset_topic: 0,
+                    limit: topics::MAX_LISTED_TOPICS as i32,
+                },
+                Some(id.chat()),
+            )
+            .await?;
+        self.described(answer.users, answer.chats);
+        let raw: Vec<RawTopic> = answer.topics.into_iter().filter_map(raw_topic).collect();
+        let (listed, truncated) =
+            topics::listed(raw, usize::try_from(answer.count).unwrap_or_default());
+        Ok((Some(listed), truncated))
     }
 
     fn cached(&self, chat: ChatId) -> Option<i64> {
@@ -1368,10 +1526,38 @@ fn raw_chat_member(participant: tl::enums::ChatParticipant) -> RawMember {
     RawMember { user, role }
 }
 
+/// A request for one Topic refused because the forum has no such Topic: the
+/// caller's to fix.
+fn topic_refusal(topic: Option<i32>, err: &InvocationError) -> Option<TgError> {
+    topic
+        .filter(|_| err.is("TOPIC_ID_INVALID") || err.is("MSG_ID_INVALID"))
+        .map(topics::unknown_topic)
+}
+
+/// The Topic a forum message's reply header names (`forum_topic`): the
+/// thread's top message, else the message it replies to, which is then the
+/// Topic's first message. `None`: General, or no forum.
+fn header_topic(header: Option<&tl::enums::MessageReplyHeader>) -> Option<i32> {
+    match header {
+        Some(tl::enums::MessageReplyHeader::Header(h)) if h.forum_topic => {
+            h.reply_to_top_id.or(h.reply_to_msg_id)
+        }
+        _ => None,
+    }
+}
+
 fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage> {
     match message {
         tl::enums::Message::Message(m) => {
+            let topic = header_topic(m.reply_to.as_ref());
             let (reply_to, reply_elsewhere) = match m.reply_to {
+                // In a Topic, a message that names no top message only
+                // points at the Topic's first one: no reply.
+                Some(tl::enums::MessageReplyHeader::Header(h))
+                    if h.forum_topic && h.reply_to_top_id.is_none() =>
+                {
+                    (None, None)
+                }
                 Some(tl::enums::MessageReplyHeader::Header(h)) => {
                     // reply_to_peer_id: the replied message is in another
                     // Chat (unless it names this one).
@@ -1401,9 +1587,15 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 edited: m.edit_date.is_some(),
                 reactions: raw_reactions(m.reactions),
                 pinned: m.pinned,
+                topic,
             })
         }
         tl::enums::Message::Service(m) => Some(RawHistoryMessage {
+            // The message that created a Topic is that Topic's first.
+            topic: match m.action {
+                tl::enums::MessageAction::TopicCreate(_) => Some(m.id),
+                _ => header_topic(m.reply_to.as_ref()),
+            },
             id: m.id,
             date: m.date,
             from: m.from_id.as_ref().map(chat_id),
@@ -1521,6 +1713,41 @@ fn found_answer(found: tl::types::contacts::Found) -> FoundAnswer {
             .filter_map(raw_user)
             .chain(found.chats.into_iter().filter_map(raw_chat))
             .collect(),
+    }
+}
+
+/// Which channels of an answer's `chats` are forums (non-min ones only: a
+/// min channel says nothing reliable), and the Topics it describes.
+fn raw_forums(chats: &[tl::enums::Chat], topics: Vec<tl::enums::ForumTopic>) -> RawForums {
+    RawForums {
+        forums: chats
+            .iter()
+            .filter_map(forum_flag)
+            .filter_map(|(chat, forum)| forum.then_some(chat))
+            .collect(),
+        topics: topics.into_iter().filter_map(raw_topic).collect(),
+    }
+}
+
+/// Whether a channel is a forum, unless it is described as min.
+fn forum_flag(chat: &tl::enums::Chat) -> Option<(ChatId, bool)> {
+    match chat {
+        tl::enums::Chat::Channel(c) if !c.min => Some((ChatId::Channel(c.id), c.forum)),
+        _ => None,
+    }
+}
+
+/// A Topic Telegram describes; a deleted one is none.
+fn raw_topic(topic: tl::enums::ForumTopic) -> Option<RawTopic> {
+    match topic {
+        tl::enums::ForumTopic::Topic(t) => Some(RawTopic {
+            chat: chat_id(&t.peer),
+            id: t.id,
+            title: t.title,
+            closed: t.closed,
+            pinned: t.pinned,
+        }),
+        tl::enums::ForumTopic::Deleted(_) => None,
     }
 }
 
@@ -1802,6 +2029,7 @@ impl GrammersConnector {
             store,
             grant,
             peers: Default::default(),
+            forums: Default::default(),
             dead: Default::default(),
             limiter: self.limits.for_account(grant_account),
             #[cfg(test)]
@@ -2781,6 +3009,7 @@ fn offline_live(grant: OpenedGrant, store: Arc<SessionStore>) -> LiveClient {
         store,
         grant,
         peers: Default::default(),
+        forums: Default::default(),
         dead: Default::default(),
         limiter: Arc::new(AccountLimiter::new(crate::limits::LimitsConfig::default())),
         sent: Default::default(),
@@ -3487,6 +3716,7 @@ mod resolve_tests {
                 SearchScope::Chat {
                     chat: channel,
                     from: Some(SearchFrom::Me),
+                    topic: None,
                 },
                 "",
             )
@@ -3496,6 +3726,7 @@ mod resolve_tests {
             SearchScope::Chat {
                 chat: channel,
                 from: Some(SearchFrom::Peer(bob)),
+                topic: None,
             },
             "",
         );
@@ -3613,6 +3844,7 @@ mod resolve_tests {
             SearchScope::Chat {
                 chat: channel,
                 from: None,
+                topic: None,
             },
         ] {
             match live.search_messages(search_query(scope, "deploy")).await {
@@ -3878,6 +4110,398 @@ mod resolve_tests {
                 tl::functions::messages::GetMessages { id: id() }.to_bytes(),
                 tl::functions::messages::GetMessages { id: id() }.to_bytes(),
             ]
+        );
+    }
+}
+
+/// Forum Topics (#28): what the TL says of a message's Topic and of forums,
+/// and the requests `topic` sends.
+#[cfg(test)]
+mod topic_tests {
+    use grammers_client::tl::{Deserializable, Identifiable, Serializable};
+
+    use super::*;
+    use crate::sessions::{TokenTtl, Vault};
+
+    async fn cold_client() -> (LiveClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let issued = vault.create_grant("client", 42, b"").await.unwrap();
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        (offline_live(grant, Arc::new(SessionStore::new())), dir)
+    }
+
+    fn sent(live: &LiveClient) -> Vec<Vec<u8>> {
+        live.sent.lock().unwrap().clone()
+    }
+
+    fn forum_peer() -> tl::enums::Peer {
+        tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 })
+    }
+
+    /// A message of channel 5 with `reply_to` (no other optional field).
+    fn message(id: i32, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {
+        let mut bytes = tl::types::Message::CONSTRUCTOR_ID.to_le_bytes().to_vec();
+        let flags: u32 = if reply_to.is_some() { 1 << 3 } else { 0 };
+        bytes.extend(flags.to_bytes());
+        bytes.extend(0u32.to_bytes());
+        bytes.extend(id.to_bytes());
+        bytes.extend(forum_peer().to_bytes());
+        if let Some(reply_to) = reply_to {
+            bytes.extend(reply_to.to_bytes());
+        }
+        bytes.extend(100i32.to_bytes());
+        bytes.extend(String::from("text").to_bytes());
+        tl::enums::Message::from_bytes(&bytes).unwrap()
+    }
+
+    fn service(
+        id: i32,
+        reply_to: Option<tl::enums::MessageReplyHeader>,
+        action: tl::enums::MessageAction,
+    ) -> tl::enums::Message {
+        tl::enums::Message::Service(tl::types::MessageService {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            reactions_are_possible: false,
+            silent: false,
+            post: false,
+            legacy: false,
+            id,
+            from_id: None,
+            peer_id: forum_peer(),
+            saved_peer_id: None,
+            reply_to,
+            date: 100,
+            action,
+            reactions: None,
+            ttl_period: None,
+        })
+    }
+
+    /// A reply header: `forum_topic`, `reply_to_msg_id`, `reply_to_top_id`.
+    fn header(
+        forum_topic: bool,
+        msg_id: i32,
+        top_id: Option<i32>,
+    ) -> tl::enums::MessageReplyHeader {
+        tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic,
+            quote: false,
+            reply_to_ephemeral: false,
+            reply_to_msg_id: Some(msg_id),
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: top_id,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            todo_item_id: None,
+            poll_option: None,
+        })
+    }
+
+    fn topic_and_reply(message: tl::enums::Message) -> (Option<i32>, Option<i32>) {
+        let m = raw_history_message(message).unwrap();
+        (m.topic, m.reply_to)
+    }
+
+    #[test]
+    fn a_message_names_its_topic_and_replies_only_when_it_replies() {
+        // In Topic 10, replying to nothing: the header points at the Topic's
+        // first message, which is no reply.
+        assert_eq!(
+            topic_and_reply(message(11, Some(header(true, 10, None)))),
+            (Some(10), None)
+        );
+        // In Topic 10, replying to 11.
+        assert_eq!(
+            topic_and_reply(message(12, Some(header(true, 11, Some(10))))),
+            (Some(10), Some(11))
+        );
+        // General (or no forum): a reply names no Topic.
+        assert_eq!(
+            topic_and_reply(message(13, Some(header(false, 2, None)))),
+            (None, Some(2))
+        );
+        assert_eq!(topic_and_reply(message(14, None)), (None, None));
+        // The message that created Topic 20 is in it; a service message in a
+        // Topic names it in its header.
+        let created = tl::enums::MessageAction::TopicCreate(tl::types::MessageActionTopicCreate {
+            title_missing: false,
+            title: "Bugs".into(),
+            icon_color: 0,
+            icon_emoji_id: None,
+        });
+        assert_eq!(
+            topic_and_reply(service(20, None, created)),
+            (Some(20), None)
+        );
+        assert_eq!(
+            topic_and_reply(service(
+                21,
+                Some(header(true, 20, None)),
+                tl::enums::MessageAction::PinMessage
+            )),
+            (Some(20), None)
+        );
+    }
+
+    fn channel(forum: bool, min: bool) -> tl::enums::Chat {
+        let (_, chat) = super::tests::tl_peers(min);
+        let tl::enums::Chat::Channel(c) = chat else {
+            unreachable!()
+        };
+        tl::enums::Chat::Channel(tl::types::Channel { forum, ..c })
+    }
+
+    fn forum_topic(id: i32, title: &str) -> tl::enums::ForumTopic {
+        tl::enums::ForumTopic::Topic(tl::types::ForumTopic {
+            my: false,
+            closed: id == 20,
+            pinned: id == 10,
+            short: false,
+            hidden: false,
+            title_missing: false,
+            id,
+            date: 100,
+            peer: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 7 }),
+            title: title.into(),
+            icon_color: 0,
+            icon_emoji_id: None,
+            top_message: id,
+            read_inbox_max_id: 0,
+            read_outbox_max_id: 0,
+            unread_count: 0,
+            unread_mentions_count: 0,
+            unread_reactions_count: 0,
+            unread_poll_votes_count: 0,
+            from_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: 1 }),
+            notify_settings: tl::enums::PeerNotifySettings::Settings(
+                tl::types::PeerNotifySettings {
+                    show_previews: None,
+                    silent: None,
+                    mute_until: None,
+                    ios_sound: None,
+                    android_sound: None,
+                    other_sound: None,
+                    stories_muted: None,
+                    stories_hide_sender: None,
+                    stories_ios_sound: None,
+                    stories_android_sound: None,
+                    stories_other_sound: None,
+                },
+            ),
+            draft: None,
+        })
+    }
+
+    #[test]
+    fn an_answer_says_which_chats_are_forums_and_which_topics_it_describes() {
+        let forums = raw_forums(
+            &[channel(true, false)],
+            vec![
+                forum_topic(10, "Releases"),
+                forum_topic(20, "Bugs"),
+                tl::enums::ForumTopic::Deleted(tl::types::ForumTopicDeleted { id: 30 }),
+            ],
+        );
+        let topic = |id, title: &str, closed, pinned| RawTopic {
+            chat: ChatId::Channel(7),
+            id,
+            title: title.into(),
+            closed,
+            pinned,
+        };
+        assert_eq!(
+            forums,
+            RawForums {
+                forums: vec![ChatId::Channel(7)],
+                topics: vec![
+                    topic(10, "Releases", false, true),
+                    topic(20, "Bugs", true, false)
+                ],
+            }
+        );
+        // A supergroup that is no forum, and a min channel, say nothing.
+        assert_eq!(
+            raw_forums(&[channel(false, false)], Vec::new()),
+            RawForums::default()
+        );
+        assert_eq!(forum_flag(&channel(true, true)), None);
+        assert_eq!(
+            forum_flag(&channel(false, false)),
+            Some((ChatId::Channel(7), false))
+        );
+    }
+
+    fn peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: 7,
+        })
+    }
+
+    fn forum() -> ChatRef {
+        ChatRef::new(ChatId::Channel(5), Some(7))
+    }
+
+    fn query(topic: i32) -> HistoryQuery {
+        HistoryQuery {
+            limit: 30,
+            topic: Some(topic),
+            ..HistoryQuery::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn topic_on_a_user_or_basic_group_is_refused_without_asking_telegram() {
+        let (live, _dir) = cold_client().await;
+        let user = ChatRef::new(ChatId::User(8), Some(3));
+        for chat in [user, ChatId::Chat(4).into()] {
+            let err = live.get_messages(chat, query(1)).await.unwrap_err();
+            assert!(
+                matches!(&err, TgError::InvalidInput(e) if e.contains("not a forum")),
+                "{err}"
+            );
+        }
+        assert_eq!(sent(&live), Vec::<Vec<u8>>::new());
+    }
+
+    #[tokio::test]
+    async fn a_channel_not_seen_yet_is_asked_whether_it_is_a_forum() {
+        let (live, _dir) = cold_client().await;
+        assert!(live.get_messages(forum(), query(10)).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [tl::functions::channels::GetChannels {
+                id: vec![tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: 5,
+                    access_hash: 7,
+                })],
+            }
+            .to_bytes()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_topic_is_read_with_get_replies_and_searched_with_top_msg_id() {
+        let (live, _dir) = cold_client().await;
+        // An earlier answer described channel 5 as a forum.
+        live.forums.lock().unwrap().insert(ChatId::Channel(5), true);
+        let around = HistoryQuery {
+            around_id: Some(40),
+            limit: 5,
+            ..query(10)
+        };
+        let pinned = HistoryQuery {
+            pinned_only: true,
+            ..query(1)
+        };
+        for q in [query(10), around, pinned] {
+            assert!(live.get_messages(forum(), q).await.is_err());
+        }
+        let search = SearchQuery {
+            scope: SearchScope::Chat {
+                chat: forum(),
+                from: None,
+                topic: Some(10),
+            },
+            text: "deploy".into(),
+            media: None,
+            since: None,
+            until: None,
+            limit: 20,
+            cursor: None,
+        };
+        assert!(live.search_messages(search).await.is_err());
+        let replies = |offset_id, add_offset, limit| {
+            tl::functions::messages::GetReplies {
+                peer: peer(),
+                msg_id: 10,
+                offset_id,
+                offset_date: 0,
+                add_offset,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            }
+            .to_bytes()
+        };
+        let search = |q: &str, top_msg_id, filter, limit| {
+            tl::functions::messages::Search {
+                peer: peer(),
+                q: q.into(),
+                from_id: None,
+                saved_peer_id: None,
+                saved_reaction: None,
+                top_msg_id: Some(top_msg_id),
+                filter,
+                min_date: 0,
+                max_date: 0,
+                offset_id: 0,
+                add_offset: 0,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            }
+            .to_bytes()
+        };
+        assert_eq!(
+            sent(&live),
+            [
+                replies(0, 0, 30),
+                replies(40, -3, 5),
+                search(
+                    "",
+                    1,
+                    tl::enums::MessagesFilter::InputMessagesFilterPinned,
+                    30
+                ),
+                search(
+                    "deploy",
+                    10,
+                    tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+                    20
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_topic_telegram_doesnt_know_is_the_callers_to_fix() {
+        type Replies = tl::functions::messages::GetReplies;
+        for code in ["TOPIC_ID_INVALID", "MSG_ID_INVALID"] {
+            let refused = topic_refusal(Some(99), &rpc::<Replies>(400, code));
+            assert!(
+                matches!(&refused, Some(TgError::InvalidInput(e)) if e.contains("topic 99")),
+                "{code}: {refused:?}"
+            );
+            // Without a Topic it is no Topic's fault.
+            assert!(topic_refusal(None, &rpc::<Replies>(400, code)).is_none());
+        }
+        assert!(topic_refusal(Some(99), &rpc::<Replies>(400, "CHANNEL_PRIVATE")).is_none());
+        assert!(topic_refusal(Some(99), &rpc::<Replies>(420, "FLOOD_WAIT_30")).is_none());
+    }
+
+    #[test]
+    fn topic_requests_are_reading_calls() {
+        use tl::functions::{channels, messages};
+        assert_eq!(
+            [
+                method_class::<messages::GetReplies>(),
+                method_class::<messages::GetForumTopics>(),
+                method_class::<messages::GetForumTopicsById>(),
+                method_class::<channels::GetChannels>(),
+            ],
+            [MethodClass::Default; 4]
         );
     }
 }

@@ -19,6 +19,7 @@ use super::{
         Issuer, KnownHashes, MAX_LINK_CHARS, Media, MediaSummary, RawHistoryMessage, Reactions,
         Sender,
     },
+    topics::{RawForums, RawTopic, SearchTopics},
 };
 
 /// Which kind of Chats a search across all of them looks in.
@@ -65,10 +66,12 @@ pub enum SearchScope {
         chat_type: Option<ChatType>,
         archived: Option<bool>,
     },
-    /// One Chat.
+    /// One Chat; `topic`: one Topic of a forum (the adapter has checked the
+    /// Chat is one).
     Chat {
         chat: ChatRef,
         from: Option<SearchFrom>,
+        topic: Option<i32>,
     },
 }
 
@@ -138,6 +141,9 @@ pub struct SearchHit {
     pub link: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// As in get_messages: the Topic of a forum message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<i32>,
 }
 
 /// A page of Search hits, newest first. No total: Telegram's isn't reliable
@@ -149,6 +155,10 @@ pub struct SearchPage {
     /// page; absent on the last page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Only with hits in forums: the title of each Topic they are in, by
+    /// the hit's `chat.id`, then by Topic id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics: Option<SearchTopics>,
 }
 
 // ── What goes to Telegram and comes back ────────────────────────────────────
@@ -168,10 +178,11 @@ pub enum RequestScope {
         offset_id: i32,
     },
     /// `messages.search`: one Chat, newest first, ids strictly below
-    /// `offset_id` (`add_offset` 0).
+    /// `offset_id` (`add_offset` 0); `topic`: only that Topic (`top_msg_id`).
     Chat {
         chat: ChatRef,
         from: Option<SearchFrom>,
+        topic: Option<i32>,
         offset_id: i32,
     },
 }
@@ -211,6 +222,8 @@ pub struct SearchAnswer {
     /// The answer's `users` and `chats`: they may not describe every Chat or
     /// sender, and min peers come without a usable access hash.
     pub peers: Vec<RawPeer>,
+    /// Which of the answer's Chats are forums, and the Topics it describes.
+    pub forums: RawForums,
 }
 
 /// Telegram's error for a search without a query where it needs one
@@ -269,9 +282,10 @@ where
             offset_peer,
             offset_id: cursor.offset_id,
         },
-        SearchScope::Chat { chat, from } => RequestScope::Chat {
+        SearchScope::Chat { chat, from, topic } => RequestScope::Chat {
             chat,
             from,
+            topic,
             offset_id: cursor.offset_id,
         },
     };
@@ -307,8 +321,9 @@ fn assemble(
         complete,
         next_rate,
         peers,
+        forums,
     } = answer;
-    let issuer = Issuer::new(&peers, known);
+    let issuer = Issuer::new(&peers, known).in_forums(&forums);
     // Only the chat that was asked keeps the hash it was asked with.
     let asked = |chat: ChatId| match query.scope {
         SearchScope::Chat { chat: asked, .. } if asked.chat() == chat => asked,
@@ -334,7 +349,7 @@ fn assemble(
         let date = i64::from(date);
         query.since.is_none_or(|s| date >= s) && query.until.is_none_or(|u| date <= u)
     };
-    let hits = messages
+    let hits: Vec<SearchHit> = messages
         .iter()
         .filter(|found| within(found.message.date))
         .map(|found| {
@@ -359,10 +374,30 @@ fn assemble(
                 reactions: message.reactions,
                 link: message.link,
                 pinned: message.pinned,
+                topic: message.topic,
             }
         })
         .collect();
-    SearchPage { hits, next_cursor }
+    SearchPage {
+        topics: search_titles(&hits, &forums.topics),
+        hits,
+        next_cursor,
+    }
+}
+
+/// A search page's `topics`: for each Chat whose hits are in Topics, the
+/// titles `known` has of those Topics; `None` when no hit is in a Topic.
+fn search_titles(hits: &[SearchHit], known: &[RawTopic]) -> Option<SearchTopics> {
+    let mut topics = SearchTopics::default();
+    for hit in hits {
+        let Some(topic) = hit.topic else { continue };
+        let titles = topics.0.entry(hit.chat.id.clone()).or_default();
+        let chat = hit.chat.id.parse::<ChatRef>().ok().map(|c| c.chat());
+        if let Some(t) = known.iter().find(|t| Some(t.chat) == chat && t.id == topic) {
+            titles.0.insert(topic, t.title.clone());
+        }
+    }
+    (!topics.0.is_empty()).then_some(topics)
 }
 
 impl SearchQuery {
@@ -374,13 +409,15 @@ impl SearchQuery {
                 chat_type,
                 archived,
             } => format!("global {chat_type:?} {archived:?}"),
-            SearchScope::Chat { chat, from } => {
+            SearchScope::Chat { chat, from, topic } => {
                 let from = match from {
                     None => String::new(),
                     Some(SearchFrom::Me) => "me".into(),
                     Some(SearchFrom::Peer(peer)) => peer.chat().to_string(),
                 };
-                format!("chat {} {from}", chat.chat())
+                // Without a Topic, as before Topics: cursors survive the deploy.
+                let topic = topic.map_or_else(String::new, |t| format!(" topic {t}"));
+                format!("chat {} {from}{topic}", chat.chat())
             }
         };
         let canonical = format!(
@@ -544,6 +581,7 @@ mod tests {
             edited: false,
             reactions: Vec::new(),
             pinned: false,
+            topic: None,
         }
     }
 
@@ -567,6 +605,7 @@ mod tests {
             scope: SearchScope::Chat {
                 chat: chat.into(),
                 from: None,
+                topic: None,
             },
             ..global(text, limit)
         }
@@ -770,6 +809,7 @@ mod tests {
             complete: false,
             next_rate,
             peers: Vec::new(),
+            forums: Default::default(),
         };
         let decode =
             |page: &SearchPage| Cursor::decode(page.next_cursor.as_deref().unwrap()).unwrap();
@@ -810,6 +850,7 @@ mod tests {
             complete,
             next_rate: None,
             peers: Vec::new(),
+            forums: Default::default(),
         };
         let f = query.fingerprint();
         assert!(
@@ -897,6 +938,7 @@ mod tests {
             scope: SearchScope::Chat {
                 chat: ChatId::Channel(7).into(),
                 from: Some(SearchFrom::Me),
+                topic: None,
             },
             ..a.clone()
         };
@@ -911,6 +953,64 @@ mod tests {
                 Err(TgError::InvalidInput(_))
             ));
         }
+    }
+
+    #[test]
+    fn a_topic_is_part_of_the_search_a_cursor_continues() {
+        let in_topic = |topic| SearchQuery {
+            scope: SearchScope::Chat {
+                chat: ChatId::Channel(5).into(),
+                from: None,
+                topic,
+            },
+            ..in_chat(ChatId::Channel(5), "deploy", 2)
+        };
+        let fingerprints = [None, Some(1), Some(10)].map(|t| in_topic(t).fingerprint());
+        assert_ne!(fingerprints[0], fingerprints[1]);
+        assert_ne!(fingerprints[1], fingerprints[2]);
+        // Without a Topic, as before Topics (#28): cursors handed out then
+        // still continue.
+        assert_eq!(fingerprints[0], 0xf9b8_688b_0721_5b90);
+    }
+
+    #[test]
+    fn a_topic_search_is_telegrams_search_with_top_msg_id_in_that_topic() {
+        let messages: Vec<RawHistoryMessage> = (1..=6)
+            .map(|i| RawHistoryMessage {
+                topic: (i % 2 == 0).then_some(10),
+                ..msg(i, DAY + i, "deploy")
+            })
+            .collect();
+        let chats = [FakeSearchChat {
+            id: ChatId::Channel(5),
+            kind: ChatKind::Supergroup,
+            archived: false,
+            messages: &messages,
+        }];
+        let query = SearchQuery {
+            scope: SearchScope::Chat {
+                chat: ChatId::Channel(5).into(),
+                from: None,
+                topic: Some(10),
+            },
+            ..in_chat(ChatId::Channel(5), "deploy", 2)
+        };
+        let mut sent = Vec::new();
+        let first = page(&chats, &query, &mut sent).unwrap();
+        assert_eq!(first.hits.iter().map(|h| h.id).collect::<Vec<_>>(), [6, 4]);
+        assert!(matches!(
+            sent[0].scope,
+            RequestScope::Chat {
+                topic: Some(10),
+                ..
+            }
+        ));
+        let next = SearchQuery {
+            cursor: first.next_cursor,
+            ..query
+        };
+        let rest = page(&chats, &next, &mut Vec::new()).unwrap();
+        assert_eq!(rest.hits.iter().map(|h| h.id).collect::<Vec<_>>(), [2]);
     }
 
     #[test]
@@ -971,6 +1071,7 @@ mod tests {
                 peer(group, "Team", ChatKind::Supergroup, Some(99)),
                 peer(ChatId::User(6), "Min", ChatKind::Private, None),
             ],
+            forums: Default::default(),
         };
         let query = global("deploy", 10);
         let page = assemble(&query, answer.clone(), &unknown, 10, query.fingerprint());
@@ -1005,6 +1106,7 @@ mod tests {
             scope: SearchScope::Chat {
                 chat: asked,
                 from: None,
+                topic: None,
             },
             ..global("deploy", 10)
         };

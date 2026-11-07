@@ -30,6 +30,7 @@ use super::{
     members::{Member, MemberPage, MembersQuery},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
+    topics::Topic,
     view::{Album, AlbumItem},
 };
 
@@ -321,7 +322,11 @@ impl Untrusted for MessagePage {
             next_after_id: _,
             continues_in: _,
             broken_at: _,
+            topics,
         } = self;
+        for title in topics.iter_mut().flat_map(|t| t.0.values_mut()) {
+            clean(title);
+        }
         for message in messages {
             let ChatMessage {
                 id: _,
@@ -339,6 +344,7 @@ impl Untrusted for MessagePage {
                 reactions: _,
                 link: _,
                 pinned: _,
+                topic: _,
                 target: _,
                 thread_root: _,
             } = message;
@@ -376,6 +382,8 @@ impl Untrusted for ChatInfo {
             birthday: _,
             common_chats_count: _,
             common_chats,
+            topics,
+            topics_truncated: _,
         } = self;
         clean(title);
         clean_opt(username);
@@ -392,6 +400,15 @@ impl Untrusted for ChatInfo {
         for chat in common_chats.iter_mut().flatten() {
             clean_found_chat(chat);
         }
+        for Topic {
+            id: _,
+            title,
+            closed: _,
+            pinned: _,
+        } in topics.iter_mut().flatten()
+        {
+            clean(title);
+        }
     }
 }
 
@@ -400,7 +417,15 @@ impl Untrusted for SearchPage {
         let SearchPage {
             hits,
             next_cursor: _,
+            topics,
         } = self;
+        for title in topics
+            .iter_mut()
+            .flat_map(|t| t.0.values_mut())
+            .flat_map(|t| t.0.values_mut())
+        {
+            clean(title);
+        }
         for hit in hits {
             let SearchHit {
                 chat:
@@ -422,6 +447,7 @@ impl Untrusted for SearchPage {
                 reactions: _,
                 link: _,
                 pinned: _,
+                topic: _,
             } = hit;
             clean(title);
             clean_text(snippet, sanitise_line, media.is_some());
@@ -932,6 +958,7 @@ mod tests {
                 reactions: None,
                 link: None,
                 pinned: false,
+                topic: None,
             }],
         );
         history.sanitise();
@@ -960,8 +987,10 @@ mod tests {
                 reactions: None,
                 link: None,
                 pinned: false,
+                topic: None,
             }],
             next_cursor: None,
+            topics: None,
         };
         found.sanitise();
         let hit = &found.hits[0];
@@ -1008,6 +1037,7 @@ mod tests {
             reactions: None,
             link: None,
             pinned: false,
+            topic: None,
         }
     }
 
@@ -1030,6 +1060,7 @@ mod tests {
             reactions: None,
             link: None,
             pinned: false,
+            topic: None,
         }
     }
 
@@ -1066,6 +1097,7 @@ mod tests {
         let mut found = SearchPage {
             hits: vec![hit("de\u{2028}ploy", None)],
             next_cursor: None,
+            topics: None,
         };
         found.sanitise();
         assert_eq!(found.hits[0].snippet, "de ploy");
@@ -1144,6 +1176,7 @@ mod tests {
                 hit("\u{2063}", Some(MediaKind::Photo)),
             ],
             next_cursor: None,
+            topics: None,
         };
         found.sanitise();
         assert_eq!(found.hits[0].snippet, NO_VISIBLE_TEXT);

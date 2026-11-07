@@ -95,6 +95,7 @@ fn post(id: i32, rich: &tl::enums::RichMessage) -> RawHistoryMessage {
         edited: false,
         reactions: Vec::new(),
         pinned: false,
+        topic: None,
     }
 }
 

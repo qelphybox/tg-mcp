@@ -18,6 +18,7 @@ use super::{
     TgError,
     find::FoundChat,
     messages::{MediaKind, MediaSummary},
+    topics::{MAX_LISTED_TOPICS, Topic},
 };
 
 /// Which Chat: `user:<id>`, `chat:<id>` (basic group) or `channel:<id>` (channels
@@ -277,6 +278,13 @@ pub struct ChatInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 20))]
     pub common_chats: Option<Vec<FoundChat>>,
+    /// Forums only: their Topics, at most 50, in Telegram's order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = MAX_LISTED_TOPICS))]
+    pub topics: Option<Vec<Topic>>,
+    /// The forum has more Topics than `topics` lists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub topics_truncated: bool,
 }
 
 /// A user's last-seen status as Telegram shows it to this account: exact
@@ -395,6 +403,8 @@ pub fn chat_info(
         birthday: None,
         common_chats_count: None,
         common_chats: None,
+        topics: None,
+        topics_truncated: false,
     }
 }
 

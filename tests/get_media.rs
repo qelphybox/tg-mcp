@@ -47,6 +47,7 @@ fn message(id: i32, media: Option<Media>) -> RawHistoryMessage {
         edited: false,
         reactions: Vec::new(),
         pinned: false,
+        topic: None,
     }
 }
 

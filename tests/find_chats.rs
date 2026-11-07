@@ -89,6 +89,7 @@ fn data() -> FakeData {
                 edited: false,
                 reactions: Vec::new(),
                 pinned: false,
+                topic: None,
             }],
         )
 }

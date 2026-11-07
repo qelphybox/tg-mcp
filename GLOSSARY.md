@@ -83,7 +83,7 @@ A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Tel
 _Avoid_: folder (unqualified), filter, tab
 
 **Topic**:
-A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic.
+A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic; the tools name it by its id, which is the id of the message that created it, and General, every forum's first Topic, is 1.
 _Avoid_: thread (a thread is a chain of replies), subchat
 
 **Rich message**:

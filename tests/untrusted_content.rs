@@ -62,6 +62,7 @@ fn message(id: i32, text: String) -> RawHistoryMessage {
         edited: false,
         reactions: Vec::new(),
         pinned: false,
+        topic: None,
     }
 }
 
