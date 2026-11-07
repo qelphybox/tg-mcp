@@ -83,7 +83,7 @@ pub struct ChatMessage {
     /// Opens the message in Telegram ([`message_link`]); absent in private
     /// chats and basic groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = MAX_LINK_CHARS))]
     pub link: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
@@ -301,6 +301,10 @@ pub struct RawReaction {
     pub reaction: Reaction,
     pub count: i32,
 }
+
+/// The longest [`message_link`]: `https://t.me/` (13), a 32-character
+/// @username or `c/` and a channel id (at most 21), `/` and a message id.
+pub const MAX_LINK_CHARS: usize = 64;
 
 /// Where message `id` of `chat` opens in Telegram, computed without asking
 /// Telegram (no `exportMessageLink`): in a channel or supergroup with a
@@ -1947,6 +1951,13 @@ mod tests {
         );
         assert_eq!(link(ChatId::User(5)), None);
         assert_eq!(link(ChatId::Chat(7)), None);
+        // The longest links fit the bound the output schema declares.
+        for longest in [
+            message_link(ChatId::Channel(i64::MAX), None, i32::MAX),
+            message_link(public, Some(&"u".repeat(32)), i32::MAX),
+        ] {
+            assert!(longest.unwrap().chars().count() <= MAX_LINK_CHARS);
+        }
         // A username Telegram couldn't have issued is not put in a link.
         assert_eq!(
             message_link(public, Some("evil.com/x?"), 42).as_deref(),

@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind},
-    messages::{Issuer, KnownHashes, Media, MediaSummary, RawHistoryMessage, Reactions, Sender},
+    messages::{
+        Issuer, KnownHashes, MAX_LINK_CHARS, Media, MediaSummary, RawHistoryMessage, Reactions,
+        Sender,
+    },
 };
 
 /// Which kind of Chats a search across all of them looks in.
@@ -131,7 +134,7 @@ pub struct SearchHit {
     pub reactions: Option<Reactions>,
     /// As in get_messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = MAX_LINK_CHARS))]
     pub link: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
