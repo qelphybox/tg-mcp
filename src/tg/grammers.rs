@@ -21,9 +21,14 @@ use super::{
         RawMessage, RawPeer,
     },
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, MessagePage, RawHistoryMessage, read_history,
+        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessagePage, RawHistoryMessage,
+        read_history,
     },
     pool::{Evicted, Live, Pool},
+    search::{
+        self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
+        SearchFrom, SearchPage, SearchQuery, SearchRequest,
+    },
     session::SessionStore,
 };
 use crate::sessions::{OpenedGrant, Vault};
@@ -425,6 +430,10 @@ impl LiveClient {
         if is_dead_session(&err) {
             self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
             TgError::BadSession(err.to_string())
+        } else if err.is("SEARCH_QUERY_EMPTY") {
+            TgError::InvalidInput(QUERY_REQUIRED.into())
+        } else if err.is("FROM_PEER_INVALID") {
+            TgError::InvalidInput("from: Telegram can't search for this sender here".into())
         } else {
             // FLOOD_WAIT surfaces as TgError::FloodWait for the limiter; the rest is upstream.
             flood_error(err, class)
@@ -611,6 +620,10 @@ impl Telegram for LiveClient {
             .ok_or_else(|| TgError::Upstream(format!("Telegram didn't describe {chat}")))?;
         Ok(chats::chat_info(peer, description, members))
     }
+
+    async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
+        search::search(&query, |request| self.search(request)).await
+    }
 }
 
 /// How far `resolve` pages through the dialogs (per folder) looking for an unknown Chat.
@@ -667,6 +680,117 @@ impl LiveClient {
         Ok(HistoryAnswer {
             messages,
             returned,
+            peers,
+        })
+    }
+
+    /// One `messages.searchGlobal` or `messages.search` call (method class Search).
+    async fn search(&self, request: SearchRequest) -> Result<SearchAnswer, TgError> {
+        let SearchRequest {
+            q,
+            filter,
+            min_date,
+            max_date,
+            limit,
+            scope,
+        } = request;
+        let filter = messages_filter(filter);
+        let answer = match scope {
+            RequestScope::Global {
+                chat_type,
+                folder_id,
+                offset_rate,
+                offset_peer,
+                offset_id,
+            } => {
+                // An unknown peer (no hash) can't be addressed: Empty, as
+                // grammers' own iterator sends it.
+                let offset_peer = offset_peer
+                    .and_then(|peer| {
+                        direct_input_peer(peer).or_else(|| {
+                            self.cached(peer.chat())
+                                .map(|hash| input_peer(peer.chat(), Some(hash)))
+                        })
+                    })
+                    .unwrap_or(tl::enums::InputPeer::Empty);
+                self.call(
+                    &tl::functions::messages::SearchGlobal {
+                        broadcasts_only: chat_type == Some(ChatType::Channels),
+                        groups_only: chat_type == Some(ChatType::Groups),
+                        users_only: chat_type == Some(ChatType::Private),
+                        folder_id,
+                        community: None,
+                        q,
+                        filter,
+                        min_date,
+                        max_date,
+                        offset_rate,
+                        offset_peer,
+                        offset_id,
+                        limit,
+                    },
+                    None,
+                )
+                .await?
+            }
+            RequestScope::Chat {
+                chat,
+                from,
+                offset_id,
+            } => {
+                let peer = self.resolve(chat).await?;
+                let from_id = match from {
+                    None => None,
+                    Some(SearchFrom::Me) => Some(tl::enums::InputPeer::PeerSelf),
+                    Some(SearchFrom::Peer(sender)) => Some(self.resolve(sender).await?),
+                };
+                self.call(
+                    &tl::functions::messages::Search {
+                        peer,
+                        q,
+                        from_id,
+                        saved_peer_id: None,
+                        saved_reaction: None,
+                        top_msg_id: None,
+                        filter,
+                        min_date,
+                        max_date,
+                        offset_id,
+                        add_offset: 0,
+                        limit,
+                        max_id: 0,
+                        min_id: 0,
+                        hash: 0,
+                    },
+                    Some(chat.chat()),
+                )
+                .await?
+            }
+        };
+        let (messages, chats, users, complete, next_rate) = match answer {
+            tl::enums::messages::Messages::Messages(m) => {
+                (m.messages, m.chats, m.users, true, None)
+            }
+            tl::enums::messages::Messages::Slice(m) => {
+                (m.messages, m.chats, m.users, false, m.next_rate)
+            }
+            tl::enums::messages::Messages::ChannelMessages(m) => {
+                (m.messages, m.chats, m.users, false, None)
+            }
+            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![], true, None),
+        };
+        let returned = messages.len();
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        self.remember(&peers);
+        Ok(SearchAnswer {
+            messages: messages.into_iter().filter_map(raw_found_message).collect(),
+            returned,
+            complete,
+            next_rate,
             peers,
         })
     }
@@ -740,11 +864,6 @@ impl LiveClient {
 fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage> {
     match message {
         tl::enums::Message::Message(m) => {
-            let text = if m.message.is_empty() {
-                media_placeholder(m.media.as_ref()).to_string()
-            } else {
-                m.message
-            };
             let reply_to = match m.reply_to {
                 // Replies into another chat aren't addressable here.
                 Some(tl::enums::MessageReplyHeader::Header(h)) if h.reply_to_peer_id.is_none() => {
@@ -757,7 +876,8 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 date: m.date,
                 from: m.from_id.as_ref().map(chat_id),
                 out: m.out,
-                text,
+                text: m.message,
+                media: media_kind(m.media.as_ref()),
                 reply_to,
                 forwarded: m.fwd_from.is_some(),
                 edited: m.edit_date.is_some(),
@@ -769,12 +889,26 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
             from: m.from_id.as_ref().map(chat_id),
             out: m.out,
             text: "[service message]".into(),
+            media: None,
             reply_to: None,
             forwarded: false,
             edited: false,
         }),
         tl::enums::Message::Empty(_) => None,
     }
+}
+
+/// A search result: the message and the Chat it is in.
+fn raw_found_message(message: tl::enums::Message) -> Option<RawFoundMessage> {
+    let chat = match &message {
+        tl::enums::Message::Message(m) => chat_id(&m.peer_id),
+        tl::enums::Message::Service(m) => chat_id(&m.peer_id),
+        tl::enums::Message::Empty(_) => return None,
+    };
+    Some(RawFoundMessage {
+        chat,
+        message: raw_history_message(message)?,
+    })
 }
 
 /// Description and member count from a group's or channel's full info.
@@ -920,10 +1054,9 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
 fn raw_message(message: tl::enums::Message) -> Option<RawMessage> {
     match message {
         tl::enums::Message::Message(m) => {
-            let text = if m.message.is_empty() {
-                media_placeholder(m.media.as_ref()).to_string()
-            } else {
-                m.message
+            let text = match media_kind(m.media.as_ref()) {
+                Some(media) if m.message.is_empty() => media.placeholder().to_string(),
+                _ => m.message,
             };
             Some(RawMessage {
                 chat: chat_id(&m.peer_id),
@@ -942,37 +1075,51 @@ fn raw_message(message: tl::enums::Message) -> Option<RawMessage> {
     }
 }
 
-/// What to show instead of an empty text. Never includes media content.
-fn media_placeholder(media: Option<&tl::enums::MessageMedia>) -> &'static str {
+fn messages_filter(filter: Option<MediaFilter>) -> tl::enums::MessagesFilter {
+    use tl::enums::MessagesFilter as F;
+    match filter {
+        None => F::InputMessagesFilterEmpty,
+        Some(MediaFilter::Photo) => F::InputMessagesFilterPhotos,
+        Some(MediaFilter::Video) => F::InputMessagesFilterVideo,
+        Some(MediaFilter::Document) => F::InputMessagesFilterDocument,
+        Some(MediaFilter::Link) => F::InputMessagesFilterUrl,
+        Some(MediaFilter::Voice) => F::InputMessagesFilterVoice,
+        Some(MediaFilter::VideoNote) => F::InputMessagesFilterRoundVideo,
+        Some(MediaFilter::Gif) => F::InputMessagesFilterGif,
+    }
+}
+
+/// What a message carries besides text. Never looks at the media content.
+fn media_kind(media: Option<&tl::enums::MessageMedia>) -> Option<Media> {
     use tl::enums::MessageMedia as M;
-    match media {
-        None | Some(M::Empty) => "",
-        Some(M::Photo(_)) => "[photo]",
-        Some(M::Document(d)) => match &d.document {
+    Some(match media? {
+        M::Empty => return None,
+        M::Photo(_) => Media::Photo,
+        M::Document(d) => match &d.document {
             Some(tl::enums::Document::Document(doc)) => doc
                 .attributes
                 .iter()
                 .find_map(|a| match a {
-                    tl::enums::DocumentAttribute::Audio(a) if a.voice => Some("[voice]"),
-                    tl::enums::DocumentAttribute::Audio(_) => Some("[audio]"),
+                    tl::enums::DocumentAttribute::Audio(a) if a.voice => Some(Media::Voice),
+                    tl::enums::DocumentAttribute::Audio(_) => Some(Media::Audio),
                     tl::enums::DocumentAttribute::Video(v) if v.round_message => {
-                        Some("[video message]")
+                        Some(Media::VideoNote)
                     }
-                    tl::enums::DocumentAttribute::Video(_) => Some("[video]"),
-                    tl::enums::DocumentAttribute::Sticker(_) => Some("[sticker]"),
-                    tl::enums::DocumentAttribute::Animated => Some("[gif]"),
+                    tl::enums::DocumentAttribute::Video(_) => Some(Media::Video),
+                    tl::enums::DocumentAttribute::Sticker(_) => Some(Media::Sticker),
+                    tl::enums::DocumentAttribute::Animated => Some(Media::Gif),
                     _ => None,
                 })
-                .unwrap_or("[file]"),
-            _ => "[file]",
+                .unwrap_or(Media::Document),
+            _ => Media::Document,
         },
-        Some(M::Geo(_) | M::GeoLive(_) | M::Venue(_)) => "[location]",
-        Some(M::Contact(_)) => "[contact]",
-        Some(M::Poll(_)) => "[poll]",
-        Some(M::Dice(_)) => "[dice]",
-        Some(M::Story(_)) => "[story]",
-        Some(_) => "[media]",
-    }
+        M::Geo(_) | M::GeoLive(_) | M::Venue(_) => Media::Location,
+        M::Contact(_) => Media::Contact,
+        M::Poll(_) => Media::Poll,
+        M::Dice(_) => Media::Dice,
+        M::Story(_) => Media::Story,
+        _ => Media::Other,
+    })
 }
 
 pub struct GrammersConnector {
@@ -1460,7 +1607,10 @@ mod resolve_tests {
     use grammers_client::tl::{Identifiable, Serializable};
 
     use super::*;
-    use crate::sessions::{TokenTtl, Vault};
+    use crate::{
+        sessions::{TokenTtl, Vault},
+        tg::search::SearchScope,
+    };
 
     const ACCOUNT: i64 = 42;
 
@@ -1731,6 +1881,241 @@ mod resolve_tests {
         }
     }
 
+    fn search_query(scope: SearchScope, text: &str) -> SearchQuery {
+        SearchQuery {
+            scope,
+            text: text.into(),
+            media: None,
+            since: None,
+            until: None,
+            limit: 20,
+            cursor: None,
+        }
+    }
+
+    fn everywhere() -> SearchScope {
+        SearchScope::Global {
+            chat_type: None,
+            archived: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_global(
+        q: &str,
+        chat_type: (bool, bool, bool),
+        folder_id: Option<i32>,
+        filter: tl::enums::MessagesFilter,
+        dates: (i32, i32),
+        offset: (i32, tl::enums::InputPeer, i32),
+    ) -> Vec<u8> {
+        tl::functions::messages::SearchGlobal {
+            broadcasts_only: chat_type.0,
+            groups_only: chat_type.1,
+            users_only: chat_type.2,
+            folder_id,
+            community: None,
+            q: q.into(),
+            filter,
+            min_date: dates.0,
+            max_date: dates.1,
+            offset_rate: offset.0,
+            offset_peer: offset.1,
+            offset_id: offset.2,
+            limit: 20,
+        }
+        .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_global_search_sends_its_filters_and_continues_at_the_cursor() {
+        let (live, _dir) = cold_client().await;
+        use tl::enums::MessagesFilter as F;
+        let groups_in_archive = SearchQuery {
+            media: Some(MediaFilter::Photo),
+            since: Some(1_000),
+            until: Some(2_000),
+            ..search_query(
+                SearchScope::Global {
+                    chat_type: Some(ChatType::Groups),
+                    archived: Some(true),
+                },
+                "  deploy ",
+            )
+        };
+        assert!(live.search_messages(groups_in_archive).await.is_err());
+        let main_channels = search_query(
+            SearchScope::Global {
+                chat_type: Some(ChatType::Channels),
+                archived: Some(false),
+            },
+            "deploy",
+        );
+        assert!(live.search_messages(main_channels).await.is_err());
+        // Page 2: Telegram's rate, the last hit's chat with its hash, its id.
+        let first = search_query(everywhere(), "deploy");
+        let next = SearchQuery {
+            cursor: Some(search::cursor_for(
+                &first,
+                Some(777),
+                Some(ChatRef::new(ChatId::Channel(5), Some(-9))),
+                31,
+            )),
+            ..first.clone()
+        };
+        assert!(live.search_messages(next).await.is_err());
+        // A last hit Telegram gave no hash for, and none is cached: Empty.
+        let next = SearchQuery {
+            cursor: Some(search::cursor_for(
+                &first,
+                Some(778),
+                Some(ChatId::User(6).into()),
+                32,
+            )),
+            ..first
+        };
+        assert!(live.search_messages(next).await.is_err());
+
+        let channel = tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: -9,
+        });
+        let empty = || tl::enums::InputPeer::Empty;
+        assert_eq!(
+            sent(&live),
+            [
+                // Inclusive bounds become Telegram's exclusive ones; the query is trimmed.
+                search_global(
+                    "deploy",
+                    (false, true, false),
+                    Some(1),
+                    F::InputMessagesFilterPhotos,
+                    (999, 2_001),
+                    (0, empty(), 0)
+                ),
+                search_global(
+                    "deploy",
+                    (true, false, false),
+                    Some(0),
+                    F::InputMessagesFilterEmpty,
+                    (0, 0),
+                    (0, empty(), 0)
+                ),
+                search_global(
+                    "deploy",
+                    (false, false, false),
+                    None,
+                    F::InputMessagesFilterEmpty,
+                    (0, 0),
+                    (777, channel, 31)
+                ),
+                search_global(
+                    "deploy",
+                    (false, false, false),
+                    None,
+                    F::InputMessagesFilterEmpty,
+                    (0, 0),
+                    (778, empty(), 32)
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_in_one_chat_names_the_chat_and_the_sender() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(7));
+        let bob = ChatRef::new(ChatId::User(8), Some(-3));
+        let mine = SearchQuery {
+            media: Some(MediaFilter::VideoNote),
+            ..search_query(
+                SearchScope::Chat {
+                    chat: channel,
+                    from: Some(SearchFrom::Me),
+                },
+                "",
+            )
+        };
+        assert!(live.search_messages(mine).await.is_err());
+        let bobs = search_query(
+            SearchScope::Chat {
+                chat: channel,
+                from: Some(SearchFrom::Peer(bob)),
+            },
+            "",
+        );
+        let bobs = SearchQuery {
+            media: Some(MediaFilter::VideoNote),
+            cursor: Some(search::cursor_for(
+                &SearchQuery {
+                    media: Some(MediaFilter::VideoNote),
+                    ..bobs.clone()
+                },
+                None,
+                None,
+                40,
+            )),
+            ..bobs
+        };
+        assert!(live.search_messages(bobs).await.is_err());
+
+        let search = |from_id, offset_id| {
+            tl::functions::messages::Search {
+                peer: tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                    channel_id: 5,
+                    access_hash: 7,
+                }),
+                q: String::new(),
+                from_id: Some(from_id),
+                saved_peer_id: None,
+                saved_reaction: None,
+                top_msg_id: None,
+                filter: tl::enums::MessagesFilter::InputMessagesFilterRoundVideo,
+                min_date: 0,
+                max_date: 0,
+                offset_id,
+                add_offset: 0,
+                limit: 20,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            }
+            .to_bytes()
+        };
+        assert_eq!(
+            sent(&live),
+            [
+                search(tl::enums::InputPeer::PeerSelf, 0),
+                search(
+                    tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                        user_id: 8,
+                        access_hash: -3,
+                    }),
+                    40
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn telegrams_search_refusals_are_the_callers_to_fix() {
+        let (live, _dir) = cold_client().await;
+        match live.classify(
+            rpc::<tl::functions::messages::SearchGlobal>(400, "SEARCH_QUERY_EMPTY"),
+            MethodClass::Search,
+        ) {
+            TgError::InvalidInput(message) => assert_eq!(message, search::QUERY_REQUIRED),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            live.classify(
+                rpc::<tl::functions::messages::Search>(400, "FROM_PEER_INVALID"),
+                MethodClass::Search,
+            ),
+            TgError::InvalidInput(_)
+        ));
+    }
+
     #[tokio::test]
     async fn a_search_flood_holds_back_searches_but_reading_still_reaches_telegram() {
         let (live, _dir) = cold_client().await;
@@ -1743,6 +2128,22 @@ mod resolve_tests {
                 ..
             }) => {}
             other => panic!("expected the search to fail fast, got {other:?}"),
+        }
+        // Both kinds of message search are held back without reaching Telegram.
+        for scope in [
+            everywhere(),
+            SearchScope::Chat {
+                chat: channel,
+                from: None,
+            },
+        ] {
+            match live.search_messages(search_query(scope, "deploy")).await {
+                Err(TgError::FloodWait {
+                    class: MethodClass::Search,
+                    ..
+                }) => {}
+                other => panic!("expected {scope:?} to fail fast, got {other:?}"),
+            }
         }
         // The offline connection fails them, but they went out: not held back.
         assert!(!matches!(

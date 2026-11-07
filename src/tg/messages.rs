@@ -81,6 +81,50 @@ pub struct MessagePage {
     pub next_after_id: Option<i32>,
 }
 
+/// What a message carries besides its text. Never the media itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Media {
+    Photo,
+    Video,
+    /// A round video message.
+    VideoNote,
+    Voice,
+    Audio,
+    Gif,
+    Sticker,
+    /// Any other file.
+    Document,
+    Location,
+    Contact,
+    Poll,
+    Dice,
+    Story,
+    Other,
+}
+
+impl Media {
+    /// How a message without text shows in get_messages and list_chats.
+    pub fn placeholder(self) -> &'static str {
+        match self {
+            Media::Photo => "[photo]",
+            Media::Video => "[video]",
+            Media::VideoNote => "[video message]",
+            Media::Voice => "[voice]",
+            Media::Audio => "[audio]",
+            Media::Gif => "[gif]",
+            Media::Sticker => "[sticker]",
+            Media::Document => "[file]",
+            Media::Location => "[location]",
+            Media::Contact => "[contact]",
+            Media::Poll => "[poll]",
+            Media::Dice => "[dice]",
+            Media::Story => "[story]",
+            Media::Other => "[media]",
+        }
+    }
+}
+
 /// One message as extracted from TL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawHistoryMessage {
@@ -93,7 +137,10 @@ pub struct RawHistoryMessage {
     pub from: Option<ChatId>,
     #[serde(default)]
     pub out: bool,
+    /// The text as written: empty for media without a caption.
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Media>,
     #[serde(default)]
     pub reply_to: Option<i32>,
     #[serde(default)]
@@ -189,10 +236,10 @@ where
             let next_after_id = (answer.returned >= query.limit)
                 .then(|| window.first().map(|m| m.id))
                 .flatten();
-            let issuer = Issuer::new(chat, &answer.peers);
+            let issuer = Issuer::new(&answer.peers);
             Ok(MessagePage {
-                chat_id: issuer.chat_id(),
-                messages: window.iter().map(|m| issuer.message(m)).collect(),
+                chat_id: issuer.chat_id(chat),
+                messages: window.iter().map(|m| issuer.message(chat, m)).collect(),
                 next_before_id: None,
                 next_after_id,
             })
@@ -255,14 +302,14 @@ where
         window.extend(newest_first(fill.messages, |id| id < oldest));
         peers.extend(fill.peers);
     }
-    let issuer = Issuer::new(chat, &peers);
+    let issuer = Issuer::new(&peers);
     Ok(MessagePage {
-        chat_id: issuer.chat_id(),
+        chat_id: issuer.chat_id(chat),
         messages: window
             .iter()
             .map(|m| ChatMessage {
                 target: m.id == target,
-                ..issuer.message(m)
+                ..issuer.message(chat, m)
             })
             .collect(),
         next_before_id: more_older.then(|| window.last().map(|m| m.id)).flatten(),
@@ -281,39 +328,44 @@ fn newest_first(
     messages
 }
 
-/// Turns raw messages into the tools' shape, handing out chat ids.
-struct Issuer<'a> {
-    chat: ChatRef,
+/// Turns raw messages into the tools' shape, handing out chat ids from the
+/// peers Telegram sent along with them.
+pub(super) struct Issuer<'a> {
     peers: HashMap<ChatId, &'a RawPeer>,
 }
 
 impl<'a> Issuer<'a> {
-    fn new(chat: ChatRef, peers: &'a [RawPeer]) -> Self {
+    pub(super) fn new(peers: &'a [RawPeer]) -> Self {
         Self {
-            chat,
             peers: peers.iter().map(|p| (p.id, p)).collect(),
         }
     }
 
-    /// Ids handed out carry the access hash Telegram just sent along; the chat
-    /// itself keeps the one it was asked with if Telegram didn't describe it.
-    fn issue(&self, id: ChatId) -> ChatRef {
+    pub(super) fn peer(&self, id: ChatId) -> Option<&'a RawPeer> {
+        self.peers.get(&id).copied()
+    }
+
+    /// Ids handed out carry the access hash Telegram just sent along (none is
+    /// invented); `asked`, the chat as the caller named it, keeps the hash it
+    /// was asked with if Telegram didn't describe it.
+    pub(super) fn issue(&self, id: ChatId, asked: ChatRef) -> ChatRef {
         match self.peers.get(&id).and_then(|p| p.access_hash) {
             Some(hash) => ChatRef::new(id, Some(hash)),
-            None if id == self.chat.chat() => self.chat,
+            None if id == asked.chat() => asked,
             None => ChatRef::from(id),
         }
     }
 
-    fn chat_id(&self) -> String {
-        self.issue(self.chat.chat()).to_string()
+    fn chat_id(&self, chat: ChatRef) -> String {
+        self.issue(chat.chat(), chat).to_string()
     }
 
-    fn message(&self, m: &RawHistoryMessage) -> ChatMessage {
+    /// `m` as a message of `chat`.
+    pub(super) fn message(&self, chat: ChatRef, m: &RawHistoryMessage) -> ChatMessage {
         let sender = (!m.out).then(|| {
-            let id = m.from.unwrap_or(self.chat.chat());
+            let id = m.from.unwrap_or(chat.chat());
             Sender {
-                id: self.issue(id).to_string(),
+                id: self.issue(id, chat).to_string(),
                 name: self
                     .peers
                     .get(&id)
@@ -321,12 +373,16 @@ impl<'a> Issuer<'a> {
                     .unwrap_or_else(|| id.to_string()),
             }
         });
+        let text = match m.media {
+            Some(media) if m.text.is_empty() => media.placeholder().to_string(),
+            _ => m.text.clone(),
+        };
         ChatMessage {
             id: m.id,
             date: rfc3339(m.date),
             sender,
             outgoing: m.out,
-            text: m.text.clone(),
+            text,
             reply_to: m.reply_to,
             forwarded: m.forwarded,
             edited: m.edited,
@@ -344,7 +400,7 @@ fn assemble_history(
     query: &HistoryQuery,
     full_page: bool,
 ) -> MessagePage {
-    let issuer = Issuer::new(chat, peers);
+    let issuer = Issuer::new(peers);
     let mut reached_since = false;
     let mut messages = Vec::new();
     for m in raw {
@@ -356,13 +412,13 @@ fn assemble_history(
             reached_since = true;
             break;
         }
-        messages.push(issuer.message(m));
+        messages.push(issuer.message(chat, m));
     }
     let next_before_id = (full_page && !reached_since)
         .then(|| raw.last().map(|m| m.id))
         .flatten();
     MessagePage {
-        chat_id: issuer.chat_id(),
+        chat_id: issuer.chat_id(chat),
         messages,
         next_before_id,
         next_after_id: None,
@@ -402,6 +458,7 @@ mod tests {
             from: None,
             out: false,
             text: format!("m{id}"),
+            media: None,
             reply_to: None,
             forwarded: false,
             edited: false,
@@ -505,6 +562,35 @@ mod tests {
         let asked = ChatRef::new(group, Some(5));
         let page = assemble_history(asked, &raw, &[], &query(10), false);
         assert_eq!(page.chat_id, asked.to_string());
+    }
+
+    #[test]
+    fn media_without_text_shows_as_a_placeholder_a_caption_as_itself() {
+        let photo = |text: &str| RawHistoryMessage {
+            text: text.into(),
+            media: Some(Media::Photo),
+            ..msg(1, 10)
+        };
+        let raw = [
+            photo(""),
+            RawHistoryMessage {
+                id: 2,
+                ..photo("look")
+            },
+            RawHistoryMessage {
+                id: 3,
+                media: Some(Media::VideoNote),
+                ..photo("")
+            },
+            RawHistoryMessage {
+                id: 4,
+                text: String::new(),
+                ..msg(4, 10)
+            },
+        ];
+        let page = assemble_history(ChatId::User(1).into(), &raw, &[], &query(10), false);
+        let texts: Vec<&str> = page.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["[photo]", "look", "[video message]", ""]);
     }
 
     #[test]

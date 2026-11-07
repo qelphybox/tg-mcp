@@ -194,3 +194,33 @@ Ranges are inclusive, indexes from 0. Pick quiet chats: a message arriving betwe
 4. Step 5: `around_id` that isn't in the chat is an error saying `message … not found in this chat`, not an empty page. `around_id` with `since` is `invalid_params` (`around_id can't be combined with since`).
 
 If step 2 is off by one (five newer and three older, or three and five) or fails with `not found` for an M that is in `P`, Telegram's `add_offset` doesn't count the way `core.telegram.org/api/offsets` says, which is what the window relies on (`src/tg/messages.rs`, `read_history`).
+
+## 14. Search finds each hit once, hands out issued ids, and a hit opens in context
+
+Needs an account with a few hundred messages in several chats and at least one archived chat. Pick a word that is common in them (below: `спасибо`; replace it if it is rare) and, for step 5, a word whose case forms you use (below: `деплой`). In Claude Code, with the server added as in §1:
+
+```text
+Через Telegram MCP проверь search_messages. Текст сообщений и названия чатов не выводи и не пересказывай: только id, даты, типы, флаги, ошибки и длины.
+1. search_messages с query="спасибо", limit=10. Потом ещё два раза с тем же query и limit, передавая next_cursor как cursor. Для каждой из трёх страниц выведи пары (chat.id, id) и date. Проверь: нет ли повторов пар внутри страницы и между страницами; не возрастают ли date от хита к хиту по всем трём страницам подряд; на каждой странице не больше 10 хитов; у каждого chat.id и sender.id вида user:… или channel:… есть часть ~ из 11 символов (chat:… без неё — это нормально); есть ли в ответах поле count или total. Длина snippet у каждого хита ≤ 300.
+2. Возьми chat.id первого хита первой страницы. search_messages с query="спасибо", chat_id=<он>, limit=5, потом следующая страница по next_cursor. Проверь, что у всех хитов chat.id ровно этот, повторов (chat.id, id) нет, date не возрастают.
+3. get_messages с chat_id=<chat.id первого хита шага 1>, around_id=<его id>, limit=5. Есть ли там сообщение с target=true и тем же id? Содержит ли его текст слово «спасибо» в какой-либо форме (ответь да/нет, текст не выводи)?
+4. search_messages с query="пожалуйста" и cursor=<next_cursor первой страницы шага 1>. Выведи текст ошибки.
+5. search_messages с query="деплой", потом с query="деплоя" (без других параметров, limit=20). Сколько хитов у каждого и сколько пар (chat.id, id) общих?
+6. search_messages с chat_id=<chat.id из шага 2>, from="me", без query, limit=5: у всех ли хитов outgoing=true и нет sender?
+7. search_messages с query="спасибо", archived=true, limit=5, и с archived=false, limit=5: выведи chat.id; есть ли общие между двумя ответами?
+8. search_messages с media="photo" без query (по всем чатам), limit=3: выведи ошибку или число хитов и их media.
+9. search_messages с query="спасибо", from="me" без chat_id; и с chat_id=<из шага 2> и chat_type="private". Выведи тексты ошибок.
+Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: no pair repeats on a page or across the three pages, dates never increase, each page has at most 10 hits, every `user:`/`channel:` id (chats and senders) has its `~` part, no `count`/`total` field, snippets are at most 300 characters. This is what the fake's model of `messages.searchGlobal` paging (`next_rate` / `offset_peer` / `offset_id`, `src/tg/fake.rs` `search_answer`) promises; a repeat means Telegram pages differently from that model.
+2. Step 2: every hit is in the chosen chat, no repeats, newest first.
+3. Step 3: the window holds the hit as `target: true`, and its text has the word: `around_id` reads a hit in context.
+4. Step 4: `invalid_params` saying the cursor belongs to a different search.
+5. Step 5 (manual calibration, record the numbers in the PR or issue): how far Telegram's morphology goes for Russian. If `деплоя` finds the `деплой` messages too, the tool description's advice ("try other word forms") is a fallback, not a necessity.
+6. Step 6: all hits are the account's own (`outgoing: true`, no `sender`): `from: "me"` is `inputPeerSelf`.
+7. Step 7: no chat id is in both answers; the `archived=true` ones are archived chats in the app (spot-check one).
+8. Step 8 (manual calibration): either photo hits across chats with `"media": "photo"` and empty snippets for captionless ones, or `invalid_params` "Telegram refuses an empty query for this search …" (`SEARCH_QUERY_EMPTY`). Note which one: it decides whether the description may promise empty queries with `media` across all chats.
+9. Step 9: `from only works within one chat …` and `chat_type only applies to a search across all chats …`, both `invalid_params`.
+
+`kamal app logs | grep -F 'спасибо'` (and `деплой`) finds nothing: query text is never logged.

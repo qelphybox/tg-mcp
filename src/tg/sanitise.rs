@@ -23,6 +23,7 @@ use super::{
     Account, Telegram, TgError,
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
     messages::{ChatMessage, HistoryQuery, MessagePage, Sender},
+    search::{HitChat, SearchHit, SearchPage, SearchQuery},
 };
 
 /// Unicode general category `Cf` (format characters), sorted. Identical in
@@ -218,6 +219,39 @@ impl Untrusted for ChatInfo {
     }
 }
 
+impl Untrusted for SearchPage {
+    fn sanitise(&mut self) {
+        let SearchPage {
+            hits,
+            next_cursor: _,
+        } = self;
+        for hit in hits {
+            let SearchHit {
+                chat:
+                    HitChat {
+                        id: _,
+                        title,
+                        kind: _,
+                    },
+                id: _,
+                date: _,
+                sender,
+                outgoing: _,
+                snippet,
+                media: _,
+                reply_to: _,
+                forwarded: _,
+                edited: _,
+            } = hit;
+            clean(title);
+            clean(snippet);
+            if let Some(Sender { id: _, name }) = sender {
+                clean(name);
+            }
+        }
+    }
+}
+
 fn sanitised<T: Untrusted>(mut value: T) -> T {
     value.sanitise();
     value
@@ -260,6 +294,10 @@ impl Telegram for Sanitised {
 
     async fn get_chat_info(&self, chat: ChatRef) -> Result<ChatInfo, TgError> {
         self.0.get_chat_info(chat).await.map(sanitised)
+    }
+
+    async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
+        self.0.search_messages(query).await.map(sanitised)
     }
 }
 
@@ -462,5 +500,36 @@ mod tests {
         history.sanitise();
         assert_eq!(history.messages[0].text, "a\nb");
         assert_eq!(history.messages[0].sender.as_ref().unwrap().name, "Bob");
+
+        let mut found = SearchPage {
+            hits: vec![SearchHit {
+                chat: HitChat {
+                    id: "channel:2~AAAAAAAAAAE".into(),
+                    title: "T\u{202E}eam".into(),
+                    kind: ChatKind::Supergroup,
+                },
+                id: 1,
+                date: "2026-11-06T00:00:00Z".into(),
+                sender: Some(Sender {
+                    id: "user:1".into(),
+                    name: "Bo\u{200B}b".into(),
+                }),
+                outgoing: false,
+                snippet: "de\u{2060}ploy\u{E0041}".into(),
+                media: None,
+                reply_to: None,
+                forwarded: false,
+                edited: false,
+            }],
+            next_cursor: None,
+        };
+        found.sanitise();
+        let hit = &found.hits[0];
+        assert_eq!(
+            (hit.chat.title.as_str(), hit.snippet.as_str()),
+            ("Team", "deploy")
+        );
+        assert_eq!(hit.sender.as_ref().unwrap().name, "Bob");
+        assert_eq!(hit.chat.id, "channel:2~AAAAAAAAAAE");
     }
 }

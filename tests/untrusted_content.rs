@@ -53,6 +53,7 @@ fn message(id: i32, text: String) -> RawHistoryMessage {
         from: None,
         out: false,
         text,
+        media: None,
         reply_to: None,
         forwarded: false,
         edited: false,
@@ -177,6 +178,25 @@ async fn get_messages_strips_text_and_sender_names_but_keeps_lines() {
 }
 
 #[tokio::test]
+async fn search_messages_strips_snippets_chat_titles_and_sender_names() {
+    let (_server, client) = client().await;
+    let page = call(&client, "search_messages", json!({ "query": "owt" })).await;
+    let hit = &page["hits"][0];
+    // Hidden characters go first, so the snippet finds the word and is one line.
+    assert_eq!(
+        hit["snippet"],
+        format!("line one  line owt Привет 你好 {EMOJI}")
+    );
+    assert_eq!(hit["chat"]["title"], format!("Alice {EMOJI}"));
+    assert_eq!(hit["sender"]["name"], format!("Alice {EMOJI}"));
+    assert_eq!(
+        hit["chat"]["id"],
+        fake_issued_id(ALICE),
+        "ids are ours, untouched"
+    );
+}
+
+#[tokio::test]
 async fn get_chat_info_strips_title_username_and_description() {
     let (_server, client) = client().await;
     let info = call(
@@ -215,7 +235,12 @@ async fn the_model_is_told_that_content_is_untrusted() {
     );
 
     let tools = client.list_all_tools().await.unwrap();
-    for name in ["list_chats", "get_messages", "get_chat_info"] {
+    for name in [
+        "list_chats",
+        "get_messages",
+        "get_chat_info",
+        "search_messages",
+    ] {
         let tool = tools.iter().find(|t| t.name == name).unwrap();
         let description = tool.description.as_deref().unwrap_or_default();
         assert!(

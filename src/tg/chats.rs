@@ -387,11 +387,7 @@ pub fn assemble_page(
                 title: peer
                     .map(|p| p.title.clone())
                     .unwrap_or_else(|| "Unknown chat".into()),
-                kind: peer.map(|p| p.kind).unwrap_or(match dialog.chat {
-                    ChatId::User(_) => ChatKind::Private,
-                    ChatId::Chat(_) => ChatKind::Group,
-                    ChatId::Channel(_) => ChatKind::Channel,
-                }),
+                kind: peer.map_or_else(|| fallback_kind(dialog.chat), |p| p.kind),
                 username: peer.and_then(|p| p.username.clone()),
                 is_self: peer.is_some_and(|p| p.is_self),
                 unread_count: dialog.unread_count,
@@ -438,6 +434,15 @@ pub fn assemble_page(
     let next_cursor = next.filter(|_| cut || full_page).map(|c| c.encode());
 
     ChatPage { chats, next_cursor }
+}
+
+/// The kind of a Chat Telegram didn't describe, as far as its id tells.
+pub fn fallback_kind(chat: ChatId) -> ChatKind {
+    match chat {
+        ChatId::User(_) => ChatKind::Private,
+        ChatId::Chat(_) => ChatKind::Group,
+        ChatId::Channel(_) => ChatKind::Channel,
+    }
 }
 
 pub fn rfc3339(unix: i32) -> String {

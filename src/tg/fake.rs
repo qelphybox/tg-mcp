@@ -16,10 +16,15 @@ use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{
         ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
-        chat_info,
+        chat_info, fallback_kind,
     },
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, MessagePage, RawHistoryMessage, read_history,
+        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessagePage, RawHistoryMessage,
+        read_history,
+    },
+    search::{
+        self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
+        SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
 };
 use crate::{limits::MethodClass, sessions::OpenedGrant};
@@ -38,9 +43,17 @@ pub struct FakeData {
     /// Descriptions and member counts, for get_chat_info.
     #[serde(default)]
     pub details: std::collections::HashMap<ChatId, FakeDetails>,
-    /// When set, every call answers like Telegram's FLOOD_WAIT_<seconds>.
+    /// Chats in the Archive; the rest are in the main list.
+    #[serde(default)]
+    pub archived: Vec<ChatId>,
+    /// When set, every reading call (method class Default) answers like
+    /// Telegram's FLOOD_WAIT_<seconds>.
     #[serde(default)]
     pub flood_wait: Option<u32>,
+    /// When set, every search (method class Search) answers like
+    /// FLOOD_WAIT_<seconds>, and nothing else does.
+    #[serde(default)]
+    pub search_flood_wait: Option<u32>,
     /// How getHistory answers a slice that reaches past the newest message.
     #[serde(default)]
     pub past_newest: PastNewest,
@@ -121,7 +134,9 @@ impl FakeData {
             chats: Vec::new(),
             messages: Default::default(),
             details: Default::default(),
+            archived: Vec::new(),
             flood_wait: None,
+            search_flood_wait: None,
             past_newest: PastNewest::default(),
         }
     }
@@ -145,6 +160,173 @@ impl FakeData {
         self.chats = chats;
         self
     }
+
+    pub fn with_archived(mut self, chats: Vec<ChatId>) -> Self {
+        self.archived = chats;
+        self
+    }
+}
+
+/// One Chat as the fake's search sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct FakeSearchChat<'a> {
+    pub id: ChatId,
+    pub kind: ChatKind,
+    pub archived: bool,
+    pub messages: &'a [RawHistoryMessage],
+}
+
+/// The fake's "rate" of a message: what orders global results and what
+/// `next_rate` hands out. Monotonic in the date but not the date, so a server
+/// that passes a date where Telegram's rate belongs pages wrong.
+pub fn fake_rate(date: i32) -> i32 {
+    date - 1_000_000_000
+}
+
+/// Telegram's order across Chats for equal rates: by peer, as the Bot API
+/// numbers them, then by message id.
+fn peer_key(chat: ChatId) -> i64 {
+    match chat {
+        ChatId::User(id) => id,
+        ChatId::Chat(id) => -id,
+        ChatId::Channel(id) => -1_000_000_000_000 - id,
+    }
+}
+
+/// Telegram's largest search `limit`, as for getHistory.
+const SEARCH_MAX_LIMIT: i32 = 100;
+
+/// `messages.searchGlobal` / `messages.search` as Telegram answers them, on
+/// the account `me`'s Chats (core.telegram.org/method/messages.searchGlobal,
+/// /method/messages.search, /constructor/messages.messagesSlice):
+///
+/// - matching: every query word begins a word of the text, case-insensitive
+///   (Telegram also matches word forms; the fake doesn't); an empty query
+///   matches everything, then `filter`, `min_date`/`max_date` (exclusive) and
+///   the sender apply;
+/// - global: results of the chosen Chats ordered by (rate, peer, id), newest
+///   first; a page holds the `limit` results strictly after (`offset_rate`,
+///   `offset_peer`, `offset_id`), and a slice's `next_rate` is the rate of its
+///   last message;
+/// - one Chat: newest first, ids strictly below `offset_id`;
+/// - the answer is `messages.messages` when a first page holds every result,
+///   else `messages.messagesSlice` (`messages.channelMessages` in a channel,
+///   which has no `next_rate`). Never more than `limit` messages, and pages
+///   never overlap.
+pub fn search_answer(chats: &[FakeSearchChat], me: i64, request: &SearchRequest) -> SearchAnswer {
+    let limit = request.limit.clamp(0, SEARCH_MAX_LIMIT) as usize;
+    let matches = |chat: ChatId, m: &RawHistoryMessage, from: Option<SearchFrom>| {
+        let sender = if m.out {
+            ChatId::User(me)
+        } else {
+            m.from.unwrap_or(chat)
+        };
+        search::text_matches(&m.text, &request.q)
+            && request.filter.is_none_or(|f| media_matches(f, m))
+            && (request.min_date == 0 || m.date > request.min_date)
+            && (request.max_date == 0 || m.date < request.max_date)
+            && from.is_none_or(|from| match from {
+                SearchFrom::Me => sender == ChatId::User(me),
+                SearchFrom::Peer(peer) => sender == peer.chat(),
+            })
+    };
+    let found = |chat: ChatId, m: &RawHistoryMessage| RawFoundMessage {
+        chat,
+        message: m.clone(),
+    };
+    let (page, first_page, rest, channel) = match request.scope {
+        RequestScope::Global {
+            chat_type,
+            folder_id,
+            offset_rate,
+            offset_peer,
+            offset_id,
+        } => {
+            let mut results: Vec<RawFoundMessage> = chats
+                .iter()
+                .filter(|c| match chat_type {
+                    None => true,
+                    Some(ChatType::Private) => matches!(c.id, ChatId::User(_)),
+                    Some(ChatType::Groups) => {
+                        matches!(c.kind, ChatKind::Group | ChatKind::Supergroup)
+                    }
+                    Some(ChatType::Channels) => c.kind == ChatKind::Channel,
+                })
+                .filter(|c| match folder_id {
+                    Some(1) => c.archived,
+                    Some(0) => !c.archived,
+                    _ => true,
+                })
+                .flat_map(|c| {
+                    c.messages
+                        .iter()
+                        .filter(|m| matches(c.id, m, None))
+                        .map(|m| found(c.id, m))
+                })
+                .collect();
+            let order =
+                |f: &RawFoundMessage| (fake_rate(f.message.date), peer_key(f.chat), f.message.id);
+            results.sort_by_key(|f| std::cmp::Reverse(order(f)));
+            let first_page = offset_rate == 0 && offset_peer.is_none() && offset_id == 0;
+            if !first_page {
+                let offset = (
+                    offset_rate,
+                    offset_peer.map_or(i64::MAX, |p| peer_key(p.chat())),
+                    offset_id,
+                );
+                results.retain(|f| order(f) < offset);
+            }
+            let rest = results.split_off(limit.min(results.len()));
+            (results, first_page, rest.len(), false)
+        }
+        RequestScope::Chat {
+            chat,
+            from,
+            offset_id,
+        } => {
+            let mut results: Vec<RawFoundMessage> = chats
+                .iter()
+                .filter(|c| c.id == chat.chat())
+                .flat_map(|c| {
+                    c.messages
+                        .iter()
+                        .filter(|m| offset_id == 0 || m.id < offset_id)
+                        .filter(|m| matches(c.id, m, from))
+                        .map(|m| found(c.id, m))
+                })
+                .collect();
+            results.sort_by_key(|f| std::cmp::Reverse(f.message.id));
+            let rest = results.split_off(limit.min(results.len()));
+            let channel = matches!(chat.chat(), ChatId::Channel(_));
+            (results, offset_id == 0, rest.len(), channel)
+        }
+    };
+    let complete = first_page && rest == 0 && !channel;
+    let global = matches!(request.scope, RequestScope::Global { .. });
+    SearchAnswer {
+        next_rate: (global && !complete)
+            .then(|| page.last().map(|f| fake_rate(f.message.date)))
+            .flatten(),
+        returned: page.len(),
+        complete,
+        messages: page,
+        peers: Vec::new(),
+    }
+}
+
+/// Telegram's `inputMessagesFilter*` on one message. Links: the fake counts
+/// a `://` in the text (Telegram goes by its url entities).
+fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
+    let media = match filter {
+        MediaFilter::Link => return m.text.contains("://"),
+        MediaFilter::Photo => Media::Photo,
+        MediaFilter::Video => Media::Video,
+        MediaFilter::Document => Media::Document,
+        MediaFilter::Voice => Media::Voice,
+        MediaFilter::VideoNote => Media::VideoNote,
+        MediaFilter::Gif => Media::Gif,
+    };
+    m.media == Some(media)
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +366,8 @@ impl Telegram for FakeTelegram {
         Ok(self.data.account.clone())
     }
 
-    /// Archived chats don't exist in the fake. Cursors are `fake:<offset>`.
+    /// The main list or the Archive, in the order of `chats`. Cursors are
+    /// `fake:<offset>` (main list) and `fake:a<offset>` (Archive).
     async fn list_chats(
         &self,
         limit: usize,
@@ -192,24 +375,31 @@ impl Telegram for FakeTelegram {
         archived: bool,
     ) -> Result<ChatPage, TgError> {
         self.flood()?;
-        let start = match cursor {
-            None => 0,
-            Some(c) => c
-                .strip_prefix(CURSOR_PREFIX)
-                .and_then(|n| n.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    TgError::InvalidInput("cursor is not one this server returned".into())
-                })?,
+        let (start, archived) = match cursor {
+            None => (0, archived),
+            Some(c) => {
+                let offset = c.strip_prefix(CURSOR_PREFIX).ok_or_else(foreign_cursor)?;
+                let (offset, archived) = match offset.strip_prefix('a') {
+                    Some(offset) => (offset, true),
+                    None => (offset, false),
+                };
+                (
+                    offset.parse::<usize>().map_err(|_| foreign_cursor())?,
+                    archived,
+                )
+            }
         };
-        if archived {
-            return Ok(ChatPage {
-                chats: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let chats: Vec<ChatSummary> = self
+        let listing: Vec<&ChatSummary> = self
             .data
             .chats
+            .iter()
+            .filter(|c| {
+                c.id.parse::<ChatRef>()
+                    .is_ok_and(|id| self.data.archived.contains(&id.chat()))
+                    == archived
+            })
+            .collect();
+        let chats: Vec<ChatSummary> = listing
             .iter()
             .skip(start)
             .take(limit)
@@ -218,12 +408,13 @@ impl Telegram for FakeTelegram {
                     .id
                     .parse::<ChatRef>()
                     .map_or_else(|_| c.id.clone(), |id| fake_issued_id(id.chat())),
-                ..c.clone()
+                ..(*c).clone()
             })
             .collect();
         let end = start + chats.len();
+        let folder = if archived { "a" } else { "" };
         Ok(ChatPage {
-            next_cursor: (end < self.data.chats.len()).then(|| format!("{CURSOR_PREFIX}{end}")),
+            next_cursor: (end < listing.len()).then(|| format!("{CURSOR_PREFIX}{folder}{end}")),
             chats,
         })
     }
@@ -267,6 +458,66 @@ impl Telegram for FakeTelegram {
         let details = self.data.details.get(&chat).cloned().unwrap_or_default();
         Ok(chat_info(&peer, details.description, details.member_count))
     }
+
+    /// The same search calls as the Live client, answered by [`search_answer`].
+    async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
+        if let Some(seconds) = self.data.search_flood_wait {
+            return Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Search,
+            });
+        }
+        if let SearchScope::Chat { chat, from } = query.scope {
+            self.check_hash(chat)?;
+            if !self.knows(chat.chat()) {
+                return Err(TgError::InvalidInput(format!(
+                    "{} is not one of your chats; chat ids come from list_chats",
+                    chat.chat()
+                )));
+            }
+            if let Some(SearchFrom::Peer(peer)) = from {
+                self.check_hash(peer)?;
+            }
+        }
+        let chats: Vec<FakeSearchChat> = self
+            .data
+            .messages
+            .iter()
+            .map(|(&id, messages)| FakeSearchChat {
+                id,
+                kind: self
+                    .data
+                    .chats
+                    .iter()
+                    .find(|c| c.id.parse::<ChatRef>().is_ok_and(|r| r.chat() == id))
+                    .map_or_else(|| fallback_kind(id), |c| c.kind),
+                archived: self.data.archived.contains(&id),
+                messages,
+            })
+            .collect();
+        let peers = self.peers();
+        let me = self.data.account.id;
+        search::search(&query, |request| {
+            // SEARCH_QUERY_EMPTY, as the Live client reports it.
+            let answer = if request.q.is_empty()
+                && request.filter.is_none()
+                && !matches!(request.scope, RequestScope::Chat { from: Some(_), .. })
+            {
+                Err(TgError::InvalidInput(QUERY_REQUIRED.into()))
+            } else {
+                Ok(SearchAnswer {
+                    peers,
+                    ..search_answer(&chats, me, &request)
+                })
+            };
+            std::future::ready(answer)
+        })
+        .await
+    }
+}
+
+fn foreign_cursor() -> TgError {
+    TgError::InvalidInput("cursor is not one this server returned".into())
 }
 
 impl FakeTelegram {
@@ -610,6 +861,7 @@ mod tests {
                 from: None,
                 out: false,
                 text: String::new(),
+                media: None,
                 reply_to: None,
                 forwarded: false,
                 edited: false,

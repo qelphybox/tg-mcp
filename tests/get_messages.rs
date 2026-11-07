@@ -41,6 +41,7 @@ fn message(id: i32, text: &str) -> RawHistoryMessage {
         from: None,
         out: id % 2 == 0,
         text: text.into(),
+        media: None,
         reply_to: None,
         forwarded: false,
         edited: false,

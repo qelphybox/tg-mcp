@@ -14,6 +14,7 @@ pub mod grammers;
 pub mod messages;
 mod pool;
 pub mod sanitise;
+pub mod search;
 mod session;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
@@ -97,6 +98,14 @@ pub trait Telegram: Send + Sync + 'static {
 
     /// Details of one Chat: title, type, @username, description/bio, member count.
     async fn get_chat_info(&self, chat: chats::ChatRef) -> Result<chats::ChatInfo, TgError>;
+
+    /// One page of Search hits, Telegram's search across the Account's Chats or
+    /// in one of them, newest first. At most `query.limit` hits; `next_cursor`
+    /// continues right after the last one.
+    async fn search_messages(
+        &self,
+        query: search::SearchQuery,
+    ) -> Result<search::SearchPage, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.
