@@ -385,3 +385,29 @@ Needs, in `list_chats` or found with `find_chats`: a contact `<C>` who shows you
 5. Step 5: the group is an `invalid_params` error `common_chats is only for users …`; the account itself gives `common_chats: []`.
 
 `kamal app logs | grep -F '<the last 4 digits of C's phone>'` and `kamal app logs | grep -iF '<a word of C's bio>'` find nothing: profile content is never logged.
+
+## 41. get_members lists a group's members and admins, says when Telegram hides them, and logs no names
+
+Needs, in `list_chats` or found with `find_chats`: a large supergroup `<L>` the account is in but doesn't administer (more than 10,000 members, e.g. a big public chat), a basic group `<G>` (`type: "group"` in list_chats), a broadcast channel `<N>` the account only reads (`type: "channel"`, not its admin), and, if the account is in one, a supergroup `<H>` that hides its members (in the app, its member list shows only admins). Write down beforehand, from the Telegram app: `<L>`'s member count, the number of its administrators (Group info → Administrators), the first word `<q>` of one member's name in `<L>` (someone the app finds with the member search), and `<G>`'s members and who of them are admins. In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), replace the `<…>` and run:
+
+```text
+Через Telegram MCP проверь get_members. Имена участников и username не пересказывай: выводи только количества, id, role, bot и is_self.
+1. get_members для <L> (id из list_chats или find_chats) с limit=200. Выведи total, сколько участников на странице, есть ли next_cursor и members_hidden. Листай дальше по next_cursor с limit=200, пока он есть, но не больше 60 страниц. Если придёт ошибка «Too many requests … retry in N s», подожди N секунд и продолжи; если придёт FLOOD_WAIT — остановись и выведи её текст. Выведи: число страниц, сколько всего участников получено, были ли повторы id, сколько было на последней странице и чем закончилось листание (нет next_cursor / ошибка).
+2. get_members для <L> с query="<q>". Выведи total, число найденных и для первого из них id и role. Потом get_chat_info для этого id: работает ли (да/нет, поля не выводи)?
+3. get_members для <L> с admins_only=true. Выведи total и количество участников по role. Потом то же с admins_only=true и query из двух первых букв имени одного из админов: сколько найдено?
+4. get_members для <G>. Выведи total и для каждого участника role, bot, is_self. Потом с limit=2 и дальше по next_cursor до конца: сколько страниц? Потом с admins_only=true: сколько и с какими role?
+5. get_members для <N> и для <N> с admins_only=true. Выведи текст ошибки или total.
+6. Если есть <H>: get_members для <H>. Выведи members_hidden, total и количество участников по role и bot.
+7. get_members для любого пользователя из list_chats (id user:…), потом для <G> с limit=201 и для <G> с query из 65 символов. Выведи код и текст каждой ошибки.
+Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: `total` is about the app's member count; pages of 200, each id once (no repeats). The listing stops before `total`: Telegram lists at most about 10,000 members of a large group to anyone (record the exact number of members received: that is Telegram's cap today, and the description's "about 10,000" must stay true). It ends without `next_cursor`, usually after one empty or short page. No `members_hidden`. No FLOOD_WAIT; if one comes, record its seconds: it is Telegram's, honoured, not retried.
+2. Step 2: the member the app finds is among the results; `total` is the number of matches, not the group's size; the id (`user:N~H`) works with get_chat_info.
+3. Step 3: as many as the app's Administrators list (the creator `creator`, the rest `admin`, bots that are admins with `bot: true`); the two-letter query keeps that admin (and any other whose name or @username contains those letters).
+4. Step 4: the same people as the app shows, the creator `creator`, admins `admin`, the account itself `is_self: true`; with `limit=2` the pages hold each member once and the last has no `next_cursor`; `admins_only` gives the creator and the admins.
+5. Step 5: the first is an `invalid_params` error `Telegram shows the members of channel:… only to its admins, and this account isn't one …` that suggests `admins_only`; no subscriber is listed. The second either lists the channel's admins, if Telegram shows them to a subscriber, or is the same error saying Telegram doesn't show the admins either (record which: it is Telegram's choice, not ours).
+6. Step 6: `members_hidden: true`, and only admins and bots are listed, as in the app.
+7. Step 7: three `invalid_params` errors: the user id `… is a user, not a group or channel …`, `limit must be between 1 and 200`, `query must be at most 64 characters …`.
+
+`kamal app logs | grep -iF '<q>'` and `kamal app logs | grep -iF '<the name of one of G's members>'` find nothing: member names are never logged (only ids and counts, if anything).
