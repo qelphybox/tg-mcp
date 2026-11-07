@@ -102,6 +102,10 @@ _Avoid_: permalink, share link
 Messages sent together as one post (Telegram's `grouped_id`): up to 10 photos, videos or files with consecutive ids in one Chat. get_media `view` shows an album, not just the one message.
 _Avoid_: media group, gallery
 
+**Transcription**:
+Telegram's own text of what is said in a voice message or video message (`messages.transcribeAudio`), read by get_media `transcribe`. The audio never leaves Telegram. Needs Telegram Premium, or the weekly free trial of an Account without it.
+_Avoid_: speech-to-text, STT, recognition
+
 **Search hit**:
 One message found by a search, together with its Chat and a snippet of its text around the match.
 _Avoid_: result, match

@@ -34,6 +34,10 @@ use super::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
+    transcribe::{
+        self, Refusal, TranscribedAudio, Transcription, TranscriptionFeed, TranscriptionUpdate,
+        Trial,
+    },
     view::{self, Album, Picture, PictureSize, RawViewMessage, SizeForm},
 };
 use crate::{limits::MethodClass, sessions::OpenedGrant};
@@ -96,7 +100,57 @@ pub struct FakeData {
     /// `media`.
     #[serde(default)]
     pub pictures: std::collections::HashMap<ChatId, Vec<FakePicture>>,
+    /// What Telegram hears in each Chat's voice messages and video messages
+    /// (#33). A voice message or video message without one is one Telegram
+    /// fails to transcribe.
+    #[serde(default)]
+    pub transcriptions: std::collections::HashMap<ChatId, Vec<FakeTranscription>>,
+    /// Whether the Account may transcribe: Premium, a weekly trial, or not.
+    #[serde(default)]
+    pub transcribe: FakeTranscribeAccess,
 }
+
+/// What Telegram hears in one message, and how long it takes to say.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeTranscription {
+    pub message_id: i32,
+    pub text: String,
+    /// From the first `transcribeAudio` for the message to the final text:
+    /// zero answers it at once, `None` never finishes by itself
+    /// ([`FakeTranscriber::finish`] does).
+    pub takes_ms: Option<u64>,
+}
+
+impl FakeTranscription {
+    pub fn new(message_id: i32, text: &str, takes_ms: Option<u64>) -> Self {
+        Self {
+            message_id,
+            text: text.into(),
+            takes_ms,
+        }
+    }
+}
+
+/// Whether an Account may transcribe (core.telegram.org/api/transcribe).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FakeTranscribeAccess {
+    /// Telegram Premium: any number of messages, no trial counter.
+    #[default]
+    Premium,
+    /// Without Premium: `remaining` free transcriptions this week, each of
+    /// a message up to [`FAKE_TRIAL_DURATION_MAX`] seconds long.
+    Trial { remaining: u32 },
+    /// Without Premium and without a trial: `PREMIUM_ACCOUNT_REQUIRED`.
+    NoTrial,
+}
+
+/// The longest message a trial transcribes (Telegram's
+/// `transcribe_audio_trial_duration_max`).
+pub const FAKE_TRIAL_DURATION_MAX: u32 = 300;
+
+/// When the fake's weekly trial resets, from the first transcription of an
+/// Account.
+pub const FAKE_TRIAL_RESETS_IN_S: i64 = 3 * 86_400 + 3_600;
 
 /// What a fake message's media shows (#34), beyond its [`Media`]: the
 /// album it is in, and the sizes Telegram keeps of its photo or the
@@ -392,7 +446,19 @@ impl FakeData {
             past_newest: PastNewest::default(),
             min_past_newest: false,
             pictures: Default::default(),
+            transcriptions: Default::default(),
+            transcribe: FakeTranscribeAccess::default(),
         }
+    }
+
+    pub fn with_transcriptions(mut self, chat: ChatId, heard: Vec<FakeTranscription>) -> Self {
+        self.transcriptions.insert(chat, heard);
+        self
+    }
+
+    pub fn with_transcribe_access(mut self, access: FakeTranscribeAccess) -> Self {
+        self.transcribe = access;
+        self
     }
 
     pub fn with_pictures(mut self, chat: ChatId, pictures: Vec<FakePicture>) -> Self {
@@ -681,6 +747,248 @@ pub struct FakeTelegram {
     data: FakeData,
     known: KnownPeers,
     files: Arc<FakeFiles>,
+    transcriber: Arc<FakeTranscriber>,
+}
+
+/// Telegram's transcription service as the fake models it
+/// (`messages.transcribeAudio` and `updateTranscribedAudio`), shared by every
+/// Grant like Telegram is. Like Telegram it transcribes a message once and
+/// keeps the text: asking again for the same message answers from that
+/// (pending, or the final text) and spends no trial, while each new message
+/// spends one; a used-up trial is `FLOOD_WAIT` until it resets (as TDLib
+/// reads it); the text comes in pieces (a partial answer, a pending update,
+/// then the final update) and other transcriptions' updates go to the same
+/// session.
+#[derive(Debug, Default)]
+pub struct FakeTranscriber {
+    state: Mutex<TranscriberState>,
+}
+
+#[derive(Debug, Default)]
+struct TranscriberState {
+    last_id: i64,
+    /// Each message's transcription, once asked for.
+    jobs: std::collections::HashMap<(i64, ChatId, i32), Job>,
+    /// Each trial Account's `(remaining, resets_at)`, once it transcribed.
+    trials: std::collections::HashMap<i64, (u32, i32)>,
+    /// Each Account's session updates.
+    feeds: std::collections::HashMap<i64, TranscriptionFeed>,
+    calls: Vec<TranscribeSeen>,
+    /// Every call answers `FLOOD_WAIT_<seconds>`.
+    flood: Option<u32>,
+}
+
+#[derive(Debug)]
+struct Job {
+    transcription_id: i64,
+    text: String,
+    done: bool,
+}
+
+/// One `messages.transcribeAudio` the fake received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscribeSeen {
+    pub account: i64,
+    pub chat: ChatId,
+    pub message_id: i32,
+}
+
+impl FakeTranscriber {
+    fn state(&self) -> std::sync::MutexGuard<'_, TranscriberState> {
+        self.state.lock().unwrap()
+    }
+
+    /// Every `transcribeAudio` so far, in order.
+    pub fn calls(&self) -> Vec<TranscribeSeen> {
+        self.state().calls.clone()
+    }
+
+    /// Every `transcribeAudio` from now on is answered `FLOOD_WAIT_<seconds>`.
+    pub fn flood(&self, seconds: u32) {
+        self.state().flood = Some(seconds);
+    }
+
+    /// The free transcriptions a trial Account has left, once it used one.
+    pub fn trial_remaining(&self, account: i64) -> Option<u32> {
+        self.state().trials.get(&account).map(|(left, _)| *left)
+    }
+
+    /// Telegram finishes a transcription that was still pending, and pushes
+    /// its final text to the Account's session.
+    pub fn finish(&self, account: i64, chat: ChatId, message_id: i32) {
+        let mut state = self.state();
+        let job = state
+            .jobs
+            .get_mut(&(account, chat, message_id))
+            .expect("a transcription was asked for");
+        job.done = true;
+        let update = TranscriptionUpdate {
+            transcription_id: job.transcription_id,
+            pending: false,
+            text: job.text.clone(),
+        };
+        let _ = state.feed(account).send(update);
+    }
+
+    /// The Account's session updates.
+    pub fn feed(&self, account: i64) -> TranscriptionFeed {
+        self.state().feed(account)
+    }
+
+    /// One `messages.transcribeAudio` for message `message_id` of `chat`.
+    fn transcribe_audio(
+        self: &Arc<Self>,
+        data: &FakeData,
+        chat: ChatId,
+        message_id: i32,
+    ) -> Result<TranscribedAudio, TgError> {
+        let account = data.account.id;
+        let mut state = self.state();
+        state.calls.push(TranscribeSeen {
+            account,
+            chat,
+            message_id,
+        });
+        if let Some(seconds) = state.flood {
+            return Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Transcribe,
+            });
+        }
+        let media = data
+            .messages
+            .get(&chat)
+            .and_then(|history| history.iter().find(|m| m.id == message_id))
+            .and_then(|m| m.media.clone());
+        let Some(media) =
+            media.filter(|m| matches!(m.kind, MediaKind::Voice | MediaKind::VideoNote))
+        else {
+            return Err(Refusal::VoiceMissing.error(message_id));
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let trial = |state: &TranscriberState| match data.transcribe {
+            FakeTranscribeAccess::Trial { remaining } => {
+                let (left, resets_at) = state
+                    .trials
+                    .get(&account)
+                    .copied()
+                    .unwrap_or((remaining, (now + FAKE_TRIAL_RESETS_IN_S) as i32));
+                Some(Trial {
+                    remaining: left,
+                    resets_at,
+                })
+            }
+            _ => None,
+        };
+        // Asked before: Telegram's own copy, pending or final; no trial spent.
+        if let Some(job) = state.jobs.get(&(account, chat, message_id)) {
+            return Ok(TranscribedAudio {
+                pending: !job.done,
+                transcription_id: job.transcription_id,
+                text: if job.done {
+                    job.text.clone()
+                } else {
+                    partial(&job.text)
+                },
+                trial: trial(&state),
+            });
+        }
+        let heard = data
+            .transcriptions
+            .get(&chat)
+            .and_then(|all| all.iter().find(|t| t.message_id == message_id))
+            .cloned();
+        match data.transcribe {
+            FakeTranscribeAccess::Premium => {}
+            FakeTranscribeAccess::NoTrial => return Err(Refusal::PremiumRequired.error(message_id)),
+            FakeTranscribeAccess::Trial { .. } => {
+                let Trial {
+                    remaining,
+                    resets_at,
+                } = trial(&state).expect("a trial account");
+                if media.duration_s.unwrap_or(0) > FAKE_TRIAL_DURATION_MAX {
+                    return Err(Refusal::TooLong.error(message_id));
+                }
+                if remaining == 0 {
+                    return Err(TgError::FloodWait {
+                        seconds: u32::try_from((i64::from(resets_at) - now).max(1))
+                            .unwrap_or(u32::MAX),
+                        class: MethodClass::Transcribe,
+                    });
+                }
+                if heard.is_some() {
+                    state.trials.insert(account, (remaining - 1, resets_at));
+                }
+            }
+        }
+        // Nothing Telegram could make out.
+        let Some(heard) = heard else {
+            return Err(Refusal::Failed.error(message_id));
+        };
+        state.last_id += 1;
+        let transcription_id = 9_000 + state.last_id;
+        let done = heard.takes_ms == Some(0);
+        state.jobs.insert(
+            (account, chat, message_id),
+            Job {
+                transcription_id,
+                text: heard.text.clone(),
+                done,
+            },
+        );
+        if let Some(ms) = heard.takes_ms.filter(|ms| *ms > 0) {
+            let telegram = self.clone();
+            let feed = state.feed(account);
+            let text = heard.text.clone();
+            tokio::spawn(async move {
+                let half = std::time::Duration::from_millis(ms / 2);
+                tokio::time::sleep(half).await;
+                let _ = feed.send(TranscriptionUpdate {
+                    transcription_id,
+                    pending: true,
+                    text: partial(&text),
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(ms) - half).await;
+                let mut state = telegram.state();
+                if let Some(job) = state.jobs.get_mut(&(account, chat, message_id)) {
+                    job.done = true;
+                }
+                let _ = feed.send(TranscriptionUpdate {
+                    transcription_id,
+                    pending: false,
+                    text,
+                });
+            });
+        }
+        Ok(TranscribedAudio {
+            pending: !done,
+            transcription_id,
+            text: if done {
+                heard.text
+            } else {
+                partial(&heard.text)
+            },
+            trial: trial(&state),
+        })
+    }
+}
+
+impl TranscriberState {
+    fn feed(&mut self, account: i64) -> TranscriptionFeed {
+        self.feeds
+            .entry(account)
+            .or_insert_with(transcribe::feed)
+            .clone()
+    }
+}
+
+/// What Telegram has heard of `text` while it is still transcribing: the
+/// first word.
+fn partial(text: &str) -> String {
+    text.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The DC every fake message says its file is in.
@@ -936,7 +1244,13 @@ impl FakeTelegram {
             data,
             known: Arc::default(),
             files: Arc::default(),
+            transcriber: Arc::default(),
         }
+    }
+
+    /// The transcription service this Account's transcriptions go to.
+    pub fn transcriber(&self) -> &Arc<FakeTranscriber> {
+        &self.transcriber
     }
 
     /// The file servers this Account's downloads go to.
@@ -1229,25 +1543,42 @@ impl Telegram for FakeTelegram {
                 "{chat} is not one of your chats; chat ids come from list_chats"
             )));
         }
-        let reference = {
-            let mut state = self.files.state();
-            state.lookups += 1;
-            state.reference()
-        };
         download::locate(id, message_id, |request| {
-            let found = get_message(&self.data.messages, chat, &request)
-                .into_iter()
-                .map(|f| RawMediaMessage {
-                    at: MessageAt {
-                        chat: f.chat,
-                        id: f.message.id,
-                    },
-                    file: fake_file(&reference, f.chat, &f.message),
-                    media: f.message.media,
-                })
-                .collect();
-            std::future::ready(Ok(found))
+            std::future::ready(Ok(self.media_messages(chat, &request)))
         })
+        .await
+    }
+
+    /// The same getMessages call as for a file, then the transcription
+    /// service (`transcribeAudio` and the Account's updates).
+    async fn transcribe(
+        &self,
+        id: ChatRef,
+        message_id: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<Transcription, TgError> {
+        self.flood()?;
+        self.check_hash(id)?;
+        let chat = id.chat();
+        if !self.knows(chat) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        let feed = self.transcriber.feed(self.data.account.id);
+        transcribe::transcribe(
+            id,
+            message_id,
+            deadline,
+            |request| std::future::ready(Ok(self.media_messages(chat, &request))),
+            &feed,
+            || {
+                std::future::ready(
+                    self.transcriber
+                        .transcribe_audio(&self.data, chat, message_id),
+                )
+            },
+        )
         .await
     }
 
@@ -1473,6 +1804,27 @@ impl FakeTelegram {
             }),
             None => Ok(()),
         }
+    }
+
+    /// What one getMessages for a message's file finds (as [`get_message`]
+    /// models it), each message with its [`fake_file`].
+    fn media_messages(&self, chat: ChatId, request: &MessageRequest) -> Vec<RawMediaMessage> {
+        let reference = {
+            let mut state = self.files.state();
+            state.lookups += 1;
+            state.reference()
+        };
+        get_message(&self.data.messages, chat, request)
+            .into_iter()
+            .map(|f| RawMediaMessage {
+                at: MessageAt {
+                    chat: f.chat,
+                    id: f.message.id,
+                },
+                file: fake_file(&reference, f.chat, &f.message),
+                media: f.message.media,
+            })
+            .collect()
     }
 
     /// Like Telegram: an id with a wrong access hash is `CHANNEL_INVALID` /
@@ -1915,6 +2267,8 @@ struct FakeTelegramSide {
     known: Mutex<std::collections::HashMap<String, KnownPeers>>,
     /// Telegram's file servers, the same for every Grant.
     files: Arc<FakeFiles>,
+    /// Telegram's transcription service, the same for every Grant.
+    transcriber: Arc<FakeTranscriber>,
 }
 
 impl FakeConnector {
@@ -1938,6 +2292,11 @@ impl FakeConnector {
     /// Telegram's file servers, where every Grant's downloads go.
     pub fn files(&self) -> Arc<FakeFiles> {
         self.telegram.files.clone()
+    }
+
+    /// Telegram's transcription service, where every Grant's transcriptions go.
+    pub fn transcriber(&self) -> Arc<FakeTranscriber> {
+        self.telegram.transcriber.clone()
     }
 
     /// Make every call to Telegram fail as if it were down.
@@ -1990,6 +2349,7 @@ impl Connector for FakeConnector {
             data,
             known,
             files: self.telegram.files.clone(),
+            transcriber: self.telegram.transcriber.clone(),
         }))
     }
 

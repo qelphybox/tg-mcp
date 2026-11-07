@@ -39,6 +39,10 @@ use super::{
         SearchFrom, SearchPage, SearchQuery, SearchRequest,
     },
     session::SessionStore,
+    transcribe::{
+        self, Refusal, TranscribedAudio, Transcription, TranscriptionFeed, TranscriptionUpdate,
+        Trial,
+    },
     view::{self, Album, RawViewMessage},
 };
 use crate::sessions::{OpenedGrant, Vault};
@@ -419,10 +423,17 @@ pub struct LiveClient {
     dead: std::sync::atomic::AtomicBool,
     /// The Account's budget and FLOOD_WAIT state, shared with its other Grants.
     limiter: Arc<AccountLimiter>,
+    /// This session's `updateTranscribedAudio` updates, for transcriptions
+    /// waiting for their final text ([`forward_transcriptions`]).
+    transcriptions: TranscriptionFeed,
     /// Every request handed to grammers (past the limiter), serialized, so tests can
     /// see what reached Telegram.
     #[cfg(test)]
     sent: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Errors Telegram answers the next requests with, in order, so tests
+    /// can see how the Live client reads them.
+    #[cfg(test)]
+    answers: std::sync::Mutex<std::collections::VecDeque<InvocationError>>,
 }
 
 impl Live for LiveClient {
@@ -481,14 +492,19 @@ impl LiveClient {
                     .lock()
                     .unwrap()
                     .push(tl::Serializable::to_bytes(request));
-                self.client
-                    .invoke(request)
-                    .await
-                    .map_err(|err| match (refusal(&err), chat) {
-                        (Some(refused), _) => refused,
-                        (None, Some(chat)) => self.classify_chat_error(err, chat, class),
-                        (None, None) => self.classify(err, class),
-                    })
+                #[cfg(test)]
+                let scripted = self.answers.lock().unwrap().pop_front();
+                #[cfg(not(test))]
+                let scripted = None;
+                let answer = match scripted {
+                    Some(err) => Err(err),
+                    None => self.client.invoke(request).await,
+                };
+                answer.map_err(|err| match (refusal(&err), chat) {
+                    (Some(refused), _) => refused,
+                    (None, Some(chat)) => self.classify_chat_error(err, chat, class),
+                    (None, None) => self.classify(err, class),
+                })
             })
             .await
     }
@@ -785,6 +801,25 @@ impl Telegram for LiveClient {
         .await
     }
 
+    async fn transcribe(
+        &self,
+        id: ChatRef,
+        message_id: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<Transcription, TgError> {
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
+        transcribe::transcribe(
+            id,
+            message_id,
+            deadline,
+            |request| self.get_media_message(&peer, chat, request),
+            &self.transcriptions,
+            || self.transcribe_audio(&peer, chat, message_id),
+        )
+        .await
+    }
+
     async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
         let FileRequest {
             location,
@@ -970,6 +1005,27 @@ impl LiveClient {
         let (messages, users, chats) = self.fetch_messages(peer, chat, ids).await?;
         self.described(users, chats);
         Ok(messages.into_iter().filter_map(raw_view_message).collect())
+    }
+
+    /// One `messages.transcribeAudio` call (method class Transcribe): under
+    /// the limiter, its refusals the caller's ([`Refusal`]).
+    async fn transcribe_audio(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        msg_id: i32,
+    ) -> Result<TranscribedAudio, TgError> {
+        let answer = self
+            .call_refusing(
+                &tl::functions::messages::TranscribeAudio {
+                    peer: peer.clone(),
+                    msg_id,
+                },
+                Some(chat),
+                |err| transcribe_refusal(err).map(|refusal| refusal.error(msg_id)),
+            )
+            .await?;
+        Ok(transcribed_audio(answer))
     }
 
     /// The messages, users and chats of one `channels.getMessages` /
@@ -1562,6 +1618,69 @@ fn direct_input_peer(id: ChatRef) -> Option<tl::enums::InputPeer> {
 }
 
 /// `FILE_MIGRATE_X`'s error code (grammers' own downloader matches on it).
+/// Telegram's refusal of a `messages.transcribeAudio`, if `err` is one.
+fn transcribe_refusal(err: &InvocationError) -> Option<Refusal> {
+    match err {
+        InvocationError::Rpc(rpc) => Refusal::of(&rpc.name),
+        _ => None,
+    }
+}
+
+fn transcribed_audio(answer: tl::enums::messages::TranscribedAudio) -> TranscribedAudio {
+    let tl::enums::messages::TranscribedAudio::Audio(audio) = answer;
+    TranscribedAudio {
+        pending: audio.pending,
+        transcription_id: audio.transcription_id,
+        text: audio.text,
+        // Both or neither (one flag in the schema).
+        trial: audio.trial_remains_num.map(|remaining| Trial {
+            remaining: u32::try_from(remaining).unwrap_or(0),
+            resets_at: audio.trial_remains_until_date.unwrap_or(0),
+        }),
+    }
+}
+
+/// The `updateTranscribedAudio` updates in what Telegram pushed.
+fn transcription_updates(updates: UpdatesLike) -> Vec<TranscriptionUpdate> {
+    let UpdatesLike::Updates(updates) = updates else {
+        return Vec::new();
+    };
+    let all = match updates {
+        tl::enums::Updates::UpdateShort(short) => vec![short.update],
+        tl::enums::Updates::Updates(full) => full.updates,
+        tl::enums::Updates::Combined(combined) => combined.updates,
+        _ => Vec::new(),
+    };
+    all.into_iter()
+        .filter_map(|update| match update {
+            tl::enums::Update::TranscribedAudio(t) => Some(TranscriptionUpdate {
+                transcription_id: t.transcription_id,
+                pending: t.pending,
+                text: t.text,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Pass a Live client's transcription updates on to its feed, dropping
+/// every other update (nothing else listens for them), until the client
+/// is gone. Nothing is kept.
+async fn forward_transcriptions(mut updates: mpsc::Receiver<UpdatesLike>, feed: TranscriptionFeed) {
+    while let Some(pushed) = updates.recv().await {
+        for update in transcription_updates(pushed) {
+            tracing::debug!(
+                transcription_id = update.transcription_id,
+                pending = update.pending,
+                chars = update.text.chars().count(),
+                "transcription update"
+            );
+            // Nobody waiting is fine: the update is for no one now.
+            let _ = feed.send(update);
+        }
+    }
+}
+
 const FILE_MIGRATE: i32 = 303;
 
 fn input_file_location(location: FileLocation) -> tl::enums::InputFileLocation {
@@ -1795,7 +1914,13 @@ impl GrammersConnector {
     async fn open(&self, grant: OpenedGrant) -> Result<LiveClient, TgError> {
         let grant_account = grant.account_id;
         let store = SessionStore::from_snapshot(&grant.telegram_session)?;
-        let Connected { client, store, .. } = connect(&self.credentials, store, Purpose::Live);
+        let Connected {
+            client,
+            store,
+            updates,
+        } = connect(&self.credentials, store, Purpose::Live);
+        let transcriptions = transcribe::feed();
+        tokio::spawn(forward_transcriptions(updates, transcriptions.clone()));
         // Prove the session still works before handing it out.
         let live = LiveClient {
             client,
@@ -1804,8 +1929,11 @@ impl GrammersConnector {
             peers: Default::default(),
             dead: Default::default(),
             limiter: self.limits.for_account(grant_account),
+            transcriptions,
             #[cfg(test)]
             sent: Default::default(),
+            #[cfg(test)]
+            answers: Default::default(),
         };
         match live.whoami().await {
             Ok(_) => Ok(live),
@@ -2625,6 +2753,164 @@ mod tests {
         )));
     }
 
+    fn transcribed(text: &str, pending: bool, trial: Option<(i32, i32)>) -> tl::enums::Update {
+        tl::enums::Update::TranscribedAudio(tl::types::UpdateTranscribedAudio {
+            pending,
+            peer: tl::enums::Peer::User(tl::types::PeerUser { user_id: 7 }),
+            msg_id: 525_381,
+            transcription_id: 4_242 + i64::from(trial.is_some()),
+            text: text.into(),
+        })
+    }
+
+    #[test]
+    fn a_transcribe_audio_answer_keeps_its_text_id_and_trial() {
+        let answer = |pending, trial: Option<(i32, i32)>| {
+            tl::enums::messages::TranscribedAudio::Audio(tl::types::messages::TranscribedAudio {
+                pending,
+                transcription_id: 4_242,
+                text: "Это голосовое".into(),
+                trial_remains_num: trial.map(|t| t.0),
+                trial_remains_until_date: trial.map(|t| t.1),
+            })
+        };
+        assert_eq!(
+            transcribed_audio(answer(true, None)),
+            TranscribedAudio {
+                pending: true,
+                transcription_id: 4_242,
+                text: "Это голосовое".into(),
+                trial: None,
+            }
+        );
+        assert_eq!(
+            transcribed_audio(answer(false, Some((2, 1_794_000_000)))).trial,
+            Some(Trial {
+                remaining: 2,
+                resets_at: 1_794_000_000
+            })
+        );
+        assert_eq!(
+            transcribed_audio(answer(false, Some((-1, 1)))).trial,
+            Some(Trial {
+                remaining: 0,
+                resets_at: 1
+            })
+        );
+    }
+
+    #[test]
+    fn transcription_updates_are_found_in_every_container_and_nothing_else_is() {
+        let final_one = TranscriptionUpdate {
+            transcription_id: 4_242,
+            pending: false,
+            text: "Всем пока".into(),
+        };
+        let short = tl::enums::Updates::UpdateShort(tl::types::UpdateShort {
+            update: transcribed("Всем пока", false, None),
+            date: 0,
+        });
+        assert_eq!(
+            transcription_updates(UpdatesLike::Updates(short)),
+            std::slice::from_ref(&final_one)
+        );
+        let full = tl::enums::Updates::Updates(tl::types::Updates {
+            updates: vec![
+                tl::enums::Update::LoginToken,
+                transcribed("Всем", true, None),
+                transcribed("Всем пока", false, None),
+            ],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq: 0,
+        });
+        let both = transcription_updates(UpdatesLike::Updates(full));
+        assert_eq!(both.len(), 2);
+        assert!(both[0].pending && !both[1].pending);
+        let combined = tl::enums::Updates::Combined(tl::types::UpdatesCombined {
+            updates: vec![transcribed("Всем пока", false, None)],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq_start: 0,
+            seq: 0,
+        });
+        assert_eq!(
+            transcription_updates(UpdatesLike::Updates(combined)),
+            [final_one]
+        );
+        for nothing in [
+            UpdatesLike::Updates(tl::enums::Updates::TooLong),
+            UpdatesLike::ConnectionClosed,
+        ] {
+            assert!(transcription_updates(nothing).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn pushed_transcriptions_reach_the_feed_until_the_session_ends() {
+        let (tx, rx) = mpsc::channel(8);
+        let feed = transcribe::feed();
+        let mut listening = feed.subscribe();
+        let forwarding = tokio::spawn(forward_transcriptions(rx, feed));
+        let short = |update| {
+            UpdatesLike::Updates(tl::enums::Updates::UpdateShort(tl::types::UpdateShort {
+                update,
+                date: 0,
+            }))
+        };
+        tx.send(short(tl::enums::Update::LoginToken)).await.unwrap();
+        tx.send(short(transcribed("Всем пока", false, None)))
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), listening.recv())
+            .await
+            .expect("the update was passed on")
+            .unwrap();
+        assert_eq!((got.transcription_id, got.pending), (4_242, false));
+        assert_eq!(got.text, "Всем пока");
+        drop(tx);
+        forwarding.await.unwrap();
+        assert!(matches!(
+            listening.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn telegrams_transcription_refusals_are_told_apart_from_floods() {
+        type TranscribeAudio = tl::functions::messages::TranscribeAudio;
+        for (code, message, refusal) in [
+            (403, "PREMIUM_ACCOUNT_REQUIRED", Refusal::PremiumRequired),
+            (400, "MSG_VOICE_MISSING", Refusal::VoiceMissing),
+            (400, "MSG_VOICE_TOO_LONG", Refusal::TooLong),
+            (400, "TRANSCRIPTION_FAILED", Refusal::Failed),
+        ] {
+            assert_eq!(
+                transcribe_refusal(&rpc::<TranscribeAudio>(code, message)),
+                Some(refusal),
+                "{message}"
+            );
+        }
+        // A used-up trial: a flood of class Transcribe for the limiter.
+        let flood = rpc::<TranscribeAudio>(420, "FLOOD_WAIT_259200");
+        assert_eq!(transcribe_refusal(&flood), None);
+        assert!(matches!(
+            flood_error(flood, method_class::<TranscribeAudio>()),
+            TgError::FloodWait {
+                seconds: 259_200,
+                class: MethodClass::Transcribe
+            }
+        ));
+        for other in [(400, "MSG_ID_INVALID"), (400, "PEER_ID_INVALID")] {
+            assert_eq!(
+                transcribe_refusal(&rpc::<TranscribeAudio>(other.0, other.1)),
+                None
+            );
+        }
+    }
+
     #[test]
     fn flood_wait_is_surfaced_with_its_seconds() {
         assert!(matches!(
@@ -2705,6 +2991,10 @@ mod tests {
             method_class::<channels::GetMessages>(),
         ];
         assert_eq!(default, [MethodClass::Default; 8]);
+        assert_eq!(
+            method_class::<messages::TranscribeAudio>(),
+            MethodClass::Transcribe
+        );
     }
 
     #[test]
@@ -2783,7 +3073,9 @@ fn offline_live(grant: OpenedGrant, store: Arc<SessionStore>) -> LiveClient {
         peers: Default::default(),
         dead: Default::default(),
         limiter: Arc::new(AccountLimiter::new(crate::limits::LimitsConfig::default())),
+        transcriptions: transcribe::feed(),
         sent: Default::default(),
+        answers: Default::default(),
     }
 }
 
@@ -3879,5 +4171,121 @@ mod resolve_tests {
                 tl::functions::messages::GetMessages { id: id() }.to_bytes(),
             ]
         );
+    }
+    #[tokio::test]
+    async fn a_transcription_is_one_transcribe_audio_through_the_limiter() {
+        let (live, _dir) = cold_client().await;
+        let peer = tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 88,
+        });
+        // Offline: it fails, after reaching `call` under the limiter.
+        assert!(matches!(
+            live.transcribe_audio(&peer, ChatId::User(7), 525_381).await,
+            Err(TgError::Upstream(_))
+        ));
+        assert_eq!(
+            sent(&live),
+            [tl::functions::messages::TranscribeAudio {
+                peer,
+                msg_id: 525_381,
+            }
+            .to_bytes()]
+        );
+        // The message is looked up first; offline that is where it ends.
+        let user = ChatRef::new(ChatId::User(7), Some(88));
+        let deadline = tokio::time::Instant::now() + transcribe::TRANSCRIBE_WAIT;
+        assert!(live.transcribe(user, 500, deadline).await.is_err());
+        let reached: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
+        assert_eq!(
+            reached[1..],
+            [tl::functions::messages::GetMessages::CONSTRUCTOR_ID]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_used_up_trial_holds_back_transcriptions_but_nothing_else() {
+        let (live, _dir) = cold_client().await;
+        let peer = tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 88,
+        });
+        let channel = ChatRef::new(ChatId::Channel(5), Some(7));
+        flood_once::<tl::functions::messages::TranscribeAudio>(&live).await;
+        for _ in 0..2 {
+            match live.transcribe_audio(&peer, ChatId::User(7), 525_381).await {
+                Err(TgError::FloodWait {
+                    seconds,
+                    class: MethodClass::Transcribe,
+                }) => assert!(seconds > 290, "{seconds}"),
+                other => panic!("expected the transcription to fail fast, got {other:?}"),
+            }
+        }
+        assert!(sent(&live).is_empty(), "no transcription reached Telegram");
+        assert!(live.get_messages(channel, query()).await.is_err());
+        assert!(live.media_file(channel, 500).await.is_err());
+        let reached: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
+        assert_eq!(
+            reached,
+            [
+                tl::functions::messages::GetHistory::CONSTRUCTOR_ID,
+                tl::functions::channels::GetMessages::CONSTRUCTOR_ID,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn telegrams_refusals_of_a_transcription_reach_the_caller_as_ours() {
+        type TranscribeAudio = tl::functions::messages::TranscribeAudio;
+        let (live, _dir) = cold_client().await;
+        let peer = tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 88,
+        });
+        live.answers.lock().unwrap().extend([
+            rpc::<TranscribeAudio>(403, "PREMIUM_ACCOUNT_REQUIRED"),
+            rpc::<TranscribeAudio>(400, "TRANSCRIPTION_FAILED"),
+            rpc::<TranscribeAudio>(420, "FLOOD_WAIT_259200"),
+        ]);
+        let ask = || live.transcribe_audio(&peer, ChatId::User(7), 525_381);
+        match ask().await {
+            Err(TgError::InvalidInput(message)) => assert!(
+                message.contains("Premium") && !message.contains("PREMIUM_ACCOUNT_REQUIRED"),
+                "{message}"
+            ),
+            other => panic!("expected the Premium refusal, got {other:?}"),
+        }
+        match ask().await {
+            Err(TgError::InvalidInput(message)) => {
+                assert!(message.contains("couldn't transcribe"), "{message}")
+            }
+            other => panic!("expected the failure, got {other:?}"),
+        }
+        // A used-up trial: honoured for the Account, never asked again.
+        for _ in 0..2 {
+            assert!(matches!(
+                ask().await,
+                Err(TgError::FloodWait {
+                    class: MethodClass::Transcribe,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(sent(&live).len(), 3, "the flood was not retried around");
+    }
+
+    #[tokio::test]
+    async fn a_reading_flood_doesnt_hold_back_transcriptions() {
+        let (live, _dir) = cold_client().await;
+        let peer = tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 88,
+        });
+        flood_once::<tl::functions::messages::GetHistory>(&live).await;
+        assert!(matches!(
+            live.transcribe_audio(&peer, ChatId::User(7), 525_381).await,
+            Err(TgError::Upstream(_))
+        ));
+        assert_eq!(sent(&live).len(), 1, "the transcription reached Telegram");
     }
 }

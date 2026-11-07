@@ -21,6 +21,7 @@ pub mod rich;
 pub mod sanitise;
 pub mod search;
 mod session;
+pub mod transcribe;
 pub mod view;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
@@ -159,6 +160,20 @@ pub trait Telegram: Send + Sync + 'static {
         chat: chats::ChatRef,
         message_id: i32,
     ) -> Result<view::Album, TgError>;
+
+    /// Telegram's transcription of message `message_id`'s voice message or
+    /// video message ([`transcribe::transcribe`]): one `getMessages` for it
+    /// (the Chat's own message only), then one `messages.transcribeAudio`
+    /// (method class Transcribe), then the final text from Telegram's
+    /// updates until `deadline`, else [`transcribe::Transcript::Pending`].
+    /// Another kind of media is [`TgError::InvalidInput`] without asking
+    /// Telegram, and so is Telegram's refusal ([`transcribe::Refusal`]).
+    async fn transcribe(
+        &self,
+        chat: chats::ChatRef,
+        message_id: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<transcribe::Transcription, TgError>;
 
     /// One `upload.getFile` call, in method class Files: through the
     /// Account's limiter, its `FLOOD_WAIT` honoured. [`download::Download`]
