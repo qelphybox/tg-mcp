@@ -675,7 +675,16 @@ fn view_result(asked: i32, shown: View) -> Result<CallToolResult, ErrorData> {
         .map(|image| image.kind)
         .ok_or_else(|| ErrorData::internal_error("the view lost the asked message", None))?;
     let total: u64 = images.iter().map(|image| image.size_bytes).sum();
-    debug_assert!(total <= MAX_VIEW_BYTES && images.len() <= MAX_VIEW_IMAGES);
+    // The view keeps to these; a result over them is a bug, never sent.
+    if total > MAX_VIEW_BYTES || images.len() > MAX_VIEW_IMAGES {
+        return Err(ErrorData::internal_error(
+            format!(
+                "a view came out at {} images and {total} bytes, over its bounds",
+                images.len()
+            ),
+            None,
+        ));
+    }
     tracing::info!(
         message_id = asked,
         images = images.len(),
@@ -1246,6 +1255,30 @@ mod tests {
         let files = flood_message(MethodClass::Files);
         assert!(files.contains("file downloads"));
         assert!(files.contains("search_messages") && files.contains("find_chats"));
+    }
+
+    #[test]
+    fn a_view_over_its_bounds_is_never_sent() {
+        use crate::tg::view::{MAX_VIEW_BYTES, View, ViewImage};
+        let image = |message_id, bytes| ViewImage {
+            message_id,
+            kind: MediaKind::Photo,
+            mime_type: "image/jpeg",
+            width: None,
+            height: None,
+            bytes: vec![0xFF; bytes],
+        };
+        let view = |images: Vec<ViewImage>| View {
+            album: (images.len() > 1).then(|| images.iter().map(|i| i.message_id).collect()),
+            images,
+            album_truncated: false,
+        };
+        let cap = MAX_VIEW_BYTES as usize;
+        assert!(super::view_result(1, view(vec![image(1, cap)])).is_ok());
+        assert!(super::view_result(1, view(vec![image(1, cap + 1)])).is_err());
+        assert!(super::view_result(1, view(vec![image(1, cap - 1), image(2, 2)])).is_err());
+        assert!(super::view_result(1, view((1..=4).map(|id| image(id, 10)).collect())).is_ok());
+        assert!(super::view_result(1, view((1..=5).map(|id| image(id, 10)).collect())).is_err());
     }
 
     #[test]
