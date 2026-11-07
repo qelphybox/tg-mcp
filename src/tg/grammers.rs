@@ -958,6 +958,9 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 reply_to,
                 reply_elsewhere,
                 forwarded: m.fwd_from.is_some(),
+                forwarded_from: m.fwd_from.as_ref().and_then(
+                    |tl::enums::MessageFwdHeader::Header(h)| h.from_id.as_ref().map(chat_id),
+                ),
                 edited: m.edit_date.is_some(),
             })
         }
@@ -971,6 +974,7 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
             reply_to: None,
             reply_elsewhere: None,
             forwarded: false,
+            forwarded_from: None,
             edited: false,
         }),
         tl::enums::Message::Empty(_) => None,
@@ -1555,6 +1559,52 @@ mod tests {
             peer_id: Some(channel(5)),
         });
         assert!(raw_found_message(empty).is_none());
+    }
+
+    #[test]
+    fn a_forward_keeps_its_original_author_apart_from_its_sender() {
+        let user = |user_id| tl::enums::Peer::User(tl::types::PeerUser { user_id });
+        // Saved Messages of Account 42: Telegram names the Account as sender
+        // and leaves `out` unset.
+        let saved = |author: Option<tl::enums::Peer>, from_name: Option<&str>| {
+            let tl::enums::Message::Message(mut m) = tl_message(30, user(42), None) else {
+                unreachable!()
+            };
+            m.from_id = Some(user(42));
+            m.fwd_from = Some(tl::enums::MessageFwdHeader::Header(
+                tl::types::MessageFwdHeader {
+                    imported: false,
+                    saved_out: false,
+                    from_id: author,
+                    from_name: from_name.map(Into::into),
+                    date: 90,
+                    channel_post: None,
+                    post_author: None,
+                    saved_from_peer: None,
+                    saved_from_msg_id: None,
+                    saved_from_id: None,
+                    saved_from_name: None,
+                    saved_date: None,
+                    psa_type: None,
+                },
+            ));
+            raw_history_message(tl::enums::Message::Message(m)).unwrap()
+        };
+        let alices = saved(Some(user(7)), None);
+        assert_eq!(
+            (
+                alices.from,
+                alices.out,
+                alices.forwarded,
+                alices.forwarded_from
+            ),
+            (Some(ChatId::User(42)), false, true, Some(ChatId::User(7)))
+        );
+        // An author hiding their account is named only by name: no id.
+        let hidden = saved(None, Some("Hidden"));
+        assert_eq!((hidden.forwarded, hidden.forwarded_from), (true, None));
+        let plain = raw_history_message(tl_message(30, user(42), None)).unwrap();
+        assert_eq!((plain.forwarded, plain.forwarded_from), (false, None));
     }
 
     #[test]

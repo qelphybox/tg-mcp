@@ -91,6 +91,7 @@ fn post(id: i32, rich: &tl::enums::RichMessage) -> RawHistoryMessage {
         reply_to: None,
         reply_elsewhere: None,
         forwarded: false,
+        forwarded_from: None,
         edited: false,
     }
 }

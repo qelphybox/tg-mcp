@@ -189,6 +189,10 @@ pub struct RawHistoryMessage {
     pub reply_elsewhere: Option<MessageAt>,
     #[serde(default)]
     pub forwarded: bool,
+    /// A forwarded message's original author (`fwd_from.from_id`); absent
+    /// when the author hides their account, or for a message not forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<ChatId>,
     #[serde(default)]
     pub edited: bool,
 }
@@ -531,6 +535,9 @@ fn newest_first(
 pub(super) struct Issuer<'a> {
     peers: HashMap<ChatId, &'a RawPeer>,
     known: KnownHashes<'a>,
+    /// The Account, as the answers describe it (its user has the `self`
+    /// flag, and is described wherever a message names it).
+    me: Option<ChatId>,
 }
 
 impl<'a> Issuer<'a> {
@@ -545,6 +552,7 @@ impl<'a> Issuer<'a> {
             }
         }
         Self {
+            me: peers.iter().find(|p| p.is_self).map(|p| p.id),
             peers: by_id,
             known,
         }
@@ -574,25 +582,36 @@ impl<'a> Issuer<'a> {
         self.issue(chat.chat(), chat).to_string()
     }
 
-    /// `m` as a message of `chat`.
+    /// `m` as a message of `chat`. Telegram names the sender in `from_id`,
+    /// else it is the other side of a private chat. The Account's own
+    /// messages are outgoing: those with `out`, and those naming the Account
+    /// as sender, which is how Telegram sends them in Saved Messages (#52).
+    /// There, a message forwarded from someone else is theirs, as Telegram's
+    /// apps show it: its sender is the original author, and it is not
+    /// outgoing. An author who hides their account has no id to name, so
+    /// that forward stays the Account's (outgoing), as does one forwarded
+    /// from the Account itself. Elsewhere a forward is the forwarder's.
     pub(super) fn message(&self, chat: ChatRef, m: &RawHistoryMessage) -> ChatMessage {
-        let sender = (!m.out).then(|| {
-            let id = m.from.unwrap_or(chat.chat());
-            Sender {
-                id: self.issue(id, chat).to_string(),
-                name: self
-                    .peers
-                    .get(&id)
-                    .map(|p| p.title.clone())
-                    .unwrap_or_else(|| id.to_string()),
-            }
+        let me = self.me;
+        let original_author = m
+            .forwarded_from
+            .filter(|&author| Some(chat.chat()) == me && Some(author) != me);
+        let from = original_author.unwrap_or(m.from.unwrap_or(chat.chat()));
+        let outgoing = original_author.is_none() && (m.out || Some(from) == me);
+        let sender = (!outgoing).then(|| Sender {
+            id: self.issue(from, chat).to_string(),
+            name: self
+                .peers
+                .get(&from)
+                .map(|p| p.title.clone())
+                .unwrap_or_else(|| from.to_string()),
         });
         let text = shown_text(m.text.clone(), m.media);
         ChatMessage {
             id: m.id,
             date: rfc3339(m.date),
             sender,
-            outgoing: m.out,
+            outgoing,
             text,
             reply_to: m.reply_to,
             forwarded: m.forwarded,
@@ -673,6 +692,7 @@ mod tests {
             reply_to: None,
             reply_elsewhere: None,
             forwarded: false,
+            forwarded_from: None,
             edited: false,
         }
     }
@@ -743,6 +763,95 @@ mod tests {
         );
         assert_eq!(page.messages[0].sender.as_ref().unwrap().name, "Bob");
         assert_eq!(page.messages[1].sender.as_ref().unwrap().name, "user:3");
+    }
+
+    /// The Account as Telegram describes it: its user, with the `self` flag.
+    fn me_peer(me: ChatId) -> RawPeer {
+        RawPeer {
+            is_self: true,
+            ..peer(me, "Me")
+        }
+    }
+
+    /// (sender name, outgoing, forwarded) of each message.
+    fn authors(page: &MessagePage) -> Vec<(Option<&str>, bool, bool)> {
+        page.messages
+            .iter()
+            .map(|m| {
+                (
+                    m.sender.as_ref().map(|s| s.name.as_str()),
+                    m.outgoing,
+                    m.forwarded,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_accounts_own_messages_are_outgoing_even_without_the_out_flag() {
+        let me = ChatId::User(42);
+        let alice = ChatId::User(1);
+        let news = ChatId::Channel(9);
+        let forwarded = |id, from: Option<ChatId>, original: Option<ChatId>| RawHistoryMessage {
+            from,
+            forwarded: true,
+            forwarded_from: original,
+            ..msg(id, id)
+        };
+        let peers = [me_peer(me), peer(alice, "Alice"), peer(news, "News")];
+
+        // Saved Messages: Telegram names the Account as sender (from_id, or
+        // only peer_id) and leaves `out` unset.
+        let saved = [
+            RawHistoryMessage {
+                from: Some(me),
+                ..msg(6, 6)
+            },
+            msg(5, 5),
+            forwarded(4, Some(me), Some(me)),
+            forwarded(3, Some(me), Some(alice)),
+            forwarded(2, Some(me), Some(news)),
+            // The original author hides their account: no one else to name.
+            forwarded(1, Some(me), None),
+        ];
+        let page = assemble_history(me.into(), &saved, &peers, &unknown, &query(10), false);
+        assert_eq!(
+            authors(&page),
+            [
+                (None, true, false),
+                (None, true, false),
+                (None, true, true),
+                (Some("Alice"), false, true),
+                (Some("News"), false, true),
+                (None, true, true),
+            ]
+        );
+        assert_eq!(
+            page.messages[3].sender.as_ref().unwrap().id,
+            "user:1",
+            "the original author's id, usable with the other tools"
+        );
+
+        // Anywhere else the Account named as sender is outgoing too, and a
+        // forward's sender is whoever forwarded it.
+        let group = [
+            RawHistoryMessage {
+                from: Some(me),
+                ..msg(3, 3)
+            },
+            forwarded(2, Some(me), Some(alice)),
+            forwarded(1, Some(alice), Some(news)),
+        ];
+        let team = ChatId::Channel(8);
+        let page = assemble_history(team.into(), &group, &peers, &unknown, &query(10), false);
+        assert_eq!(
+            authors(&page),
+            [
+                (None, true, false),
+                (None, true, true),
+                (Some("Alice"), false, true),
+            ]
+        );
     }
 
     #[test]

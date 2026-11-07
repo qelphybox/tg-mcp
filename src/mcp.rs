@@ -271,7 +271,8 @@ instructions.",
         description = "Read messages of one chat, newest first. `chat_id` comes from list_chats \
 or a message sender, passed verbatim (`user:N~H`, `channel:N~H` or `chat:N`). Each message \
 has an id, date (UTC), sender (id + name; absent and `outgoing: true` for messages the account \
-itself sent), text (media and service messages as [photo], [voice], ...; rich posts' tables, \
+itself sent; in Saved Messages a message forwarded from someone else has its original author as \
+sender), text (media and service messages as [photo], [voice], ...; rich posts' tables, \
 lists and collapsible sections as plain lines, table cells joined by ` | `; cut to 1000 \
 characters), the id it replies to, and forwarded/edited flags. Page with `before_id` = the \
 previous `next_before_id`; no `next_before_id` means there is nothing older (within `since`). \
@@ -370,9 +371,9 @@ Across all chats, `chat_type` (private, groups, channels) and `archived` (true: 
 Archive, false: only the main list; omitted: both) choose the chats; they don't go with \
 `chat_id`, and `from` needs it. An empty query is accepted only with `media` or `from`. Each hit \
 has its chat (id, title, type), the message id, date (UTC), sender (id + name; absent and \
-`outgoing: true` for the account's own messages), a snippet of up to 300 characters around the \
-first word that matches (the start of the text when Telegram matched another word form; empty \
-for media without text), a `media` marker and the reply/forwarded/edited fields of \
+`outgoing: true` for the account's own messages; in Saved Messages as in get_messages), a \
+snippet of up to 300 characters around the first word that matches (the start of the text \
+when Telegram matched another word form; empty for media without text), a `media` marker and the reply/forwarded/edited fields of \
 get_messages. To read a hit in context, call get_messages with `chat_id` = the hit's `chat.id` \
 and `around_id` = its `id`. Paginated: pass `next_cursor` back as `cursor`, with the same query \
 and filters; no `next_cursor` means this was the last page. There is no total count. Snippets, \

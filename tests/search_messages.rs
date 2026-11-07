@@ -52,6 +52,7 @@ fn message(id: i32, minute: i32, text: &str) -> RawHistoryMessage {
         reply_to: None,
         reply_elsewhere: None,
         forwarded: false,
+        forwarded_from: None,
         edited: false,
     }
 }
@@ -730,4 +731,64 @@ async fn the_tool_is_read_only_bounded_and_counts_nothing() {
     ] {
         assert!(description.contains(needle), "{needle}: {description}");
     }
+}
+
+/// Hits in Saved Messages, which Telegram sends with the Account as sender
+/// (`from_id`) and no `out` flag (#52), have the shape of get_messages: the
+/// Account's own messages are outgoing, a saved message of Alice's is hers.
+#[tokio::test]
+async fn the_accounts_own_hits_in_saved_messages_are_outgoing() {
+    let me = ChatId::User(ME);
+    let saved = ChatSummary {
+        is_self: true,
+        ..chat(me, "Me", ChatKind::Private)
+    };
+    let alices = RawHistoryMessage {
+        forwarded: true,
+        forwarded_from: Some(ALICE),
+        ..from(me, message(2, 2, "deploy at noon"))
+    };
+    let data = FakeData::new(account(ME, "Me"))
+        .with_chats(vec![saved, chat(ALICE, "Alice", ChatKind::Private)])
+        .with_messages(
+            me,
+            vec![from(me, message(1, 1, "deploy checklist")), alices],
+        );
+    let (_server, client) = client_for(data).await;
+    let authors = |page: &Value| -> Vec<(i64, Value, Value)> {
+        hits(page)
+            .iter()
+            .map(|h| {
+                (
+                    h["id"].as_i64().unwrap(),
+                    h["sender"].clone(),
+                    h["outgoing"].clone(),
+                )
+            })
+            .collect()
+    };
+    let alice = json!({ "id": fake_issued_id(ALICE), "name": "Alice" });
+
+    for arguments in [
+        json!({ "query": "deploy" }),
+        json!({ "query": "deploy", "chat_id": fake_issued_id(me) }),
+    ] {
+        let page = search(&client, arguments.clone()).await.unwrap();
+        assert_eq!(
+            authors(&page),
+            [
+                (2, alice.clone(), Value::Null),
+                (1, Value::Null, json!(true))
+            ],
+            "{arguments}"
+        );
+    }
+    // `from: "me"` still asks Telegram for the Account's messages.
+    let page = search(
+        &client,
+        json!({ "chat_id": fake_issued_id(me), "query": "checklist", "from": "me" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(authors(&page), [(1, Value::Null, json!(true))]);
 }

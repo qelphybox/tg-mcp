@@ -85,6 +85,7 @@ fn data() -> FakeData {
                 reply_to: None,
                 reply_elsewhere: None,
                 forwarded: false,
+                forwarded_from: None,
                 edited: false,
             }],
         )

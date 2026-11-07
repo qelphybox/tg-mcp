@@ -39,7 +39,9 @@ pub struct FakeData {
     /// (`user:101`); the fake hands them out with [`fake_access_hash`].
     #[serde(default)]
     pub chats: Vec<ChatSummary>,
-    /// Each Chat's history, in any order.
+    /// Each Chat's history, in any order, as Telegram sends it: in Saved
+    /// Messages (the Account's own id) every message has the Account as
+    /// `from` and no `out`, a forward also its original author (#52).
     #[serde(default)]
     pub messages: std::collections::HashMap<ChatId, Vec<RawHistoryMessage>>,
     /// Descriptions and member counts, for get_chat_info.
@@ -600,12 +602,18 @@ impl Telegram for FakeTelegram {
             &|chat| self.known(chat),
             |request| {
                 let messages = get_history(history, &request, self.data.past_newest);
-                // The Chat and the senders of these messages, as Telegram
-                // describes them in a getHistory answer.
+                // The Chat, the senders of these messages and the original
+                // authors of forwarded ones, as Telegram describes them in a
+                // getHistory answer.
                 let min = self.data.min_past_newest && reaches_past_newest(history, &request);
+                let named = |id| {
+                    messages
+                        .iter()
+                        .any(|m| m.from == Some(id) || m.forwarded_from == Some(id))
+                };
                 let described: Vec<RawPeer> = peers
                     .iter()
-                    .filter(|p| p.id == chat || messages.iter().any(|m| m.from == Some(p.id)))
+                    .filter(|p| p.id == chat || named(p.id))
                     .map(|p| RawPeer {
                         access_hash: p.access_hash.filter(|_| !min),
                         ..p.clone()
@@ -1230,6 +1238,7 @@ mod tests {
                 reply_to: None,
                 reply_elsewhere: None,
                 forwarded: false,
+                forwarded_from: None,
                 edited: false,
             })
             .collect()

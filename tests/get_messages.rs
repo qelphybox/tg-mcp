@@ -45,6 +45,7 @@ fn message(id: i32, text: &str) -> RawHistoryMessage {
         reply_to: None,
         reply_elsewhere: None,
         forwarded: false,
+        forwarded_from: None,
         edited: false,
     }
 }
@@ -986,4 +987,108 @@ async fn every_answer_teaches_the_hashes_later_ids_carry() {
             "{tool} {arguments}"
         );
     }
+}
+
+const ME: ChatId = ChatId::User(42);
+
+/// Saved Messages as Telegram sends them (#52): every message names the
+/// Account as sender (`from_id`) and none has the `out` flag. 1 is a note,
+/// 2 Alice's message saved there, 3 a note replying to it, 4 a message the
+/// Account wrote elsewhere and saved there.
+async fn saved_messages_client() -> (common::TestServer, Client) {
+    let mine = |id, text: &str| RawHistoryMessage {
+        from: Some(ME),
+        out: false,
+        ..message(id, text)
+    };
+    let forwarded = |id, text: &str, author| RawHistoryMessage {
+        forwarded: true,
+        forwarded_from: Some(author),
+        ..mine(id, text)
+    };
+    let saved = ChatSummary {
+        id: ME.to_string(),
+        title: "Me".into(),
+        is_self: true,
+        ..alice_chat()
+    };
+    let data = FakeData::new(account(42, "Me"))
+        .with_chats(vec![saved, alice_chat()])
+        .with_messages(
+            ME,
+            vec![
+                mine(1, "buy milk"),
+                forwarded(2, "the address is on the card", ALICE),
+                RawHistoryMessage {
+                    reply_to: Some(2),
+                    ..mine(3, "ask Alice which card")
+                },
+                forwarded(4, "see you at 6", ME),
+            ],
+        );
+    let server = start_with(vec![data]).await;
+    let (_, tokens) = server.login().await;
+    let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+    (server, client)
+}
+
+#[tokio::test]
+async fn the_accounts_own_messages_in_saved_messages_are_outgoing() {
+    let (_server, client) = saved_messages_client().await;
+    let me = fake_issued_id(ME);
+    let alice = json!({ "id": alice_id(), "name": "Alice" });
+
+    let page = call(&client, json!({ "chat_id": me })).await.unwrap();
+    assert_eq!(
+        page["messages"],
+        json!([
+            { "id": 4, "date": "2026-11-06T04:00:00Z", "outgoing": true, "text": "see you at 6",
+              "forwarded": true },
+            { "id": 3, "date": "2026-11-06T03:00:00Z", "outgoing": true,
+              "text": "ask Alice which card", "reply_to": 2 },
+            { "id": 2, "date": "2026-11-06T02:00:00Z", "sender": alice,
+              "text": "the address is on the card", "forwarded": true },
+            { "id": 1, "date": "2026-11-06T01:00:00Z", "outgoing": true, "text": "buy milk" },
+        ])
+    );
+
+    // The same in a reply chain and in a window around a message.
+    let chain = call(&client, json!({ "chat_id": me, "thread_of": 3 }))
+        .await
+        .unwrap();
+    let authors = |page: &Value| -> Vec<(i64, Value, Value)> {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_i64().unwrap(),
+                    m["sender"].clone(),
+                    m["outgoing"].clone(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        authors(&chain),
+        [
+            (3, Value::Null, json!(true)),
+            (2, alice.clone(), Value::Null)
+        ]
+    );
+    let window = call(
+        &client,
+        json!({ "chat_id": me, "around_id": 2, "limit": 3 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        authors(&window),
+        [
+            (3, Value::Null, json!(true)),
+            (2, alice, Value::Null),
+            (1, Value::Null, json!(true)),
+        ]
+    );
 }
