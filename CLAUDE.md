@@ -1,6 +1,6 @@
 # tg-mcp
 
-Remote MCP server (streamable HTTP) giving AI clients read-only access to a personal Telegram account. Onboarding: `claude mcp add --transport http <name> <url>` → OAuth in the browser → QR login → done. Vocabulary is in `GLOSSARY.md`; decisions in `docs/adr/`.
+Remote MCP server (streamable HTTP) giving AI clients access to a personal Telegram account: read access now, write tools from v0.2.0 (ADR-0005). Onboarding: `claude mcp add --transport http <name> <url>` → OAuth in the browser → QR login → done. Vocabulary is in `GLOSSARY.md`; decisions in `docs/adr/`.
 
 ## Stack
 
