@@ -193,6 +193,7 @@ Needs a private chat and a group or channel, each with at least 30 messages. Mes
 3. get_messages с after_id=<next_after_id из шага 2>, limit=4 и с before_id=<next_before_id из шага 2>, limit=4. Сравни с P[6..9] и P[19..22].
 4. get_messages с around_id=N, limit=9. Сравни с P[0..8]; есть ли next_after_id?
 5. get_messages с around_id=N+1000, потом с around_id=M и since=2020-01-01. Выведи текст ошибок.
+6. Только для группы: выведи id отправителей (без имён) из ответа шага 4. У каждого ли id вида user:… или channel:… есть ~ с хэшем?
 Для каждого шага напиши: совпало / не совпало (и чем отличается).
 ```
 
@@ -202,6 +203,7 @@ Ranges are inclusive, indexes from 0. Pick quiet chats: a message arriving betwe
 2. Step 3: the `after_id` page is `P[6]`…`P[9]` (the four right above the window, newest first) and the `before_id` page is `P[19]`…`P[22]`. Together with the window that is `P[6]`…`P[22]` with nothing missing or doubled.
 3. Step 4 equals `P[0]`…`P[8]`: the newest message has nothing newer, so the window is filled from older ones, and there is no `next_after_id`.
 4. Step 5: `around_id` that isn't in the chat is an error saying `message … not found in this chat`, not an empty page. `around_id` with `since` is `invalid_params` (`around_id can't be combined with since`).
+5. Step 6: every `user:` and `channel:` sender id in the group's window at its newest message carries `~` and a hash (#51). Telegram describes the senders without a usable hash ("min") in its answer to a slice that reaches past the newest message; the window takes their hashes from the earlier answers of the same Live client (step 1 described them in full). A sender without `~` here that has one in step 1 means that fallback is broken (`Issuer` in `src/tg/messages.rs`).
 
 If step 2 is off by one (five newer and three older, or three and five) or fails with `not found` for an M that is in `P`, Telegram's `add_offset` doesn't count the way `core.telegram.org/api/offsets` says, which is what the window relies on (`src/tg/messages.rs`, `read_history`).
 

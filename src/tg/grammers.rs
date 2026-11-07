@@ -538,14 +538,9 @@ impl Telegram for LiveClient {
         // A full page may have more after it; a short one is the end.
         let full_page = dialogs.len() >= limit;
         let dialogs: Vec<RawDialog> = dialogs.into_iter().filter_map(raw_dialog).collect();
-        let peers: Vec<RawPeer> = users
-            .into_iter()
-            .filter_map(raw_user)
-            .chain(chats.into_iter().filter_map(raw_chat))
-            .collect();
+        let peers = self.described(users, chats);
         let messages: Vec<RawMessage> = messages.into_iter().filter_map(raw_message).collect();
 
-        self.remember(&peers);
         Ok(chats::assemble_page(
             &dialogs, &peers, &messages, limit, full_page, listing,
         ))
@@ -557,6 +552,7 @@ impl Telegram for LiveClient {
         read_history(
             id,
             &query,
+            &|chat| self.cached(chat),
             |request| self.get_history(peer, id.chat(), request),
             |request| self.get_message(peer, id.chat(), request),
         )
@@ -615,12 +611,7 @@ impl Telegram for LiveClient {
             }
             _ => return Err(TgError::InvalidInput(format!("{chat} can't be looked up"))),
         };
-        let peers: Vec<RawPeer> = users
-            .into_iter()
-            .filter_map(raw_user)
-            .chain(chats.into_iter().filter_map(raw_chat))
-            .collect();
-        self.remember(&peers);
+        let peers = self.described(users, chats);
         let peer = peers
             .iter()
             .find(|p| p.id == chat)
@@ -629,11 +620,17 @@ impl Telegram for LiveClient {
     }
 
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
-        search::search(&query, |request| self.search(request)).await
+        search::search(&query, &|chat| self.cached(chat), |request| {
+            self.search(request)
+        })
+        .await
     }
 
     async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
-        find::find_chats(query, limit, |request| self.contacts_search(request)).await
+        find::find_chats(query, limit, &|chat| self.cached(chat), |request| {
+            self.contacts_search(request)
+        })
+        .await
     }
 }
 
@@ -682,12 +679,7 @@ impl LiveClient {
             .into_iter()
             .filter_map(raw_history_message)
             .collect();
-        let peers: Vec<RawPeer> = users
-            .into_iter()
-            .filter_map(raw_user)
-            .chain(chats.into_iter().filter_map(raw_chat))
-            .collect();
-        self.remember(&peers);
+        let peers = self.described(users, chats);
         Ok(HistoryAnswer {
             messages,
             returned,
@@ -730,12 +722,7 @@ impl LiveClient {
             tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
             tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
         };
-        let peers: Vec<RawPeer> = users
-            .into_iter()
-            .filter_map(raw_user)
-            .chain(chats.into_iter().filter_map(raw_chat))
-            .collect();
-        self.remember(&peers);
+        let peers = self.described(users, chats);
         Ok(MessageAnswer {
             messages: messages.into_iter().filter_map(raw_found_message).collect(),
             peers,
@@ -838,12 +825,7 @@ impl LiveClient {
             tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![], true, None),
         };
         let returned = messages.len();
-        let peers: Vec<RawPeer> = users
-            .into_iter()
-            .filter_map(raw_user)
-            .chain(chats.into_iter().filter_map(raw_chat))
-            .collect();
-        self.remember(&peers);
+        let peers = self.described(users, chats);
         Ok(SearchAnswer {
             messages: messages.into_iter().filter_map(raw_found_message).collect(),
             returned,
@@ -869,6 +851,18 @@ impl LiveClient {
         let answer = found_answer(found);
         self.remember(&answer.peers);
         Ok(answer)
+    }
+
+    /// The peers an answer describes (its `users` and `chats`), remembered:
+    /// every answer that describes peers goes through here (or `remember`).
+    fn described(&self, users: Vec<tl::enums::User>, chats: Vec<tl::enums::Chat>) -> Vec<RawPeer> {
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        self.remember(&peers);
+        peers
     }
 
     fn remember(&self, peers: &[RawPeer]) {
@@ -1375,7 +1369,7 @@ mod tests {
 
     /// A user or channel 7 with access hash 99, as Telegram would send it (only
     /// the fields that aren't optional; the TL structs have 50 of them).
-    fn tl_peers(min: bool) -> (tl::enums::User, tl::enums::Chat) {
+    pub(super) fn tl_peers(min: bool) -> (tl::enums::User, tl::enums::Chat) {
         use grammers_client::tl::{Deserializable, Identifiable, Serializable};
         let user_flags: u32 = 1 | if min { 1 << 20 } else { 0 };
         let mut user = tl::types::User::CONSTRUCTOR_ID.to_le_bytes().to_vec();
@@ -2009,6 +2003,21 @@ mod resolve_tests {
                 tl::types::InputPeerChat { chat_id: 4 }
             ))]
         );
+    }
+
+    #[tokio::test]
+    async fn the_peers_an_answer_describes_are_remembered_never_a_min_hash() {
+        let (live, _dir) = cold_client().await;
+        let (min_user, min_channel) = super::tests::tl_peers(true);
+        live.described(vec![min_user], vec![min_channel]);
+        assert_eq!(live.cached(ChatId::User(7)), None);
+        assert_eq!(live.cached(ChatId::Channel(7)), None);
+
+        let (user, channel) = super::tests::tl_peers(false);
+        let peers = live.described(vec![user], vec![channel]);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(live.cached(ChatId::User(7)), Some(99));
+        assert_eq!(live.cached(ChatId::Channel(7)), Some(99));
     }
 
     #[tokio::test]

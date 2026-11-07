@@ -877,3 +877,111 @@ async fn the_schema_bounds_thread_of_and_depth() {
         assert!(description.contains(word), "{word}: {description}");
     }
 }
+
+/// Team, where Bob (a member the account also has a private chat with) wrote
+/// the newest message, 10, and Alice the rest. Telegram describes users and
+/// channels as "min" (no hash to hand out) in a getHistory answer whose slice
+/// reaches past the newest message, as it did in production (#51).
+async fn team_client(past_newest: PastNewest) -> (common::TestServer, Client) {
+    let history = (1..=10)
+        .map(|id| RawHistoryMessage {
+            from: Some(if id == 10 { BOB } else { ALICE }),
+            out: false,
+            ..message(id, "x")
+        })
+        .collect();
+    let data = FakeData::new(account(42, "Me"))
+        .with_chats(vec![
+            alice_chat(),
+            chat(BOB, "Bob", ChatKind::Private),
+            chat(TEAM, "Team", ChatKind::Supergroup),
+        ])
+        .with_messages(TEAM, history)
+        .with_past_newest(past_newest)
+        .with_min_past_newest();
+    let server = start_with(vec![data]).await;
+    let (_, tokens) = server.login().await;
+    let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+    (server, client)
+}
+
+/// The window of 3 around Team's newest message.
+fn newest_window() -> Value {
+    json!({ "chat_id": fake_issued_id(TEAM), "around_id": 10, "limit": 3 })
+}
+
+fn sender_of(page: &Value, id: i64) -> &str {
+    let message = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap();
+    message["sender"]["id"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn a_window_at_the_newest_message_keeps_the_hashes_seen_before() {
+    for past_newest in BOTH_EDGES {
+        let (_server, client) = team_client(past_newest).await;
+        // Nothing has described Bob in full yet: his id has no hash, and none
+        // is invented.
+        let page = call(&client, newest_window()).await.unwrap();
+        assert_eq!(ids(&page), [10, 9, 8], "{past_newest:?}");
+        assert_eq!(sender_of(&page, 10), BOB.to_string(), "{past_newest:?}");
+        if past_newest == PastNewest::Shorten {
+            // Alice wrote 9, in the min answer, and 8, in the second call that
+            // fills the shortened window: the merged answers give her hash.
+            assert_eq!(sender_of(&page, 9), fake_issued_id(ALICE));
+        }
+
+        // A plain page describes Bob in full; from then on the window
+        // hands out his id with its hash.
+        call(
+            &client,
+            json!({ "chat_id": fake_issued_id(TEAM), "limit": 5 }),
+        )
+        .await
+        .unwrap();
+        let page = call(&client, newest_window()).await.unwrap();
+        assert_eq!(sender_of(&page, 10), fake_issued_id(BOB), "{past_newest:?}");
+        assert_eq!(
+            sender_of(&page, 9),
+            fake_issued_id(ALICE),
+            "{past_newest:?}"
+        );
+        assert_eq!(
+            sender_of(&page, 8),
+            fake_issued_id(ALICE),
+            "{past_newest:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_answer_teaches_the_hashes_later_ids_carry() {
+    let team = fake_issued_id(TEAM);
+    for (tool, arguments) in [
+        ("list_chats", json!({})),
+        ("get_chat_info", json!({ "chat_id": fake_issued_id(BOB) })),
+        ("find_chats", json!({ "query": "bob" })),
+        ("search_messages", json!({ "query": "x" })),
+        ("get_messages", json!({ "chat_id": team, "thread_of": 9 })),
+        ("get_messages", json!({ "chat_id": team, "limit": 5 })),
+    ] {
+        let (_server, client) = team_client(PastNewest::Shorten).await;
+        client
+            .call_tool(
+                CallToolRequestParams::new(tool)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        let page = call(&client, newest_window()).await.unwrap();
+        assert_eq!(
+            sender_of(&page, 10),
+            fake_issued_id(BOB),
+            "{tool} {arguments}"
+        );
+    }
+}

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind},
-    messages::{Issuer, Media, RawHistoryMessage, Sender},
+    messages::{Issuer, KnownHashes, Media, RawHistoryMessage, Sender},
 };
 
 /// Which kind of Chats a search across all of them looks in.
@@ -209,8 +209,13 @@ required here. Add one or more words.";
 pub const CURSOR_MISMATCH: &str = "cursor belongs to a different search: the query or a filter \
 changed. Start again without cursor, or repeat the search exactly as before.";
 
-/// Answer `query` with one search call, sent through `send`.
-pub async fn search<F, Fut>(query: &SearchQuery, send: F) -> Result<SearchPage, TgError>
+/// Answer `query` with one search call, sent through `send`; ids the answer
+/// leaves without a hash take the one in `known`.
+pub async fn search<F, Fut>(
+    query: &SearchQuery,
+    known: KnownHashes<'_>,
+    send: F,
+) -> Result<SearchPage, TgError>
 where
     F: FnOnce(SearchRequest) -> Fut,
     Fut: Future<Output = Result<SearchAnswer, TgError>>,
@@ -272,13 +277,14 @@ where
         scope,
     })
     .await?;
-    Ok(assemble(query, answer, limit as usize, fingerprint))
+    Ok(assemble(query, answer, known, limit as usize, fingerprint))
 }
 
 /// A page of at most `limit` hits from `answer`, and where the next one starts.
 fn assemble(
     query: &SearchQuery,
     answer: SearchAnswer,
+    known: KnownHashes<'_>,
     limit: usize,
     fingerprint: u64,
 ) -> SearchPage {
@@ -289,7 +295,7 @@ fn assemble(
         next_rate,
         peers,
     } = answer;
-    let issuer = Issuer::new(&peers);
+    let issuer = Issuer::new(&peers, known);
     // Only the chat that was asked keeps the hash it was asked with.
     let asked = |chat: ChatId| match query.scope {
         SearchScope::Chat { chat: asked, .. } if asked.chat() == chat => asked,
@@ -500,6 +506,11 @@ mod tests {
     use super::*;
     use crate::tg::fake::{FakeSearchChat, fake_rate, search_answer};
 
+    /// No hash seen before: what a cold Live client knows.
+    fn unknown(_: ChatId) -> Option<i64> {
+        None
+    }
+
     const DAY: i32 = 1_793_923_200;
 
     fn msg(id: i32, date: i32, text: &str) -> RawHistoryMessage {
@@ -558,7 +569,7 @@ mod tests {
         query: &SearchQuery,
         sent: &mut Vec<SearchRequest>,
     ) -> Result<SearchPage, TgError> {
-        now(search(query, |request| {
+        now(search(query, &unknown, |request| {
             sent.push(request.clone());
             std::future::ready(Ok(search_answer(chats, 42, &request)))
         }))
@@ -746,13 +757,13 @@ mod tests {
         let query = global("x", 3);
         let fingerprint = query.fingerprint();
 
-        let page = assemble(&query, answer(3, Some(777)), 3, fingerprint);
+        let page = assemble(&query, answer(3, Some(777)), &unknown, 3, fingerprint);
         assert_eq!(decode(&page).offset_rate, Some(777));
-        let page = assemble(&query, answer(3, None), 3, fingerprint);
+        let page = assemble(&query, answer(3, None), &unknown, 3, fingerprint);
         assert_eq!(decode(&page).offset_rate, Some(10), "the oldest hit's date");
 
         // More than `limit` sent: cut, and continue right after the last hit kept.
-        let page = assemble(&query, answer(5, Some(777)), 3, fingerprint);
+        let page = assemble(&query, answer(5, Some(777)), &unknown, 3, fingerprint);
         assert_eq!(
             page.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
             [5, 4, 3]
@@ -783,18 +794,18 @@ mod tests {
         };
         let f = query.fingerprint();
         assert!(
-            assemble(&query, answer(2, 2, false), 3, f)
+            assemble(&query, answer(2, 2, false), &unknown, 3, f)
                 .next_cursor
                 .is_none()
         );
         assert!(
-            assemble(&query, answer(3, 3, true), 3, f)
+            assemble(&query, answer(3, 3, true), &unknown, 3, f)
                 .next_cursor
                 .is_none()
         );
         // A full slice may have more, even if a messageEmpty was left out.
         assert!(
-            assemble(&query, answer(2, 3, false), 3, f)
+            assemble(&query, answer(2, 3, false), &unknown, 3, f)
                 .next_cursor
                 .is_some()
         );
@@ -943,7 +954,7 @@ mod tests {
             ],
         };
         let query = global("deploy", 10);
-        let page = assemble(&query, answer.clone(), 10, query.fingerprint());
+        let page = assemble(&query, answer.clone(), &unknown, 10, query.fingerprint());
         let team = ChatRef::new(group, Some(99)).to_string();
         assert_eq!(
             page.hits[0].chat,
@@ -978,7 +989,7 @@ mod tests {
             },
             ..global("deploy", 10)
         };
-        let page = assemble(&query, answer, 10, query.fingerprint());
+        let page = assemble(&query, answer, &unknown, 10, query.fingerprint());
         assert_eq!(page.hits[2].chat.id, asked.to_string());
         assert_eq!(page.hits[0].chat.id, team);
     }

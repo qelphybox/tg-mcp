@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind},
-    messages::Issuer,
+    messages::{Issuer, KnownHashes},
 };
 
 /// One Chat or contact found: the part of a list_chats Chat that names it.
@@ -69,8 +69,14 @@ pub const QUERY_TOO_SHORT: &str = "Telegram refuses so short a query for its cha
 more of the name, title or @username.";
 
 /// Find the Account's Chats and contacts matching `query` (already trimmed,
-/// without a leading `@`), at most `limit`, with one call sent through `send`.
-pub async fn find_chats<F, Fut>(query: &str, limit: usize, send: F) -> Result<FoundChats, TgError>
+/// without a leading `@`), at most `limit`, with one call sent through `send`;
+/// ids the answer leaves without a hash take the one in `known`.
+pub async fn find_chats<F, Fut>(
+    query: &str,
+    limit: usize,
+    known: KnownHashes<'_>,
+    send: F,
+) -> Result<FoundChats, TgError>
 where
     F: FnOnce(FindRequest) -> Fut,
     Fut: Future<Output = Result<FoundAnswer, TgError>>,
@@ -83,11 +89,11 @@ where
         limit: TELEGRAM_LIMIT,
     })
     .await?;
-    Ok(assemble(answer, limit))
+    Ok(assemble(answer, known, limit))
 }
 
 /// The Account's own matches, each once, at most `limit`, with issued ids.
-fn assemble(answer: FoundAnswer, limit: usize) -> FoundChats {
+fn assemble(answer: FoundAnswer, known: KnownHashes<'_>, limit: usize) -> FoundChats {
     let FoundAnswer {
         my_results,
         // Public Chats the Account hasn't joined are out of bounds (#19), and
@@ -95,7 +101,7 @@ fn assemble(answer: FoundAnswer, limit: usize) -> FoundChats {
         results: _,
         peers,
     } = answer;
-    let issuer = Issuer::new(&peers);
+    let issuer = Issuer::new(&peers, known);
     let mut seen = HashSet::new();
     let chats = my_results
         .into_iter()
@@ -117,6 +123,11 @@ fn assemble(answer: FoundAnswer, limit: usize) -> FoundChats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No hash seen before: what a cold Live client knows.
+    fn unknown(_: ChatId) -> Option<i64> {
+        None
+    }
 
     fn peer(id: ChatId, title: &str, hash: Option<i64>) -> RawPeer {
         RawPeer {
@@ -158,7 +169,7 @@ mod tests {
                 peer(stranger, "Stranger", Some(30)),
             ],
         };
-        let found = assemble(answer, 10);
+        let found = assemble(answer, &unknown, 10);
         assert_eq!(
             ids(&found),
             [
@@ -180,7 +191,7 @@ mod tests {
             results: Vec::new(),
             peers: vec![peer(min, "Min", None), peer(group, "Group", None)],
         };
-        let found = assemble(answer, 10);
+        let found = assemble(answer, &unknown, 10);
         assert_eq!(ids(&found), ["user:5", "channel:6", "chat:7"]);
         assert_eq!(
             (found.chats[1].title.as_str(), found.chats[1].kind),
@@ -200,13 +211,16 @@ mod tests {
             results: Vec::new(),
             peers: Vec::new(),
         };
-        assert_eq!(ids(&assemble(answer, 3)), ["user:1", "user:2", "user:3"]);
+        assert_eq!(
+            ids(&assemble(answer, &unknown, 3)),
+            ["user:1", "user:2", "user:3"]
+        );
     }
 
     #[test]
     fn telegram_is_asked_for_more_than_the_caller_wants() {
         let mut sent = Vec::new();
-        let found = now(find_chats("alice", 2, |request| {
+        let found = now(find_chats("alice", 2, &unknown, |request| {
             sent.push(request);
             std::future::ready(Ok(FoundAnswer {
                 my_results: (1..=5).map(ChatId::User).collect(),
@@ -223,7 +237,7 @@ mod tests {
             }]
         );
         for limit in [0, 51] {
-            let result = now(find_chats("alice", limit, |_| async {
+            let result = now(find_chats("alice", limit, &unknown, |_| async {
                 unreachable!("nothing is asked of Telegram")
             }));
             assert!(matches!(result, Err(TgError::InvalidInput(_))));

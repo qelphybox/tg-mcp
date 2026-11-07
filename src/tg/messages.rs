@@ -249,12 +249,18 @@ pub struct MessageAnswer {
     pub peers: Vec<RawPeer>,
 }
 
+/// Access hashes of users and channels seen in earlier answers (the Live
+/// client's peer cache, #24). An id the answers at hand leave without a usable
+/// hash (a peer described as "min", or not at all) takes it from here.
+pub type KnownHashes<'a> = &'a (dyn Fn(ChatId) -> Option<i64> + Sync);
+
 /// Answer `query` with as many `messages.getHistory` calls as it takes (one,
 /// or two for a window at the newest message), sent through `get_history`;
 /// a `thread_of` chain with one `get_message` per message of the chain.
 pub async fn read_history<F, Fut, G, GFut>(
     chat: ChatRef,
     query: &HistoryQuery,
+    known: KnownHashes<'_>,
     mut get_history: F,
     get_message: G,
 ) -> Result<MessagePage, TgError>
@@ -278,7 +284,7 @@ where
                     .into(),
             ));
         }
-        return read_thread(chat, start, query.limit, get_message).await;
+        return read_thread(chat, start, query.limit, known, get_message).await;
     }
     match (query.before_id, query.around_id, query.after_id) {
         (_, None, None) => {
@@ -298,11 +304,14 @@ where
                 chat,
                 &answer.messages,
                 &answer.peers,
+                known,
                 query,
                 full_page,
             ))
         }
-        (None, Some(target), None) if !dated => around(chat, target, limit, get_history).await,
+        (None, Some(target), None) if !dated => {
+            around(chat, target, limit, known, get_history).await
+        }
         (None, None, Some(after)) if !dated => {
             // Everything at and above after+1, i.e. strictly newer; min_id drops
             // older ones should Telegram fill a slice that reaches past the
@@ -319,7 +328,7 @@ where
             let next_after_id = (answer.returned >= query.limit)
                 .then(|| window.first().map(|m| m.id))
                 .flatten();
-            let issuer = Issuer::new(&answer.peers);
+            let issuer = Issuer::new(&answer.peers, known);
             Ok(MessagePage {
                 next_after_id,
                 ..MessagePage::new(
@@ -342,6 +351,7 @@ async fn around<F, Fut>(
     chat: ChatRef,
     target: i32,
     limit: i32,
+    known: KnownHashes<'_>,
     mut get_history: F,
 ) -> Result<MessagePage, TgError>
 where
@@ -386,7 +396,7 @@ where
         window.extend(newest_first(fill.messages, |id| id < oldest));
         peers.extend(fill.peers);
     }
-    let issuer = Issuer::new(&peers);
+    let issuer = Issuer::new(&peers, known);
     Ok(MessagePage {
         next_before_id: more_older.then(|| window.last().map(|m| m.id)).flatten(),
         next_after_id: (!at_newest).then(|| window.first().map(|m| m.id)).flatten(),
@@ -413,6 +423,7 @@ async fn read_thread<G, GFut>(
     chat: ChatRef,
     start: i32,
     limit: usize,
+    known: KnownHashes<'_>,
     mut get_message: G,
 ) -> Result<MessagePage, TgError>
 where
@@ -464,7 +475,7 @@ where
             Some(parent) => next = parent,
         }
     }
-    let issuer = Issuer::new(&peers);
+    let issuer = Issuer::new(&peers, known);
     let last = chain.len() - 1;
     let messages = chain
         .iter()
@@ -511,15 +522,26 @@ fn newest_first(
 }
 
 /// Turns raw messages into the tools' shape, handing out chat ids from the
-/// peers Telegram sent along with them.
+/// peers Telegram sent along with them, else from the hashes seen before.
 pub(super) struct Issuer<'a> {
     peers: HashMap<ChatId, &'a RawPeer>,
+    known: KnownHashes<'a>,
 }
 
 impl<'a> Issuer<'a> {
-    pub(super) fn new(peers: &'a [RawPeer]) -> Self {
+    /// `peers` may come from several answers and describe a peer more than
+    /// once: a description with a usable hash wins over one without (min).
+    pub(super) fn new(peers: &'a [RawPeer], known: KnownHashes<'a>) -> Self {
+        let mut by_id: HashMap<ChatId, &'a RawPeer> = HashMap::new();
+        for peer in peers {
+            let kept = by_id.entry(peer.id).or_insert(peer);
+            if kept.access_hash.is_none() && peer.access_hash.is_some() {
+                *kept = peer;
+            }
+        }
         Self {
-            peers: peers.iter().map(|p| (p.id, p)).collect(),
+            peers: by_id,
+            known,
         }
     }
 
@@ -527,11 +549,16 @@ impl<'a> Issuer<'a> {
         self.peers.get(&id).copied()
     }
 
-    /// Ids handed out carry the access hash Telegram just sent along (none is
-    /// invented); `asked`, the chat as the caller named it, keeps the hash it
-    /// was asked with if Telegram didn't describe it.
+    /// Ids handed out carry the access hash Telegram just sent along, else
+    /// the one seen before (none is invented); `asked`, the chat as the
+    /// caller named it, keeps the hash it was asked with if neither has one.
     pub(super) fn issue(&self, id: ChatId, asked: ChatRef) -> ChatRef {
-        match self.peers.get(&id).and_then(|p| p.access_hash) {
+        let hash = self
+            .peers
+            .get(&id)
+            .and_then(|p| p.access_hash)
+            .or_else(|| (self.known)(id));
+        match hash {
             Some(hash) => ChatRef::new(id, Some(hash)),
             None if id == asked.chat() => asked,
             None => ChatRef::from(id),
@@ -577,10 +604,11 @@ fn assemble_history(
     chat: ChatRef,
     raw: &[RawHistoryMessage],
     peers: &[RawPeer],
+    known: KnownHashes<'_>,
     query: &HistoryQuery,
     full_page: bool,
 ) -> MessagePage {
-    let issuer = Issuer::new(peers);
+    let issuer = Issuer::new(peers, known);
     let mut reached_since = false;
     let mut messages = Vec::new();
     for m in raw {
@@ -677,6 +705,7 @@ mod tests {
             alice.into(),
             &[mine, msg(1, 90)],
             &[peer(alice, "Alice")],
+            &unknown,
             &query(10),
             false,
         );
@@ -703,6 +732,7 @@ mod tests {
             group.into(),
             &[from_bob, from_ghost],
             &[peer(bob, "Bob")],
+            &unknown,
             &query(10),
             false,
         );
@@ -731,7 +761,7 @@ mod tests {
         let peers = [with_hash(bob, -7), with_hash(group, 99)];
 
         // Asked with a legacy id: the answer hands out hashed ids.
-        let page = assemble_history(group.into(), &raw, &peers, &query(10), false);
+        let page = assemble_history(group.into(), &raw, &peers, &unknown, &query(10), false);
         assert_eq!(page.chat_id, ChatRef::new(group, Some(99)).to_string());
         let sender = |i: usize| page.messages[i].sender.as_ref().unwrap().id.clone();
         assert_eq!(sender(0), ChatRef::new(bob, Some(-7)).to_string());
@@ -739,8 +769,172 @@ mod tests {
 
         // Telegram didn't describe the chat: its id stays as it was asked.
         let asked = ChatRef::new(group, Some(5));
-        let page = assemble_history(asked, &raw, &[], &query(10), false);
+        let page = assemble_history(asked, &raw, &[], &unknown, &query(10), false);
         assert_eq!(page.chat_id, asked.to_string());
+    }
+
+    /// No hash seen before: what a cold Live client knows.
+    fn unknown(_: ChatId) -> Option<i64> {
+        None
+    }
+
+    #[test]
+    fn ids_the_answer_leaves_without_a_hash_take_the_one_seen_before() {
+        let group = ChatId::Channel(9);
+        let (bob, carol, dave) = (ChatId::User(2), ChatId::User(3), ChatId::User(4));
+        // Seen in earlier answers: Bob, Dave, the group, and a channel with
+        // Carol's number, which is another peer (its hash isn't Carol's).
+        let known = |id: ChatId| match id {
+            ChatId::User(2) => Some(-7),
+            ChatId::User(4) => Some(1),
+            ChatId::Channel(3) => Some(11),
+            ChatId::Channel(9) => Some(99),
+            _ => None,
+        };
+        let from = |id, who| RawHistoryMessage {
+            from: Some(who),
+            ..msg(id, id)
+        };
+        let raw = [from(3, bob), from(2, carol), from(1, dave)];
+        // Bob described as min (no usable hash), Carol not at all, Dave with
+        // the hash this answer gives.
+        let peers = [
+            peer(bob, "Bob"),
+            RawPeer {
+                access_hash: Some(5),
+                ..peer(dave, "Dave")
+            },
+        ];
+        let page = assemble_history(group.into(), &raw, &peers, &known, &query(10), false);
+        assert_eq!(page.chat_id, ChatRef::new(group, Some(99)).to_string());
+        let senders: Vec<&str> = page
+            .messages
+            .iter()
+            .map(|m| m.sender.as_ref().unwrap().id.as_str())
+            .collect();
+        assert_eq!(
+            senders,
+            [
+                ChatRef::new(bob, Some(-7)).to_string(),
+                "user:3".into(),
+                ChatRef::new(dave, Some(5)).to_string(),
+            ]
+        );
+    }
+
+    /// How one answer describes Bob: with his access hash, as "min" (the
+    /// adapter leaves its hash out) or not at all.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Described {
+        Hashed,
+        Min,
+        Not,
+    }
+
+    const BOB: ChatId = ChatId::User(2);
+    const BOB_HASH: i64 = -7;
+
+    fn describing_bob(how: Described) -> Vec<RawPeer> {
+        let bob = peer(BOB, "Bob");
+        match how {
+            Described::Hashed => vec![RawPeer {
+                access_hash: Some(BOB_HASH),
+                ..bob
+            }],
+            Described::Min => vec![bob],
+            Described::Not => Vec::new(),
+        }
+    }
+
+    /// Every way two answers can describe Bob, and the id he gets from them:
+    /// with his hash if either answer gives it, whichever of them that is.
+    fn two_answers() -> Vec<([Described; 2], String)> {
+        use Described::*;
+        let all = [Hashed, Min, Not];
+        all.iter()
+            .flat_map(|&a| all.iter().map(move |&b| [a, b]))
+            .map(|answers| {
+                let hash = answers.contains(&Hashed).then_some(BOB_HASH);
+                (answers, ChatRef::new(BOB, hash).to_string())
+            })
+            .collect()
+    }
+
+    fn sender_of(page: &MessagePage, id: i32) -> String {
+        let message = page.messages.iter().find(|m| m.id == id).unwrap();
+        message.sender.as_ref().unwrap().id.clone()
+    }
+
+    #[test]
+    fn a_window_merged_from_two_answers_issues_ids_from_both() {
+        // Bob wrote the newest message; Telegram shortens the window around it
+        // (6, 5) and the second call fills it from below (4).
+        let history: Vec<RawHistoryMessage> = (1..=6)
+            .map(|id| RawHistoryMessage {
+                from: (id == 6).then_some(BOB),
+                ..msg(id, id)
+            })
+            .collect();
+        for (answers, expected) in two_answers() {
+            let mut calls = 0;
+            let page = futures_executor(read_history(
+                ChatId::Channel(1).into(),
+                &around(6, 3),
+                &unknown,
+                |request| {
+                    let messages = get_history(&history, &request, PastNewest::Shorten);
+                    calls += 1;
+                    std::future::ready(Ok(HistoryAnswer {
+                        returned: messages.len(),
+                        messages,
+                        peers: describing_bob(answers[calls - 1]),
+                    }))
+                },
+                |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
+                    unreachable!("a window fetches no message by id")
+                },
+            ))
+            .unwrap();
+            assert_eq!(calls, 2);
+            assert_eq!(sender_of(&page, 6), expected, "{answers:?}");
+        }
+    }
+
+    #[test]
+    fn a_chain_merged_from_its_answers_issues_ids_from_all_of_them() {
+        // Bob wrote 3, which replies to 2; each is a getMessages call.
+        let histories: Histories = [(
+            GROUP,
+            vec![
+                RawHistoryMessage {
+                    from: Some(BOB),
+                    ..reply(3, 2)
+                },
+                msg(2, 2),
+            ],
+        )]
+        .into();
+        for (answers, expected) in two_answers() {
+            let mut calls = 0;
+            let page = futures_executor(read_history(
+                GROUP.into(),
+                &thread(3, 5),
+                &unknown,
+                |_| -> std::future::Ready<Result<HistoryAnswer, TgError>> {
+                    unreachable!("a chain reads no history")
+                },
+                |request| {
+                    calls += 1;
+                    std::future::ready(Ok(MessageAnswer {
+                        messages: get_message(&histories, GROUP, &request),
+                        peers: describing_bob(answers[calls - 1]),
+                    }))
+                },
+            ))
+            .unwrap();
+            assert_eq!(calls, 2);
+            assert_eq!(sender_of(&page, 3), expected, "{answers:?}");
+        }
     }
 
     #[test]
@@ -782,7 +976,14 @@ mod tests {
                 ..msg(7, 10)
             },
         ];
-        let page = assemble_history(ChatId::User(1).into(), &raw, &[], &query(10), false);
+        let page = assemble_history(
+            ChatId::User(1).into(),
+            &raw,
+            &[],
+            &unknown,
+            &query(10),
+            false,
+        );
         let texts: Vec<&str> = page.messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -803,11 +1004,11 @@ mod tests {
         let chat = ChatId::User(1);
         let raw = [msg(30, 300), msg(20, 200), msg(10, 100)];
         assert_eq!(
-            assemble_history(chat.into(), &raw, &[], &query(3), true).next_before_id,
+            assemble_history(chat.into(), &raw, &[], &unknown, &query(3), true).next_before_id,
             Some(10)
         );
         assert_eq!(
-            assemble_history(chat.into(), &raw, &[], &query(5), false).next_before_id,
+            assemble_history(chat.into(), &raw, &[], &unknown, &query(5), false).next_before_id,
             None
         );
     }
@@ -821,7 +1022,7 @@ mod tests {
             until: Some(300),
             ..query(4)
         };
-        let page = assemble_history(chat.into(), &raw, &[], &q, true);
+        let page = assemble_history(chat.into(), &raw, &[], &unknown, &q, true);
         let ids: Vec<i32> = page.messages.iter().map(|m| m.id).collect();
         assert_eq!(ids, [30, 20]);
         assert_eq!(
@@ -841,6 +1042,7 @@ mod tests {
         let page = futures_executor(read_history(
             ChatId::Channel(1).into(),
             &query,
+            &unknown,
             |request| {
                 sent.push(request);
                 let messages = get_history(history, &request, past_newest);
@@ -1088,6 +1290,7 @@ mod tests {
         let page = futures_executor(read_history(
             chat.into(),
             &thread(start, limit),
+            &unknown,
             |_| -> std::future::Ready<Result<HistoryAnswer, TgError>> {
                 unreachable!("a chain reads no history")
             },
@@ -1199,6 +1402,7 @@ mod tests {
         let page = futures_executor(read_history(
             GROUP.into(),
             &thread(50, 20),
+            &unknown,
             |_| -> std::future::Ready<Result<HistoryAnswer, TgError>> { unreachable!() },
             |request| {
                 sent.push(request.id);

@@ -71,6 +71,10 @@ pub struct FakeData {
     /// How getHistory answers a slice that reaches past the newest message.
     #[serde(default)]
     pub past_newest: PastNewest,
+    /// When set, such a slice's answer describes its users and channels as
+    /// "min" (no hash to hand out), as Telegram did in production (#51).
+    #[serde(default)]
+    pub min_past_newest: bool,
 }
 
 /// What Telegram does when `add_offset` puts a getHistory slice's start above
@@ -101,19 +105,8 @@ pub fn get_history(
 ) -> Vec<RawHistoryMessage> {
     let mut list = history.to_vec();
     list.sort_by_key(|m| std::cmp::Reverse(m.id));
-    let position = if request.offset_id != 0 {
-        list.iter()
-            .take_while(|m| m.id >= request.offset_id)
-            .count()
-    } else if request.offset_date != 0 {
-        list.iter()
-            .take_while(|m| m.date >= request.offset_date)
-            .count()
-    } else {
-        0
-    };
     let limit = i64::from(request.limit).clamp(0, HISTORY_MAX_LIMIT);
-    let mut start = position as i64 + i64::from(request.add_offset);
+    let mut start = slice_start(&list, request);
     let mut take = limit;
     if start < 0 {
         if past_newest == PastNewest::Shorten {
@@ -127,6 +120,30 @@ pub fn get_history(
         .filter(|m| request.max_id == 0 || m.id < request.max_id)
         .filter(|m| request.min_id == 0 || m.id > request.min_id)
         .collect()
+}
+
+/// Whether a getHistory slice starts above the newest message of `history`.
+fn reaches_past_newest(history: &[RawHistoryMessage], request: &HistoryRequest) -> bool {
+    let mut list = history.to_vec();
+    list.sort_by_key(|m| std::cmp::Reverse(m.id));
+    slice_start(&list, request) < 0
+}
+
+/// Where a getHistory slice starts in `list` (newest first): below 0 when
+/// `add_offset` reaches past the newest message.
+fn slice_start(list: &[RawHistoryMessage], request: &HistoryRequest) -> i64 {
+    let position = if request.offset_id != 0 {
+        list.iter()
+            .take_while(|m| m.id >= request.offset_id)
+            .count()
+    } else if request.offset_date != 0 {
+        list.iter()
+            .take_while(|m| m.date >= request.offset_date)
+            .count()
+    } else {
+        0
+    };
+    position as i64 + i64::from(request.add_offset)
 }
 
 /// `messages.getMessages` / `channels.getMessages` for one id as Telegram
@@ -196,11 +213,17 @@ impl FakeData {
             flood_wait: None,
             search_flood_wait: None,
             past_newest: PastNewest::default(),
+            min_past_newest: false,
         }
     }
 
     pub fn with_past_newest(mut self, past_newest: PastNewest) -> Self {
         self.past_newest = past_newest;
+        self
+    }
+
+    pub fn with_min_past_newest(mut self) -> Self {
+        self.min_past_newest = true;
         self
     }
 
@@ -463,11 +486,19 @@ fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
 #[derive(Debug, Clone)]
 pub struct FakeTelegram {
     data: FakeData,
+    known: KnownPeers,
 }
+
+/// Access hashes of the users and channels a Grant's answers described, like
+/// a Live client's peer cache.
+type KnownPeers = Arc<Mutex<std::collections::HashMap<ChatId, i64>>>;
 
 impl FakeTelegram {
     pub fn new(data: FakeData) -> Self {
-        Self { data }
+        Self {
+            data,
+            known: Arc::default(),
+        }
     }
 }
 
@@ -542,6 +573,7 @@ impl Telegram for FakeTelegram {
                 ..(*c).clone()
             })
             .collect();
+        self.remember(&Self::raw_peers(&chats));
         let end = start + chats.len();
         let folder = if archived { "a" } else { "" };
         Ok(ChatPage {
@@ -565,15 +597,29 @@ impl Telegram for FakeTelegram {
         read_history(
             id,
             &query,
+            &|chat| self.known(chat),
             |request| {
                 let messages = get_history(history, &request, self.data.past_newest);
+                // The Chat and the senders of these messages, as Telegram
+                // describes them in a getHistory answer.
+                let min = self.data.min_past_newest && reaches_past_newest(history, &request);
+                let described: Vec<RawPeer> = peers
+                    .iter()
+                    .filter(|p| p.id == chat || messages.iter().any(|m| m.from == Some(p.id)))
+                    .map(|p| RawPeer {
+                        access_hash: p.access_hash.filter(|_| !min),
+                        ..p.clone()
+                    })
+                    .collect();
+                self.remember(&described);
                 std::future::ready(Ok(HistoryAnswer {
                     returned: messages.len(),
                     messages,
-                    peers: peers.clone(),
+                    peers: described,
                 }))
             },
             |request| {
+                self.remember(&peers);
                 std::future::ready(Ok(MessageAnswer {
                     messages: get_message(&self.data.messages, chat, &request),
                     peers: peers.clone(),
@@ -596,6 +642,7 @@ impl Telegram for FakeTelegram {
                     "{chat} is not one of your chats; chat ids come from list_chats"
                 ))
             })?;
+        self.remember(std::slice::from_ref(&peer));
         let details = self.data.details.get(&chat).cloned().unwrap_or_default();
         Ok(chat_info(&peer, details.description, details.member_count))
     }
@@ -638,7 +685,7 @@ impl Telegram for FakeTelegram {
             .collect();
         let peers = self.peers();
         let me = self.data.account.id;
-        search::search(&query, |request| {
+        search::search(&query, &|chat| self.known(chat), |request| {
             // SEARCH_QUERY_EMPTY, as the Live client reports it.
             let answer = if request.q.is_empty()
                 && request.filter.is_none()
@@ -646,6 +693,7 @@ impl Telegram for FakeTelegram {
             {
                 Err(TgError::InvalidInput(QUERY_REQUIRED.into()))
             } else {
+                self.remember(&peers);
                 Ok(SearchAnswer {
                     peers,
                     ..search_answer(&chats, me, &request)
@@ -672,13 +720,10 @@ impl Telegram for FakeTelegram {
             .filter(|p| p.id != ChatId::User(me))
             .collect();
         let public = Self::raw_peers(&self.data.public);
-        find::find_chats(query, limit, |request| {
-            std::future::ready(Ok(contacts_search(
-                &own,
-                &public,
-                &self.data.min_peers,
-                &request,
-            )))
+        find::find_chats(query, limit, &|chat| self.known(chat), |request| {
+            let answer = contacts_search(&own, &public, &self.data.min_peers, &request);
+            self.remember(&answer.peers);
+            std::future::ready(Ok(answer))
         })
         .await
     }
@@ -720,6 +765,18 @@ impl FakeTelegram {
                 .iter()
                 .chain(&self.data.contacts)
                 .any(|c| c.id.parse::<ChatRef>().is_ok_and(|id| id.chat() == chat))
+    }
+
+    /// Like the Live client: every hash an answer gives is kept.
+    fn remember(&self, peers: &[RawPeer]) {
+        self.known
+            .lock()
+            .unwrap()
+            .extend(peers.iter().filter_map(|p| Some((p.id, p.access_hash?))));
+    }
+
+    fn known(&self, chat: ChatId) -> Option<i64> {
+        self.known.lock().unwrap().get(&chat).copied()
     }
 
     fn raw_peers(chats: &[ChatSummary]) -> Vec<RawPeer> {
@@ -1065,6 +1122,9 @@ struct FakeTelegramSide {
     unreachable: std::sync::atomic::AtomicBool,
     /// How many times [`Connector::shutdown`] was called.
     shutdowns: std::sync::atomic::AtomicUsize,
+    /// Each Grant's peer cache, kept across requests as the Live client
+    /// pool keeps a Grant's Live client.
+    known: Mutex<std::collections::HashMap<String, KnownPeers>>,
 }
 
 impl FakeConnector {
@@ -1123,7 +1183,15 @@ impl Connector for FakeConnector {
         {
             return Err(TgError::BadSession("fake session was ended".into()));
         }
-        Ok(Arc::new(FakeTelegram::new(data)))
+        let known = self
+            .telegram
+            .known
+            .lock()
+            .unwrap()
+            .entry(grant.grant_id.as_str().to_string())
+            .or_default()
+            .clone();
+        Ok(Arc::new(FakeTelegram { data, known }))
     }
 
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
@@ -1134,8 +1202,9 @@ impl Connector for FakeConnector {
         Ok(())
     }
 
-    /// Nothing is held open, so there is nothing to flush; only counted.
+    /// Nothing is held open; the peer caches go, as with the Live clients.
     async fn shutdown(&self) {
+        self.telegram.known.lock().unwrap().clear();
         self.telegram
             .shutdowns
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
