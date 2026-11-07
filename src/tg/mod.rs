@@ -101,8 +101,19 @@ pub trait Telegram: Send + Sync + 'static {
         query: messages::HistoryQuery,
     ) -> Result<messages::MessagePage, TgError>;
 
-    /// Details of one Chat: title, type, @username, description/bio, member count.
+    /// Details of one Chat: title, type, @username, description, member count;
+    /// for a user, the profile Telegram shows the Account
+    /// ([`chats::user_info`]), without `common_chats`.
     async fn get_chat_info(&self, chat: chats::ChatRef) -> Result<chats::ChatInfo, TgError>;
+
+    /// The groups and channels the Account shares with a user
+    /// (`messages.getCommonChats`), at most `limit`
+    /// ([`find::MAX_COMMON_CHATS`]). Not a user is [`TgError::InvalidInput`].
+    async fn common_chats(
+        &self,
+        user: chats::ChatRef,
+        limit: usize,
+    ) -> Result<find::FoundChats, TgError>;
 
     /// One page of Search hits, Telegram's search across the Account's Chats or
     /// in one of them, newest first. At most `query.limit` hits; `next_cursor`

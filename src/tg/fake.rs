@@ -17,7 +17,7 @@ use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{
         ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
-        chat_info, fallback_kind,
+        RawProfile, chat_info, fallback_kind, user_info,
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
@@ -50,6 +50,10 @@ pub struct FakeData {
     /// Descriptions and member counts, for get_chat_info.
     #[serde(default)]
     pub details: std::collections::HashMap<ChatId, FakeDetails>,
+    /// Users' profiles and the Chats they share with the Account, for
+    /// get_chat_info. A user without one has an empty profile.
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<ChatId, FakeProfile>,
     /// Chats in the Archive; the rest are in the main list.
     #[serde(default)]
     pub archived: Vec<ChatId>,
@@ -290,6 +294,17 @@ pub struct FakeDetails {
     pub member_count: Option<i32>,
 }
 
+/// A user as `users.getFullUser` describes them to the Account, and the Chats
+/// `messages.getCommonChats` lists for them (Chats of the Account's list; the
+/// profile's count is Telegram's, so it is set separately).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FakeProfile {
+    #[serde(default)]
+    pub profile: RawProfile,
+    #[serde(default)]
+    pub common_chats: Vec<ChatId>,
+}
+
 impl From<Account> for FakeData {
     fn from(account: Account) -> Self {
         Self::new(account)
@@ -303,6 +318,7 @@ impl FakeData {
             chats: Vec::new(),
             messages: Default::default(),
             details: Default::default(),
+            profiles: Default::default(),
             archived: Vec::new(),
             contacts: Vec::new(),
             public: Vec::new(),
@@ -332,6 +348,11 @@ impl FakeData {
 
     pub fn with_details(mut self, chat: ChatId, details: FakeDetails) -> Self {
         self.details.insert(chat, details);
+        self
+    }
+
+    pub fn with_profile(mut self, user: ChatId, profile: FakeProfile) -> Self {
+        self.profiles.insert(user, profile);
         self
     }
 
@@ -1002,8 +1023,37 @@ impl Telegram for FakeTelegram {
                 ))
             })?;
         self.remember(std::slice::from_ref(&peer));
+        if let ChatId::User(_) = chat {
+            let profile = self.data.profiles.get(&chat).cloned().unwrap_or_default();
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            return Ok(user_info(&peer, profile.profile, now));
+        }
         let details = self.data.details.get(&chat).cloned().unwrap_or_default();
         Ok(chat_info(&peer, details.description, details.member_count))
+    }
+
+    /// Like Telegram: the user's common Chats as `messages.getCommonChats`
+    /// describes them, cut to `limit`.
+    async fn common_chats(&self, user: ChatRef, limit: usize) -> Result<FoundChats, TgError> {
+        self.flood()?;
+        self.check_hash(user)?;
+        let chat = user.chat();
+        if !matches!(chat, ChatId::User(_)) {
+            return Err(TgError::InvalidInput(format!("{chat} is not a user")));
+        }
+        let common = self
+            .data
+            .profiles
+            .get(&chat)
+            .map_or(&[][..], |p| p.common_chats.as_slice());
+        let known = self.peers();
+        let peers: Vec<RawPeer> = common
+            .iter()
+            .filter_map(|id| known.iter().find(|p| p.id == *id).cloned())
+            .take(limit)
+            .collect();
+        self.remember(&peers);
+        Ok(find::common_chats(&peers, &|chat| self.known(chat), limit))
     }
 
     /// The same search calls as the Live client, answered by [`search_answer`].
