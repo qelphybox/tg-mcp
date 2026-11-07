@@ -4,7 +4,11 @@
 //! [`RawMessage`]s from a `messages.getDialogs` answer; everything that needs
 //! thinking (pairing, titles, kinds, the pagination cursor) happens here.
 
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use schemars::JsonSchema;
@@ -12,8 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::TgError;
 
-/// A Chat's stable id, shared by every tool: `user:<id>`, `chat:<id>` (basic group)
-/// or `channel:<id>` (channels and supergroups).
+/// Which Chat: `user:<id>`, `chat:<id>` (basic group) or `channel:<id>` (channels
+/// and supergroups). The tools hand out and take [`ChatRef`]s, which add the
+/// access hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatId {
     User(i64),
@@ -54,6 +59,9 @@ impl FromStr for ChatId {
             ))
         };
         let (kind, id) = s.split_once(':').ok_or_else(invalid)?;
+        if !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
         let id: i64 = id.parse().map_err(|_| invalid())?;
         if id <= 0 {
             return Err(invalid());
@@ -65,6 +73,92 @@ impl FromStr for ChatId {
             _ => Err(invalid()),
         }
     }
+}
+
+/// A chat id as the tools hand it out and take it back: the Chat, plus the
+/// access hash Telegram needs to address a user or channel, so resolving an id
+/// takes no lookup. Written `user:N~H`, `channel:N~H` (H: the hash as 11
+/// base64url characters) and `chat:N` (basic groups need no hash). Ids without
+/// `~H`, as issued before hashes were added, are still accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChatRef {
+    chat: ChatId,
+    access_hash: Option<i64>,
+}
+
+/// Longest chat id we issue: `channel:` + 19 digits + `~` + 11 hash characters.
+pub const CHAT_REF_MAX_LEN: usize = 39;
+
+/// What a chat id looks like (for input schemas).
+pub const CHAT_REF_PATTERN: &str =
+    r"^(chat:[1-9][0-9]{0,18}|(user|channel):[1-9][0-9]{0,18}(~[A-Za-z0-9_-]{11})?)$";
+
+/// Base64url characters of an encoded access hash (8 bytes, no padding).
+const HASH_CHARS: usize = 11;
+
+impl ChatRef {
+    /// A basic group's hash is dropped: it has none.
+    pub fn new(chat: ChatId, access_hash: Option<i64>) -> Self {
+        let access_hash = access_hash.filter(|_| !matches!(chat, ChatId::Chat(_)));
+        Self { chat, access_hash }
+    }
+
+    pub fn chat(&self) -> ChatId {
+        self.chat
+    }
+
+    pub fn access_hash(&self) -> Option<i64> {
+        self.access_hash
+    }
+}
+
+/// An id without a hash: resolved through the Live client's peer cache.
+impl From<ChatId> for ChatRef {
+    fn from(chat: ChatId) -> Self {
+        Self::new(chat, None)
+    }
+}
+
+impl fmt::Display for ChatRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.chat)?;
+        if let Some(hash) = self.access_hash {
+            write!(f, "~{}", URL_SAFE_NO_PAD.encode(hash.to_be_bytes()))?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for ChatRef {
+    type Err = TgError;
+
+    fn from_str(s: &str) -> Result<Self, TgError> {
+        let invalid = || {
+            TgError::InvalidInput(format!(
+                "'{s}' is not a chat id (expected user:N, chat:N or channel:N, \
+                 optionally followed by ~ and an access hash, as list_chats returns them)"
+            ))
+        };
+        let (chat, hash) = match s.split_once('~') {
+            Some((chat, hash)) => (chat, Some(hash)),
+            None => (s, None),
+        };
+        let chat: ChatId = chat.parse().map_err(|_| invalid())?;
+        let access_hash = match hash {
+            None => None,
+            Some(_) if matches!(chat, ChatId::Chat(_)) => return Err(invalid()),
+            Some(hash) => Some(decode_hash(hash).ok_or_else(invalid)?),
+        };
+        Ok(Self { chat, access_hash })
+    }
+}
+
+fn decode_hash(s: &str) -> Option<i64> {
+    if s.len() != HASH_CHARS {
+        return None;
+    }
+    let bytes: [u8; 8] = URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -97,6 +191,9 @@ pub struct ChatSummary {
     pub kind: ChatKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// The connected account itself: this chat is Telegram's "Saved Messages".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
     pub unread_count: i32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
@@ -121,7 +218,11 @@ pub struct ChatInfo {
     pub kind: ChatKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Bio of a user, or the description of a group/channel.
+    /// The connected account itself: this chat is Telegram's "Saved Messages".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
+    /// Bio of a user, or the description of a group/channel. Absent if there is
+    /// none, or if the person hides it from this account (privacy settings).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Members of a group, subscribers of a channel; absent when Telegram hides it.
@@ -144,10 +245,11 @@ pub fn chat_info(
         _ => member_count.filter(|n| *n > 0),
     };
     ChatInfo {
-        id: peer.id.to_string(),
+        id: peer.chat_ref().to_string(),
         title: peer.title.clone(),
         kind: peer.kind,
         username: peer.username.clone(),
+        is_self: peer.is_self,
         description,
         member_count,
     }
@@ -164,6 +266,15 @@ pub struct RawPeer {
     pub kind: ChatKind,
     pub username: Option<String>,
     pub access_hash: Option<i64>,
+    /// The connected Account itself (its chat is Telegram's Saved Messages).
+    pub is_self: bool,
+}
+
+impl RawPeer {
+    /// The id to hand out for this peer, with its access hash if it has one.
+    pub fn chat_ref(&self) -> ChatRef {
+        ChatRef::new(self.id, self.access_hash)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,17 +292,41 @@ pub struct RawDialog {
     pub top_message: i32,
     pub unread_count: i32,
     pub pinned: bool,
+    /// Telegram's peer folder: 0 (absent in TL) is the main list, 1 the Archive.
+    pub folder_id: i32,
 }
 
-/// Where the next `messages.getDialogs` page starts: the last dialog of this one.
+/// Which listing a page belongs to (main list or Archive), and whether it is
+/// its first page. Decides both the `messages.getDialogs` flags and what of the
+/// answer is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listing {
+    pub archived: bool,
+    pub first_page: bool,
+}
+
+impl Listing {
+    /// Asked for explicitly: without a folder Telegram answers from all of them.
+    pub fn folder_id(self) -> i32 {
+        if self.archived { 1 } else { 0 }
+    }
+
+    /// Pinned chats come once, first, on the first page; later pages skip them.
+    pub fn exclude_pinned(self) -> bool {
+        !self.first_page
+    }
+}
+
+/// Where the next `messages.getDialogs` page starts: the last unpinned dialog
+/// of this one, or the top of the unpinned list (`offset_peer` absent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     #[serde(rename = "d")]
     pub offset_date: i32,
     #[serde(rename = "i")]
     pub offset_id: i32,
-    #[serde(rename = "p")]
-    pub offset_peer: String,
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub offset_peer: Option<String>,
     #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
     pub offset_access_hash: Option<i64>,
     #[serde(rename = "a", default)]
@@ -207,43 +342,54 @@ impl Cursor {
         let invalid = || TgError::InvalidInput("cursor is not one this server returned".into());
         let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| invalid())?;
         let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        cursor
-            .offset_peer
-            .parse::<ChatId>()
-            .map_err(|_| invalid())?;
+        if let Some(peer) = &cursor.offset_peer {
+            peer.parse::<ChatId>().map_err(|_| invalid())?;
+        }
         Ok(cursor)
     }
 }
 
-/// Assemble a page. `full_page` = Telegram returned as many dialogs as asked for,
-/// so there may be more.
+/// Assemble a page of at most `limit` chats. `full_page` = Telegram returned
+/// as many dialogs as asked for, so there may be more. Whatever Telegram sends,
+/// the page keeps only dialogs of the listing's folder, pinned ones only on the
+/// first page, each chat once. The page is cut here and nowhere else: the
+/// cursor has to know where it ends.
 pub fn assemble_page(
     dialogs: &[RawDialog],
     peers: &[RawPeer],
     messages: &[RawMessage],
+    limit: usize,
     full_page: bool,
-    archived: bool,
+    listing: Listing,
 ) -> ChatPage {
     let peers: HashMap<ChatId, &RawPeer> = peers.iter().map(|p| (p.id, p)).collect();
     let messages: HashMap<(ChatId, i32), &RawMessage> =
         messages.iter().map(|m| ((m.chat, m.id), m)).collect();
 
-    let chats = dialogs
+    let mut seen = HashSet::new();
+    let mut shown: Vec<&RawDialog> = dialogs
+        .iter()
+        .filter(|d| d.folder_id == listing.folder_id())
+        .filter(|d| !(d.pinned && listing.exclude_pinned()))
+        .filter(|d| seen.insert(d.chat))
+        .collect();
+    // A first page brings the pinned dialogs on top of `limit` unpinned ones.
+    let cut = shown.len() > limit;
+    shown.truncate(limit);
+
+    let chats = shown
         .iter()
         .map(|dialog| {
             let peer = peers.get(&dialog.chat);
             let top = messages.get(&(dialog.chat, dialog.top_message));
             ChatSummary {
-                id: dialog.chat.to_string(),
+                id: ChatRef::new(dialog.chat, peer.and_then(|p| p.access_hash)).to_string(),
                 title: peer
                     .map(|p| p.title.clone())
                     .unwrap_or_else(|| "Unknown chat".into()),
-                kind: peer.map(|p| p.kind).unwrap_or(match dialog.chat {
-                    ChatId::User(_) => ChatKind::Private,
-                    ChatId::Chat(_) => ChatKind::Group,
-                    ChatId::Channel(_) => ChatKind::Channel,
-                }),
+                kind: peer.map_or_else(|| fallback_kind(dialog.chat), |p| p.kind),
                 username: peer.and_then(|p| p.username.clone()),
+                is_self: peer.is_some_and(|p| p.is_self),
                 unread_count: dialog.unread_count,
                 pinned: dialog.pinned,
                 last_message: top.map(|m| MessagePreview {
@@ -254,21 +400,49 @@ pub fn assemble_page(
         })
         .collect();
 
-    let next_cursor = dialogs.last().filter(|_| full_page).map(|last| {
-        Cursor {
+    // A cut page continues right after its last shown chat. Otherwise offsets
+    // come from what Telegram sent, kept or not, so dropped dialogs aren't asked
+    // for again. Pinned dates are out of order: a pinned dialog is never one.
+    let last_unpinned = if cut {
+        shown.iter().copied().rev().find(|d| !d.pinned)
+    } else {
+        dialogs.iter().rev().find(|d| !d.pinned)
+    };
+    let next = match last_unpinned {
+        Some(last) => Some(Cursor {
             offset_date: messages
                 .get(&(last.chat, last.top_message))
                 .map(|m| m.date)
                 .unwrap_or(0),
             offset_id: last.top_message,
-            offset_peer: last.chat.to_string(),
+            offset_peer: Some(last.chat.to_string()),
             offset_access_hash: peers.get(&last.chat).and_then(|p| p.access_hash),
-            archived,
-        }
-        .encode()
-    });
+            archived: listing.archived,
+        }),
+        // A first page of pinned chats only: the unpinned ones start at the top.
+        None if listing.first_page => Some(Cursor {
+            offset_date: 0,
+            offset_id: 0,
+            offset_peer: None,
+            offset_access_hash: None,
+            archived: listing.archived,
+        }),
+        // A later page with nothing to go on would only repeat itself.
+        None => None,
+    };
+    // What was cut off is still to come.
+    let next_cursor = next.filter(|_| cut || full_page).map(|c| c.encode());
 
     ChatPage { chats, next_cursor }
+}
+
+/// The kind of a Chat Telegram didn't describe, as far as its id tells.
+pub fn fallback_kind(chat: ChatId) -> ChatKind {
+    match chat {
+        ChatId::User(_) => ChatKind::Private,
+        ChatId::Chat(_) => ChatKind::Group,
+        ChatId::Channel(_) => ChatKind::Channel,
+    }
 }
 
 pub fn rfc3339(unix: i32) -> String {
@@ -285,6 +459,47 @@ pub fn rfc3339(unix: i32) -> String {
 mod tests {
     use super::*;
 
+    const MAIN_FIRST: Listing = Listing {
+        archived: false,
+        first_page: true,
+    };
+    const MAIN_NEXT: Listing = Listing {
+        archived: false,
+        first_page: false,
+    };
+    const ARCHIVE_FIRST: Listing = Listing {
+        archived: true,
+        first_page: true,
+    };
+
+    /// A main-list dialog whose top message is `user:<n>`'s message `n`, dated `n`.
+    fn dialog(n: i64, pinned: bool) -> RawDialog {
+        RawDialog {
+            chat: ChatId::User(n),
+            top_message: n as i32,
+            unread_count: 0,
+            pinned,
+            folder_id: 0,
+        }
+    }
+
+    fn message(n: i64) -> RawMessage {
+        RawMessage {
+            chat: ChatId::User(n),
+            id: n as i32,
+            date: n as i32,
+            text: String::new(),
+        }
+    }
+
+    fn ids(page: &ChatPage) -> Vec<String> {
+        page.chats.iter().map(|c| c.id.clone()).collect()
+    }
+
+    fn cursor(page: &ChatPage) -> Cursor {
+        Cursor::decode(page.next_cursor.as_deref().expect("a next page")).unwrap()
+    }
+
     fn peer(id: ChatId, title: &str, kind: ChatKind, hash: Option<i64>) -> RawPeer {
         RawPeer {
             id,
@@ -292,7 +507,37 @@ mod tests {
             kind,
             username: None,
             access_hash: hash,
+            is_self: false,
         }
+    }
+
+    #[test]
+    fn the_accounts_own_chat_is_marked_self() {
+        let me = RawPeer {
+            is_self: true,
+            ..peer(ChatId::User(42), "Me", ChatKind::Private, Some(1))
+        };
+        let dialogs = [
+            RawDialog {
+                chat: ChatId::User(42),
+                top_message: 1,
+                unread_count: 0,
+                pinned: false,
+                folder_id: 0,
+            },
+            RawDialog {
+                chat: ChatId::User(7),
+                top_message: 2,
+                unread_count: 0,
+                pinned: false,
+                folder_id: 0,
+            },
+        ];
+        let other = peer(ChatId::User(7), "Bob", ChatKind::Private, Some(2));
+        let page = assemble_page(&dialogs, &[me.clone(), other], &[], 100, false, MAIN_FIRST);
+        assert!(page.chats[0].is_self);
+        assert!(!page.chats[1].is_self);
+        assert!(chat_info(&me, None, None).is_self);
     }
 
     #[test]
@@ -324,9 +569,76 @@ mod tests {
             assert_eq!(id.to_string().parse::<ChatId>().unwrap(), id);
         }
         for bad in [
-            "42", "user:", "user:-1", "user:0", "group:5", "user:abc", "",
+            "42", "user:", "user:-1", "user:0", "group:5", "user:abc", "", "user:+5",
         ] {
             assert!(bad.parse::<ChatId>().is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn issued_ids_carry_the_access_hash_and_round_trip() {
+        for hash in [0, 1, -1, 42, -5_000_000_000, i64::MAX, i64::MIN] {
+            for chat in [ChatId::User(42), ChatId::Channel(1_234_567_890_123)] {
+                let id = ChatRef::new(chat, Some(hash));
+                let text = id.to_string();
+                let parsed: ChatRef = text.parse().unwrap();
+                assert_eq!(parsed, id, "{text}");
+                assert_eq!(parsed.access_hash(), Some(hash), "{text}");
+                assert_eq!(parsed.to_string(), text);
+                assert!(
+                    text.starts_with(&format!("{chat}~")),
+                    "kind and number stay readable: {text}"
+                );
+                assert!(
+                    text.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-:~".contains(&b)),
+                    "URL-safe: {text}"
+                );
+            }
+        }
+        assert_eq!(
+            ChatRef::new(ChatId::User(101), Some(-2)).to_string(),
+            "user:101~__________4"
+        );
+        assert_eq!(
+            ChatRef::new(ChatId::Channel(5), Some(0x1234_5678_9abc_def0)).to_string(),
+            "channel:5~EjRWeJq83vA"
+        );
+        let longest = ChatRef::new(ChatId::Channel(i64::MAX), Some(i64::MIN)).to_string();
+        assert_eq!(longest.len(), CHAT_REF_MAX_LEN, "{longest}");
+    }
+
+    #[test]
+    fn hashless_ids_still_parse_and_basic_groups_never_carry_a_hash() {
+        let legacy: ChatRef = "channel:7".parse().unwrap();
+        assert_eq!(legacy, ChatRef::from(ChatId::Channel(7)));
+        assert_eq!(legacy.access_hash(), None);
+        assert_eq!(legacy.to_string(), "channel:7");
+
+        let group = ChatRef::new(ChatId::Chat(4), Some(99));
+        assert_eq!(group.access_hash(), None);
+        assert_eq!(group.to_string(), "chat:4");
+        assert_eq!("chat:4".parse::<ChatRef>().unwrap(), group);
+    }
+
+    #[test]
+    fn malformed_or_misplaced_hashes_are_rejected() {
+        let hash = ChatRef::new(ChatId::User(1), Some(-5)).to_string();
+        let hash = hash.split_once('~').unwrap().1;
+        for bad in [
+            format!("chat:4~{hash}"),
+            "user:1~".into(),
+            "user:1~AAAA".into(),
+            format!("user:1~{hash}A"),
+            format!("user:1~{hash}~{hash}"),
+            "user:1~AAAAAAAAAA!".into(),
+            // Non-canonical: the last character carries bits beyond the 8 bytes.
+            "user:1~AAAAAAAAAAB".into(),
+            format!("user:-1~{hash}"),
+            format!("group:1~{hash}"),
+            format!("~{hash}"),
+        ] {
+            assert!(bad.parse::<ChatRef>().is_err(), "accepted {bad:?}");
         }
     }
 
@@ -340,12 +652,14 @@ mod tests {
                 top_message: 900,
                 unread_count: 3,
                 pinned: true,
+                folder_id: 0,
             },
             RawDialog {
                 chat: alice,
                 top_message: 55,
                 unread_count: 0,
                 pinned: false,
+                folder_id: 0,
             },
         ];
         let peers = [
@@ -374,9 +688,17 @@ mod tests {
             },
         ];
 
-        let page = assemble_page(&dialogs, &peers, &messages, false, false);
+        let page = assemble_page(&dialogs, &peers, &messages, 100, false, MAIN_FIRST);
         assert_eq!(page.next_cursor, None, "a short page is the last one");
-        assert_eq!(page.chats[0].id, "channel:2");
+        assert_eq!(
+            page.chats[0].id,
+            ChatRef::new(team, Some(222)).to_string(),
+            "ids carry the access hash"
+        );
+        assert_eq!(
+            page.chats[0].id.parse::<ChatRef>().unwrap().access_hash(),
+            Some(222)
+        );
         assert_eq!(page.chats[0].kind, ChatKind::Supergroup);
         assert!(page.chats[0].pinned);
         assert_eq!(page.chats[0].unread_count, 3);
@@ -399,6 +721,7 @@ mod tests {
             top_message: 77,
             unread_count: 0,
             pinned: false,
+            folder_id: 1,
         }];
         let peers = [peer(bob, "Bob", ChatKind::Bot, Some(-5))];
         let messages = [RawMessage {
@@ -408,14 +731,14 @@ mod tests {
             text: "x".into(),
         }];
 
-        let page = assemble_page(&dialogs, &peers, &messages, true, true);
+        let page = assemble_page(&dialogs, &peers, &messages, 1, true, ARCHIVE_FIRST);
         let cursor = Cursor::decode(page.next_cursor.as_deref().unwrap()).unwrap();
         assert_eq!(
             cursor,
             Cursor {
                 offset_date: 1_600_000_000,
                 offset_id: 77,
-                offset_peer: "user:9".into(),
+                offset_peer: Some("user:9".into()),
                 offset_access_hash: Some(-5),
                 archived: true,
             }
@@ -432,6 +755,7 @@ mod tests {
             top_message: 55,
             unread_count: 0,
             pinned: false,
+            folder_id: 0,
         }];
         let messages = [RawMessage {
             chat: news,
@@ -439,7 +763,7 @@ mod tests {
             date: 1,
             text: "someone else's message".into(),
         }];
-        let page = assemble_page(&dialogs, &[], &messages, false, false);
+        let page = assemble_page(&dialogs, &[], &messages, 100, false, MAIN_FIRST);
         assert_eq!(page.chats[0].last_message, None);
     }
 
@@ -451,11 +775,265 @@ mod tests {
             top_message: 1,
             unread_count: 0,
             pinned: false,
+            folder_id: 0,
         }];
-        let page = assemble_page(&dialogs, &[], &[], false, false);
+        let page = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
         assert_eq!(page.chats[0].title, "Unknown chat");
         assert_eq!(page.chats[0].kind, ChatKind::Group);
         assert_eq!(page.chats[0].last_message, None);
+    }
+
+    #[test]
+    fn pinned_chats_are_listed_on_the_first_page_only() {
+        let dialogs = [dialog(1, true), dialog(9, false), dialog(8, false)];
+        let first = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
+        assert_eq!(ids(&first), ["user:1", "user:9", "user:8"]);
+        assert!(first.chats[0].pinned);
+
+        // A later page drops a pinned dialog even if Telegram sends one.
+        let later = assemble_page(&dialogs, &[], &[], 100, false, MAIN_NEXT);
+        assert_eq!(ids(&later), ["user:9", "user:8"]);
+    }
+
+    #[test]
+    fn the_next_page_starts_after_the_last_unpinned_dialog() {
+        // Pinned dates are not in order, so a trailing pinned dialog is no offset.
+        let dialogs = [
+            dialog(1, true),
+            dialog(9, false),
+            dialog(8, false),
+            dialog(2, true),
+        ];
+        let messages: Vec<RawMessage> = [1, 9, 8, 2].map(message).into();
+        for listing in [MAIN_FIRST, MAIN_NEXT] {
+            let page = assemble_page(&dialogs, &[], &messages, 4, true, listing);
+            assert_eq!(
+                cursor(&page),
+                Cursor {
+                    offset_date: 8,
+                    offset_id: 8,
+                    offset_peer: Some("user:8".into()),
+                    offset_access_hash: None,
+                    archived: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_page_of_only_pinned_chats_continues_from_the_top() {
+        let dialogs = [dialog(1, true), dialog(2, true)].map(|d| RawDialog { folder_id: 1, ..d });
+        let page = assemble_page(&dialogs, &[], &[1, 2].map(message), 2, true, ARCHIVE_FIRST);
+        assert_eq!(page.chats.len(), 2);
+        assert_eq!(
+            cursor(&page),
+            Cursor {
+                offset_date: 0,
+                offset_id: 0,
+                offset_peer: None,
+                offset_access_hash: None,
+                archived: true,
+            }
+        );
+
+        // On a later page that would ask for the same page again: stop instead.
+        let later = assemble_page(&dialogs, &[], &[], 100, true, MAIN_NEXT);
+        assert!(later.chats.is_empty());
+        assert_eq!(later.next_cursor, None);
+    }
+
+    #[test]
+    fn a_cut_first_page_continues_after_its_last_shown_chat() {
+        // Telegram sends the pinned dialogs on top of `limit` unpinned ones.
+        let dialogs = [
+            dialog(5, true),
+            dialog(999, true),
+            dialog(30, false),
+            dialog(29, false),
+            dialog(28, false),
+        ];
+        let messages: Vec<RawMessage> = [5, 999, 30, 29, 28].map(message).into();
+        let page = assemble_page(&dialogs, &[], &messages, 3, true, MAIN_FIRST);
+        assert_eq!(ids(&page), ["user:5", "user:999", "user:30"]);
+        // Telegram starts strictly after the offset: user:29 comes next.
+        assert_eq!(
+            cursor(&page),
+            Cursor {
+                offset_date: 30,
+                offset_id: 30,
+                offset_peer: Some("user:30".into()),
+                offset_access_hash: None,
+                archived: false,
+            }
+        );
+
+        // A cut page has more after it, whatever the dialog count said.
+        let page = assemble_page(&dialogs, &[], &messages, 3, false, MAIN_FIRST);
+        assert_eq!(cursor(&page).offset_peer.as_deref(), Some("user:30"));
+    }
+
+    #[test]
+    fn a_first_page_cut_to_pinned_chats_continues_from_the_top() {
+        let dialogs = [
+            dialog(5, true),
+            dialog(999, true),
+            dialog(3, true),
+            dialog(30, false),
+            dialog(29, false),
+        ];
+        let messages: Vec<RawMessage> = [5, 999, 3, 30, 29].map(message).into();
+        for limit in [2, 3] {
+            let page = assemble_page(&dialogs, &[], &messages, limit, true, MAIN_FIRST);
+            assert_eq!(page.chats.len(), limit);
+            assert!(page.chats.iter().all(|c| c.pinned));
+            assert_eq!(
+                cursor(&page),
+                Cursor {
+                    offset_date: 0,
+                    offset_id: 0,
+                    offset_peer: None,
+                    offset_access_hash: None,
+                    archived: false,
+                },
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// One folder as `messages.getDialogs` serves it (as seen on production):
+    /// a first page brings every pinned dialog on top of `limit` unpinned ones,
+    /// and each page's unpinned dialogs are the newest strictly older than the
+    /// offset. `dialog(n)` is dated `n`, so `unpinned` is in descending order;
+    /// pinned dates are deliberately out of that order.
+    struct Folder {
+        archived: bool,
+        pinned: Vec<i64>,
+        unpinned: Vec<i64>,
+    }
+
+    impl Folder {
+        /// What `LiveClient::list_chats` gets from Telegram and hands on.
+        fn list_chats(&self, limit: usize, cursor: Option<&str>) -> ChatPage {
+            let cursor = cursor.map(|c| Cursor::decode(c).unwrap());
+            let listing = Listing {
+                archived: cursor.as_ref().map_or(self.archived, |c| c.archived),
+                first_page: cursor.is_none(),
+            };
+            assert_eq!(listing.archived, self.archived);
+            let older_than = cursor.map_or(i32::MAX, |c| match c.offset_date {
+                0 => i32::MAX,
+                date => date,
+            });
+            let pinned = self.pinned.iter().filter(|_| !listing.exclude_pinned());
+            let unpinned = self.unpinned.iter().filter(|&&n| (n as i32) < older_than);
+            let dialogs: Vec<RawDialog> = pinned
+                .map(|&n| dialog(n, true))
+                .chain(unpinned.take(limit).map(|&n| dialog(n, false)))
+                .map(|d| RawDialog {
+                    folder_id: listing.folder_id(),
+                    ..d
+                })
+                .collect();
+            let messages: Vec<RawMessage> = dialogs
+                .iter()
+                .map(|d| message(d.top_message.into()))
+                .collect();
+            let full_page = dialogs.len() >= limit;
+            assemble_page(&dialogs, &[], &messages, limit, full_page, listing)
+        }
+
+        /// Every page, from the first until there is no `next_cursor`.
+        fn page_through(&self, limit: usize) -> Vec<ChatPage> {
+            let mut pages = vec![self.list_chats(limit, None)];
+            while let Some(next) = pages.last().unwrap().next_cursor.clone() {
+                assert!(pages.len() < 100, "paging never ends");
+                pages.push(self.list_chats(limit, Some(&next)));
+            }
+            pages
+        }
+    }
+
+    #[test]
+    fn paging_shows_every_chat_exactly_once_in_order() {
+        let pinned_sets: [&[i64]; 4] = [&[], &[5], &[999, 3, 1000], &[5, 999, 3, 998]];
+        for archived in [false, true] {
+            for pinned in pinned_sets {
+                for unpinned in 0..=12 {
+                    for limit in 1..=9 {
+                        let folder = Folder {
+                            archived,
+                            pinned: pinned.to_vec(),
+                            unpinned: (100..100 + unpinned).rev().collect(),
+                        };
+                        let case = format!(
+                            "archived {archived}, pinned {pinned:?}, {unpinned} unpinned, \
+                             limit {limit}"
+                        );
+                        let pages = folder.page_through(limit);
+                        for page in &pages {
+                            assert!(page.chats.len() <= limit, "{case}");
+                        }
+                        let shown: Vec<String> = pages.iter().flat_map(ids).collect();
+                        // Pinned chats beyond `limit` are not shown (#37's limitation).
+                        let expected: Vec<String> = folder
+                            .pinned
+                            .iter()
+                            .take(limit)
+                            .chain(&folder.unpinned)
+                            .map(|n| format!("user:{n}"))
+                            .collect();
+                        assert_eq!(shown, expected, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dialogs_of_the_other_folder_are_dropped() {
+        let archived = RawDialog {
+            folder_id: 1,
+            ..dialog(5, false)
+        };
+        let dialogs = [dialog(9, false), archived, dialog(4, false)];
+        let main = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
+        assert_eq!(ids(&main), ["user:9", "user:4"]);
+        let archive = assemble_page(&dialogs, &[], &[], 100, false, ARCHIVE_FIRST);
+        assert_eq!(ids(&archive), ["user:5"]);
+    }
+
+    #[test]
+    fn a_chat_appears_once_per_page() {
+        let dialogs = [dialog(1, true), dialog(9, false), dialog(1, false)];
+        let page = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
+        assert_eq!(ids(&page), ["user:1", "user:9"]);
+        assert!(page.chats[0].pinned, "the first occurrence wins");
+    }
+
+    #[test]
+    fn cursors_issued_by_v0_1_1_still_decode() {
+        let main = URL_SAFE_NO_PAD.encode(br#"{"d":1600000000,"i":77,"p":"user:9","h":-5}"#);
+        assert_eq!(
+            Cursor::decode(&main).unwrap(),
+            Cursor {
+                offset_date: 1_600_000_000,
+                offset_id: 77,
+                offset_peer: Some("user:9".into()),
+                offset_access_hash: Some(-5),
+                archived: false,
+            }
+        );
+        let archive = URL_SAFE_NO_PAD.encode(br#"{"d":5,"i":6,"p":"chat:7","a":true}"#);
+        assert_eq!(
+            Cursor::decode(&archive).unwrap(),
+            Cursor {
+                offset_date: 5,
+                offset_id: 6,
+                offset_peer: Some("chat:7".into()),
+                offset_access_hash: None,
+                archived: true,
+            }
+        );
     }
 
     #[test]

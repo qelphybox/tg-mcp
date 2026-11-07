@@ -22,6 +22,10 @@ builder:
 
 proxy:
   host: tgmcp.qelphybox.space
+  # forward_headers stays unset (false with ssl): kamal-proxy drops any client-sent
+  # X-Forwarded-For and sets it to the TCP peer it saw, which the app trusts
+  # (TG_MCP_TRUST_FORWARDED_FOR). With forward_headers: true it would append that
+  # address instead, so the right-most entry the app reads is the same either way.
   ssl: true
   app_port: 8080
   healthcheck:
@@ -37,6 +41,8 @@ env:
     TG_MCP_PUBLIC_URL: https://tgmcp.qelphybox.space
     TG_MCP_BIND: 0.0.0.0:8080
     TG_MCP_DB_PATH: /data/tg-mcp.db
+    # kamal-proxy is the only way in; client IPs (for rate limits) come from its XFF.
+    TG_MCP_TRUST_FORWARDED_FOR: "1"
     RUST_LOG: info
   secret:
     - TG_MCP_API_ID
@@ -47,6 +53,9 @@ volumes:
 
 # Old container gets this long to finish in-flight requests before SIGTERM.
 drain_timeout: 30
+# Then this long to exit after SIGTERM before SIGKILL (Docker's default is 10 s
+# for proxied roles); shutdown re-seals changed Telegram sessions in this window.
+stop_timeout: 30
 
 logging:
   options:

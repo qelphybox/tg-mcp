@@ -11,6 +11,7 @@ pub mod clients;
 mod flows;
 mod pages;
 mod pkce;
+pub mod rate_limit;
 mod revoke;
 mod token;
 
@@ -20,14 +21,18 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, StatusCode, header},
-    middleware::Next,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::json;
 
-use self::{clients::ClientRegistry, flows::Flows};
+use self::{
+    clients::ClientRegistry,
+    flows::Flows,
+    rate_limit::{Endpoint, OAuthLimits, RateLimiter},
+};
 use crate::{
     sessions::{GrantId, Vault, VaultError},
     tg::{Connector, Login, Telegram, TgError},
@@ -44,6 +49,7 @@ pub struct AuthState {
     pub login: Arc<dyn Login>,
     pub connector: Arc<dyn Connector>,
     flows: Flows,
+    rate_limiter: RateLimiter,
 }
 
 impl AuthState {
@@ -53,6 +59,7 @@ impl AuthState {
         clients: ClientRegistry,
         login: Arc<dyn Login>,
         connector: Arc<dyn Connector>,
+        limits: OAuthLimits,
     ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -60,7 +67,11 @@ impl AuthState {
             clients,
             login,
             connector,
-            flows: Flows::default(),
+            flows: Flows::new(
+                limits.max_pending_logins,
+                limits.max_pending_logins_per_client,
+            ),
+            rate_limiter: RateLimiter::new(limits),
         }
     }
 
@@ -102,8 +113,11 @@ pub struct Caller {
     pub telegram: Arc<dyn Telegram>,
 }
 
-/// All OAuth endpoints and Login flow pages.
+/// All OAuth endpoints and Login flow pages. Only the anonymous OAuth endpoints are
+/// rate limited: the Login flow pages are polled by the page and need its cookie.
 pub fn router(auth: Arc<AuthState>) -> Router {
+    let limited =
+        |endpoint| middleware::from_fn_with_state((auth.clone(), endpoint), rate_limit::limit);
     Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
@@ -117,10 +131,22 @@ pub fn router(auth: Arc<AuthState>) -> Router {
             "/.well-known/oauth-authorization-server",
             get(authorization_server),
         )
-        .route("/register", post(register))
-        .route("/token", post(token::token))
-        .route("/revoke", post(revoke::revoke))
-        .route("/authorize", get(authorize::authorize))
+        .route(
+            "/register",
+            post(register).route_layer(limited(Endpoint::Register)),
+        )
+        .route(
+            "/token",
+            post(token::token).route_layer(limited(Endpoint::Token)),
+        )
+        .route(
+            "/revoke",
+            post(revoke::revoke).route_layer(limited(Endpoint::Revoke)),
+        )
+        .route(
+            "/authorize",
+            get(authorize::authorize).route_layer(limited(Endpoint::Authorize)),
+        )
         .route("/login/{id}", get(authorize::login_page))
         .route("/login/{id}/status", get(authorize::login_status))
         .route(

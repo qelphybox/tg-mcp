@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Form, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
@@ -21,9 +21,10 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::{
-    AuthState,
+    AuthState, clients,
     flows::{AuthRequest, PendingLogin, Progress},
     pages, pkce,
+    rate_limit::ClientIp,
 };
 use crate::tg::{LoginState, TgError};
 
@@ -47,6 +48,7 @@ pub struct AuthorizeQuery {
 
 pub async fn authorize(
     State(auth): State<Arc<AuthState>>,
+    Extension(client_ip): Extension<ClientIp>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Response {
     // Until client and redirect_uri check out, errors are shown, never redirected.
@@ -123,6 +125,14 @@ pub async fn authorize(
         );
     }
 
+    // Each Login flow holds a Telegram connection: take a slot before opening one.
+    let slot = match auth.flows.reserve(client_ip) {
+        Ok(slot) => slot,
+        Err(full) => {
+            tracing::warn!(client_ip = %client_ip, reason = %full, "login flow refused");
+            return fail("temporarily_unavailable", "too many logins in progress");
+        }
+    };
     let attempt = match auth.login.start().await {
         Ok(attempt) => attempt,
         Err(err) => {
@@ -140,9 +150,7 @@ pub async fn authorize(
         code_challenge,
         state: q.state.clone(),
     };
-    let Ok(login_id) = auth.flows.start_login(request, attempt) else {
-        return fail("temporarily_unavailable", "too many logins in progress");
-    };
+    let login_id = auth.flows.start_login(slot, request, attempt);
 
     let mut response = Redirect::to(&format!("/login/{login_id}")).into_response();
     let secure = if auth.base_url.starts_with("https://") {
@@ -302,7 +310,7 @@ pub async fn password_submit(
                 &format!("Wrong password. {left} {attempts} left."),
             )
         }
-        Err(TgError::FloodWait { seconds }) => {
+        Err(TgError::FloodWait { seconds, .. }) => {
             tracing::warn!(seconds, "telegram flood wait on cloud password");
             login
                 .password_gate
@@ -364,7 +372,7 @@ fn wait_message(what: &str, seconds: u64) -> String {
 /// Status, title and message for a Telegram error during the Login flow.
 fn telegram_failure(err: &TgError) -> (StatusCode, &'static str, String) {
     match err {
-        TgError::FloodWait { seconds } => {
+        TgError::FloodWait { seconds, .. } => {
             tracing::warn!(seconds, "telegram flood wait during login");
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -407,6 +415,7 @@ pub async fn consent_page(
         login_id: &id,
         client_name: &login.request.client_name,
         redirect_target: &target,
+        redirect_is_loopback: redirect_is_loopback(&login.request.redirect_uri),
         account_name: &account_name,
         account_username: logged_in.account.username.as_deref(),
     })
@@ -541,6 +550,14 @@ fn redirect_target(redirect_uri: &str) -> String {
     }
 }
 
+/// An `http(s)` redirect to this computer. A private-use scheme
+/// (`myapp://localhost/…`) keeps its name, which says more than "this computer".
+fn redirect_is_loopback(redirect_uri: &str) -> bool {
+    Url::parse(redirect_uri).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https") && clients::is_loopback_host(&url)
+    })
+}
+
 /// The `tg://login` URL as an SVG QR code, base64 for a `data:` URL. The fake
 /// login's URL is rendered too; only an unencodable URL yields `None`.
 fn qr_svg_base64(qr_url: &str) -> Option<String> {
@@ -552,4 +569,44 @@ fn qr_svg_base64(qr_url: &str) -> Option<String> {
         .quiet_zone(true)
         .build();
     Some(STANDARD.encode(svg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_redirects_are_told_apart() {
+        for uri in [
+            "http://localhost:33418/callback",
+            "http://LOCALHOST/cb",
+            "http://127.0.0.1:43123/callback",
+            "http://127.1.2.3/cb",
+            "http://[::1]:8080/cb",
+            "https://localhost/cb",
+        ] {
+            assert!(redirect_is_loopback(uri), "{uri}");
+        }
+        for uri in [
+            "https://claude.ai/api/mcp/auth_callback",
+            "http://localhost.evil.example/cb",
+            "cursor://anysphere.cursor-retrieval/oauth/callback",
+            "myapp://localhost/cb",
+            "not a uri",
+        ] {
+            assert!(!redirect_is_loopback(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn redirect_targets_read_as_hosts() {
+        assert_eq!(
+            redirect_target("https://claude.ai/api/mcp/auth_callback"),
+            "claude.ai"
+        );
+        assert_eq!(
+            redirect_target("cursor://anysphere.cursor-retrieval/oauth/callback"),
+            "cursor://anysphere.cursor-retrieval"
+        );
+    }
 }

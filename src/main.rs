@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 
@@ -10,7 +10,7 @@ use tg_mcp::{
     limits::Limits,
     sessions::{TokenTtl, Vault},
     tg::{
-        Connector, FakeConnector, FakeLogin, Login,
+        self, Connector, FakeConnector, FakeLogin, Login,
         grammers::{GrammersConnector, GrammersLogin},
     },
 };
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         vault,
         clients: ClientRegistry::new(pool),
         login,
-        connector,
+        connector: connector.clone(),
     };
     let shutdown = CancellationToken::new();
     let app = tg_mcp::app(&config, deps, shutdown.clone());
@@ -75,12 +75,19 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(bind = %config.bind, public_url = %config.public_url, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown.cancel();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown.cancel();
+    })
+    .await?;
+
+    // Every connection is closed by now, so no request can open a Live client
+    // while the pool is drained.
+    tg::shut_down(connector.as_ref(), tg::SHUTDOWN_TIMEOUT).await;
     Ok(())
 }
 

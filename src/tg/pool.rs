@@ -33,6 +33,10 @@ struct Slot<L> {
     opened_with: Mutex<Option<Zeroizing<Vec<u8>>>>,
 }
 
+/// A Live client taken out of the pool whose Telegram session changed while it
+/// was live: `(key, live, new snapshot)`.
+pub type Evicted<L> = (String, Arc<L>, Zeroizing<Vec<u8>>);
+
 pub struct Pool<L> {
     slots: Mutex<HashMap<String, Arc<Slot<L>>>>,
     idle_ttl: Duration,
@@ -106,15 +110,25 @@ impl<L: Live> Pool<L> {
     /// Shut down Live clients idle for longer than the TTL. For each one whose
     /// Telegram session changed, returns `(key, live, new snapshot)` so the caller
     /// can persist it.
-    pub fn evict_idle(&self) -> Vec<(String, Arc<L>, Zeroizing<Vec<u8>>)> {
-        let idle: Vec<(String, Arc<Slot<L>>)> = {
+    pub fn evict_idle(&self) -> Vec<Evicted<L>> {
+        self.evict(|slot| {
+            slot.cell.initialized()
+                && slot.last_used.lock().expect("pool lock").elapsed() >= self.idle_ttl
+        })
+    }
+
+    /// Shut down every Live client, however recently used, and leave the pool
+    /// empty (graceful shutdown). Reports changed sessions like [`Pool::evict_idle`].
+    pub fn drain(&self) -> Vec<Evicted<L>> {
+        self.evict(|_| true)
+    }
+
+    fn evict(&self, pick: impl Fn(&Slot<L>) -> bool) -> Vec<Evicted<L>> {
+        let picked: Vec<(String, Arc<Slot<L>>)> = {
             let mut slots = self.slots.lock().expect("pool lock");
             let keys: Vec<String> = slots
                 .iter()
-                .filter(|(_, slot)| {
-                    slot.cell.initialized()
-                        && slot.last_used.lock().expect("pool lock").elapsed() >= self.idle_ttl
-                })
+                .filter(|(_, slot)| pick(slot))
                 .map(|(key, _)| key.clone())
                 .collect();
             keys.into_iter()
@@ -122,7 +136,7 @@ impl<L: Live> Pool<L> {
                 .collect()
         };
         let mut changed = Vec::new();
-        for (key, slot) in idle {
+        for (key, slot) in picked {
             let Some(live) = slot.cell.get().cloned() else {
                 continue;
             };
@@ -140,7 +154,6 @@ impl<L: Live> Pool<L> {
         changed
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.slots.lock().expect("pool lock").len()
     }
@@ -241,5 +254,30 @@ mod tests {
             .unwrap();
         assert!(pool.evict_idle().is_empty());
         assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_shuts_down_every_client_and_reports_only_changed_sessions() {
+        let pool = Pool::new(Duration::from_secs(60));
+        let same = pool
+            .get_or_open("same", b"s1", || async { Ok(live(b"s1")) })
+            .await
+            .unwrap();
+        let moved = pool
+            .get_or_open("moved", b"s2", || async { Ok(live(b"s2")) })
+            .await
+            .unwrap();
+        *moved.session.lock().unwrap() = b"s2-after-dc-migration".to_vec();
+        // Both were just used: an idle sweep would keep them.
+        assert!(pool.evict_idle().is_empty());
+
+        let changed = pool.drain();
+        assert!(pool.is_empty(), "nothing may stay open after a drain");
+        assert!(same.down.load(Ordering::SeqCst) && moved.down.load(Ordering::SeqCst));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, "moved");
+        assert!(Arc::ptr_eq(&changed[0].1, &moved));
+        assert_eq!(changed[0].2.as_slice(), b"s2-after-dc-migration");
+        assert!(pool.drain().is_empty(), "a second drain finds nothing");
     }
 }

@@ -13,17 +13,19 @@ pub mod fake;
 pub mod grammers;
 pub mod messages;
 mod pool;
+pub mod sanitise;
+pub mod search;
 mod session;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::sessions::OpenedGrant;
+use crate::{limits::MethodClass, sessions::OpenedGrant};
 
 /// The Telegram Account a Grant reads on behalf of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -58,9 +60,10 @@ pub enum TgError {
     /// The Cloud password didn't match.
     #[error("the cloud password is wrong")]
     WrongPassword,
-    /// Telegram's `FLOOD_WAIT`: nothing may be retried before `seconds` pass.
+    /// Telegram's `FLOOD_WAIT`: nothing of `class` may be retried before `seconds`
+    /// pass. Other classes of the same Account are not blocked by it.
     #[error("telegram asks to wait {seconds} s")]
-    FloodWait { seconds: u32 },
+    FloodWait { seconds: u32, class: MethodClass },
     /// Our own per-Account request budget is used up; retry after `seconds`.
     #[error("this account's request budget is used up; retry in {seconds} s")]
     RateLimited { seconds: u32 },
@@ -74,8 +77,11 @@ pub enum TgError {
 pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
 
-    /// One page of the Account's Chats, most recent first. `cursor` is a
-    /// `next_cursor` from a previous page (it also decides `archived`).
+    /// One page of the Account's Chats in the main list or the Archive: pinned
+    /// first on the first page, then most recent first, each Chat once. At most
+    /// `limit` Chats, and `next_cursor` continues right after the last one, so
+    /// callers must not cut the page. `cursor` is a `next_cursor` from a
+    /// previous page (it also decides `archived`).
     async fn list_chats(
         &self,
         limit: usize,
@@ -86,12 +92,20 @@ pub trait Telegram: Send + Sync + 'static {
     /// Messages of one Chat, newest first, within `query`'s bounds.
     async fn get_messages(
         &self,
-        chat: chats::ChatId,
+        chat: chats::ChatRef,
         query: messages::HistoryQuery,
     ) -> Result<messages::MessagePage, TgError>;
 
     /// Details of one Chat: title, type, @username, description/bio, member count.
-    async fn get_chat_info(&self, chat: chats::ChatId) -> Result<chats::ChatInfo, TgError>;
+    async fn get_chat_info(&self, chat: chats::ChatRef) -> Result<chats::ChatInfo, TgError>;
+
+    /// One page of Search hits, Telegram's search across the Account's Chats or
+    /// in one of them, newest first. At most `query.limit` hits; `next_cursor`
+    /// continues right after the last one.
+    async fn search_messages(
+        &self,
+        query: search::SearchQuery,
+    ) -> Result<search::SearchPage, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.
@@ -105,6 +119,32 @@ pub trait Connector: Send + Sync + 'static {
     /// Active sessions) and drop its Live client. A session Telegram already
     /// considers dead counts as logged out.
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError>;
+
+    /// Graceful shutdown, once the HTTP server has stopped: close every Live client
+    /// and re-seal each Telegram session that changed while it was live. Failures
+    /// are logged (Grant ids only), not returned: the process is exiting anyway.
+    /// Call it through [`shut_down`], which bounds how long it may take.
+    async fn shutdown(&self);
+}
+
+/// How long graceful shutdown waits for [`Connector::shutdown`]. Docker gives a
+/// container 10 s between SIGTERM and SIGKILL unless told otherwise (Kamal's
+/// `stop_timeout`); re-sealing normally takes milliseconds.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run [`Connector::shutdown`], giving up after `within` so a hung save can't
+/// block exit. Returns whether it finished in time.
+pub async fn shut_down(connector: &dyn Connector, within: Duration) -> bool {
+    let finished = tokio::time::timeout(within, connector.shutdown())
+        .await
+        .is_ok();
+    if !finished {
+        tracing::warn!(
+            timeout_s = within.as_secs(),
+            "flushing the client pool timed out; unsaved telegram session changes are lost"
+        );
+    }
+    finished
 }
 
 /// Starts the Telegram part of a Login flow.
@@ -149,5 +189,44 @@ impl fmt::Debug for LoggedIn {
                 &format_args!("<{} bytes>", self.telegram_session.len()),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connector whose shutdown never finishes (e.g. the database hangs).
+    struct Hung;
+
+    #[async_trait::async_trait]
+    impl Connector for Hung {
+        async fn connect(&self, _: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError> {
+            unreachable!()
+        }
+        async fn log_out(&self, _: OpenedGrant) -> Result<(), TgError> {
+            unreachable!()
+        }
+        async fn shutdown(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_shutdown_is_cut_off() {
+        let started = tokio::time::Instant::now();
+        let finished =
+            tokio::time::timeout(2 * SHUTDOWN_TIMEOUT, shut_down(&Hung, SHUTDOWN_TIMEOUT))
+                .await
+                .expect("shut_down gives up on its own");
+        assert!(!finished);
+        assert_eq!(started.elapsed(), SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_finished_shutdown_is_reported() {
+        let connector = FakeConnector::default();
+        assert!(shut_down(&connector, SHUTDOWN_TIMEOUT).await);
+        assert_eq!(connector.shutdowns(), 1);
     }
 }

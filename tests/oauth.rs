@@ -183,16 +183,49 @@ async fn consent_page_shows_who_gets_what_and_cannot_be_framed() {
     assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
     let html = res.text().await.unwrap();
     for needle in [
-        "Test Client",
-        "read-only access to all chats",
-        "Alice",
-        "@alice",
-        "127.0.0.1",
+        // The test client redirects to 127.0.0.1: a loopback host leads.
+        r#"<h1 class="ask">Allow <b>an app on this computer (localhost)</b> read-only access to all chats of <b>Alice</b> (@alice)?</h1>"#,
+        r#"<p class="muted">The app calls itself “Test Client” (not verified).</p>"#,
         "Settings → Devices",
-        "in Test Client alone does not end that session",
+        "in the app alone does not end that session",
     ] {
         assert!(html.contains(needle), "consent page lacks {needle:?}");
     }
+}
+
+#[tokio::test]
+async fn consent_page_shows_a_hostile_client_name_escaped_and_cleaned() {
+    let server = start(vec![account(42, "Alice")]).await;
+    let (status, body) = json(
+        server
+            .post_json(
+                "/register",
+                json!({
+                    "client_name": "<b>Claude</b>\u{202E}\u{200B}evil",
+                    "redirect_uris": [REDIRECT],
+                }),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let client_id = body["client_id"].as_str().unwrap();
+    let (login_path, cookie) = server.start_authorize(client_id, &pkce(), "s").await;
+    let consent_path = server.wait_logged_in(&login_path, &cookie).await;
+
+    let html = server
+        .get(&consent_path, Some(&cookie))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains(
+            r#"<p class="muted">The app calls itself “&lt;b&gt;Claude&lt;/b&gt;evil” (not verified).</p>"#
+        ),
+        "{html}"
+    );
+    assert!(!html.contains("<b>Claude</b>"), "{html}");
 }
 
 #[tokio::test]

@@ -70,6 +70,10 @@ The set of Live clients, keyed by Grant.
 Any Telegram dialog the Account can see: private chat, group, supergroup or channel.
 _Avoid_: dialog, conversation, peer (peer is the MTProto term; use it only in code that talks MTProto)
 
+**Chat id**:
+How the tools name a Chat: `user:N~H`, `channel:N~H` or `chat:N` (basic group), where `H` is the user's or channel's access hash, so an id is resolved without a lookup. Ids without `~H`, issued before ids carried it, are still accepted and looked up in the dialog list.
+_Avoid_: peer id, chat handle
+
 **Archive**:
 Telegram's single built-in place for Chats the user moved out of the main chat list. A Chat is either archived or not.
 _Avoid_: archived folder, folder (unqualified)

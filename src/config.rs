@@ -5,7 +5,11 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{Context, bail};
 use axum::http::Uri;
 
-use crate::{limits::LimitsConfig, tg::grammers::AppCredentials};
+use crate::{
+    auth::rate_limit::{OAuthLimits, Rate},
+    limits::LimitsConfig,
+    tg::grammers::AppCredentials,
+};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -23,6 +27,8 @@ pub struct Config {
     pub live_client_idle_ttl: Duration,
     /// Per-Account request budget and FLOOD_WAIT handling.
     pub limits: LimitsConfig,
+    /// Per-client limits on the anonymous OAuth endpoints and on Login flows.
+    pub oauth_limits: OAuthLimits,
 }
 
 impl Config {
@@ -93,6 +99,31 @@ impl Config {
             ),
         };
 
+        let defaults = OAuthLimits::default();
+        let rate = |name: &str, default: Rate| -> anyhow::Result<Rate> {
+            Ok(Rate {
+                per_minute: number(&format!("TG_MCP_{name}_PER_MINUTE"), default.per_minute)?,
+                burst: number(&format!("TG_MCP_{name}_BURST"), default.burst)?,
+            })
+        };
+        let oauth_limits = OAuthLimits {
+            trust_forwarded_for: matches!(
+                get("TG_MCP_TRUST_FORWARDED_FOR").as_deref(),
+                Some("1" | "true")
+            ),
+            authorize: rate("AUTHORIZE", defaults.authorize)?,
+            register: rate("REGISTER", defaults.register)?,
+            token: rate("TOKEN", defaults.token)?,
+            max_pending_logins: number(
+                "TG_MCP_MAX_PENDING_LOGINS",
+                defaults.max_pending_logins as u32,
+            )? as usize,
+            max_pending_logins_per_client: number(
+                "TG_MCP_MAX_PENDING_LOGINS_PER_IP",
+                defaults.max_pending_logins_per_client as u32,
+            )? as usize,
+        };
+
         Ok(Self {
             bind,
             public_url,
@@ -101,6 +132,7 @@ impl Config {
             telegram_app,
             live_client_idle_ttl,
             limits,
+            oauth_limits,
         })
     }
 
@@ -170,6 +202,44 @@ mod tests {
             Config::from_lookup(env(&[
                 ("TG_MCP_FAKE_TELEGRAM", "1"),
                 ("TG_MCP_ACCOUNT_BURST", "0")
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_limits_default_to_the_brief_and_come_from_env() {
+        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")])).unwrap();
+        let limits = config.oauth_limits;
+        assert!(!limits.trust_forwarded_for);
+        assert_eq!(
+            (limits.authorize.per_minute, limits.authorize.burst),
+            (10, 5)
+        );
+        assert_eq!((limits.register.per_minute, limits.register.burst), (5, 5));
+        assert_eq!((limits.token.per_minute, limits.token.burst), (30, 10));
+        assert_eq!(limits.max_pending_logins, 50);
+        assert_eq!(limits.max_pending_logins_per_client, 3);
+
+        let config = Config::from_lookup(env(&[
+            ("TG_MCP_FAKE_TELEGRAM", "1"),
+            ("TG_MCP_TRUST_FORWARDED_FOR", "1"),
+            ("TG_MCP_AUTHORIZE_PER_MINUTE", "20"),
+            ("TG_MCP_TOKEN_BURST", "3"),
+            ("TG_MCP_MAX_PENDING_LOGINS", "7"),
+            ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "2"),
+        ]))
+        .unwrap();
+        let limits = config.oauth_limits;
+        assert!(limits.trust_forwarded_for);
+        assert_eq!(limits.authorize.per_minute, 20);
+        assert_eq!(limits.token.burst, 3);
+        assert_eq!(limits.max_pending_logins, 7);
+        assert_eq!(limits.max_pending_logins_per_client, 2);
+        assert!(
+            Config::from_lookup(env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "0")
             ]))
             .is_err()
         );

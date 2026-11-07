@@ -1,9 +1,12 @@
 //! A real server on a random port plus a scripted "browser + MCP client".
 #![allow(dead_code)]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -62,6 +65,20 @@ pub struct SequenceLogin {
     next: AtomicUsize,
 }
 
+impl SequenceLogin {
+    pub fn new(accounts: Vec<Account>) -> Self {
+        Self {
+            accounts: accounts.into_iter().map(FakeData::new).collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many Telegram logins were started.
+    pub fn started(&self) -> usize {
+        self.next.load(Ordering::SeqCst)
+    }
+}
+
 #[async_trait::async_trait]
 impl Login for SequenceLogin {
     async fn start(&self) -> Result<Box<dyn LoginAttempt>, TgError> {
@@ -84,6 +101,22 @@ pub async fn start_with(accounts: Vec<FakeData>) -> TestServer {
 }
 
 pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
+    start_with_env(login, &[]).await
+}
+
+/// Every test talks from 127.0.0.1, so the per-IP rate limits of the OAuth
+/// endpoints are lifted unless a test sets them (`env` wins over these).
+const RELAXED_LIMITS: &[(&str, &str)] = &[
+    ("TG_MCP_AUTHORIZE_PER_MINUTE", "10000"),
+    ("TG_MCP_AUTHORIZE_BURST", "10000"),
+    ("TG_MCP_REGISTER_PER_MINUTE", "10000"),
+    ("TG_MCP_REGISTER_BURST", "10000"),
+    ("TG_MCP_TOKEN_PER_MINUTE", "10000"),
+    ("TG_MCP_TOKEN_BURST", "10000"),
+];
+
+/// A server with extra environment variables on top of the test defaults.
+pub async fn start_with_env(login: Arc<dyn Login>, env: &[(&str, &str)]) -> TestServer {
     let connector = FakeConnector::default();
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -91,7 +124,11 @@ pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
     let config = Config::from_lookup(|key| match key {
         "TG_MCP_PUBLIC_URL" => Some(base.clone()),
         "TG_MCP_FAKE_TELEGRAM" => Some("1".into()),
-        _ => None,
+        _ => env
+            .iter()
+            .chain(RELAXED_LIMITS)
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.to_string()),
     })
     .unwrap();
     let pool = db::open(&dir.path().join("test.db")).await.unwrap();
@@ -105,10 +142,13 @@ pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
     let app = tg_mcp::app(&config, deps, shutdown.clone());
     let stop = shutdown.clone();
     tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(stop.cancelled_owned())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(stop.cancelled_owned())
+        .await
+        .unwrap();
     });
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -222,14 +262,9 @@ impl TestServer {
         body["client_id"].as_str().unwrap().to_string()
     }
 
-    /// GET /authorize; returns the login page path and the cookie, like a browser would.
-    pub async fn start_authorize(
-        &self,
-        client_id: &str,
-        pkce: &Pkce,
-        state: &str,
-    ) -> (String, String) {
-        let path = format!(
+    /// A valid `/authorize` request for `client_id`.
+    pub fn authorize_path(&self, client_id: &str, pkce: &Pkce, state: &str) -> String {
+        format!(
             "/authorize?{}",
             form(&[
                 ("response_type", "code"),
@@ -240,8 +275,19 @@ impl TestServer {
                 ("state", state),
                 ("resource", &self.url("/mcp")),
             ])
-        );
-        let res = self.get(&path, None).await;
+        )
+    }
+
+    /// GET /authorize; returns the login page path and the cookie, like a browser would.
+    pub async fn start_authorize(
+        &self,
+        client_id: &str,
+        pkce: &Pkce,
+        state: &str,
+    ) -> (String, String) {
+        let res = self
+            .get(&self.authorize_path(client_id, pkce, state), None)
+            .await;
         assert_eq!(
             res.status(),
             StatusCode::SEE_OTHER,
