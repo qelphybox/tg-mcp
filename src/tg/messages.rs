@@ -381,20 +381,25 @@ where
     // Fewer newer messages than asked for: the slice reached past the newest one.
     let at_newest = newer < newer_wanted;
     let mut more_older = older >= older_wanted;
-    // Telegram may answer such a slice short (it keeps its older end) or full
-    // (it moves down); if short, fill it up from below.
+    // Telegram may answer such a slice short (it keeps its older end, as in
+    // production) or full (it moves down). If short, the window is the
+    // newest `limit` messages: read them again as a plain page from the top,
+    // whose answer describes the senders in full where the first one gave
+    // them as min (#51).
     if at_newest && more_older && window.len() < size {
-        let oldest = window.last().map_or(target, |m| m.id);
-        let missing = size - window.len();
-        let fill = get_history(HistoryRequest {
-            offset_id: oldest,
-            limit: missing as i32,
+        let top = get_history(HistoryRequest {
+            limit,
             ..HistoryRequest::default()
         })
         .await?;
-        more_older = fill.returned >= missing;
-        window.extend(newest_first(fill.messages, |id| id < oldest));
-        peers.extend(fill.peers);
+        let top_window = newest_first(top.messages, |_| true);
+        // Unless so many messages arrived in between that the target left
+        // the top: then the first answer is the window.
+        if top_window.iter().any(|m| m.id == target) {
+            more_older = top.returned >= size;
+            window = top_window;
+        }
+        peers.extend(top.peers);
     }
     let issuer = Issuer::new(&peers, known);
     Ok(MessagePage {
@@ -868,7 +873,7 @@ mod tests {
     #[test]
     fn a_window_merged_from_two_answers_issues_ids_from_both() {
         // Bob wrote the newest message; Telegram shortens the window around it
-        // (6, 5) and the second call fills it from below (4).
+        // (6, 5) and the second call reads the top again (6, 5, 4).
         let history: Vec<RawHistoryMessage> = (1..=6)
             .map(|id| RawHistoryMessage {
                 from: (id == 6).then_some(BOB),
@@ -1159,18 +1164,50 @@ mod tests {
         );
         let (_, sent) = read(&history, around(19, 5), PastNewest::ShiftOlder);
         assert_eq!(sent.len(), 1);
-        // Shortened at the newest message (20, 19, 18, 17): one more page
-        // below it for what is missing.
+        // Shortened at the newest message (20, 19, 18, 17): the window is
+        // the newest 5, read again as a plain page from the top, whose
+        // answer describes its senders in full (#51).
         let (page, sent) = read(&history, around(19, 5), PastNewest::Shorten);
         assert_eq!(page_ids(&page.unwrap()), [20, 19, 18, 17, 16]);
         assert_eq!(
             sent[1..],
             [HistoryRequest {
-                offset_id: 17,
-                limit: 1,
+                limit: 5,
                 ..HistoryRequest::default()
             }]
         );
+    }
+
+    #[test]
+    fn a_window_whose_target_left_the_top_in_between_keeps_the_first_answer() {
+        // Between the two calls so many messages arrived that the target is
+        // no longer among the newest: the shortened first answer is the window.
+        let history: Vec<RawHistoryMessage> = (1..=20).map(|i| msg(i, i)).collect();
+        let arrived: Vec<RawHistoryMessage> = (1..=30).map(|i| msg(i, i)).collect();
+        let mut calls = 0;
+        let page = futures_executor(read_history(
+            ChatId::Channel(1).into(),
+            &around(19, 5),
+            &unknown,
+            |request| {
+                calls += 1;
+                let now = if calls == 1 { &history } else { &arrived };
+                let messages = get_history(now, &request, PastNewest::Shorten);
+                std::future::ready(Ok(HistoryAnswer {
+                    returned: messages.len(),
+                    messages,
+                    peers: Vec::new(),
+                }))
+            },
+            |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
+                unreachable!("a window fetches no message by id")
+            },
+        ))
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(page_ids(&page), [20, 19, 18, 17]);
+        assert_eq!(page.next_before_id, Some(17));
+        assert_eq!(page.next_after_id, None);
     }
 
     #[test]

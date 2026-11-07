@@ -921,41 +921,43 @@ fn sender_of(page: &Value, id: i64) -> &str {
 }
 
 #[tokio::test]
-async fn a_window_at_the_newest_message_keeps_the_hashes_seen_before() {
-    for past_newest in BOTH_EDGES {
-        let (_server, client) = team_client(past_newest).await;
-        // Nothing has described Bob in full yet: his id has no hash, and none
-        // is invented.
-        let page = call(&client, newest_window()).await.unwrap();
-        assert_eq!(ids(&page), [10, 9, 8], "{past_newest:?}");
-        assert_eq!(sender_of(&page, 10), BOB.to_string(), "{past_newest:?}");
-        if past_newest == PastNewest::Shorten {
-            // Alice wrote 9, in the min answer, and 8, in the second call that
-            // fills the shortened window: the merged answers give her hash.
-            assert_eq!(sender_of(&page, 9), fake_issued_id(ALICE));
-        }
+async fn a_cold_window_at_the_newest_message_has_every_senders_hash() {
+    // Telegram shortens the slice past the newest message (as in
+    // production), so the window is read again from the top: a plain page,
+    // whose answer describes its senders in full. Nothing was seen before.
+    let (_server, client) = team_client(PastNewest::Shorten).await;
+    let page = call(&client, newest_window()).await.unwrap();
+    assert_eq!(ids(&page), [10, 9, 8]);
+    assert_eq!(targets(&page), [10]);
+    assert_eq!(page["next_before_id"], 8);
+    assert_eq!(page.get("next_after_id"), None);
+    assert_eq!(sender_of(&page, 10), fake_issued_id(BOB));
+    assert_eq!(sender_of(&page, 9), fake_issued_id(ALICE));
+    assert_eq!(sender_of(&page, 8), fake_issued_id(ALICE));
+}
 
-        // A plain page describes Bob in full; from then on the window
-        // hands out his id with its hash.
-        call(
-            &client,
-            json!({ "chat_id": fake_issued_id(TEAM), "limit": 5 }),
-        )
-        .await
-        .unwrap();
-        let page = call(&client, newest_window()).await.unwrap();
-        assert_eq!(sender_of(&page, 10), fake_issued_id(BOB), "{past_newest:?}");
-        assert_eq!(
-            sender_of(&page, 9),
-            fake_issued_id(ALICE),
-            "{past_newest:?}"
-        );
-        assert_eq!(
-            sender_of(&page, 8),
-            fake_issued_id(ALICE),
-            "{past_newest:?}"
-        );
-    }
+#[tokio::test]
+async fn a_window_answered_with_min_peers_takes_the_hashes_seen_before() {
+    // Telegram answers the slice past the newest message in full (shifted
+    // down): one call, and its senders described as min.
+    let (_server, client) = team_client(PastNewest::ShiftOlder).await;
+    // Nothing has described Bob in full yet: no hash, and none is invented.
+    let page = call(&client, newest_window()).await.unwrap();
+    assert_eq!(ids(&page), [10, 9, 8]);
+    assert_eq!(sender_of(&page, 10), BOB.to_string());
+
+    // A plain page describes Bob in full; from then on the window hands out
+    // his id with its hash.
+    call(
+        &client,
+        json!({ "chat_id": fake_issued_id(TEAM), "limit": 5 }),
+    )
+    .await
+    .unwrap();
+    let page = call(&client, newest_window()).await.unwrap();
+    assert_eq!(sender_of(&page, 10), fake_issued_id(BOB));
+    assert_eq!(sender_of(&page, 9), fake_issued_id(ALICE));
+    assert_eq!(sender_of(&page, 8), fake_issued_id(ALICE));
 }
 
 #[tokio::test]
@@ -969,7 +971,7 @@ async fn every_answer_teaches_the_hashes_later_ids_carry() {
         ("get_messages", json!({ "chat_id": team, "thread_of": 9 })),
         ("get_messages", json!({ "chat_id": team, "limit": 5 })),
     ] {
-        let (_server, client) = team_client(PastNewest::Shorten).await;
+        let (_server, client) = team_client(PastNewest::ShiftOlder).await;
         client
             .call_tool(
                 CallToolRequestParams::new(tool)
