@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     TgError,
+    find::FoundChat,
     messages::{MediaKind, MediaSummary},
 };
 
@@ -236,6 +237,130 @@ pub struct ChatInfo {
     /// Members of a group, subscribers of a channel; absent when Telegram hides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<i32>,
+    /// Users only: the bio, as Telegram shows it to this account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    /// Users only: when they were last online, as Telegram shows it to this
+    /// account. Absent when Telegram gives none (bots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<UserStatus>,
+    /// With `status: last_seen`: when, UTC, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bot: bool,
+    /// Bots only: what the bot says it can do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_description: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub premium: bool,
+    /// Telegram marks the user as a scam.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scam: bool,
+    /// Telegram marks the user as impersonating someone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fake: bool,
+    /// Users only, when Telegram shows it to this account: international
+    /// format, `+` and digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    /// Users only, when Telegram shows it to this account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday: Option<Birthday>,
+    /// Users only: how many groups and channels this account shares with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_chats_count: Option<i32>,
+    /// Only when asked for (`common_chats: true`): those groups and channels,
+    /// at most 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 20))]
+    pub common_chats: Option<Vec<FoundChat>>,
+}
+
+/// A user's last-seen status as Telegram shows it to this account: exact
+/// (`online`, `last_seen` with `last_seen_at`) or, when they hide it,
+/// approximate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStatus {
+    Online,
+    /// At `last_seen_at`.
+    LastSeen,
+    /// Within the last few days.
+    Recently,
+    LastWeek,
+    LastMonth,
+    /// More than a month ago, or never.
+    LongAgo,
+}
+
+/// A user's status as Telegram sends it (`UserStatus`), times in Unix seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawUserStatus {
+    /// `userStatusEmpty`: Telegram's apps show "last seen a long time ago".
+    Empty,
+    /// Online until `expires`; after that, last seen then.
+    Online {
+        expires: i32,
+    },
+    Offline {
+        was_online: i32,
+    },
+    Recently,
+    LastWeek,
+    LastMonth,
+}
+
+impl RawUserStatus {
+    /// What the tools say, at Unix time `now`, with the exact time if any.
+    pub fn shown(self, now: i64) -> (UserStatus, Option<String>) {
+        match self {
+            RawUserStatus::Empty => (UserStatus::LongAgo, None),
+            RawUserStatus::Online { expires } if i64::from(expires) > now => {
+                (UserStatus::Online, None)
+            }
+            RawUserStatus::Online { expires: at } | RawUserStatus::Offline { was_online: at } => (
+                UserStatus::LastSeen,
+                Some(rfc3339(at)).filter(|t| !t.is_empty()),
+            ),
+            RawUserStatus::Recently => (UserStatus::Recently, None),
+            RawUserStatus::LastWeek => (UserStatus::LastWeek, None),
+            RawUserStatus::LastMonth => (UserStatus::LastMonth, None),
+        }
+    }
+}
+
+/// A birthday as Telegram shows it; the year only if the user shares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Birthday {
+    #[schemars(range(min = 1, max = 31))]
+    pub day: i32,
+    #[schemars(range(min = 1, max = 12))]
+    pub month: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<i32>,
+}
+
+/// A user's profile as the adapter extracts it from `users.getFullUser` and
+/// the user object. Telegram only sends `phone` and `birthday` when it shows
+/// them to this Account.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawProfile {
+    pub bio: Option<String>,
+    pub status: Option<RawUserStatus>,
+    pub bot: bool,
+    pub bot_description: Option<String>,
+    pub verified: bool,
+    pub premium: bool,
+    pub scam: bool,
+    pub fake: bool,
+    /// Digits, as Telegram sends it (no `+`).
+    pub phone: Option<String>,
+    pub birthday: Option<Birthday>,
+    pub common_chats_count: i32,
 }
 
 /// Normalise what Telegram returns: empty descriptions are none, counts are
@@ -245,9 +370,6 @@ pub fn chat_info(
     description: Option<String>,
     member_count: Option<i32>,
 ) -> ChatInfo {
-    let description = description
-        .map(|d| d.trim().to_string())
-        .filter(|d| !d.is_empty());
     let member_count = match peer.kind {
         ChatKind::Private | ChatKind::Bot => None,
         _ => member_count.filter(|n| *n > 0),
@@ -258,9 +380,72 @@ pub fn chat_info(
         kind: peer.kind,
         username: peer.username.clone(),
         is_self: peer.is_self,
-        description,
+        description: non_empty(description),
         member_count,
+        bio: None,
+        status: None,
+        last_seen_at: None,
+        bot: false,
+        bot_description: None,
+        verified: false,
+        premium: false,
+        scam: false,
+        fake: false,
+        phone: None,
+        birthday: None,
+        common_chats_count: None,
+        common_chats: None,
     }
+}
+
+/// A user's details: their profile as Telegram shows it at Unix time `now`.
+/// Empty strings are none; a birthday that is no date is left out.
+pub fn user_info(peer: &RawPeer, profile: RawProfile, now: i64) -> ChatInfo {
+    let RawProfile {
+        bio,
+        status,
+        bot,
+        bot_description,
+        verified,
+        premium,
+        scam,
+        fake,
+        phone,
+        birthday,
+        common_chats_count,
+    } = profile;
+    let (status, last_seen_at) = match status.map(|s| s.shown(now)) {
+        Some((status, at)) => (Some(status), at),
+        None => (None, None),
+    };
+    let phone = non_empty(phone).map(|p| match p.strip_prefix('+') {
+        Some(_) => p,
+        None => format!("+{p}"),
+    });
+    ChatInfo {
+        bio: non_empty(bio),
+        status,
+        last_seen_at,
+        bot,
+        bot_description: non_empty(bot_description),
+        verified,
+        premium,
+        scam,
+        fake,
+        phone,
+        birthday: birthday
+            .filter(|b| (1..=31).contains(&b.day) && (1..=12).contains(&b.month))
+            .map(|b| Birthday {
+                year: b.year.filter(|y| *y > 0),
+                ..b
+            }),
+        common_chats_count: Some(common_chats_count.max(0)),
+        ..chat_info(peer, None, None)
+    }
+}
+
+fn non_empty(text: Option<String>) -> Option<String> {
+    text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 // ── What the adapter extracts from TL ───────────────────────────────────────
@@ -569,6 +754,158 @@ mod tests {
             chat_info(&alice, Some("bio".into()), Some(2)).member_count,
             None
         );
+    }
+
+    #[test]
+    fn each_status_shows_as_telegram_apps_show_it() {
+        const NOW: i64 = 1_700_000_000;
+        let at = |t: &str| Some(t.to_string());
+        for (raw, shown) in [
+            (RawUserStatus::Empty, (UserStatus::LongAgo, None)),
+            (
+                RawUserStatus::Online {
+                    expires: NOW as i32 + 60,
+                },
+                (UserStatus::Online, None),
+            ),
+            // Online ran out without an update: last seen when it did.
+            (
+                RawUserStatus::Online {
+                    expires: NOW as i32 - 60,
+                },
+                (UserStatus::LastSeen, at("2023-11-14T22:12:20Z")),
+            ),
+            (
+                RawUserStatus::Offline {
+                    was_online: 1_600_000_000,
+                },
+                (UserStatus::LastSeen, at("2020-09-13T12:26:40Z")),
+            ),
+            (RawUserStatus::Recently, (UserStatus::Recently, None)),
+            (RawUserStatus::LastWeek, (UserStatus::LastWeek, None)),
+            (RawUserStatus::LastMonth, (UserStatus::LastMonth, None)),
+        ] {
+            assert_eq!(raw.shown(NOW), shown, "{raw:?}");
+        }
+        assert_eq!(
+            serde_json::to_value([
+                UserStatus::Online,
+                UserStatus::LastSeen,
+                UserStatus::Recently,
+                UserStatus::LastWeek,
+                UserStatus::LastMonth,
+                UserStatus::LongAgo,
+            ])
+            .unwrap(),
+            serde_json::json!([
+                "online",
+                "last_seen",
+                "recently",
+                "last_week",
+                "last_month",
+                "long_ago"
+            ])
+        );
+    }
+
+    #[test]
+    fn user_info_shows_the_profile_and_only_what_telegram_shows() {
+        let alice = peer(ChatId::User(1), "Alice", ChatKind::Private, Some(1));
+        let info = user_info(
+            &alice,
+            RawProfile {
+                bio: Some(" coffee \n".into()),
+                status: Some(RawUserStatus::Offline { was_online: 0 }),
+                verified: true,
+                phone: Some("79991234567".into()),
+                birthday: Some(Birthday {
+                    day: 17,
+                    month: 5,
+                    year: Some(1990),
+                }),
+                common_chats_count: 3,
+                ..RawProfile::default()
+            },
+            1,
+        );
+        assert_eq!(info.bio.as_deref(), Some("coffee"));
+        assert_eq!(info.description, None, "a user's bio is `bio`");
+        assert_eq!(info.member_count, None);
+        assert_eq!(info.status, Some(UserStatus::LastSeen));
+        assert_eq!(info.last_seen_at.as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert!(info.verified && !info.premium && !info.scam && !info.fake && !info.bot);
+        assert_eq!(info.phone.as_deref(), Some("+79991234567"));
+        assert_eq!(info.birthday.unwrap().year, Some(1990));
+        assert_eq!(info.common_chats_count, Some(3));
+        assert_eq!(info.common_chats, None, "only when asked for");
+
+        // Hidden from this account: nothing to show, nothing made up.
+        let hidden = user_info(&alice, RawProfile::default(), 1);
+        assert_eq!(
+            (hidden.bio, hidden.phone, hidden.birthday, hidden.status),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            hidden.common_chats_count,
+            Some(0),
+            "the count is always there"
+        );
+
+        let odd = user_info(
+            &alice,
+            RawProfile {
+                phone: Some("+1555".into()),
+                bio: Some("  ".into()),
+                birthday: Some(Birthday {
+                    day: 1,
+                    month: 2,
+                    year: Some(0),
+                }),
+                ..RawProfile::default()
+            },
+            1,
+        );
+        assert_eq!(odd.phone.as_deref(), Some("+1555"));
+        assert_eq!(odd.bio, None);
+        assert_eq!(
+            odd.birthday,
+            Some(Birthday {
+                day: 1,
+                month: 2,
+                year: None
+            })
+        );
+        let no_date = RawProfile {
+            birthday: Some(Birthday {
+                day: 0,
+                month: 13,
+                year: None,
+            }),
+            ..RawProfile::default()
+        };
+        assert_eq!(user_info(&alice, no_date, 1).birthday, None);
+    }
+
+    #[test]
+    fn a_bot_has_its_description() {
+        let bot = peer(ChatId::User(9), "Helper", ChatKind::Bot, Some(1));
+        let info = user_info(
+            &bot,
+            RawProfile {
+                bot: true,
+                bio: Some("I help".into()),
+                bot_description: Some("What can this bot do?\nEverything.".into()),
+                ..RawProfile::default()
+            },
+            1,
+        );
+        assert!(info.bot);
+        assert_eq!(info.kind, ChatKind::Bot);
+        assert_eq!(
+            info.bot_description.as_deref(),
+            Some("What can this bot do?\nEverything.")
+        );
+        assert_eq!(info.status, None, "bots have no status");
     }
 
     #[test]

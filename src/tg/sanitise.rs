@@ -362,15 +362,34 @@ impl Untrusted for ChatInfo {
             is_self: _,
             description,
             member_count: _,
+            bio,
+            status: _,
+            last_seen_at: _,
+            bot: _,
+            bot_description,
+            verified: _,
+            premium: _,
+            scam: _,
+            fake: _,
+            phone,
+            birthday: _,
+            common_chats_count: _,
+            common_chats,
         } = self;
         clean(title);
         clean_opt(username);
-        if let Some(description) = description {
-            *description = sanitise(description);
+        for text in [description, bio, bot_description] {
+            if let Some(value) = text {
+                *value = sanitise(value);
+            }
+            // Nothing but hidden characters is no text.
+            if text.as_deref().is_some_and(|d| d.trim().is_empty()) {
+                *text = None;
+            }
         }
-        // Nothing but hidden characters is no description.
-        if description.as_deref().is_some_and(|d| d.trim().is_empty()) {
-            *description = None;
+        clean_opt_visible(phone);
+        for chat in common_chats.iter_mut().flatten() {
+            clean_found_chat(chat);
         }
     }
 }
@@ -416,16 +435,20 @@ impl Untrusted for FoundChats {
     fn sanitise(&mut self) {
         let FoundChats { chats } = self;
         for chat in chats {
-            let FoundChat {
-                id: _,
-                title,
-                kind: _,
-                username,
-            } = chat;
-            clean(title);
-            clean_opt(username);
+            clean_found_chat(chat);
         }
     }
+}
+
+fn clean_found_chat(chat: &mut FoundChat) {
+    let FoundChat {
+        id: _,
+        title,
+        kind: _,
+        username,
+    } = chat;
+    clean(title);
+    clean_opt(username);
 }
 
 impl Untrusted for MediaFile {
@@ -497,6 +520,10 @@ impl Telegram for Sanitised {
         self.0.get_chat_info(chat).await.map(sanitised)
     }
 
+    async fn common_chats(&self, user: ChatRef, limit: usize) -> Result<FoundChats, TgError> {
+        self.0.common_chats(user, limit).await.map(sanitised)
+    }
+
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
         self.0.search_messages(query).await.map(sanitised)
     }
@@ -523,7 +550,7 @@ impl Telegram for Sanitised {
 mod tests {
     use super::*;
     use crate::tg::{
-        chats::ChatKind,
+        chats::{ChatId, ChatKind, RawPeer, chat_info},
         messages::{MediaKind, MediaSummary},
     };
 
@@ -710,6 +737,60 @@ mod tests {
         }
     }
 
+    /// A Chat's details with nothing in them.
+    fn blank_info() -> ChatInfo {
+        let peer = RawPeer {
+            id: ChatId::Channel(2),
+            title: String::new(),
+            kind: ChatKind::Channel,
+            username: None,
+            access_hash: None,
+            is_self: false,
+        };
+        chat_info(&peer, None, None)
+    }
+
+    #[test]
+    fn a_users_profile_and_common_chats_are_sanitised() {
+        let mut info = ChatInfo {
+            bio: Some("co\u{200B}ffee\n& code".into()),
+            bot_description: Some("\u{202E}I help\u{2028}a lot".into()),
+            phone: Some("+7999\u{2060}123".into()),
+            common_chats: Some(vec![FoundChat {
+                id: "chat:1".into(),
+                title: "Fa\u{200F}mily".into(),
+                kind: ChatKind::Group,
+                username: Some("fa\u{FEFF}m".into()),
+            }]),
+            ..blank_info()
+        };
+        info.sanitise();
+        assert_eq!(info.bio.as_deref(), Some("coffee\n& code"));
+        assert_eq!(info.bot_description.as_deref(), Some("I help\na lot"));
+        assert_eq!(info.phone.as_deref(), Some("+7999123"));
+        let chat = &info.common_chats.as_ref().unwrap()[0];
+        assert_eq!(
+            (
+                chat.id.as_str(),
+                chat.title.as_str(),
+                chat.username.as_deref()
+            ),
+            ("chat:1", "Family", Some("fam"))
+        );
+
+        let mut ghost = ChatInfo {
+            bio: Some("\u{200B}".into()),
+            bot_description: Some("\u{2060}\u{3164}".into()),
+            phone: Some("\u{200B}".into()),
+            ..blank_info()
+        };
+        ghost.sanitise();
+        assert_eq!(
+            (ghost.bio, ghost.bot_description, ghost.phone),
+            (None, None, None)
+        );
+    }
+
     fn summary(title: &str, preview: &str) -> ChatSummary {
         ChatSummary {
             id: "user:1~AAAAAAAAAAE".into(),
@@ -748,6 +829,7 @@ mod tests {
             is_self: false,
             description: Some("line\u{200F}\nnext".into()),
             member_count: Some(3),
+            ..blank_info()
         };
         info.sanitise();
         assert_eq!(
@@ -924,6 +1006,7 @@ mod tests {
             is_self: false,
             description: Some("line\u{2029}next".into()),
             member_count: None,
+            ..blank_info()
         };
         info.sanitise();
         assert_eq!(info.title, "T eam");

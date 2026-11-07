@@ -18,7 +18,7 @@ use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{
         self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, Listing, RawDialog,
-        RawMessage, RawPeer,
+        RawMessage, RawPeer, RawProfile, RawUserStatus,
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
@@ -619,7 +619,7 @@ impl Telegram for LiveClient {
     async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
         let peer = self.resolve(id).await?;
         let chat = id.chat();
-        let (description, members, users, chats) = match peer {
+        let (description, members, users, chats, profile) = match peer {
             tl::enums::InputPeer::User(u) => {
                 let tl::enums::users::UserFull::Full(full) = self
                     .call(
@@ -639,7 +639,29 @@ impl Telegram for LiveClient {
                     )
                     .await?;
                 let tl::enums::UserFull::Full(user) = full.full_user;
-                (user.about, None, full.users, full.chats)
+                let mut profile = full
+                    .users
+                    .iter()
+                    .find_map(|other| match other {
+                        tl::enums::User::User(other) if other.id == u.user_id => {
+                            Some(raw_profile(other))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                profile.bio = user.about;
+                profile.bot_description = user
+                    .bot_info
+                    .and_then(|tl::enums::BotInfo::Info(info)| info.description);
+                profile.birthday =
+                    user.birthday
+                        .map(|tl::enums::Birthday::Birthday(b)| chats::Birthday {
+                            day: b.day,
+                            month: b.month,
+                            year: b.year,
+                        });
+                profile.common_chats_count = user.common_chats_count;
+                (None, None, full.users, full.chats, Some(profile))
             }
             tl::enums::InputPeer::Chat(c) => {
                 let tl::enums::messages::ChatFull::Full(full) = self
@@ -649,7 +671,7 @@ impl Telegram for LiveClient {
                     )
                     .await?;
                 let (about, members) = full_chat_details(full.full_chat);
-                (about, members, full.users, full.chats)
+                (about, members, full.users, full.chats, None)
             }
             tl::enums::InputPeer::Channel(c) => {
                 let tl::enums::messages::ChatFull::Full(full) = self
@@ -664,7 +686,7 @@ impl Telegram for LiveClient {
                     )
                     .await?;
                 let (about, members) = full_chat_details(full.full_chat);
-                (about, members, full.users, full.chats)
+                (about, members, full.users, full.chats, None)
             }
             _ => return Err(TgError::InvalidInput(format!("{chat} can't be looked up"))),
         };
@@ -673,7 +695,40 @@ impl Telegram for LiveClient {
             .iter()
             .find(|p| p.id == chat)
             .ok_or_else(|| TgError::Upstream(format!("Telegram didn't describe {chat}")))?;
-        Ok(chats::chat_info(peer, description, members))
+        Ok(match profile {
+            Some(profile) => chats::user_info(
+                peer,
+                profile,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            ),
+            None => chats::chat_info(peer, description, members),
+        })
+    }
+
+    async fn common_chats(&self, id: ChatRef, limit: usize) -> Result<FoundChats, TgError> {
+        let chat = id.chat();
+        let tl::enums::InputPeer::User(user) = self.resolve(id).await? else {
+            return Err(TgError::InvalidInput(format!("{chat} is not a user")));
+        };
+        let answer = self
+            .call(
+                &tl::functions::messages::GetCommonChats {
+                    user_id: tl::enums::InputUser::User(tl::types::InputUser {
+                        user_id: user.user_id,
+                        access_hash: user.access_hash,
+                    }),
+                    max_id: 0,
+                    limit: i32::try_from(limit).unwrap_or(i32::MAX),
+                },
+                Some(chat),
+            )
+            .await?;
+        let chats = match answer {
+            tl::enums::messages::Chats::Chats(c) => c.chats,
+            tl::enums::messages::Chats::Slice(c) => c.chats,
+        };
+        let peers = self.described(Vec::new(), chats);
+        Ok(find::common_chats(&peers, &|chat| self.cached(chat), limit))
     }
 
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
@@ -1431,6 +1486,31 @@ fn raw_user(user: tl::enums::User) -> Option<RawPeer> {
     })
 }
 
+/// What the user object says of a user's profile: status, flags, phone.
+/// The rest comes from `users.getFullUser`'s `UserFull`.
+fn raw_profile(user: &tl::types::User) -> RawProfile {
+    RawProfile {
+        status: user.status.as_ref().map(|status| match status {
+            tl::enums::UserStatus::Empty => RawUserStatus::Empty,
+            tl::enums::UserStatus::Online(s) => RawUserStatus::Online { expires: s.expires },
+            tl::enums::UserStatus::Offline(s) => RawUserStatus::Offline {
+                was_online: s.was_online,
+            },
+            tl::enums::UserStatus::Recently(_) => RawUserStatus::Recently,
+            tl::enums::UserStatus::LastWeek(_) => RawUserStatus::LastWeek,
+            tl::enums::UserStatus::LastMonth(_) => RawUserStatus::LastMonth,
+        }),
+        bot: user.bot,
+        verified: user.verified,
+        premium: user.premium,
+        scam: user.scam,
+        fake: user.fake,
+        // Telegram leaves it out unless the user shows it to the Account.
+        phone: user.phone.clone(),
+        ..RawProfile::default()
+    }
+}
+
 fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
     let channel_kind = |megagroup| {
         if megagroup {
@@ -1746,6 +1826,54 @@ mod tests {
         let (user, channel) = tl_peers(false);
         assert_eq!(raw_user(user).unwrap().access_hash, Some(99));
         assert_eq!(raw_chat(channel).unwrap().access_hash, Some(99));
+    }
+
+    #[test]
+    fn a_users_status_flags_and_phone_come_from_the_user_object() {
+        let (tl::enums::User::User(mut user), _) = tl_peers(false) else {
+            unreachable!()
+        };
+        // Nothing shown: no status, no phone, no flags.
+        assert_eq!(raw_profile(&user), RawProfile::default());
+
+        user.bot = true;
+        user.verified = true;
+        user.premium = true;
+        user.scam = true;
+        user.fake = true;
+        user.phone = Some("79991234567".into());
+        let profile = raw_profile(&user);
+        assert!(profile.bot && profile.verified && profile.premium);
+        assert!(profile.scam && profile.fake);
+        assert_eq!(profile.phone.as_deref(), Some("79991234567"));
+
+        use tl::{enums::UserStatus as S, types};
+        for (status, raw) in [
+            (S::Empty, RawUserStatus::Empty),
+            (
+                S::Online(types::UserStatusOnline { expires: 5 }),
+                RawUserStatus::Online { expires: 5 },
+            ),
+            (
+                S::Offline(types::UserStatusOffline { was_online: 6 }),
+                RawUserStatus::Offline { was_online: 6 },
+            ),
+            (
+                S::Recently(types::UserStatusRecently { by_me: true }),
+                RawUserStatus::Recently,
+            ),
+            (
+                S::LastWeek(types::UserStatusLastWeek { by_me: false }),
+                RawUserStatus::LastWeek,
+            ),
+            (
+                S::LastMonth(types::UserStatusLastMonth { by_me: false }),
+                RawUserStatus::LastMonth,
+            ),
+        ] {
+            user.status = Some(status);
+            assert_eq!(raw_profile(&user).status, Some(raw));
+        }
     }
 
     #[test]
@@ -2648,6 +2776,35 @@ mod resolve_tests {
                 tl::functions::messages::GetMessages { id: id() }.to_bytes(),
                 tl::functions::messages::GetMessages { id: id() }.to_bytes(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn common_chats_ask_telegram_for_the_user_with_its_hash() {
+        let (live, _dir) = cold_client().await;
+        let user = ChatRef::new(ChatId::User(7), Some(-88));
+        assert!(live.common_chats(user, 20).await.is_err());
+        // Not a user: refused before anything is sent.
+        let channel = ChatRef::new(ChatId::Channel(5), Some(1));
+        assert!(matches!(
+            live.common_chats(channel, 20).await,
+            Err(TgError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            live.common_chats(ChatId::Chat(4).into(), 20).await,
+            Err(TgError::InvalidInput(_))
+        ));
+        assert_eq!(
+            sent(&live),
+            [tl::functions::messages::GetCommonChats {
+                user_id: tl::enums::InputUser::User(tl::types::InputUser {
+                    user_id: 7,
+                    access_hash: -88,
+                }),
+                max_id: 0,
+                limit: 20,
+            }
+            .to_bytes()]
         );
     }
 
