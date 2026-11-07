@@ -1,0 +1,882 @@
+//! What media a message carries (#39), from TL.
+//!
+//! [`describe`] turns a message's `media` into a [`Media`]: its kind and the
+//! metadata Telegram sends along with the message (duration, size, MIME type,
+//! file name, dimensions). Nothing is downloaded, and nothing that would let
+//! anyone download it leaves this module: ids, access hashes, file
+//! references and DC ids stay in TL. Whoever needs the file itself (#36)
+//! fetches the message again by Chat and id and takes it from there, with the
+//! same [`document_kind`] deciding what kind of file it is.
+//!
+//! Every `MessageMedia` constructor of the layer is named in [`describe`],
+//! without a wildcard, so a layer bump that adds one doesn't compile until it
+//! is sorted into a kind.
+
+use grammers_client::tl;
+
+use super::messages::{Media, MediaKind};
+
+/// The media `media` describes; none for no media, `messageMediaEmpty` and a
+/// link preview (`messageMediaWebPage`: the link is in the text).
+pub fn describe(media: Option<&tl::enums::MessageMedia>) -> Option<Media> {
+    use tl::enums::MessageMedia as M;
+    let other = || Some(Media::from(MediaKind::Other));
+    match media? {
+        M::Empty | M::WebPage(_) => None,
+        // A live photo's video is part of the photo.
+        M::Photo(p) => Some(photo(p.photo.as_ref())),
+        M::Document(d) => Some(document(d)),
+        M::Geo(_) | M::GeoLive(_) | M::Venue(_) => Some(MediaKind::Location.into()),
+        M::Contact(_) => Some(MediaKind::Contact.into()),
+        M::Poll(_) => Some(MediaKind::Poll.into()),
+        M::Dice(_) => other(),
+        M::Story(_) => other(),
+        M::Game(_) => other(),
+        M::Invoice(_) => other(),
+        M::Giveaway(_) => other(),
+        M::GiveawayResults(_) => other(),
+        // Paid media is locked until paid for; what is inside isn't ours to say.
+        M::PaidMedia(_) => other(),
+        M::ToDo(_) => other(),
+        M::VideoStream(_) => other(),
+        // Media of a newer layer than this server's.
+        M::Unsupported => other(),
+    }
+}
+
+/// A photo, with its largest size. A self-destructing photo that is gone
+/// comes without one: only the kind is left.
+fn photo(photo: Option<&tl::enums::Photo>) -> Media {
+    let mut media = Media::from(MediaKind::Photo);
+    let Some(tl::enums::Photo::Photo(photo)) = photo else {
+        return media;
+    };
+    // Inline thumbnails (cached, stripped, path) are no size of the photo.
+    let largest = photo
+        .sizes
+        .iter()
+        .filter_map(|size| match size {
+            tl::enums::PhotoSize::Size(s) => Some((s.w, s.h, Some(s.size))),
+            tl::enums::PhotoSize::Progressive(s) => Some((s.w, s.h, s.sizes.iter().copied().max())),
+            tl::enums::PhotoSize::Empty(_)
+            | tl::enums::PhotoSize::PhotoCachedSize(_)
+            | tl::enums::PhotoSize::PhotoStrippedSize(_)
+            | tl::enums::PhotoSize::PhotoPathSize(_) => None,
+        })
+        .max_by_key(|&(w, h, _)| i64::from(w) * i64::from(h));
+    if let Some((w, h, size)) = largest {
+        media.width = dimension(w);
+        media.height = dimension(h);
+        media.size_bytes = size.and_then(|s| u64::try_from(s).ok()).filter(|&s| s > 0);
+    }
+    media
+}
+
+/// A file: its kind from its attributes (the flags on the message when the
+/// document is gone, as with an expired self-destructing one), its metadata
+/// from the document.
+fn document(d: &tl::types::MessageMediaDocument) -> Media {
+    let Some(tl::enums::Document::Document(doc)) = &d.document else {
+        let kind = if d.round {
+            MediaKind::VideoNote
+        } else if d.voice {
+            MediaKind::Voice
+        } else if d.video {
+            MediaKind::Video
+        } else {
+            MediaKind::Document
+        };
+        return kind.into();
+    };
+    let mut media = Media {
+        size_bytes: u64::try_from(doc.size).ok().filter(|&s| s > 0),
+        mime_type: Some(doc.mime_type.clone()).filter(|m| !m.is_empty()),
+        ..Media::from(document_kind(doc))
+    };
+    for attribute in &doc.attributes {
+        use tl::enums::DocumentAttribute as A;
+        match attribute {
+            A::Filename(f) => {
+                media.file_name = Some(f.file_name.clone()).filter(|n| !n.is_empty());
+            }
+            A::Audio(a) => media.duration_s = u32::try_from(a.duration).ok(),
+            A::Video(v) => {
+                media.duration_s = seconds(v.duration);
+                media.width = dimension(v.w);
+                media.height = dimension(v.h);
+            }
+            // A video's own dimensions win over an image size.
+            A::ImageSize(i) => {
+                if media.width.is_none() {
+                    media.width = dimension(i.w);
+                    media.height = dimension(i.h);
+                }
+            }
+            A::Animated | A::Sticker(_) | A::HasStickers | A::CustomEmoji(_) => {}
+        }
+    }
+    media
+}
+
+/// What kind of file `doc` is, by all of its attributes rather than the
+/// first that fits: Telegram lists them in no fixed order, and a GIF carries
+/// a video attribute besides `animated`, a video sticker a video attribute
+/// besides `sticker`.
+pub fn document_kind(doc: &tl::types::Document) -> MediaKind {
+    use tl::enums::DocumentAttribute as A;
+    let has = |wanted: fn(&A) -> bool| doc.attributes.iter().any(wanted);
+    if has(|a| matches!(a, A::Sticker(_) | A::CustomEmoji(_))) {
+        MediaKind::Sticker
+    } else if has(|a| matches!(a, A::Animated)) {
+        MediaKind::Gif
+    } else if has(|a| matches!(a, A::Video(v) if v.round_message)) {
+        MediaKind::VideoNote
+    } else if has(|a| matches!(a, A::Audio(a) if a.voice)) {
+        MediaKind::Voice
+    } else if has(|a| matches!(a, A::Audio(_))) {
+        MediaKind::Audio
+    } else if has(|a| matches!(a, A::Video(_))) {
+        MediaKind::Video
+    } else {
+        MediaKind::Document
+    }
+}
+
+/// Whole seconds of a video's duration (a double in TL), rounded.
+fn seconds(duration: f64) -> Option<u32> {
+    (duration.is_finite() && duration >= 0.0 && duration < f64::from(u32::MAX))
+        .then(|| duration.round() as u32)
+}
+
+/// Pixels; 0 (or less) is Telegram not knowing.
+fn dimension(pixels: i32) -> Option<u32> {
+    u32::try_from(pixels).ok().filter(|&p| p > 0)
+}
+
+/// Media as Telegram sends it, for tests here and in the adapter.
+#[cfg(test)]
+pub(super) mod fixtures {
+    use super::*;
+    pub use tl::{enums, types};
+
+    pub const HASH: i64 = 0x5EC2_E7AC_CE55_0001;
+    pub const FILE_REFERENCE: &[u8] = b"\x01\x02secret-file-reference";
+
+    pub fn photo_of(sizes: Vec<enums::PhotoSize>) -> enums::Photo {
+        enums::Photo::Photo(types::Photo {
+            has_stickers: false,
+            id: 5_000_000_001,
+            access_hash: HASH,
+            file_reference: FILE_REFERENCE.to_vec(),
+            date: 1_700_000_000,
+            sizes,
+            video_sizes: None,
+            dc_id: 2,
+        })
+    }
+
+    /// The sizes a photo comes with: a stripped inline thumbnail, `m` and
+    /// `x` sizes, and a progressive `y` whose last size is the full one.
+    pub fn full_photo() -> enums::Photo {
+        photo_of(vec![
+            enums::PhotoSize::PhotoStrippedSize(types::PhotoStrippedSize {
+                r#type: "i".into(),
+                bytes: vec![1; 40],
+            }),
+            enums::PhotoSize::Size(types::PhotoSize {
+                r#type: "m".into(),
+                w: 320,
+                h: 240,
+                size: 15_000,
+            }),
+            enums::PhotoSize::Size(types::PhotoSize {
+                r#type: "x".into(),
+                w: 800,
+                h: 600,
+                size: 70_000,
+            }),
+            enums::PhotoSize::Progressive(types::PhotoSizeProgressive {
+                r#type: "y".into(),
+                w: 1280,
+                h: 960,
+                sizes: vec![10_000, 40_000, 90_000, 152_331],
+            }),
+        ])
+    }
+
+    pub fn photo_media(
+        photo: Option<enums::Photo>,
+        ttl_seconds: Option<i32>,
+    ) -> enums::MessageMedia {
+        enums::MessageMedia::Photo(types::MessageMediaPhoto {
+            spoiler: ttl_seconds.is_some(),
+            live_photo: false,
+            photo,
+            ttl_seconds,
+            video: None,
+        })
+    }
+
+    pub fn doc(
+        mime_type: &str,
+        size: i64,
+        attributes: Vec<enums::DocumentAttribute>,
+    ) -> types::Document {
+        types::Document {
+            id: 6_000_000_001,
+            access_hash: HASH,
+            file_reference: FILE_REFERENCE.to_vec(),
+            date: 1_700_000_000,
+            mime_type: mime_type.into(),
+            size,
+            thumbs: None,
+            video_thumbs: None,
+            dc_id: 4,
+            attributes,
+        }
+    }
+
+    /// A document as a message's media, with the flags Telegram sets on the
+    /// media for videos, video notes and voice messages.
+    pub fn doc_media(doc: Option<types::Document>) -> enums::MessageMedia {
+        let kind = doc.as_ref().map(document_kind);
+        enums::MessageMedia::Document(types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: matches!(kind, Some(MediaKind::Video | MediaKind::VideoNote)),
+            round: kind == Some(MediaKind::VideoNote),
+            voice: kind == Some(MediaKind::Voice),
+            document: doc.map(enums::Document::Document),
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        })
+    }
+
+    pub fn file_name(name: &str) -> enums::DocumentAttribute {
+        enums::DocumentAttribute::Filename(types::DocumentAttributeFilename {
+            file_name: name.into(),
+        })
+    }
+
+    pub fn audio(voice: bool, duration: i32) -> enums::DocumentAttribute {
+        enums::DocumentAttribute::Audio(types::DocumentAttributeAudio {
+            voice,
+            duration,
+            title: (!voice).then(|| "Song title".into()),
+            performer: (!voice).then(|| "Performer".into()),
+            waveform: voice.then(|| vec![0, 4, 31, 7]),
+        })
+    }
+
+    pub fn video(round: bool, duration: f64, w: i32, h: i32) -> enums::DocumentAttribute {
+        enums::DocumentAttribute::Video(types::DocumentAttributeVideo {
+            round_message: round,
+            supports_streaming: !round,
+            nosound: false,
+            duration,
+            w,
+            h,
+            preload_prefix_size: None,
+            video_start_ts: None,
+            video_codec: None,
+        })
+    }
+
+    pub fn image_size(w: i32, h: i32) -> enums::DocumentAttribute {
+        enums::DocumentAttribute::ImageSize(types::DocumentAttributeImageSize { w, h })
+    }
+
+    pub fn sticker(alt: &str) -> enums::DocumentAttribute {
+        enums::DocumentAttribute::Sticker(types::DocumentAttributeSticker {
+            mask: false,
+            alt: alt.into(),
+            stickerset: enums::InputStickerSet::Id(types::InputStickerSetId {
+                id: 7,
+                access_hash: HASH,
+            }),
+            mask_coords: None,
+        })
+    }
+
+    pub fn text(text: &str) -> enums::TextWithEntities {
+        enums::TextWithEntities::Entities(types::TextWithEntities {
+            text: text.into(),
+            entities: Vec::new(),
+        })
+    }
+
+    pub fn poll(quiz: bool, closed: bool, with_results: bool) -> enums::MessageMedia {
+        let answer = |t: &str, option: u8| {
+            enums::PollAnswer::Answer(types::PollAnswer {
+                text: text(t),
+                option: vec![option],
+                media: None,
+                added_by: None,
+                date: None,
+            })
+        };
+        enums::MessageMedia::Poll(Box::new(types::MessageMediaPoll {
+            poll: enums::Poll::Poll(types::Poll {
+                id: 1,
+                closed,
+                public_voters: false,
+                multiple_choice: !quiz,
+                quiz,
+                open_answers: false,
+                revoting_disabled: false,
+                shuffle_answers: false,
+                hide_results_until_close: false,
+                creator: false,
+                subscribers_only: false,
+                question: text("Where do we eat?"),
+                answers: vec![answer("Here", 0), answer("There", 1)],
+                close_period: None,
+                close_date: None,
+                countries_iso2: None,
+                hash: 0,
+            }),
+            results: enums::PollResults::Results(Box::new(types::PollResults {
+                min: false,
+                has_unread_votes: false,
+                can_view_stats: false,
+                results: with_results.then(Vec::new),
+                total_voters: with_results.then_some(3),
+                recent_voters: None,
+                solution: quiz.then(|| "Because".into()),
+                solution_entities: None,
+                solution_media: None,
+            })),
+            attached_media: None,
+        }))
+    }
+
+    pub fn geo() -> enums::GeoPoint {
+        enums::GeoPoint::Point(types::GeoPoint {
+            long: 37.6,
+            lat: 55.7,
+            access_hash: HASH,
+            accuracy_radius: None,
+        })
+    }
+
+    pub fn kind(media: &enums::MessageMedia) -> Option<MediaKind> {
+        describe(Some(media)).map(|m| m.kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fixtures::*, *};
+
+    #[test]
+    fn a_photo_is_described_by_its_largest_size() {
+        assert_eq!(
+            describe(Some(&photo_media(Some(full_photo()), None))),
+            Some(Media {
+                width: Some(1280),
+                height: Some(960),
+                size_bytes: Some(152_331),
+                ..Media::from(MediaKind::Photo)
+            })
+        );
+        // Without a progressive size, the largest plain one.
+        let plain = photo_of(vec![
+            enums::PhotoSize::Size(types::PhotoSize {
+                r#type: "w".into(),
+                w: 2560,
+                h: 1920,
+                size: 900_000,
+            }),
+            enums::PhotoSize::Size(types::PhotoSize {
+                r#type: "s".into(),
+                w: 100,
+                h: 75,
+                size: 2_000,
+            }),
+            enums::PhotoSize::PhotoCachedSize(types::PhotoCachedSize {
+                r#type: "s".into(),
+                w: 9_000,
+                h: 9_000,
+                bytes: vec![1; 10],
+            }),
+        ]);
+        let described = describe(Some(&photo_media(Some(plain), None))).unwrap();
+        assert_eq!(
+            (described.width, described.height, described.size_bytes),
+            (Some(2560), Some(1920), Some(900_000))
+        );
+    }
+
+    #[test]
+    fn a_self_destructing_photo_that_is_gone_is_still_a_photo() {
+        assert_eq!(
+            describe(Some(&photo_media(None, Some(10)))),
+            Some(MediaKind::Photo.into())
+        );
+        assert_eq!(
+            describe(Some(&photo_media(
+                Some(enums::Photo::Empty(types::PhotoEmpty { id: 1 })),
+                Some(10)
+            ))),
+            Some(MediaKind::Photo.into())
+        );
+        // A self-destructing voice message that is gone: the media's flags.
+        let gone = |round, voice, video| {
+            describe(Some(&enums::MessageMedia::Document(
+                types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video,
+                    round,
+                    voice,
+                    document: None,
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: Some(30),
+                },
+            )))
+        };
+        assert_eq!(gone(false, true, false), Some(MediaKind::Voice.into()));
+        assert_eq!(gone(true, false, true), Some(MediaKind::VideoNote.into()));
+        assert_eq!(gone(false, false, true), Some(MediaKind::Video.into()));
+        assert_eq!(gone(false, false, false), Some(MediaKind::Document.into()));
+    }
+
+    #[test]
+    fn a_voice_message_has_its_duration_size_and_type() {
+        let voice = doc("audio/ogg", 23_211, vec![audio(true, 7)]);
+        assert_eq!(
+            describe(Some(&doc_media(Some(voice)))),
+            Some(Media {
+                duration_s: Some(7),
+                size_bytes: Some(23_211),
+                mime_type: Some("audio/ogg".into()),
+                ..Media::from(MediaKind::Voice)
+            })
+        );
+    }
+
+    #[test]
+    fn every_kind_of_file_is_told_apart_whatever_the_attribute_order() {
+        let cases = [
+            (
+                "music",
+                doc(
+                    "audio/mpeg",
+                    5_000_000,
+                    vec![audio(false, 215), file_name("song.mp3")],
+                ),
+                Media {
+                    duration_s: Some(215),
+                    size_bytes: Some(5_000_000),
+                    mime_type: Some("audio/mpeg".into()),
+                    file_name: Some("song.mp3".into()),
+                    ..Media::from(MediaKind::Audio)
+                },
+            ),
+            (
+                "video",
+                doc(
+                    "video/mp4",
+                    8_000_000,
+                    vec![video(false, 12.6, 1280, 720), file_name("clip.mp4")],
+                ),
+                Media {
+                    duration_s: Some(13),
+                    size_bytes: Some(8_000_000),
+                    mime_type: Some("video/mp4".into()),
+                    file_name: Some("clip.mp4".into()),
+                    width: Some(1280),
+                    height: Some(720),
+                    ..Media::from(MediaKind::Video)
+                },
+            ),
+            (
+                "video note",
+                doc("video/mp4", 900_000, vec![video(true, 9.0, 384, 384)]),
+                Media {
+                    duration_s: Some(9),
+                    size_bytes: Some(900_000),
+                    mime_type: Some("video/mp4".into()),
+                    width: Some(384),
+                    height: Some(384),
+                    ..Media::from(MediaKind::VideoNote)
+                },
+            ),
+            (
+                // As Telegram sends a GIF: the video attribute first.
+                "gif",
+                doc(
+                    "video/mp4",
+                    300_000,
+                    vec![
+                        video(false, 2.4, 480, 270),
+                        file_name("giphy.mp4"),
+                        enums::DocumentAttribute::Animated,
+                    ],
+                ),
+                Media {
+                    duration_s: Some(2),
+                    size_bytes: Some(300_000),
+                    mime_type: Some("video/mp4".into()),
+                    file_name: Some("giphy.mp4".into()),
+                    width: Some(480),
+                    height: Some(270),
+                    ..Media::from(MediaKind::Gif)
+                },
+            ),
+            (
+                "sticker",
+                doc(
+                    "image/webp",
+                    25_000,
+                    vec![
+                        image_size(512, 512),
+                        sticker("😀"),
+                        file_name("sticker.webp"),
+                    ],
+                ),
+                Media {
+                    size_bytes: Some(25_000),
+                    mime_type: Some("image/webp".into()),
+                    file_name: Some("sticker.webp".into()),
+                    width: Some(512),
+                    height: Some(512),
+                    ..Media::from(MediaKind::Sticker)
+                },
+            ),
+            (
+                // A video sticker: a video attribute before the sticker one.
+                "video sticker",
+                doc(
+                    "video/webm",
+                    40_000,
+                    vec![
+                        video(false, 3.0, 512, 512),
+                        file_name("sticker.webm"),
+                        sticker("🎉"),
+                    ],
+                ),
+                Media {
+                    duration_s: Some(3),
+                    size_bytes: Some(40_000),
+                    mime_type: Some("video/webm".into()),
+                    file_name: Some("sticker.webm".into()),
+                    width: Some(512),
+                    height: Some(512),
+                    ..Media::from(MediaKind::Sticker)
+                },
+            ),
+            (
+                "animated sticker",
+                doc(
+                    "application/x-tgsticker",
+                    12_000,
+                    vec![
+                        image_size(512, 512),
+                        sticker("🐱"),
+                        file_name("AnimatedSticker.tgs"),
+                    ],
+                ),
+                Media {
+                    size_bytes: Some(12_000),
+                    mime_type: Some("application/x-tgsticker".into()),
+                    file_name: Some("AnimatedSticker.tgs".into()),
+                    width: Some(512),
+                    height: Some(512),
+                    ..Media::from(MediaKind::Sticker)
+                },
+            ),
+            (
+                "pdf",
+                doc("application/pdf", 120_000, vec![file_name("report.pdf")]),
+                Media {
+                    size_bytes: Some(120_000),
+                    mime_type: Some("application/pdf".into()),
+                    file_name: Some("report.pdf".into()),
+                    ..Media::from(MediaKind::Document)
+                },
+            ),
+            (
+                "image sent as a file",
+                doc(
+                    "image/png",
+                    2_000_000,
+                    vec![image_size(3000, 2000), file_name("scan.png")],
+                ),
+                Media {
+                    size_bytes: Some(2_000_000),
+                    mime_type: Some("image/png".into()),
+                    file_name: Some("scan.png".into()),
+                    width: Some(3000),
+                    height: Some(2000),
+                    ..Media::from(MediaKind::Document)
+                },
+            ),
+            (
+                // Nothing Telegram leaves out, or sends as 0, is made up.
+                "bare file",
+                doc("", 0, vec![image_size(0, 0)]),
+                Media::from(MediaKind::Document),
+            ),
+        ];
+        for (name, document, expected) in cases {
+            assert_eq!(
+                describe(Some(&doc_media(Some(document.clone())))),
+                Some(expected.clone()),
+                "{name}"
+            );
+            // Reversed attributes: the same.
+            let reversed = types::Document {
+                attributes: document.attributes.iter().rev().cloned().collect(),
+                ..document
+            };
+            assert_eq!(
+                describe(Some(&doc_media(Some(reversed)))),
+                Some(expected),
+                "{name}, reversed"
+            );
+        }
+    }
+
+    #[test]
+    fn every_media_constructor_of_the_layer_has_a_kind() {
+        use enums::MessageMedia as M;
+        let other = Some(MediaKind::Other);
+        let cases: Vec<(&str, M, Option<MediaKind>)> = vec![
+            ("empty", M::Empty, None),
+            (
+                "link preview, pending",
+                M::WebPage(types::MessageMediaWebPage {
+                    force_large_media: false,
+                    force_small_media: false,
+                    manual: false,
+                    safe: true,
+                    webpage: enums::WebPage::Pending(types::WebPagePending {
+                        id: 1,
+                        url: Some("https://example.com".into()),
+                        date: 1,
+                    }),
+                }),
+                None,
+            ),
+            (
+                "link preview, empty",
+                M::WebPage(types::MessageMediaWebPage {
+                    force_large_media: false,
+                    force_small_media: false,
+                    manual: true,
+                    safe: false,
+                    webpage: enums::WebPage::Empty(types::WebPageEmpty { id: 1, url: None }),
+                }),
+                None,
+            ),
+            (
+                "geo",
+                M::Geo(types::MessageMediaGeo { geo: geo() }),
+                Some(MediaKind::Location),
+            ),
+            (
+                "geo, empty point",
+                M::Geo(types::MessageMediaGeo {
+                    geo: enums::GeoPoint::Empty,
+                }),
+                Some(MediaKind::Location),
+            ),
+            (
+                "live location",
+                M::GeoLive(types::MessageMediaGeoLive {
+                    geo: geo(),
+                    heading: Some(90),
+                    period: 900,
+                    proximity_notification_radius: None,
+                }),
+                Some(MediaKind::Location),
+            ),
+            (
+                "venue",
+                M::Venue(types::MessageMediaVenue {
+                    geo: geo(),
+                    title: "Cafe".into(),
+                    address: "Main st. 1".into(),
+                    provider: "foursquare".into(),
+                    venue_id: "abc".into(),
+                    venue_type: "food".into(),
+                }),
+                Some(MediaKind::Location),
+            ),
+            (
+                "contact",
+                M::Contact(types::MessageMediaContact {
+                    phone_number: "+10000000000".into(),
+                    first_name: "Ann".into(),
+                    last_name: String::new(),
+                    vcard: String::new(),
+                    user_id: 9,
+                }),
+                Some(MediaKind::Contact),
+            ),
+            ("poll", poll(false, false, false), Some(MediaKind::Poll)),
+            ("closed quiz", poll(true, true, true), Some(MediaKind::Poll)),
+            (
+                "dice",
+                M::Dice(types::MessageMediaDice {
+                    value: 6,
+                    emoticon: "🎲".into(),
+                    game_outcome: None,
+                }),
+                other,
+            ),
+            (
+                "story",
+                M::Story(Box::new(types::MessageMediaStory {
+                    via_mention: false,
+                    peer: enums::Peer::User(types::PeerUser { user_id: 9 }),
+                    id: 3,
+                    story: None,
+                })),
+                other,
+            ),
+            (
+                "game",
+                M::Game(types::MessageMediaGame {
+                    game: enums::Game::Game(types::Game {
+                        id: 1,
+                        access_hash: HASH,
+                        short_name: "g".into(),
+                        title: "Game".into(),
+                        description: String::new(),
+                        photo: enums::Photo::Empty(types::PhotoEmpty { id: 1 }),
+                        document: None,
+                    }),
+                }),
+                other,
+            ),
+            (
+                "invoice",
+                M::Invoice(Box::new(types::MessageMediaInvoice {
+                    shipping_address_requested: false,
+                    test: true,
+                    title: "Pay".into(),
+                    description: "for it".into(),
+                    photo: None,
+                    receipt_msg_id: None,
+                    currency: "XTR".into(),
+                    total_amount: 100,
+                    start_param: String::new(),
+                    extended_media: None,
+                })),
+                other,
+            ),
+            (
+                "giveaway",
+                M::Giveaway(types::MessageMediaGiveaway {
+                    only_new_subscribers: false,
+                    winners_are_visible: true,
+                    channels: vec![1],
+                    countries_iso2: None,
+                    prize_description: Some("prize".into()),
+                    quantity: 3,
+                    months: Some(3),
+                    stars: None,
+                    until_date: 1,
+                }),
+                other,
+            ),
+            (
+                "giveaway results",
+                M::GiveawayResults(types::MessageMediaGiveawayResults {
+                    only_new_subscribers: false,
+                    refunded: false,
+                    channel_id: 1,
+                    additional_peers_count: None,
+                    launch_msg_id: 1,
+                    winners_count: 1,
+                    unclaimed_count: 0,
+                    winners: vec![9],
+                    months: None,
+                    stars: Some(50),
+                    prize_description: None,
+                    until_date: 1,
+                }),
+                other,
+            ),
+            (
+                "paid media",
+                M::PaidMedia(types::MessageMediaPaidMedia {
+                    stars_amount: 10,
+                    extended_media: Vec::new(),
+                }),
+                other,
+            ),
+            (
+                "checklist",
+                M::ToDo(types::MessageMediaToDo {
+                    todo: enums::TodoList::List(types::TodoList {
+                        others_can_append: false,
+                        others_can_complete: false,
+                        title: text("Groceries"),
+                        list: Vec::new(),
+                    }),
+                    completions: None,
+                }),
+                other,
+            ),
+            (
+                "live stream",
+                M::VideoStream(types::MessageMediaVideoStream {
+                    rtmp_stream: false,
+                    call: enums::InputGroupCall::Call(types::InputGroupCall {
+                        id: 1,
+                        access_hash: HASH,
+                    }),
+                }),
+                other,
+            ),
+            ("unsupported", M::Unsupported, other),
+            (
+                "photo",
+                photo_media(Some(full_photo()), None),
+                Some(MediaKind::Photo),
+            ),
+            (
+                "document",
+                doc_media(Some(doc("application/zip", 1, vec![file_name("a.zip")]))),
+                Some(MediaKind::Document),
+            ),
+        ];
+        for (name, media, expected) in &cases {
+            assert_eq!(kind(media), *expected, "{name}");
+        }
+        assert_eq!(describe(None), None);
+    }
+
+    #[test]
+    fn nothing_to_fetch_the_media_with_leaves_tl() {
+        let media = [
+            photo_media(Some(full_photo()), None),
+            doc_media(Some(doc(
+                "video/mp4",
+                10,
+                vec![video(false, 1.0, 2, 2), file_name("v.mp4")],
+            ))),
+        ];
+        for media in &media {
+            let json = serde_json::to_string(&describe(Some(media))).unwrap();
+            for leak in [
+                HASH.to_string(),
+                "secret-file-reference".into(),
+                "6000000001".into(),
+                "5000000001".into(),
+                "dc_id".into(),
+                "access_hash".into(),
+                "file_reference".into(),
+            ] {
+                assert!(!json.contains(&leak), "{leak} in {json}");
+            }
+        }
+    }
+}

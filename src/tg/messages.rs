@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatRef, RawPeer, rfc3339},
-    sanitise::is_blank,
     search::RawFoundMessage,
 };
 
@@ -58,10 +57,15 @@ pub struct ChatMessage {
     pub sender: Option<Sender>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outgoing: bool,
-    /// The text; media and service messages as `[photo]`, `[voice]`, …; a
-    /// Rich message as plain lines (`src/tg/rich.rs`); text with nothing
-    /// visible (only hidden characters) as `[no visible text]`.
+    /// The message's own text, or the caption of its media: possibly empty
+    /// (`media` says what there is). A service message as `[service
+    /// message]`; a Rich message as plain lines (`src/tg/rich.rs`); text with
+    /// nothing visible (only hidden characters) as `[no visible text]`.
     pub text: String,
+    /// Absent when the message has none. A link preview is no media: the
+    /// link is in the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Media>,
     /// Id of the message this one replies to, in the same chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i32>,
@@ -108,59 +112,82 @@ pub struct MessagePage {
     pub broken_at: Option<i32>,
 }
 
-/// What a message carries besides its text. Never the media itself.
+/// What kind of media a message carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Media {
+pub enum MediaKind {
     Photo,
     Video,
     /// A round video message.
     VideoNote,
     Voice,
+    /// Music or another audio file.
     Audio,
-    Gif,
-    Sticker,
     /// Any other file.
     Document,
+    Sticker,
+    Gif,
+    /// A point on the map, a venue or a live location.
     Location,
+    /// A shared contact card.
     Contact,
     Poll,
-    Dice,
-    Story,
+    /// Anything else (dice, story, game, invoice, giveaway, paid media,
+    /// checklist, live stream, or something this server doesn't know yet).
     Other,
 }
 
-impl Media {
-    /// How a message without text shows in get_messages and list_chats.
-    pub fn placeholder(self) -> &'static str {
-        match self {
-            Media::Photo => "[photo]",
-            Media::Video => "[video]",
-            Media::VideoNote => "[video message]",
-            Media::Voice => "[voice]",
-            Media::Audio => "[audio]",
-            Media::Gif => "[gif]",
-            Media::Sticker => "[sticker]",
-            Media::Document => "[file]",
-            Media::Location => "[location]",
-            Media::Contact => "[contact]",
-            Media::Poll => "[poll]",
-            Media::Dice => "[dice]",
-            Media::Story => "[story]",
-            Media::Other => "[media]",
+/// The media a message carries, as Telegram describes it along with the
+/// message: what it is, never the media itself or anything to fetch it
+/// with. Every field but `kind` only when Telegram sent it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Media {
+    pub kind: MediaKind,
+    /// Length in whole seconds (voice, audio, video, video note, GIF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// As the sender's app declared it (photos have none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The name the sender gave the file: untrusted content, cut to 128
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// In pixels (photo: its largest size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl From<MediaKind> for Media {
+    /// Media Telegram says nothing more about.
+    fn from(kind: MediaKind) -> Self {
+        Media {
+            kind,
+            duration_s: None,
+            size_bytes: None,
+            mime_type: None,
+            file_name: None,
+            width: None,
+            height: None,
         }
     }
 }
 
-/// A message's text as get_messages and list_chats show it: media whose
-/// caption has nothing visible (none, blanks or only hidden characters) shows
-/// as its placeholder. Text-only messages are left to the sanitiser, which
-/// marks the ones with nothing visible `[no visible text]`.
-pub fn shown_text(text: String, media: Option<Media>) -> String {
-    match media {
-        Some(media) if is_blank(&text) => media.placeholder().to_string(),
-        _ => text,
+impl Media {
+    pub fn summary(&self) -> MediaSummary {
+        MediaSummary { kind: self.kind }
     }
+}
+
+/// Only what kind of media a message carries (list_chats previews, Search
+/// hits); get_messages has the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MediaSummary {
+    pub kind: MediaKind,
 }
 
 /// One message as extracted from TL.
@@ -606,13 +633,13 @@ impl<'a> Issuer<'a> {
                 .map(|p| p.title.clone())
                 .unwrap_or_else(|| from.to_string()),
         });
-        let text = shown_text(m.text.clone(), m.media);
         ChatMessage {
             id: m.id,
             date: rfc3339(m.date),
             sender,
             outgoing,
-            text,
+            text: m.text.clone(),
+            media: m.media.clone(),
             reply_to: m.reply_to,
             forwarded: m.forwarded,
             edited: m.edited,
@@ -1052,42 +1079,23 @@ mod tests {
     }
 
     #[test]
-    fn media_without_text_shows_as_a_placeholder_a_caption_as_itself() {
-        let photo = |text: &str| RawHistoryMessage {
-            text: text.into(),
-            media: Some(Media::Photo),
-            ..msg(1, 10)
+    fn media_is_its_own_field_and_text_only_the_caption() {
+        let voice = Media {
+            duration_s: Some(3),
+            size_bytes: Some(4_000),
+            mime_type: Some("audio/ogg".into()),
+            ..Media::from(MediaKind::Voice)
         };
         let raw = [
-            photo(""),
             RawHistoryMessage {
-                id: 2,
-                ..photo("look")
+                text: "look".into(),
+                media: Some(MediaKind::Photo.into()),
+                ..msg(2, 10)
             },
             RawHistoryMessage {
-                id: 3,
-                media: Some(Media::VideoNote),
-                ..photo("")
-            },
-            RawHistoryMessage {
-                id: 4,
                 text: String::new(),
-                ..msg(4, 10)
-            },
-            // A caption of nothing but hidden characters or blanks is none.
-            RawHistoryMessage {
-                id: 5,
-                ..photo("\u{2063}\u{200B}")
-            },
-            RawHistoryMessage {
-                id: 6,
-                ..photo(" \n")
-            },
-            // Without media the sanitiser decides (`[no visible text]`).
-            RawHistoryMessage {
-                id: 7,
-                text: "\u{2063}".into(),
-                ..msg(7, 10)
+                media: Some(voice.clone()),
+                ..msg(1, 10)
             },
         ];
         let page = assemble_history(
@@ -1098,18 +1106,14 @@ mod tests {
             &query(10),
             false,
         );
-        let texts: Vec<&str> = page.messages.iter().map(|m| m.text.as_str()).collect();
+        let shown: Vec<(&str, Option<&Media>)> = page
+            .messages
+            .iter()
+            .map(|m| (m.text.as_str(), m.media.as_ref()))
+            .collect();
         assert_eq!(
-            texts,
-            [
-                "[photo]",
-                "look",
-                "[video message]",
-                "",
-                "[photo]",
-                "[photo]",
-                "\u{2063}"
-            ]
+            shown,
+            [("look", Some(&MediaKind::Photo.into())), ("", Some(&voice))]
         );
     }
 

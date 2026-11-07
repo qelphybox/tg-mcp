@@ -12,6 +12,7 @@ pub mod chats;
 pub mod fake;
 pub mod find;
 pub mod grammers;
+pub mod media;
 pub mod messages;
 mod pool;
 pub mod rich;

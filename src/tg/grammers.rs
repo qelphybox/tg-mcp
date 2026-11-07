@@ -21,9 +21,10 @@ use super::{
         RawMessage, RawPeer,
     },
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
+    media,
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessageAnswer, MessageAt, MessagePage,
-        MessageRequest, RawHistoryMessage, read_history, shown_text,
+        HistoryAnswer, HistoryQuery, HistoryRequest, MessageAnswer, MessageAt, MessagePage,
+        MessageRequest, RawHistoryMessage, read_history,
     },
     pool::{Evicted, Live, Pool},
     rich::message_text,
@@ -954,7 +955,7 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 from: m.from_id.as_ref().map(chat_id),
                 out: m.out,
                 text: message_text(m.message, m.rich_message.as_ref()),
-                media: media_kind(m.media.as_ref()),
+                media: media::describe(m.media.as_ref()),
                 reply_to,
                 reply_elsewhere,
                 forwarded: m.fwd_from.is_some(),
@@ -1150,23 +1151,19 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
 
 fn raw_message(message: tl::enums::Message) -> Option<RawMessage> {
     match message {
-        tl::enums::Message::Message(m) => {
-            let text = shown_text(
-                message_text(m.message, m.rich_message.as_ref()),
-                media_kind(m.media.as_ref()),
-            );
-            Some(RawMessage {
-                chat: chat_id(&m.peer_id),
-                id: m.id,
-                date: m.date,
-                text,
-            })
-        }
+        tl::enums::Message::Message(m) => Some(RawMessage {
+            chat: chat_id(&m.peer_id),
+            id: m.id,
+            date: m.date,
+            media: media::describe(m.media.as_ref()).map(|media| media.kind),
+            text: message_text(m.message, m.rich_message.as_ref()),
+        }),
         tl::enums::Message::Service(m) => Some(RawMessage {
             chat: chat_id(&m.peer_id),
             id: m.id,
             date: m.date,
             text: "[service message]".into(),
+            media: None,
         }),
         tl::enums::Message::Empty(_) => None,
     }
@@ -1184,39 +1181,6 @@ fn messages_filter(filter: Option<MediaFilter>) -> tl::enums::MessagesFilter {
         Some(MediaFilter::VideoNote) => F::InputMessagesFilterRoundVideo,
         Some(MediaFilter::Gif) => F::InputMessagesFilterGif,
     }
-}
-
-/// What a message carries besides text. Never looks at the media content.
-fn media_kind(media: Option<&tl::enums::MessageMedia>) -> Option<Media> {
-    use tl::enums::MessageMedia as M;
-    Some(match media? {
-        M::Empty => return None,
-        M::Photo(_) => Media::Photo,
-        M::Document(d) => match &d.document {
-            Some(tl::enums::Document::Document(doc)) => doc
-                .attributes
-                .iter()
-                .find_map(|a| match a {
-                    tl::enums::DocumentAttribute::Audio(a) if a.voice => Some(Media::Voice),
-                    tl::enums::DocumentAttribute::Audio(_) => Some(Media::Audio),
-                    tl::enums::DocumentAttribute::Video(v) if v.round_message => {
-                        Some(Media::VideoNote)
-                    }
-                    tl::enums::DocumentAttribute::Video(_) => Some(Media::Video),
-                    tl::enums::DocumentAttribute::Sticker(_) => Some(Media::Sticker),
-                    tl::enums::DocumentAttribute::Animated => Some(Media::Gif),
-                    _ => None,
-                })
-                .unwrap_or(Media::Document),
-            _ => Media::Document,
-        },
-        M::Geo(_) | M::GeoLive(_) | M::Venue(_) => Media::Location,
-        M::Contact(_) => Media::Contact,
-        M::Poll(_) => Media::Poll,
-        M::Dice(_) => Media::Dice,
-        M::Story(_) => Media::Story,
-        _ => Media::Other,
-    })
 }
 
 pub struct GrammersConnector {
@@ -1626,6 +1590,78 @@ mod tests {
         assert_eq!(raw_message(rich("")).unwrap().text, flat);
         let found = raw_found_message(rich("Подпись")).unwrap();
         assert_eq!(found.message.text, format!("Подпись\n\n{flat}"));
+    }
+
+    #[test]
+    fn media_is_described_beside_the_text_never_in_it() {
+        use crate::tg::{
+            media::fixtures::{audio, doc, doc_media, full_photo, photo_media},
+            messages::MediaKind,
+        };
+        let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 });
+        let with = |message: &str, media: Option<tl::enums::MessageMedia>| {
+            let tl::enums::Message::Message(mut m) = tl_message(30, channel.clone(), None) else {
+                unreachable!()
+            };
+            m.message = message.into();
+            m.media = media;
+            tl::enums::Message::Message(m)
+        };
+        let voice = || doc_media(Some(doc("audio/ogg", 23_211, vec![audio(true, 7)])));
+        let link_preview = || {
+            tl::enums::MessageMedia::WebPage(tl::types::MessageMediaWebPage {
+                force_large_media: false,
+                force_small_media: false,
+                manual: false,
+                safe: false,
+                webpage: tl::enums::WebPage::Pending(tl::types::WebPagePending {
+                    id: 1,
+                    url: Some("https://example.com".into()),
+                    date: 1,
+                }),
+            })
+        };
+        let cases = [
+            (
+                with("Кухня", Some(photo_media(Some(full_photo()), None))),
+                "Кухня",
+                Some(MediaKind::Photo),
+            ),
+            (with("", Some(voice())), "", Some(MediaKind::Voice)),
+            (
+                with("see https://example.com", Some(link_preview())),
+                "see https://example.com",
+                None,
+            ),
+            (
+                with("", Some(tl::enums::MessageMedia::Unsupported)),
+                "",
+                Some(MediaKind::Other),
+            ),
+            (with("plain", None), "plain", None),
+        ];
+        for (message, text, kind) in cases {
+            let history = raw_history_message(message.clone()).unwrap();
+            assert_eq!(
+                (
+                    history.text.as_str(),
+                    history.media.as_ref().map(|m| m.kind)
+                ),
+                (text, kind)
+            );
+            let preview = raw_message(message).unwrap();
+            assert_eq!((preview.text.as_str(), preview.media), (text, kind));
+        }
+        let history = raw_history_message(with("", Some(voice()))).unwrap();
+        let voice = history.media.unwrap();
+        assert_eq!(
+            (
+                voice.duration_s,
+                voice.size_bytes,
+                voice.mime_type.as_deref()
+            ),
+            (Some(7), Some(23_211), Some("audio/ogg"))
+        );
     }
 
     #[test]

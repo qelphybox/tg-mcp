@@ -14,7 +14,10 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::TgError;
+use super::{
+    TgError,
+    messages::{MediaKind, MediaSummary},
+};
 
 /// Which Chat: `user:<id>`, `chat:<id>` (basic group) or `channel:<id>` (channels
 /// and supergroups). The tools hand out and take [`ChatRef`]s, which add the
@@ -178,9 +181,13 @@ pub enum ChatKind {
 pub struct MessagePreview {
     /// UTC, RFC 3339.
     pub date: String,
-    /// The text, shortened; media and service messages as `[photo]`, `[voice]`, …;
-    /// text with nothing visible (only hidden characters) as `[no visible text]`.
+    /// The text or caption, shortened, possibly empty (`media` says what there
+    /// is); a service message as `[service message]`; text with nothing
+    /// visible (only hidden characters) as `[no visible text]`.
     pub text: String,
+    /// Only the kind; get_messages describes it in full. Absent without media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -284,7 +291,9 @@ pub struct RawMessage {
     pub id: i32,
     /// Unix seconds.
     pub date: i32,
+    /// The text or caption, empty if there is none.
     pub text: String,
+    pub media: Option<MediaKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +405,7 @@ pub fn assemble_page(
                 last_message: top.map(|m| MessagePreview {
                     date: rfc3339(m.date),
                     text: m.text.clone(),
+                    media: m.media.map(|kind| MediaSummary { kind }),
                 }),
             }
         })
@@ -490,6 +500,7 @@ mod tests {
             id: n as i32,
             date: n as i32,
             text: String::new(),
+            media: None,
         }
     }
 
@@ -674,18 +685,21 @@ mod tests {
                 id: 55,
                 date: 1,
                 text: "wrong one".into(),
+                media: None,
             },
             RawMessage {
                 chat: alice,
                 id: 55,
                 date: 1_700_000_000,
                 text: "hi".into(),
+                media: None,
             },
             RawMessage {
                 chat: team,
                 id: 900,
                 date: 1_700_000_100,
-                text: "[photo]".into(),
+                text: String::new(),
+                media: Some(MediaKind::Photo),
             },
         ];
 
@@ -703,13 +717,23 @@ mod tests {
         assert_eq!(page.chats[0].kind, ChatKind::Supergroup);
         assert!(page.chats[0].pinned);
         assert_eq!(page.chats[0].unread_count, 3);
-        assert_eq!(page.chats[0].last_message.as_ref().unwrap().text, "[photo]");
+        assert_eq!(
+            page.chats[0].last_message,
+            Some(MessagePreview {
+                date: "2023-11-14T22:15:00Z".into(),
+                text: String::new(),
+                media: Some(MediaSummary {
+                    kind: MediaKind::Photo
+                }),
+            })
+        );
         assert_eq!(page.chats[1].title, "Alice Smith");
         assert_eq!(
             page.chats[1].last_message,
             Some(MessagePreview {
                 date: "2023-11-14T22:13:20Z".into(),
-                text: "hi".into()
+                text: "hi".into(),
+                media: None,
             })
         );
     }
@@ -730,6 +754,7 @@ mod tests {
             id: 77,
             date: 1_600_000_000,
             text: "x".into(),
+            media: None,
         }];
 
         let page = assemble_page(&dialogs, &peers, &messages, 1, true, ARCHIVE_FIRST);
@@ -763,6 +788,7 @@ mod tests {
             id: 55,
             date: 1,
             text: "someone else's message".into(),
+            media: None,
         }];
         let page = assemble_page(&dialogs, &[], &messages, 100, false, MAIN_FIRST);
         assert_eq!(page.chats[0].last_message, None);

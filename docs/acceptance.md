@@ -137,7 +137,7 @@ Then in Claude Code ask for `list_chats`, `get_messages` of that group and `get_
    python3 -c 'print("\u2063\u200b\u3164", end="")' | pbcopy
    ```
 
-   `get_messages` with `limit: 3` shows `[no visible text]`, `[photo]` (the media marker wins over the empty caption) and `👀️ H E S O Y A M` / `second line ✖︎ 1️⃣` on two lines; the `list_chats` preview of the group is `[no visible text]`, and a search for `second` gives that message's snippet on one line. Code-point check, as in step 3: `claude -p 'Call get_messages for <the group id> with limit 3 and print only the text field of the oldest message verbatim' | python3 -c 'import sys; t = sys.stdin.read(); print(t.count("\ufe0f"), [hex(ord(c)) for c in t if ord(c) in (0x34f, 0x115f, 0x1160, 0x2028, 0x2029, 0x3164, 0xffa0)])'` prints `2 []`: one selector after 👀, one in the keycap.
+   `get_messages` with `limit: 3` shows `[no visible text]`, an empty text with `media.kind: "photo"` (a caption with nothing visible is no text) and `👀️ H E S O Y A M` / `second line ✖︎ 1️⃣` on two lines; the `list_chats` preview of the group is `[no visible text]`, and a search for `second` gives that message's snippet on one line. Code-point check, as in step 3: `claude -p 'Call get_messages for <the group id> with limit 3 and print only the text field of the oldest message verbatim' | python3 -c 'import sys; t = sys.stdin.read(); print(t.count("\ufe0f"), [hex(ord(c)) for c in t if ord(c) in (0x34f, 0x115f, 0x1160, 0x2028, 0x2029, 0x3164, 0xffa0)])'` prints `2 []`: one selector after 👀, one in the keycap.
 
 If Telegram itself already drops a character from a title or name, that field's check is moot; the message text keeps everything Telegram accepts.
 
@@ -234,7 +234,7 @@ Needs an account with a few hundred messages in several chats and at least one a
 5. Step 5 (manual calibration, record the numbers in the PR or issue): how far Telegram's morphology goes for Russian. If `деплоя` finds the `деплой` messages too, the tool description's advice ("try other word forms") is a fallback, not a necessity.
 6. Step 6: all hits are the account's own (`outgoing: true`, no `sender`): `from: "me"` is `inputPeerSelf`.
 7. Step 7: no chat id is in both answers; the `archived=true` ones are archived chats in the app (spot-check one).
-8. Step 8 (manual calibration): either photo hits across chats with `"media": "photo"` and empty snippets for captionless ones, or `invalid_params` "Telegram refuses an empty query for this search …" (`SEARCH_QUERY_EMPTY`). Note which one: it decides whether the description may promise empty queries with `media` across all chats.
+8. Step 8 (manual calibration): either photo hits across chats with `"media": { "kind": "photo" }` and empty snippets for captionless ones, or `invalid_params` "Telegram refuses an empty query for this search …" (`SEARCH_QUERY_EMPTY`). Note which one: it decides whether the description may promise empty queries with `media` across all chats.
 9. Step 9: `from only works within one chat …` and `chat_type only applies to a search across all chats …`, both `invalid_params`.
 
 `kamal app logs | grep -F 'спасибо'` (and `деплой`) finds nothing: query text is never logged.
@@ -305,3 +305,20 @@ Some channels post Rich messages: the Telegram app shows a table, collapsible se
 2. The hit for `P` is there and its snippet holds the word, on one line. If the channel's latest post is a rich one, its `list_chats` preview is its first line(s), not empty.
 
 `kamal app logs | grep -F 'Кондиционеры'` finds nothing: message text is never logged.
+
+## 18. Every message says what media it carries, and text is only text or caption
+
+Needs a chat (Saved Messages will do) whose latest messages include a photo with a caption, a photo without one, a voice message, a video message (round), a GIF, a sticker, a file (a PDF, say) and a message with a link that shows a preview; send the missing ones yourself. In Claude Code, with the server added as in §1, replace the `<…>` and run:
+
+```text
+Через Telegram MCP: get_messages для <id чата> с limit=20. Для каждого сообщения выведи только id, длину text (число символов) и поле media целиком (JSON как есть; если media нет, напиши «нет»). Текст сообщений не выводи, кроме одного: для сообщения со ссылкой выведи, есть ли в его text «http» (да/нет). Потом list_chats с limit=30: для этого чата выведи last_message.media и длину last_message.text. Потом search_messages с chat_id=<id чата>, media="voice", limit=3: выведи у хитов id, длину snippet и media. Проверь: встречается ли где-нибудь в ответах строка вида [photo], [voice], [video message], [file], [gif], [sticker] или [media]?
+```
+
+1. The photo with a caption has `text` = the caption (non-zero length) and `media.kind: "photo"` with `width`, `height`, `size_bytes`; the photo without one has an empty `text` and the same kind of `media`.
+2. The voice message: empty `text`, `media` = `kind: "voice"`, `duration_s` (matches the app, ±1 s), `size_bytes`, `mime_type: "audio/ogg"`. The round video: `kind: "video_note"` with `duration_s`, `width` = `height`. The GIF: `kind: "gif"` (not `video`), with `mime_type: "video/mp4"`. The sticker: `kind: "sticker"` (also for an animated or video sticker). The PDF: `kind: "document"` with the `file_name` the app shows, `mime_type: "application/pdf"`, `size_bytes` matching the app.
+3. The message with a link has `text` with `http` and no `media`: a link preview is not media.
+4. No `media` object has anything but `kind`, `duration_s`, `size_bytes`, `mime_type`, `file_name`, `width`, `height`: no ids, hashes or file references.
+5. The `list_chats` preview of the chat has `media` = `{ "kind": … }` only, matching its latest message; search hits have `media` = `{ "kind": "voice" }` and nothing more.
+6. None of the old placeholders (`[photo]`, `[voice]`, `[video message]`, `[file]`, …) appears anywhere. (`[10 photos]`-style lines inside a Rich message, §17, are its content and stay.)
+
+`kamal app logs | grep -F '<the PDF's file name>'` finds nothing: file names are content and never logged.

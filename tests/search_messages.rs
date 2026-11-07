@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary},
     fake::{FakeData, fake_issued_id},
-    messages::{Media, RawHistoryMessage},
+    messages::{Media, MediaKind, RawHistoryMessage},
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
@@ -68,9 +68,16 @@ fn mine(m: RawHistoryMessage) -> RawHistoryMessage {
     RawHistoryMessage { out: true, ..m }
 }
 
-fn with_media(media: Media, m: RawHistoryMessage) -> RawHistoryMessage {
+/// Media with what Telegram tells about it besides the kind, which hits leave
+/// to get_messages.
+fn with_media(kind: MediaKind, m: RawHistoryMessage) -> RawHistoryMessage {
     RawHistoryMessage {
-        media: Some(media),
+        media: Some(Media {
+            size_bytes: Some(70_000),
+            width: Some(800),
+            height: Some(600),
+            ..Media::from(kind)
+        }),
         ..m
     }
 }
@@ -92,8 +99,8 @@ fn data() -> FakeData {
                 message(1, 1, "Deploy is planned for Friday"),
                 mine(message(2, 5, "ok, deploying then")),
                 message(3, 9, "lunch?"),
-                with_media(Media::Photo, message(4, 30, "")),
-                with_media(Media::Photo, message(5, 31, "the deploy dashboard")),
+                with_media(MediaKind::Photo, message(4, 30, "")),
+                with_media(MediaKind::Photo, message(5, 31, "the deploy dashboard")),
             ],
         )
         .with_messages(BOB, vec![message(1, 2, "did the deploy go out?")])
@@ -101,7 +108,7 @@ fn data() -> FakeData {
             NEWS,
             vec![
                 message(1, 3, "Release notes: https://example.com/deploy"),
-                with_media(Media::Video, message(2, 40, "deploy walkthrough")),
+                with_media(MediaKind::Video, message(2, 40, "deploy walkthrough")),
             ],
         )
         .with_messages(
@@ -111,7 +118,7 @@ fn data() -> FakeData {
                 mine(message(2, 6, "deploy done")),
                 from(BOB, message(3, 7, "redeploy please")),
                 from(BOB, message(4, 8, "Deploy again tomorrow")),
-                with_media(Media::Voice, from(ALICE, message(5, 50, ""))),
+                with_media(MediaKind::Voice, from(ALICE, message(5, 50, ""))),
                 from(ChatId::Channel(999), message(6, 51, "deploy as a channel")),
             ],
         )
@@ -236,8 +243,8 @@ async fn a_global_search_finds_every_chat_newest_first() {
     // Our own message: no sender, outgoing.
     assert_eq!(hits(&page)[6]["outgoing"], true);
     assert_eq!(hits(&page)[6].get("sender"), None);
-    // A photo with a caption: the caption, and the marker.
-    assert_eq!(hits(&page)[2]["media"], "photo");
+    // A photo with a caption: the caption, and only the kind of media.
+    assert_eq!(hits(&page)[2]["media"], json!({ "kind": "photo" }));
     assert_eq!(hits(&page)[2]["snippet"], "the deploy dashboard");
     // A chat Telegram didn't describe: no hash is invented, the id still works.
     assert_eq!(hits(&page)[3]["chat"]["title"], "Unknown chat");
@@ -423,7 +430,7 @@ async fn media_and_dates_narrow_both_kinds_of_search() {
     let page = search(&client, json!({ "media": "photo" })).await.unwrap();
     assert_eq!(keys(&page), [hit(ALICE, 5), hit(ALICE, 4)]);
     assert_eq!(hits(&page)[1]["snippet"], "");
-    assert_eq!(hits(&page)[1]["media"], "photo");
+    assert_eq!(hits(&page)[1]["media"], json!({ "kind": "photo" }));
     let page = search(
         &client,
         json!({ "media": "voice", "chat_id": fake_issued_id(TEAM) }),
@@ -607,7 +614,7 @@ async fn snippets_are_centred_on_the_match_and_hits_stay_small() {
             (1..=50)
                 .map(|i| from(ALICE, message(i, i, &long)))
                 .chain([with_media(
-                    Media::Photo,
+                    MediaKind::Photo,
                     message(51, 0, &format!("{} deploy", "c ".repeat(300))),
                 )])
                 .collect(),

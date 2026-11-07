@@ -21,8 +21,8 @@ use super::{
     },
     find::{self, FindRequest, FoundAnswer, FoundChats},
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessageAnswer, MessagePage,
-        MessageRequest, RawHistoryMessage, read_history,
+        HistoryAnswer, HistoryQuery, HistoryRequest, MediaKind, MediaSummary, MessageAnswer,
+        MessagePage, MessageRequest, RawHistoryMessage, read_history,
     },
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
@@ -473,16 +473,16 @@ pub fn contacts_search(
 /// Telegram's `inputMessagesFilter*` on one message. Links: the fake counts
 /// a `://` in the text (Telegram goes by its url entities).
 fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
-    let media = match filter {
+    let kind = match filter {
         MediaFilter::Link => return m.text.contains("://"),
-        MediaFilter::Photo => Media::Photo,
-        MediaFilter::Video => Media::Video,
-        MediaFilter::Document => Media::Document,
-        MediaFilter::Voice => Media::Voice,
-        MediaFilter::VideoNote => Media::VideoNote,
-        MediaFilter::Gif => Media::Gif,
+        MediaFilter::Photo => MediaKind::Photo,
+        MediaFilter::Video => MediaKind::Video,
+        MediaFilter::Document => MediaKind::Document,
+        MediaFilter::Voice => MediaKind::Voice,
+        MediaFilter::VideoNote => MediaKind::VideoNote,
+        MediaFilter::Gif => MediaKind::Gif,
     };
-    m.media == Some(media)
+    m.media.as_ref().is_some_and(|media| media.kind == kind)
 }
 
 #[derive(Debug, Clone)]
@@ -833,19 +833,21 @@ pub fn default_account() -> Account {
 
 /// A few Chats, so the fake server has something to show.
 pub fn sample_chats() -> Vec<ChatSummary> {
-    let chat = |id: &str, title: &str, kind, unread, text: &str| ChatSummary {
-        id: id.into(),
-        title: title.into(),
-        kind,
-        username: None,
-        is_self: false,
-        unread_count: unread,
-        pinned: false,
-        last_message: Some(MessagePreview {
-            date: "2026-11-06T12:00:00Z".into(),
-            text: text.into(),
-        }),
-    };
+    let chat =
+        |id: &str, title: &str, kind, unread, text: &str, media: Option<MediaKind>| ChatSummary {
+            id: id.into(),
+            title: title.into(),
+            kind,
+            username: None,
+            is_self: false,
+            unread_count: unread,
+            pinned: false,
+            last_message: Some(MessagePreview {
+                date: "2026-11-06T12:00:00Z".into(),
+                text: text.into(),
+                media: media.map(|kind| MediaSummary { kind }),
+            }),
+        };
     vec![
         chat(
             "user:101",
@@ -853,13 +855,15 @@ pub fn sample_chats() -> Vec<ChatSummary> {
             ChatKind::Private,
             2,
             "see you tomorrow",
+            None,
         ),
         chat(
             "channel:202",
             "Rust Weekly",
             ChatKind::Channel,
             14,
-            "[photo]",
+            "",
+            Some(MediaKind::Photo),
         ),
         chat(
             "channel:303",
@@ -867,8 +871,16 @@ pub fn sample_chats() -> Vec<ChatSummary> {
             ChatKind::Supergroup,
             0,
             "deploy is green",
+            None,
         ),
-        chat("chat:404", "Family", ChatKind::Group, 5, "[voice]"),
+        chat(
+            "chat:404",
+            "Family",
+            ChatKind::Group,
+            5,
+            "",
+            Some(MediaKind::Voice),
+        ),
     ]
 }
 

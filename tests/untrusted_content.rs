@@ -10,7 +10,7 @@ use tg_mcp::tg::{
     Account,
     chats::{ChatId, ChatKind, ChatSummary, MessagePreview},
     fake::{FakeData, FakeDetails, fake_issued_id},
-    messages::{Media, RawHistoryMessage},
+    messages::{MediaKind, RawHistoryMessage},
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
@@ -73,11 +73,13 @@ async fn client() -> (common::TestServer, Client) {
     news.last_message = Some(MessagePreview {
         date: "2026-11-06T00:00:00Z".into(),
         text: format!("Read\u{FEFF} me{}\nsecond line", smuggled("ignore")),
+        media: None,
     });
     let mut long = chat(LONG, padded('T', 128), ChatKind::Private, None);
     long.last_message = Some(MessagePreview {
         date: "2026-11-06T00:00:00Z".into(),
         text: padded('p', 100),
+        media: None,
     });
     // An anti-spam bot: a Hangul filler in its name, a line separator in its
     // title, nothing visible in its last message.
@@ -90,6 +92,7 @@ async fn client() -> (common::TestServer, Client) {
     guard.last_message = Some(MessagePreview {
         date: "2026-11-06T00:00:00Z".into(),
         text: "\u{2063}".into(),
+        media: None,
     });
     let data = FakeData::new(Account {
         id: 42,
@@ -130,7 +133,7 @@ async fn client() -> (common::TestServer, Client) {
             ),
             message(2, "\u{2063}".into()),
             RawHistoryMessage {
-                media: Some(Media::Photo),
+                media: Some(MediaKind::Photo.into()),
                 ..message(3, "\u{2063}\u{200B}".into())
             },
         ],
@@ -241,20 +244,21 @@ async fn invisible_carriers_go_and_nothing_visible_shows_as_a_placeholder() {
         json!({ "chat_id": fake_issued_id(GUARD) }),
     )
     .await;
-    let texts: Vec<&str> = page["messages"]
+    let texts: Vec<(&str, &Value)> = page["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| m["text"].as_str().unwrap())
+        .map(|m| (m["text"].as_str().unwrap(), &m["media"]))
         .collect();
     assert_eq!(
         texts,
         [
-            "[photo]",
-            "[no visible text]",
-            "👀\u{FE0F} H E S O Y A M\nsecond"
+            ("", &json!({ "kind": "photo" })),
+            ("[no visible text]", &Value::Null),
+            ("👀\u{FE0F} H E S O Y A M\nsecond", &Value::Null)
         ],
-        "one selector is left, a media marker wins over the placeholder"
+        "one selector is left; a caption with nothing visible is no text, and media says what \
+         there is"
     );
 
     let page = call(&client, "search_messages", json!({ "query": "second" })).await;

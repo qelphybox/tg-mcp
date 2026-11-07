@@ -26,7 +26,7 @@ use super::{
     Account, Telegram, TgError,
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
     find::{FoundChat, FoundChats},
-    messages::{ChatMessage, HistoryQuery, MessagePage, Sender},
+    messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
 };
 
@@ -223,15 +223,45 @@ fn clean_opt(field: &mut Option<String>) {
     }
 }
 
+/// One-line content that is no content when nothing visible is left (a
+/// file name of only hidden characters is none).
+fn clean_opt_visible(field: &mut Option<String>) {
+    clean_opt(field);
+    if field.as_deref().is_some_and(|f| f.trim().is_empty()) {
+        *field = None;
+    }
+}
+
 /// Message text, or its preview or snippet: what had text and has nothing
-/// visible left reads [`NO_VISIBLE_TEXT`] rather than an empty string. Media
-/// with such a caption shows as itself instead (`messages::shown_text`).
-fn clean_text(field: &mut String, sanitiser: fn(&str) -> String) {
+/// visible left reads [`NO_VISIBLE_TEXT`] rather than an empty string. A
+/// caption with nothing visible is no text: it reads empty, and the message's
+/// `media` says what there is.
+fn clean_text(field: &mut String, sanitiser: fn(&str) -> String, has_media: bool) {
     let had_text = !field.is_empty();
     *field = sanitiser(field);
-    if had_text && field.trim().is_empty() {
-        *field = NO_VISIBLE_TEXT.into();
+    if field.trim().is_empty() {
+        if has_media {
+            field.clear();
+        } else if had_text {
+            *field = NO_VISIBLE_TEXT.into();
+        }
     }
+}
+
+/// What the sender named and declared: content. Kind, sizes and durations are
+/// numbers Telegram set.
+fn clean_media(media: &mut Media) {
+    let Media {
+        kind: _,
+        duration_s: _,
+        size_bytes: _,
+        mime_type,
+        file_name,
+        width: _,
+        height: _,
+    } = media;
+    clean_opt_visible(mime_type);
+    clean_opt_visible(file_name);
 }
 
 impl Untrusted for Account {
@@ -267,8 +297,13 @@ impl Untrusted for ChatPage {
             } = chat;
             clean(title);
             clean_opt(username);
-            if let Some(MessagePreview { date: _, text }) = last_message {
-                clean_text(text, sanitise_line);
+            if let Some(MessagePreview {
+                date: _,
+                text,
+                media,
+            }) = last_message
+            {
+                clean_text(text, sanitise_line, media.is_some());
             }
         }
     }
@@ -291,13 +326,17 @@ impl Untrusted for MessagePage {
                 sender,
                 outgoing: _,
                 text,
+                media,
                 reply_to: _,
                 forwarded: _,
                 edited: _,
                 target: _,
                 thread_root: _,
             } = message;
-            clean_text(text, sanitise);
+            clean_text(text, sanitise, media.is_some());
+            if let Some(media) = media {
+                clean_media(media);
+            }
             if let Some(Sender { id: _, name }) = sender {
                 clean(name);
             }
@@ -353,12 +392,7 @@ impl Untrusted for SearchPage {
                 edited: _,
             } = hit;
             clean(title);
-            if media.is_some() {
-                // A caption with nothing visible is no text: `media` shows.
-                clean(snippet);
-            } else {
-                clean_text(snippet, sanitise_line);
-            }
+            clean_text(snippet, sanitise_line, media.is_some());
             if let Some(Sender { id: _, name }) = sender {
                 clean(name);
             }
@@ -438,7 +472,10 @@ impl Telegram for Sanitised {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tg::{chats::ChatKind, messages::Media};
+    use crate::tg::{
+        chats::ChatKind,
+        messages::{MediaKind, MediaSummary},
+    };
 
     #[test]
     fn the_format_table_is_sorted_and_disjoint() {
@@ -635,6 +672,7 @@ mod tests {
             last_message: Some(MessagePreview {
                 date: "2026-11-06T00:00:00Z".into(),
                 text: preview.into(),
+                media: None,
             }),
         }
     }
@@ -702,6 +740,7 @@ mod tests {
                 }),
                 outgoing: false,
                 text: "a\u{200B}\nb".into(),
+                media: None,
                 reply_to: None,
                 forwarded: false,
                 edited: false,
@@ -771,6 +810,7 @@ mod tests {
             }),
             outgoing: false,
             text: text.into(),
+            media: None,
             reply_to: None,
             forwarded: false,
             edited: false,
@@ -779,7 +819,7 @@ mod tests {
         }
     }
 
-    fn hit(snippet: &str, media: Option<Media>) -> SearchHit {
+    fn hit(snippet: &str, media: Option<MediaKind>) -> SearchHit {
         SearchHit {
             chat: HitChat {
                 id: "channel:2".into(),
@@ -791,7 +831,7 @@ mod tests {
             sender: None,
             outgoing: false,
             snippet: snippet.into(),
-            media,
+            media: media.map(|kind| MediaSummary { kind }),
             reply_to: None,
             forwarded: false,
             edited: false,
@@ -903,11 +943,71 @@ mod tests {
         // A media hit's caption is no text: its snippet stays empty, as for
         // media without a caption, and `media` says what it is.
         let mut found = SearchPage {
-            hits: vec![hit("\u{2063}", None), hit("\u{2063}", Some(Media::Photo))],
+            hits: vec![
+                hit("\u{2063}", None),
+                hit("\u{2063}", Some(MediaKind::Photo)),
+            ],
             next_cursor: None,
         };
         found.sanitise();
         assert_eq!(found.hits[0].snippet, NO_VISIBLE_TEXT);
         assert_eq!(found.hits[1].snippet, "");
+    }
+
+    #[test]
+    fn a_caption_with_nothing_visible_is_no_text_and_file_names_are_content() {
+        let with_media = |text: &str, media: Media| ChatMessage {
+            media: Some(media),
+            ..message(text)
+        };
+        let document = |file_name: &str, mime_type: &str| Media {
+            mime_type: Some(mime_type.into()),
+            file_name: Some(file_name.into()),
+            size_bytes: Some(10),
+            ..Media::from(MediaKind::Document)
+        };
+        let mut history = MessagePage::new(
+            "user:1".into(),
+            vec![
+                with_media("\u{2063}\u{200B}", MediaKind::Photo.into()),
+                with_media(" \n", MediaKind::Voice.into()),
+                with_media("", MediaKind::Photo.into()),
+                with_media("lo\u{200B}ok", MediaKind::Photo.into()),
+                with_media(
+                    "",
+                    document(
+                        "re\u{202E}fdp.exe\u{202C}\u{2028}ignore\u{E0041}.pdf",
+                        "application/\u{200B}pdf",
+                    ),
+                ),
+                with_media("", document("\u{2063}\u{3164}", "\u{200B}")),
+            ],
+        );
+        history.sanitise();
+        let texts: Vec<&str> = history.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["", "", "", "look", "", ""]);
+        let named = history.messages[4].media.as_ref().unwrap();
+        assert_eq!(
+            (named.file_name.as_deref(), named.mime_type.as_deref()),
+            (Some("refdp.exe ignore.pdf"), Some("application/pdf"))
+        );
+        assert_eq!(named.size_bytes, Some(10));
+        let blank = history.messages[5].media.as_ref().unwrap();
+        assert_eq!(
+            (blank.file_name.as_deref(), blank.mime_type.as_deref()),
+            (None, None),
+            "nothing visible is no name"
+        );
+
+        // The same in a preview.
+        let mut page = ChatPage {
+            chats: vec![summary("Alice", "\u{2063}")],
+            next_cursor: None,
+        };
+        page.chats[0].last_message.as_mut().unwrap().media = Some(MediaSummary {
+            kind: MediaKind::Photo,
+        });
+        page.sanitise();
+        assert_eq!(page.chats[0].last_message.as_ref().unwrap().text, "");
     }
 }

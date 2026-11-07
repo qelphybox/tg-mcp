@@ -114,6 +114,7 @@ async fn client() -> (common::TestServer, Client) {
         last_message: Some(MessagePreview {
             date: "2026-11-06T00:00:02Z".into(),
             text: message_text(String::new(), Some(&rich_listing())),
+            media: None,
         }),
     }])
     .with_messages(

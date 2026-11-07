@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind},
-    messages::{Issuer, KnownHashes, Media, RawHistoryMessage, Sender},
+    messages::{Issuer, KnownHashes, Media, MediaSummary, RawHistoryMessage, Sender},
 };
 
 /// Which kind of Chats a search across all of them looks in.
@@ -113,11 +113,12 @@ pub struct SearchHit {
     pub outgoing: bool,
     /// Up to 300 characters of the text around the first word that matches the
     /// query (the start of the text if none matches literally); empty for media
-    /// without text, `[no visible text]` for text with nothing visible.
+    /// without a caption, `[no visible text]` for text with nothing visible.
     pub snippet: String,
-    /// What the message carries besides text.
+    /// Only the kind of media the message carries; get_messages describes it
+    /// in full. Absent without media.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media: Option<Media>,
+    pub media: Option<MediaSummary>,
     /// Id of the message this one replies to, in the same chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i32>,
@@ -339,7 +340,7 @@ fn assemble(
                 sender: message.sender,
                 outgoing: message.outgoing,
                 snippet: found.message.text.clone(),
-                media: found.message.media,
+                media: message.media.as_ref().map(Media::summary),
                 reply_to: message.reply_to,
                 forwarded: message.forwarded,
                 edited: message.edited,

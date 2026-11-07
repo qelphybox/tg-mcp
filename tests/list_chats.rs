@@ -22,6 +22,7 @@ fn chat(n: usize) -> ChatSummary {
         last_message: Some(MessagePreview {
             date: "2026-11-06T12:00:00Z".into(),
             text: format!("hello {n}"),
+            media: None,
         }),
     }
 }
