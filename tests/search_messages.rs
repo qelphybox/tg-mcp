@@ -54,6 +54,8 @@ fn message(id: i32, minute: i32, text: &str) -> RawHistoryMessage {
         forwarded: false,
         forwarded_from: None,
         edited: false,
+        reactions: Vec::new(),
+        pinned: false,
     }
 }
 
@@ -238,6 +240,7 @@ async fn a_global_search_finds_every_chat_newest_first() {
             "date": "2026-11-06T00:08:00Z",
             "sender": { "id": fake_issued_id(BOB), "name": "Bob" },
             "snippet": "Deploy again tomorrow",
+            "link": "https://t.me/c/303/4",
         })
     );
     // Our own message: no sender, outgoing.

@@ -93,6 +93,8 @@ fn post(id: i32, rich: &tl::enums::RichMessage) -> RawHistoryMessage {
         forwarded: false,
         forwarded_from: None,
         edited: false,
+        reactions: Vec::new(),
+        pinned: false,
     }
 }
 

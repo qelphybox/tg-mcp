@@ -8,7 +8,7 @@
 //! side and where a reply chain ends are decided here. The fake answers the
 //! same requests with a model of Telegram.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,8 @@ use super::{
 
 /// What to fetch. Messages come newest first. At most one of `before_id`,
 /// `around_id`, `after_id` and `thread_of` is set, and `since`/`until` only go
-/// with `before_id` (or none of them).
+/// with `before_id` (or none of them). `pinned_only` goes with `before_id`
+/// alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HistoryQuery {
     pub limit: usize,
@@ -38,6 +39,9 @@ pub struct HistoryQuery {
     /// The reply chain of this message: it, the message it replies to, that
     /// one's parent, …, at most `limit` messages in all.
     pub thread_of: Option<i32>,
+    /// Only the Chat's pinned messages (Telegram's search with the pinned
+    /// filter), paged with `before_id`.
+    pub pinned_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -73,6 +77,16 @@ pub struct ChatMessage {
     pub forwarded: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub edited: bool,
+    /// Absent when the message has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Reactions>,
+    /// Opens the message in Telegram ([`message_link`]); absent in private
+    /// chats and basic groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub link: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     /// The message an `around_id` window or a `thread_of` chain was asked for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub target: bool,
@@ -210,6 +224,103 @@ pub struct MediaSummary {
     pub kind: MediaKind,
 }
 
+/// At most this many emoji in a message's [`Reactions`], the most chosen
+/// ones; Telegram allows far fewer distinct reactions on one message.
+pub const MAX_REACTION_EMOJI: usize = 20;
+/// The longest emoji a [`Reactions`] key may be, in characters (a ZWJ
+/// sequence is several).
+const MAX_EMOJI_CHARS: usize = 16;
+
+/// A message's reactions, as Telegram counts them on the message: each
+/// standard emoji with how many chose it, all custom emoji summed under
+/// `custom`, Telegram Stars under `paid`. Who reacted, and whether the
+/// Account did, is not kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(extend("maxProperties" = MAX_REACTION_EMOJI + 2))]
+pub struct Reactions(pub BTreeMap<String, u32>);
+
+impl Reactions {
+    /// Telegram's counts summed per key; `None` when nothing counts. Of the
+    /// standard emoji only the [`MAX_REACTION_EMOJI`] most chosen are kept,
+    /// and only keys that look like an emoji (never `custom` or `paid`).
+    pub fn count(raw: &[RawReaction]) -> Option<Self> {
+        let mut emoji: Vec<(&str, u32)> = Vec::new();
+        let (mut custom, mut paid) = (0u32, 0u32);
+        for RawReaction { reaction, count } in raw {
+            let Ok(count) = u32::try_from(*count) else {
+                continue;
+            };
+            match reaction {
+                Reaction::Emoji(e) if is_emoji(e) => {
+                    match emoji.iter_mut().find(|(seen, _)| seen == e) {
+                        Some((_, total)) => *total = total.saturating_add(count),
+                        None => emoji.push((e, count)),
+                    }
+                }
+                Reaction::Emoji(_) => {}
+                Reaction::Custom => custom = custom.saturating_add(count),
+                Reaction::Paid => paid = paid.saturating_add(count),
+            }
+        }
+        // Stable: equal counts keep Telegram's order.
+        emoji.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        let counts: BTreeMap<String, u32> = emoji
+            .into_iter()
+            .take(MAX_REACTION_EMOJI)
+            .map(|(e, count)| (e.to_string(), count))
+            .chain([("custom".to_string(), custom), ("paid".to_string(), paid)])
+            .filter(|&(_, count)| count > 0)
+            .collect();
+        (!counts.is_empty()).then_some(Self(counts))
+    }
+}
+
+/// An emoji as Telegram names a standard reaction: a few characters, none of
+/// them ASCII or control characters.
+fn is_emoji(s: &str) -> bool {
+    (1..=MAX_EMOJI_CHARS).contains(&s.chars().count())
+        && s.chars().all(|c| !c.is_ascii() && !c.is_control())
+}
+
+/// What one reaction on a message is (`reactionCount.reaction`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reaction {
+    /// A standard emoji (`reactionEmoji`).
+    Emoji(String),
+    /// A custom emoji (`reactionCustomEmoji`); which one is not kept.
+    Custom,
+    /// Telegram Stars (`reactionPaid`).
+    Paid,
+}
+
+/// How many chose one reaction on a message (`reactionCount`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawReaction {
+    pub reaction: Reaction,
+    pub count: i32,
+}
+
+/// Where message `id` of `chat` opens in Telegram, computed without asking
+/// Telegram (no `exportMessageLink`): in a channel or supergroup with a
+/// public @username `https://t.me/<username>/<id>`, in one without
+/// `https://t.me/c/<channel id>/<id>` (for its members). Private chats and
+/// basic groups have no message links.
+pub fn message_link(chat: ChatId, username: Option<&str>, id: i32) -> Option<String> {
+    let ChatId::Channel(channel) = chat else {
+        return None;
+    };
+    // Telegram's usernames are at most 32 letters, digits and underscores.
+    let public = username.filter(|u| {
+        (1..=32).contains(&u.len()) && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    });
+    Some(match public {
+        Some(username) => format!("https://t.me/{username}/{id}"),
+        None => format!("https://t.me/c/{channel}/{id}"),
+    })
+}
+
 /// One message as extracted from TL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawHistoryMessage {
@@ -242,6 +353,11 @@ pub struct RawHistoryMessage {
     pub forwarded_from: Option<ChatId>,
     #[serde(default)]
     pub edited: bool,
+    /// `reactions.results`, as Telegram counts them on the message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<RawReaction>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// A message by its Chat and id.
@@ -270,6 +386,9 @@ pub struct HistoryRequest {
     pub max_id: i32,
     /// Only ids strictly above it.
     pub min_id: i32,
+    /// Only pinned messages: `messages.search` with the pinned filter and the
+    /// same offsets instead (it has no `offset_date`, which stays 0).
+    pub pinned: bool,
 }
 
 /// What Telegram answered to one [`HistoryRequest`].
@@ -326,6 +445,14 @@ where
         .filter(|&l| l >= 1)
         .ok_or_else(|| TgError::InvalidInput("limit is out of range".into()))?;
     let dated = query.since.is_some() || query.until.is_some();
+    let anchored =
+        query.around_id.is_some() || query.after_id.is_some() || query.thread_of.is_some();
+    if query.pinned_only && (anchored || dated) {
+        return Err(TgError::InvalidInput(
+            "pinned_only doesn't combine with around_id, after_id, thread_of, since or until"
+                .into(),
+        ));
+    }
     if let Some(start) = query.thread_of {
         let positioned =
             query.before_id.is_some() || query.around_id.is_some() || query.after_id.is_some();
@@ -340,6 +467,7 @@ where
     match (query.before_id, query.around_id, query.after_id) {
         (_, None, None) => {
             let answer = get_history(HistoryRequest {
+                pinned: query.pinned_only,
                 offset_id: query.before_id.unwrap_or(0),
                 // getHistory returns messages strictly before offset_date.
                 offset_date: query
@@ -681,6 +809,13 @@ impl<'a> Issuer<'a> {
             reply_to: m.reply_to,
             forwarded: m.forwarded,
             edited: m.edited,
+            reactions: Reactions::count(&m.reactions),
+            link: message_link(
+                chat.chat(),
+                self.peer(chat.chat()).and_then(|p| p.username.as_deref()),
+                m.id,
+            ),
+            pinned: m.pinned,
             target: false,
             thread_root: false,
         }
@@ -772,6 +907,8 @@ mod tests {
             forwarded: false,
             forwarded_from: None,
             edited: false,
+            reactions: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -1681,5 +1818,272 @@ mod tests {
             Some(1_793_923_200 + 86_399)
         );
         assert_eq!(parse_bound("yesterday", false), None);
+    }
+
+    fn reacted(reaction: Reaction, count: i32) -> RawReaction {
+        RawReaction { reaction, count }
+    }
+
+    fn emoji(e: &str, count: i32) -> RawReaction {
+        reacted(Reaction::Emoji(e.into()), count)
+    }
+
+    fn counts(pairs: &[(&str, u32)]) -> Option<Reactions> {
+        Some(Reactions(
+            pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
+        ))
+    }
+
+    #[test]
+    fn reactions_count_each_emoji_and_sum_custom_and_paid_ones() {
+        let raw = [
+            RawHistoryMessage {
+                reactions: vec![
+                    emoji("👍", 5),
+                    reacted(Reaction::Custom, 3),
+                    emoji("❤", 2),
+                    reacted(Reaction::Custom, 4),
+                    reacted(Reaction::Paid, 50),
+                    emoji("👨‍💻", 1),
+                ],
+                ..msg(2, 20)
+            },
+            msg(1, 10),
+        ];
+        let page = assemble_history(
+            ChatId::Channel(9).into(),
+            &raw,
+            &[],
+            &unknown,
+            &query(10),
+            false,
+        );
+        assert_eq!(
+            page.messages[0].reactions,
+            counts(&[("👍", 5), ("❤", 2), ("👨‍💻", 1), ("custom", 7), ("paid", 50)])
+        );
+        assert_eq!(page.messages[1].reactions, None);
+        let json = serde_json::to_value(&page.messages[0]).unwrap();
+        assert_eq!(
+            json["reactions"],
+            serde_json::json!({ "👍": 5, "❤": 2, "👨‍💻": 1, "custom": 7, "paid": 50 })
+        );
+        assert!(
+            serde_json::to_value(&page.messages[1])
+                .unwrap()
+                .get("reactions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reactions_keep_only_counted_emoji_and_at_most_twenty_of_them() {
+        // Nothing that counts: no reactions at all.
+        assert_eq!(
+            Reactions::count(&[emoji("👍", 0), reacted(Reaction::Paid, -1)]),
+            None
+        );
+        // Keys that aren't an emoji are never shown (they would read as
+        // `custom` or `paid`, or carry text).
+        assert_eq!(
+            Reactions::count(&[
+                emoji("custom", 9),
+                emoji("paid", 9),
+                emoji("", 9),
+                emoji("👍\n", 9),
+                emoji(&"🔥".repeat(17), 9),
+                emoji("👍", 1),
+                emoji("👍", 2),
+            ]),
+            counts(&[("👍", 3)])
+        );
+        // 25 emoji, the n-th chosen n times: the 20 most chosen stay.
+        let many: Vec<RawReaction> = (1..=25)
+            .map(|n| emoji(&char::from_u32(0x1F600 + n).unwrap().to_string(), n as i32))
+            .collect();
+        let kept = Reactions::count(&many).unwrap().0;
+        assert_eq!(kept.len(), MAX_REACTION_EMOJI);
+        assert_eq!(kept.values().min(), Some(&6));
+    }
+
+    #[test]
+    fn a_message_links_to_its_channel_by_username_or_by_id() {
+        let public = ChatId::Channel(1_001);
+        let private = ChatId::Channel(1_002);
+        let peers = [
+            RawPeer {
+                kind: ChatKind::Channel,
+                username: Some("rust_weekly".into()),
+                ..peer(public, "Rust Weekly")
+            },
+            RawPeer {
+                kind: ChatKind::Supergroup,
+                ..peer(private, "Team")
+            },
+            RawPeer {
+                kind: ChatKind::Group,
+                ..peer(ChatId::Chat(7), "Family")
+            },
+        ];
+        let link = |chat: ChatId| {
+            assemble_history(
+                chat.into(),
+                &[msg(42, 1)],
+                &peers,
+                &unknown,
+                &query(10),
+                false,
+            )
+            .messages[0]
+                .link
+                .clone()
+        };
+        assert_eq!(link(public).as_deref(), Some("https://t.me/rust_weekly/42"));
+        assert_eq!(link(private).as_deref(), Some("https://t.me/c/1002/42"));
+        // Telegram didn't describe the channel: members open it by its id.
+        assert_eq!(
+            link(ChatId::Channel(1_003)).as_deref(),
+            Some("https://t.me/c/1003/42")
+        );
+        assert_eq!(link(ChatId::User(5)), None);
+        assert_eq!(link(ChatId::Chat(7)), None);
+        // A username Telegram couldn't have issued is not put in a link.
+        assert_eq!(
+            message_link(public, Some("evil.com/x?"), 42).as_deref(),
+            Some("https://t.me/c/1001/42")
+        );
+    }
+
+    #[test]
+    fn a_pinned_message_says_so() {
+        let raw = [
+            RawHistoryMessage {
+                pinned: true,
+                ..msg(2, 20)
+            },
+            msg(1, 10),
+        ];
+        let page = assemble_history(
+            ChatId::User(1).into(),
+            &raw,
+            &[],
+            &unknown,
+            &query(10),
+            false,
+        );
+        let pinned: Vec<bool> = page.messages.iter().map(|m| m.pinned).collect();
+        assert_eq!(pinned, [true, false]);
+        let json = serde_json::to_value(&page.messages[1]).unwrap();
+        assert!(json.get("pinned").is_none(), "{json}");
+    }
+
+    /// Ids 1..=20, every third one pinned (3, 6, …, 18).
+    fn with_pins() -> Vec<RawHistoryMessage> {
+        (1..=20)
+            .map(|id| RawHistoryMessage {
+                pinned: id % 3 == 0,
+                ..msg(id, id)
+            })
+            .collect()
+    }
+
+    fn pinned_only(limit: usize, before_id: Option<i32>) -> HistoryQuery {
+        HistoryQuery {
+            pinned_only: true,
+            before_id,
+            ..query(limit)
+        }
+    }
+
+    /// Read `query` from `history`, with the requests it sent.
+    fn read_pinned(
+        history: &[RawHistoryMessage],
+        query: HistoryQuery,
+    ) -> (Result<MessagePage, TgError>, Vec<HistoryRequest>) {
+        let mut sent = Vec::new();
+        let page = futures_executor(read_history(
+            ChatId::Channel(9).into(),
+            &query,
+            &unknown,
+            |request| {
+                sent.push(request);
+                let messages = get_history(history, &request, PastNewest::Shorten);
+                std::future::ready(Ok(HistoryAnswer {
+                    returned: messages.len(),
+                    messages,
+                    peers: Vec::new(),
+                }))
+            },
+            |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
+                unreachable!("pinned messages are read by search")
+            },
+        ));
+        (page, sent)
+    }
+
+    #[test]
+    fn pinned_only_pages_through_the_pinned_messages_newest_first() {
+        let history = with_pins();
+        let (page, sent) = read_pinned(&history, pinned_only(4, None));
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [18, 15, 12, 9]);
+        assert!(page.messages.iter().all(|m| m.pinned));
+        assert_eq!(page.next_before_id, Some(9));
+        assert_eq!(
+            sent,
+            [HistoryRequest {
+                limit: 4,
+                pinned: true,
+                ..HistoryRequest::default()
+            }]
+        );
+
+        let (page, sent) = read_pinned(&history, pinned_only(4, Some(9)));
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [6, 3]);
+        assert_eq!(page.next_before_id, None);
+        assert_eq!(
+            sent,
+            [HistoryRequest {
+                offset_id: 9,
+                limit: 4,
+                pinned: true,
+                ..HistoryRequest::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn pinned_only_goes_with_before_id_alone() {
+        let history = with_pins();
+        for query in [
+            HistoryQuery {
+                around_id: Some(9),
+                ..pinned_only(4, None)
+            },
+            HistoryQuery {
+                after_id: Some(9),
+                ..pinned_only(4, None)
+            },
+            HistoryQuery {
+                thread_of: Some(9),
+                ..pinned_only(4, None)
+            },
+            HistoryQuery {
+                since: Some(1),
+                ..pinned_only(4, None)
+            },
+            HistoryQuery {
+                until: Some(1),
+                ..pinned_only(4, None)
+            },
+        ] {
+            let (page, sent) = read_pinned(&history, query);
+            assert!(
+                matches!(page, Err(TgError::InvalidInput(ref e)) if e.contains("pinned_only")),
+                "{query:?}: {page:?}"
+            );
+            assert!(sent.is_empty());
+        }
     }
 }

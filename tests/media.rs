@@ -71,6 +71,8 @@ fn message(id: i32, text: &str, media: Option<Media>) -> RawHistoryMessage {
         forwarded: false,
         forwarded_from: None,
         edited: false,
+        reactions: Vec::new(),
+        pinned: false,
     }
 }
 

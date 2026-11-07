@@ -94,6 +94,10 @@ _Avoid_: Instant View (that is a web page's preview), formatted message
 A short-lived URL that lets whoever holds it download the media of one message, without a Token.
 _Avoid_: download token, file URL
 
+**Message link**:
+A `https://t.me/…` URL that opens one message in the Telegram apps: `t.me/<username>/<id>` in a channel or supergroup with a public @username, `t.me/c/<channel id>/<id>` (members only) in one without. Computed by the server, never fetched; private chats and basic groups have none. Carries no credential, unlike a Media link.
+_Avoid_: permalink, share link
+
 **Album**:
 Messages sent together as one post (Telegram's `grouped_id`): up to 10 photos, videos or files with consecutive ids in one Chat. get_media `view` shows an album, not just the one message.
 _Avoid_: media group, gallery
