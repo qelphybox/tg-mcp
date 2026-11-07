@@ -26,6 +26,7 @@ use super::{
         MessageRequest, RawHistoryMessage, read_history, shown_text,
     },
     pool::{Evicted, Live, Pool},
+    rich::message_text,
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest,
@@ -958,7 +959,7 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 date: m.date,
                 from: m.from_id.as_ref().map(chat_id),
                 out: m.out,
-                text: m.message,
+                text: message_text(m.message, m.rich_message.as_ref()),
                 media: media_kind(m.media.as_ref()),
                 reply_to,
                 reply_elsewhere,
@@ -1152,7 +1153,10 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
 fn raw_message(message: tl::enums::Message) -> Option<RawMessage> {
     match message {
         tl::enums::Message::Message(m) => {
-            let text = shown_text(m.message, media_kind(m.media.as_ref()));
+            let text = shown_text(
+                message_text(m.message, m.rich_message.as_ref()),
+                media_kind(m.media.as_ref()),
+            );
             Some(RawMessage {
                 chat: chat_id(&m.peer_id),
                 id: m.id,
@@ -1557,6 +1561,27 @@ mod tests {
             peer_id: Some(channel(5)),
         });
         assert!(raw_found_message(empty).is_none());
+    }
+
+    #[test]
+    fn a_rich_message_is_read_as_its_flattened_text() {
+        use crate::tg::fake::rich_listing;
+        let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 });
+        let rich = |message: &str| {
+            let tl::enums::Message::Message(mut m) = tl_message(30, channel.clone(), None) else {
+                unreachable!()
+            };
+            m.message = message.into();
+            m.rich_message = Some(rich_listing());
+            tl::enums::Message::Message(m)
+        };
+        let flat = crate::tg::rich::flatten(&rich_listing());
+        assert!(flat.contains("Комнаты | 4"));
+        let history = raw_history_message(rich("")).unwrap();
+        assert_eq!(history.text, flat);
+        assert_eq!(raw_message(rich("")).unwrap().text, flat);
+        let found = raw_found_message(rich("Подпись")).unwrap();
+        assert_eq!(found.message.text, format!("Подпись\n\n{flat}"));
     }
 
     #[test]

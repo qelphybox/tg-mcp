@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use grammers_client::tl;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -804,6 +805,102 @@ pub fn sample_chats() -> Vec<ChatSummary> {
         ),
         chat("chat:404", "Family", ChatKind::Group, 5, "[voice]"),
     ]
+}
+
+/// A Rich message shaped like a real-estate channel's post (#50): a bold title,
+/// an address with a link, a paragraph, a collapsible "Параметры и удобства"
+/// section with a two-column table and a line, and a collapsible "Теги" section
+/// with an id and hashtags. Its `message.message` is empty. The "Кондиционеры"
+/// cell hides a zero-width space and the word "ignore" in tag characters, which
+/// the flattened text keeps for the sanitiser to strip.
+pub fn rich_listing() -> tl::enums::RichMessage {
+    use tl::{enums::PageBlock as B, enums::RichText as T, types};
+    let plain = |text: &str| T::TextPlain(types::TextPlain { text: text.into() });
+    let concat = |texts: Vec<T>| T::TextConcat(types::TextConcat { texts });
+    let bold = |text: T| T::TextBold(Box::new(types::TextBold { text }));
+    let paragraph = |text: T| B::Paragraph(types::PageBlockParagraph { text });
+    let hashtag = |tag: &str| T::TextHashtag(Box::new(types::TextHashtag { text: plain(tag) }));
+    let cell = |text: T| {
+        tl::enums::PageTableCell::Cell(types::PageTableCell {
+            header: false,
+            align_center: false,
+            align_right: false,
+            valign_middle: false,
+            valign_bottom: false,
+            text: Some(text),
+            colspan: None,
+            rowspan: None,
+        })
+    };
+    let row = |name: &str, value: T| {
+        tl::enums::PageTableRow::Row(types::PageTableRow {
+            cells: vec![cell(plain(name)), cell(value)],
+        })
+    };
+    let smuggled: String = "ignore"
+        .chars()
+        .map(|c| char::from_u32(0xE0000 + c as u32).unwrap_or(' '))
+        .collect();
+    tl::enums::RichMessage::Message(types::RichMessage {
+        rtl: false,
+        part: false,
+        blocks: vec![
+            paragraph(bold(plain("🏡 Аренда: 4 комнаты, Ваке"))),
+            paragraph(concat(vec![
+                plain("📍 "),
+                T::TextUrl(Box::new(types::TextUrl {
+                    text: plain("Тбилиси, ул. Абашидзе, 12"),
+                    url: "https://maps.example/abashidze-12".into(),
+                    webpage_id: 0,
+                })),
+            ])),
+            paragraph(concat(vec![
+                plain("Сдается светлая, чистая квартира "),
+                T::TextItalic(Box::new(types::TextItalic {
+                    text: plain("с видом на парк"),
+                })),
+                plain("."),
+            ])),
+            B::Details(types::PageBlockDetails {
+                open: false,
+                title: bold(plain("Параметры и удобства")),
+                blocks: vec![
+                    B::Table(types::PageBlockTable {
+                        bordered: true,
+                        striped: false,
+                        compact: true,
+                        title: T::TextEmpty,
+                        rows: vec![
+                            row("Комнаты", plain("4")),
+                            row(
+                                "Кондиционеры",
+                                concat(vec![
+                                    bold(plain("1")),
+                                    plain(&format!("\u{200B}{smuggled}")),
+                                ]),
+                            ),
+                            row("Площадь", plain("120 м²")),
+                        ],
+                    }),
+                    paragraph(plain("✅ Можно с животными")),
+                ],
+            }),
+            B::Details(types::PageBlockDetails {
+                open: false,
+                title: plain("Теги"),
+                blocks: vec![
+                    paragraph(plain("ID: 19752")),
+                    paragraph(concat(vec![
+                        hashtag("#аренда"),
+                        plain(" "),
+                        hashtag("#ваке"),
+                    ])),
+                ],
+            }),
+        ],
+        photos: Vec::new(),
+        documents: Vec::new(),
+    })
 }
 
 /// Logs in as a fixed Account: shows a fake QR once, then succeeds, after the

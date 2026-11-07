@@ -271,7 +271,8 @@ instructions.",
         description = "Read messages of one chat, newest first. `chat_id` comes from list_chats \
 or a message sender, passed verbatim (`user:N~H`, `channel:N~H` or `chat:N`). Each message \
 has an id, date (UTC), sender (id + name; absent and `outgoing: true` for messages the account \
-itself sent), text (media and service messages as [photo], [voice], ...; cut to 1000 \
+itself sent), text (media and service messages as [photo], [voice], ...; rich posts' tables, \
+lists and collapsible sections as plain lines, table cells joined by ` | `; cut to 1000 \
 characters), the id it replies to, and forwarded/edited flags. Page with `before_id` = the \
 previous `next_before_id`; no `next_before_id` means there is nothing older (within `since`). \
 Narrow by time with `since`/`until`. To read the context of one message (e.g. a search hit), \

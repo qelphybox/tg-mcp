@@ -58,8 +58,9 @@ pub struct ChatMessage {
     pub sender: Option<Sender>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outgoing: bool,
-    /// The text; media and service messages as `[photo]`, `[voice]`, …; text
-    /// with nothing visible (only hidden characters) as `[no visible text]`.
+    /// The text; media and service messages as `[photo]`, `[voice]`, …; a
+    /// Rich message as plain lines (`src/tg/rich.rs`); text with nothing
+    /// visible (only hidden characters) as `[no visible text]`.
     pub text: String,
     /// Id of the message this one replies to, in the same chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,7 +175,8 @@ pub struct RawHistoryMessage {
     pub from: Option<ChatId>,
     #[serde(default)]
     pub out: bool,
-    /// The text as written: empty for media without a caption.
+    /// The text as written, then its Rich message flattened
+    /// ([`super::rich::message_text`]): empty for media without a caption.
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<Media>,

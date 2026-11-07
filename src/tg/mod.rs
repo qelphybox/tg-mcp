@@ -14,6 +14,7 @@ pub mod find;
 pub mod grammers;
 pub mod messages;
 mod pool;
+pub mod rich;
 pub mod sanitise;
 pub mod search;
 mod session;

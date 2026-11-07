@@ -86,6 +86,10 @@ _Avoid_: folder (unqualified), filter, tab
 A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic.
 _Avoid_: thread (a thread is a chain of replies), subchat
 
+**Rich message**:
+A message whose content is page blocks (paragraphs, lists, tables, collapsible sections, photos: Telegram's Instant View blocks, `message.rich_message`) rather than, or besides, its plain text. The tools read it as plain lines after the plain text.
+_Avoid_: Instant View (that is a web page's preview), formatted message
+
 **Media link**:
 A short-lived URL that lets whoever holds it download the media of one message, without a Token.
 _Avoid_: download token, file URL

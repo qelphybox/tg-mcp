@@ -288,3 +288,16 @@ Prepare in the Telegram app: in **Saved Messages** send `тест 1`, reply to i
 6. Step 6 (manual check of `reply_to_peer_id`, record the answer in the issue): a reply in Replies points to a message in the discussion group, so `continues_in` names that group and the message id there; it opens with `around_id` when the account is in that group, and is an error saying it can't be read when it isn't. If `thread_of` on a Replies message itself fails with `not found in this chat`, Telegram gives those messages a `peer_id` other than the Replies chat (core.telegram.org/api/discussion says "our own peer"), and the chain's check that a fetched message belongs to the chat (`src/tg/messages.rs`, `read_thread`) needs a look.
 
 A chain costs one Telegram call per message: `depth: 50` on a long chain takes up to ~30 s once the per-account burst is spent. `kamal app logs | grep -F 'тест'` finds nothing: message text is never logged.
+
+## 17. A rich post reads as its lines, not as empty text
+
+Some channels post Rich messages: the Telegram app shows a table, collapsible sections ("Параметры и удобства", "Теги") and buttons, while the message's plain text is empty. Needed: such a channel in `list_chats` and the id of one such post `P` (open the post in the app, "Copy link": the number at the end). In Claude Code, with the server added as in §1, replace the `<…>` and run:
+
+```text
+Через Telegram MCP: get_messages для <id канала> с before_id=<P + 1>, limit=1. Выведи id сообщения, число строк в text и строки, в которых есть « | ». Потом search_messages с query=<одно слово из таблицы или раздела, например «Кондиционеры»> и chat_id=<id канала>: есть ли среди hits сообщение P, и есть ли это слово в его snippet? Текст поста целиком не выводи.
+```
+
+1. The message is `P`, its `text` is not empty and has the post's lines in the app's order: title, address, paragraph, then each collapsed section's title followed by its content, each table row on its own line with cells joined by ` | ` (`Комнаты | 4`, `Кондиционеры | 1`, …). Nothing is hidden behind a collapsed section. Buttons are not shown.
+2. The hit for `P` is there and its snippet holds the word, on one line. If the channel's latest post is a rich one, its `list_chats` preview is its first line(s), not empty.
+
+`kamal app logs | grep -F 'Кондиционеры'` finds nothing: message text is never logged.
