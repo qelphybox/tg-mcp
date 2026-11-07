@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatRef, RawPeer, rfc3339},
+    sanitise::is_blank,
     search::RawFoundMessage,
 };
 
@@ -57,7 +58,8 @@ pub struct ChatMessage {
     pub sender: Option<Sender>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outgoing: bool,
-    /// The text; media and service messages as `[photo]`, `[voice]`, ….
+    /// The text; media and service messages as `[photo]`, `[voice]`, …; text
+    /// with nothing visible (only hidden characters) as `[no visible text]`.
     pub text: String,
     /// Id of the message this one replies to, in the same chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +148,17 @@ impl Media {
             Media::Story => "[story]",
             Media::Other => "[media]",
         }
+    }
+}
+
+/// A message's text as get_messages and list_chats show it: media whose
+/// caption has nothing visible (none, blanks or only hidden characters) shows
+/// as its placeholder. Text-only messages are left to the sanitiser, which
+/// marks the ones with nothing visible `[no visible text]`.
+pub fn shown_text(text: String, media: Option<Media>) -> String {
+    match media {
+        Some(media) if is_blank(&text) => media.placeholder().to_string(),
+        _ => text,
     }
 }
 
@@ -540,10 +553,7 @@ impl<'a> Issuer<'a> {
                     .unwrap_or_else(|| id.to_string()),
             }
         });
-        let text = match m.media {
-            Some(media) if m.text.is_empty() => media.placeholder().to_string(),
-            _ => m.text.clone(),
-        };
+        let text = shown_text(m.text.clone(), m.media);
         ChatMessage {
             id: m.id,
             date: rfc3339(m.date),
@@ -754,10 +764,36 @@ mod tests {
                 text: String::new(),
                 ..msg(4, 10)
             },
+            // A caption of nothing but hidden characters or blanks is none.
+            RawHistoryMessage {
+                id: 5,
+                ..photo("\u{2063}\u{200B}")
+            },
+            RawHistoryMessage {
+                id: 6,
+                ..photo(" \n")
+            },
+            // Without media the sanitiser decides (`[no visible text]`).
+            RawHistoryMessage {
+                id: 7,
+                text: "\u{2063}".into(),
+                ..msg(7, 10)
+            },
         ];
         let page = assemble_history(ChatId::User(1).into(), &raw, &[], &query(10), false);
         let texts: Vec<&str> = page.messages.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, ["[photo]", "look", "[video message]", ""]);
+        assert_eq!(
+            texts,
+            [
+                "[photo]",
+                "look",
+                "[video message]",
+                "",
+                "[photo]",
+                "[photo]",
+                "\u{2063}"
+            ]
+        );
     }
 
     #[test]

@@ -178,7 +178,8 @@ pub enum ChatKind {
 pub struct MessagePreview {
     /// UTC, RFC 3339.
     pub date: String,
-    /// The text, shortened; media and service messages as `[photo]`, `[voice]`, ….
+    /// The text, shortened; media and service messages as `[photo]`, `[voice]`, …;
+    /// text with nothing visible (only hidden characters) as `[no visible text]`.
     pub text: String,
 }
 

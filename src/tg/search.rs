@@ -113,7 +113,7 @@ pub struct SearchHit {
     pub outgoing: bool,
     /// Up to 300 characters of the text around the first word that matches the
     /// query (the start of the text if none matches literally); empty for media
-    /// without text.
+    /// without text, `[no visible text]` for text with nothing visible.
     pub snippet: String,
     /// What the message carries besides text.
     #[serde(default, skip_serializing_if = "Option::is_none")]

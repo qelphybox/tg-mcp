@@ -7,8 +7,11 @@
 //! characters that hide text from a human reading the transcript while the
 //! model still reads it: Unicode format characters (general category `Cf`:
 //! zero-width spaces, bidi overrides and isolates, BOM, invisible operators,
-//! tag characters, …) and control characters other than line breaks and tabs.
-//! Detecting injection attempts by their content is not attempted.
+//! tag characters, …), control characters other than line breaks and tabs,
+//! the invisible characters that are not `Cf` (Hangul fillers, the combining
+//! grapheme joiner) and variation selectors that modify nothing. Message text
+//! with nothing visible left reads `[no visible text]`. Detecting injection
+//! attempts by their content is not attempted.
 //!
 //! The seam is the [`Telegram`] trait itself: tools read through [`Sanitised`],
 //! which sanitises every answer of the Live client or the fake before a tool
@@ -54,8 +57,18 @@ const FORMAT: &[(char, char)] = &[
     ('\u{E0020}', '\u{E007F}'), // tag characters ("ASCII smuggling")
 ];
 
+/// Invisible characters that are not `Cf`: the combining grapheme joiner and
+/// the Hangul fillers, which render as nothing (blank "names" use them).
+const INVISIBLE: [char; 5] = ['\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}'];
+
 const ZWJ: char = '\u{200D}';
+const TEXT_PRESENTATION: char = '\u{FE0E}';
 const EMOJI_PRESENTATION: char = '\u{FE0F}';
+const LINE_SEPARATOR: char = '\u{2028}';
+const PARAGRAPH_SEPARATOR: char = '\u{2029}';
+
+/// What message text, a preview or a snippet with nothing visible left reads.
+pub const NO_VISIBLE_TEXT: &str = "[no visible text]";
 
 /// Unicode general category `Cf`.
 pub fn is_format(c: char) -> bool {
@@ -79,16 +92,82 @@ fn is_emoji(c: char) -> bool {
     matches!(c, '\u{2300}'..='\u{2BFF}' | '\u{1F000}'..='\u{1FAFF}')
 }
 
-/// Strip what hides text from a human: every `Cf` character, and control
-/// characters other than `\n` and `\t` (CRLF and a lone CR become `\n`, the
-/// rest a space). Everything visible stays, emoji included: flags, skin tones
-/// and keycaps contain no `Cf`. ZWJ (U+200D) is `Cf` too, but it is kept where
-/// it joins two emoji (👨‍👩‍👧, 🏳️‍🌈, 👩🏽‍💻), so those still render as one
-/// glyph; anywhere else it goes. Tag characters always go, so the subdivision
-/// flags (England, Scotland, Wales) show as a plain black flag 🏴.
+/// Variation selectors VS1–VS16 and the ideographic VS17–VS256 (category
+/// `Mn`). One picks a glyph for the character before it; a run of them, or one
+/// after nothing it can modify, only carries hidden bytes.
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// Whether variation selector `vs` can modify `base`, the character before it.
+fn modifies(vs: char, base: char) -> bool {
+    match vs {
+        // Text or emoji presentation: emoji, and the characters outside the
+        // emoji blocks that have an emoji form (keycap bases, © ® ‼ ⁉ ™ ℹ,
+        // arrows, 〰 〽 ㊗ ㊙), as `emoji-variation-sequences.txt` lists them.
+        TEXT_PRESENTATION | EMOJI_PRESENTATION => {
+            is_emoji(base)
+                || matches!(
+                    base,
+                    '#' | '*'
+                        | '0'..='9'
+                        | '\u{00A9}'
+                        | '\u{00AE}'
+                        | '\u{203C}'
+                        | '\u{2049}'
+                        | '\u{2122}'
+                        | '\u{2139}'
+                        | '\u{2194}'..='\u{2199}'
+                        | '\u{21A9}'..='\u{21AA}'
+                        | '\u{3030}'
+                        | '\u{303D}'
+                        | '\u{3297}'
+                        | '\u{3299}'
+                )
+        }
+        // Ideographic variation sequences: CJK ideographs only.
+        '\u{E0100}'..='\u{E01EF}' => matches!(
+            base,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{20000}'..='\u{3FFFF}'
+        ),
+        // Standardized variants (math symbols, CJK punctuation and
+        // ideographs, Myanmar, Egyptian hieroglyphs, a slashed zero, …) are
+        // too scattered to list: any visible character.
+        _ => !base.is_whitespace() && !is_variation_selector(base),
+    }
+}
+
+/// Strip what hides text from a human: every `Cf` character, the invisible
+/// non-`Cf` ones, and control characters other than `\n` and `\t` (CRLF, a
+/// lone CR and the line and paragraph separators U+2028/U+2029 become `\n`,
+/// the rest a space). Everything visible stays, emoji included: flags, skin
+/// tones and keycaps contain no `Cf`. ZWJ (U+200D) is `Cf` too, but it is kept
+/// where it joins two emoji (👨‍👩‍👧, 🏳️‍🌈, 👩🏽‍💻), so those still render as
+/// one glyph; anywhere else it goes. Tag characters always go, so the
+/// subdivision flags (England, Scotland, Wales) show as a plain black flag 🏴.
+/// A variation selector stays only right after a character it can modify, so
+/// of a run (👀 and six U+FE0F) one is left.
 ///
 /// Characters, not length, are its business: callers cap the result.
 pub fn sanitise(text: &str) -> String {
+    sanitise_with(text, '\n')
+}
+
+/// [`sanitise`] for one-line fields (titles, names, previews, snippets):
+/// every line break becomes a space.
+pub fn sanitise_line(text: &str) -> String {
+    sanitise_with(text, ' ')
+}
+
+/// Nothing a human would see: empty, blank, or only hidden characters.
+pub fn is_blank(text: &str) -> bool {
+    sanitise(text).trim().is_empty()
+}
+
+fn sanitise_with(text: &str, line_break: char) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -103,11 +182,20 @@ pub fn sanitise(text: &str) -> String {
                     out.push(c);
                 }
             }
-            '\n' | '\t' => out.push(c),
+            '\t' => out.push(c),
             '\r' if chars.peek() == Some(&'\n') => {}
-            '\r' => out.push('\n'),
+            '\n' | '\r' | LINE_SEPARATOR | PARAGRAPH_SEPARATOR => out.push(line_break),
+            c if is_variation_selector(c) => {
+                if out
+                    .chars()
+                    .next_back()
+                    .is_some_and(|base| modifies(c, base))
+                {
+                    out.push(c);
+                }
+            }
             c if c.is_control() => out.push(' '),
-            c if is_format(c) => {}
+            c if is_format(c) || INVISIBLE.contains(&c) => {}
             c => out.push(c),
         }
     }
@@ -121,13 +209,25 @@ pub trait Untrusted {
     fn sanitise(&mut self);
 }
 
+/// One-line content: titles, names, usernames.
 fn clean(field: &mut String) {
-    *field = sanitise(field);
+    *field = sanitise_line(field);
 }
 
 fn clean_opt(field: &mut Option<String>) {
     if let Some(value) = field {
         clean(value);
+    }
+}
+
+/// Message text, or its preview or snippet: what had text and has nothing
+/// visible left reads [`NO_VISIBLE_TEXT`] rather than an empty string. Media
+/// with such a caption shows as itself instead (`messages::shown_text`).
+fn clean_text(field: &mut String, sanitiser: fn(&str) -> String) {
+    let had_text = !field.is_empty();
+    *field = sanitiser(field);
+    if had_text && field.trim().is_empty() {
+        *field = NO_VISIBLE_TEXT.into();
     }
 }
 
@@ -165,7 +265,7 @@ impl Untrusted for ChatPage {
             clean(title);
             clean_opt(username);
             if let Some(MessagePreview { date: _, text }) = last_message {
-                clean(text);
+                clean_text(text, sanitise_line);
             }
         }
     }
@@ -194,7 +294,7 @@ impl Untrusted for MessagePage {
                 target: _,
                 thread_root: _,
             } = message;
-            clean(text);
+            clean_text(text, sanitise);
             if let Some(Sender { id: _, name }) = sender {
                 clean(name);
             }
@@ -215,7 +315,9 @@ impl Untrusted for ChatInfo {
         } = self;
         clean(title);
         clean_opt(username);
-        clean_opt(description);
+        if let Some(description) = description {
+            *description = sanitise(description);
+        }
         // Nothing but hidden characters is no description.
         if description.as_deref().is_some_and(|d| d.trim().is_empty()) {
             *description = None;
@@ -242,13 +344,18 @@ impl Untrusted for SearchPage {
                 sender,
                 outgoing: _,
                 snippet,
-                media: _,
+                media,
                 reply_to: _,
                 forwarded: _,
                 edited: _,
             } = hit;
             clean(title);
-            clean(snippet);
+            if media.is_some() {
+                // A caption with nothing visible is no text: `media` shows.
+                clean(snippet);
+            } else {
+                clean_text(snippet, sanitise_line);
+            }
             if let Some(Sender { id: _, name }) = sender {
                 clean(name);
             }
@@ -328,7 +435,7 @@ impl Telegram for Sanitised {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tg::chats::ChatKind;
+    use crate::tg::{chats::ChatKind, messages::Media};
 
     #[test]
     fn the_format_table_is_sorted_and_disjoint() {
@@ -432,6 +539,77 @@ mod tests {
             sanitise("bell\u{7}esc\u{1B}[2Jnul\u{0}c1\u{85}"),
             "bell esc [2Jnul c1 "
         );
+    }
+
+    #[test]
+    fn a_run_of_variation_selectors_keeps_one_after_a_character_it_modifies() {
+        let run = "\u{FE0F}".repeat(6);
+        assert_eq!(
+            sanitise(&format!("👀{run} H E S O Y A M")),
+            "👀\u{FE0F} H E S O Y A M"
+        );
+        // Ideographic variation selectors after a CJK ideograph.
+        assert_eq!(sanitise("葛\u{E0100}\u{E0101}\u{E0102}城"), "葛\u{E0100}城");
+        // A standardized variant (≩ with a vertical stroke, a slashed zero).
+        assert_eq!(
+            sanitise("\u{2269}\u{FE00}\u{FE00} 0\u{FE00}"),
+            "\u{2269}\u{FE00} 0\u{FE00}"
+        );
+    }
+
+    #[test]
+    fn variation_selectors_with_nothing_to_modify_are_removed() {
+        assert_eq!(sanitise("\u{FE0F}hi"), "hi", "start of the text");
+        assert_eq!(sanitise("a \u{FE0F}b \u{FE00}c\n\u{E0100}"), "a b c\n");
+        // Emoji presentation needs a character with an emoji form.
+        assert_eq!(sanitise("a\u{FE0F}b\u{FE0E}"), "ab");
+        // Ideographic ones need an ideograph: "hi" hidden after an emoji, a
+        // byte per selector, is dropped.
+        assert_eq!(sanitise("😀\u{E0158}\u{E0159} x\u{E0100}"), "😀 x");
+        // The keycap's enclosing mark is no base.
+        assert_eq!(sanitise("1\u{FE0F}\u{20E3}\u{FE0F}"), "1\u{FE0F}\u{20E3}");
+    }
+
+    #[test]
+    fn variation_selectors_that_belong_stay() {
+        for text in [
+            "\u{2716}\u{FE0E} \u{2716}\u{FE0F}",
+            "1\u{FE0F}\u{20E3} #\u{FE0F}\u{20E3} *\u{FE0F}\u{20E3}",
+            "\u{00A9}\u{FE0F} \u{2122}\u{FE0F} \u{203C}\u{FE0F} \u{2194}\u{FE0F} \u{3030}\u{FE0F}",
+            "\u{2764}\u{FE0F} \u{263A}\u{FE0F} \u{1F3F3}\u{FE0F}",
+            "\u{8FBB}\u{E0100} \u{2000B}\u{E0101}",
+        ] {
+            assert_eq!(sanitise(text), text);
+        }
+    }
+
+    #[test]
+    fn hangul_fillers_and_the_grapheme_joiner_are_removed() {
+        assert_eq!(
+            sanitise("a\u{034F}b\u{115F}\u{1160}c\u{3164}d\u{FFA0}e"),
+            "abcde"
+        );
+        assert_eq!(sanitise("\u{3164}"), "", "a 'blank' name");
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_follow_the_field() {
+        assert_eq!(sanitise("a\u{2028}b\u{2029}c"), "a\nb\nc");
+        assert_eq!(sanitise_line("a\u{2028}b\u{2029}c"), "a b c");
+        assert_eq!(
+            sanitise_line("one\r\ntwo\nthree\rfour\tcol"),
+            "one two three four\tcol"
+        );
+    }
+
+    #[test]
+    fn blank_is_nothing_a_human_would_see() {
+        for text in ["", " \n", "\u{2063}", "\u{200B}\u{3164} \u{FE0F}"] {
+            assert!(is_blank(text), "{text:?}");
+        }
+        for text in ["x", "👀", ".\u{2063}"] {
+            assert!(!is_blank(text), "{text:?}");
+        }
     }
 
     fn summary(title: &str, preview: &str) -> ChatSummary {
@@ -570,5 +748,153 @@ mod tests {
             ("Carol lorac", Some("carol"))
         );
         assert_eq!(chat.id, "user:1~AAAAAAAAAAE");
+    }
+
+    fn message(text: &str) -> ChatMessage {
+        ChatMessage {
+            id: 1,
+            date: "2026-11-06T00:00:00Z".into(),
+            sender: Some(Sender {
+                id: "user:1".into(),
+                name: "Bo\u{2028}b".into(),
+            }),
+            outgoing: false,
+            text: text.into(),
+            reply_to: None,
+            forwarded: false,
+            edited: false,
+            target: false,
+            thread_root: false,
+        }
+    }
+
+    fn hit(snippet: &str, media: Option<Media>) -> SearchHit {
+        SearchHit {
+            chat: HitChat {
+                id: "channel:2".into(),
+                title: "Te\u{2029}am".into(),
+                kind: ChatKind::Supergroup,
+            },
+            id: 1,
+            date: "2026-11-06T00:00:00Z".into(),
+            sender: None,
+            outgoing: false,
+            snippet: snippet.into(),
+            media,
+            reply_to: None,
+            forwarded: false,
+            edited: false,
+        }
+    }
+
+    #[test]
+    fn separators_break_lines_in_text_and_are_spaces_in_one_line_fields() {
+        let mut page = ChatPage {
+            chats: vec![summary("Al\u{2028}ice", "hi\u{2029}there")],
+            next_cursor: None,
+        };
+        page.sanitise();
+        let chat = &page.chats[0];
+        assert_eq!(chat.title, "Al ice");
+        assert_eq!(chat.last_message.as_ref().unwrap().text, "hi there");
+
+        let mut history = MessagePage::new("user:1".into(), vec![message("a\u{2028}b")]);
+        history.sanitise();
+        assert_eq!(history.messages[0].text, "a\nb");
+        assert_eq!(history.messages[0].sender.as_ref().unwrap().name, "Bo b");
+
+        let mut info = ChatInfo {
+            id: "channel:2".into(),
+            title: "T\u{2029}eam".into(),
+            kind: ChatKind::Channel,
+            username: None,
+            is_self: false,
+            description: Some("line\u{2029}next".into()),
+            member_count: None,
+        };
+        info.sanitise();
+        assert_eq!(info.title, "T eam");
+        assert_eq!(info.description.as_deref(), Some("line\nnext"));
+
+        let mut found = SearchPage {
+            hits: vec![hit("de\u{2028}ploy", None)],
+            next_cursor: None,
+        };
+        found.sanitise();
+        assert_eq!(found.hits[0].snippet, "de ploy");
+        assert_eq!(found.hits[0].chat.title, "Te am");
+
+        let mut chats = FoundChats {
+            chats: vec![FoundChat {
+                id: "user:1".into(),
+                title: "Ca\u{2028}rol".into(),
+                kind: ChatKind::Private,
+                username: None,
+            }],
+        };
+        chats.sanitise();
+        assert_eq!(chats.chats[0].title, "Ca rol");
+
+        let mut me = Account {
+            id: 1,
+            first_name: "M\u{2028}e".into(),
+            last_name: Some("La\u{2029}st".into()),
+            username: None,
+        };
+        me.sanitise();
+        assert_eq!(
+            (me.first_name.as_str(), me.last_name.as_deref()),
+            ("M e", Some("La st"))
+        );
+    }
+
+    #[test]
+    fn text_with_nothing_visible_left_shows_as_a_placeholder() {
+        let mut history = MessagePage::new(
+            "user:1".into(),
+            [
+                "\u{2063}",
+                "\u{200B} \u{FE0F}\n",
+                " ",
+                "",
+                "[photo]",
+                "hi\u{2063}",
+            ]
+            .map(message)
+            .into(),
+        );
+        history.sanitise();
+        let texts: Vec<&str> = history.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                NO_VISIBLE_TEXT,
+                NO_VISIBLE_TEXT,
+                NO_VISIBLE_TEXT,
+                "",
+                "[photo]",
+                "hi"
+            ]
+        );
+
+        // A preview, but not a title: a blank title stays blank.
+        let mut page = ChatPage {
+            chats: vec![summary("\u{3164}", "\u{2063}\u{3164}")],
+            next_cursor: None,
+        };
+        page.sanitise();
+        let chat = &page.chats[0];
+        assert_eq!(chat.title, "");
+        assert_eq!(chat.last_message.as_ref().unwrap().text, NO_VISIBLE_TEXT);
+
+        // A media hit's caption is no text: its snippet stays empty, as for
+        // media without a caption, and `media` says what it is.
+        let mut found = SearchPage {
+            hits: vec![hit("\u{2063}", None), hit("\u{2063}", Some(Media::Photo))],
+            next_cursor: None,
+        };
+        found.sanitise();
+        assert_eq!(found.hits[0].snippet, NO_VISIBLE_TEXT);
+        assert_eq!(found.hits[1].snippet, "");
     }
 }

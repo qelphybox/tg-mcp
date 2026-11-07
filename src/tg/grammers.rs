@@ -23,7 +23,7 @@ use super::{
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessageAnswer, MessageAt, MessagePage,
-        MessageRequest, RawHistoryMessage, read_history,
+        MessageRequest, RawHistoryMessage, read_history, shown_text,
     },
     pool::{Evicted, Live, Pool},
     search::{
@@ -1152,10 +1152,7 @@ fn raw_chat(chat: tl::enums::Chat) -> Option<RawPeer> {
 fn raw_message(message: tl::enums::Message) -> Option<RawMessage> {
     match message {
         tl::enums::Message::Message(m) => {
-            let text = match media_kind(m.media.as_ref()) {
-                Some(media) if m.message.is_empty() => media.placeholder().to_string(),
-                _ => m.message,
-            };
+            let text = shown_text(m.message, media_kind(m.media.as_ref()));
             Some(RawMessage {
                 chat: chat_id(&m.peer_id),
                 id: m.id,

@@ -10,7 +10,7 @@ use tg_mcp::tg::{
     Account,
     chats::{ChatId, ChatKind, ChatSummary, MessagePreview},
     fake::{FakeData, FakeDetails, fake_issued_id},
-    messages::RawHistoryMessage,
+    messages::{Media, RawHistoryMessage},
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
@@ -18,6 +18,7 @@ type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::Clien
 const ALICE: ChatId = ChatId::User(101);
 const NEWS: ChatId = ChatId::Channel(202);
 const LONG: ChatId = ChatId::User(303);
+const GUARD: ChatId = ChatId::User(404);
 
 /// "ignore" written in tag characters: invisible, but the model reads it.
 fn smuggled(text: &str) -> String {
@@ -77,6 +78,18 @@ async fn client() -> (common::TestServer, Client) {
         date: "2026-11-06T00:00:00Z".into(),
         text: padded('p', 100),
     });
+    // An anti-spam bot: a Hangul filler in its name, a line separator in its
+    // title, nothing visible in its last message.
+    let mut guard = chat(
+        GUARD,
+        "Guard\u{3164}\u{2028}Bob".into(),
+        ChatKind::Private,
+        None,
+    );
+    guard.last_message = Some(MessagePreview {
+        date: "2026-11-06T00:00:00Z".into(),
+        text: "\u{2063}".into(),
+    });
     let data = FakeData::new(Account {
         id: 42,
         first_name: "M\u{200B}e".into(),
@@ -92,6 +105,7 @@ async fn client() -> (common::TestServer, Client) {
         ),
         news,
         long,
+        guard,
     ])
     .with_messages(
         ALICE,
@@ -104,6 +118,20 @@ async fn client() -> (common::TestServer, Client) {
                 ),
             ),
             message(2, padded('x', 1000)),
+        ],
+    )
+    .with_messages(
+        GUARD,
+        vec![
+            message(
+                1,
+                format!("👀{} H E S O Y A M\u{2028}second", "\u{FE0F}".repeat(6)),
+            ),
+            message(2, "\u{2063}".into()),
+            RawHistoryMessage {
+                media: Some(Media::Photo),
+                ..message(3, "\u{2063}\u{200B}".into())
+            },
         ],
     )
     .with_details(
@@ -194,6 +222,44 @@ async fn search_messages_strips_snippets_chat_titles_and_sender_names() {
         hit["chat"]["id"],
         fake_issued_id(ALICE),
         "ids are ours, untouched"
+    );
+}
+
+#[tokio::test]
+async fn invisible_carriers_go_and_nothing_visible_shows_as_a_placeholder() {
+    let (_server, client) = client().await;
+    let page = call(&client, "list_chats", json!({})).await;
+    let guard = &page["chats"][3];
+    assert_eq!(guard["id"], fake_issued_id(GUARD));
+    assert_eq!(guard["title"], "Guard Bob");
+    assert_eq!(guard["last_message"]["text"], "[no visible text]");
+
+    let page = call(
+        &client,
+        "get_messages",
+        json!({ "chat_id": fake_issued_id(GUARD) }),
+    )
+    .await;
+    let texts: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "[photo]",
+            "[no visible text]",
+            "👀\u{FE0F} H E S O Y A M\nsecond"
+        ],
+        "one selector is left, a media marker wins over the placeholder"
+    );
+
+    let page = call(&client, "search_messages", json!({ "query": "second" })).await;
+    assert_eq!(
+        page["hits"][0]["snippet"],
+        "👀\u{FE0F} H E S O Y A M second"
     );
 }
 
