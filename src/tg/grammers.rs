@@ -20,8 +20,10 @@ use super::{
         self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, Listing, RawDialog,
         RawMessage, RawPeer,
     },
+    download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     media,
+    media::{FileLocation, StoredFile},
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MessageAnswer, MessageAt, MessagePage,
         MessageRequest, RawHistoryMessage, read_history,
@@ -470,6 +472,59 @@ impl LiveClient {
             .await
     }
 
+    /// Like [`Self::call`], to DC `dc_id` (a file's DC): under the Account's
+    /// limiter, in the request's [`MethodClass`], so a `FLOOD_WAIT` blocks that
+    /// class for the Account and is never retried around. Every other error
+    /// comes back as Telegram sent it, for the caller to read (`FILE_MIGRATE_X`,
+    /// `FILE_REFERENCE_EXPIRED`, a DC without authorization).
+    async fn call_in_dc<R: tl::RemoteCall + tl::Identifiable>(
+        &self,
+        dc_id: i32,
+        request: &R,
+    ) -> Result<Result<R::Return, InvocationError>, TgError> {
+        let class = method_class::<R>();
+        self.limiter
+            .run(class, || async {
+                #[cfg(test)]
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .push(tl::Serializable::to_bytes(request));
+                match self.client.invoke_in_dc(dc_id, request).await {
+                    Ok(answer) => Ok(Ok(answer)),
+                    Err(err) if flood_seconds(&err).is_some() => Err(flood_error(err, class)),
+                    Err(err) => Ok(Err(err)),
+                }
+            })
+            .await
+    }
+
+    fn home_dc(&self) -> Result<i32, TgError> {
+        self.store
+            .home_dc_id()
+            .map_err(|e| TgError::Upstream(e.to_string()))
+    }
+
+    /// Log this session in to DC `dc_id` with an authorization exported from
+    /// the home DC (`auth.exportAuthorization` → `auth.importAuthorization`),
+    /// as grammers' own downloader does, but through the limiter.
+    async fn authorize_in(&self, dc_id: i32) -> Result<(), TgError> {
+        let tl::enums::auth::ExportedAuthorization::Authorization(exported) = self
+            .call(&tl::functions::auth::ExportAuthorization { dc_id }, None)
+            .await?;
+        self.call_in_dc(
+            dc_id,
+            &tl::functions::auth::ImportAuthorization {
+                id: exported.id,
+                bytes: exported.bytes,
+            },
+        )
+        .await?
+        .map_err(upstream)?;
+        tracing::info!(dc_id, "authorized in another dc for a download");
+        Ok(())
+    }
+
     fn is_dead(&self) -> bool {
         self.dead.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -633,6 +688,79 @@ impl Telegram for LiveClient {
         })
         .await
     }
+
+    async fn media_file(&self, id: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {
+        let peer = self.resolve(id).await?;
+        download::locate(id, message_id, |request| {
+            self.get_media_message(&peer, id.chat(), request)
+        })
+        .await
+    }
+
+    async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
+        let FileRequest {
+            location,
+            dc_id,
+            offset,
+            limit,
+        } = request;
+        let get_file = tl::functions::upload::GetFile {
+            precise: false,
+            cdn_supported: false,
+            location: input_file_location(location),
+            offset,
+            limit,
+        };
+        let mut authorized = false;
+        loop {
+            let err = match self.call_in_dc(dc_id, &get_file).await? {
+                Ok(tl::enums::upload::File::File(file)) => return Ok(FilePart::Bytes(file.bytes)),
+                Ok(tl::enums::upload::File::CdnRedirect(_)) => return Ok(FilePart::CdnRedirect),
+                Err(err) => err,
+            };
+            match file_refusal(&err, dc_id, self.home_dc()?) {
+                FileRefusal::Migrate(Some(to)) => return Err(FileError::Migrate(to)),
+                FileRefusal::Migrate(None) => {
+                    return Err(TgError::Upstream("FILE_MIGRATE without a DC".into()).into());
+                }
+                FileRefusal::ReferenceExpired => return Err(FileError::ReferenceExpired),
+                FileRefusal::NotAuthorizedInDc if !authorized => {
+                    self.authorize_in(dc_id).await?;
+                    authorized = true;
+                }
+                FileRefusal::NotAuthorizedInDc => return Err(upstream(err).into()),
+                FileRefusal::Other => return Err(self.classify(err, MethodClass::Files).into()),
+            }
+        }
+    }
+}
+
+/// What a refused `upload.getFile` to DC `dc_id` asks of the downloader.
+#[derive(Debug, PartialEq, Eq)]
+enum FileRefusal {
+    /// `FILE_MIGRATE_X`: ask DC X.
+    Migrate(Option<i32>),
+    /// `FILE_REFERENCE_EXPIRED` / `FILE_REFERENCE_INVALID`: both mean "fetch
+    /// the message again" (core.telegram.org/api/file-references).
+    ReferenceExpired,
+    /// `AUTH_KEY_UNREGISTERED` from a DC other than the home DC: this session
+    /// isn't logged in there yet. Not a dead session (only the home DC says that).
+    NotAuthorizedInDc,
+    /// Anything else, for [`LiveClient::classify`].
+    Other,
+}
+
+fn file_refusal(err: &InvocationError, dc_id: i32, home_dc: i32) -> FileRefusal {
+    match err {
+        InvocationError::Rpc(rpc) if rpc.code == FILE_MIGRATE => {
+            FileRefusal::Migrate(rpc.value.and_then(|v| i32::try_from(v).ok()))
+        }
+        _ if err.is("FILE_REFERENCE_EXPIRED") || err.is("FILE_REFERENCE_INVALID") => {
+            FileRefusal::ReferenceExpired
+        }
+        _ if err.is("AUTH_KEY_UNREGISTERED") && dc_id != home_dc => FileRefusal::NotAuthorizedInDc,
+        _ => FileRefusal::Other,
+    }
 }
 
 /// How far `resolve` pages through the dialogs (per folder) looking for an unknown Chat.
@@ -695,8 +823,44 @@ impl LiveClient {
         &self,
         peer: &tl::enums::InputPeer,
         chat: ChatId,
-        MessageRequest { id }: MessageRequest,
+        request: MessageRequest,
     ) -> Result<MessageAnswer, TgError> {
+        let (messages, users, chats) = self.fetch_message(peer, chat, request).await?;
+        let peers = self.described(users, chats);
+        Ok(MessageAnswer {
+            messages: messages.into_iter().filter_map(raw_found_message).collect(),
+            peers,
+        })
+    }
+
+    /// The same call as [`Self::get_message`], each message reduced to its
+    /// media and that media's file (#36).
+    async fn get_media_message(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        request: MessageRequest,
+    ) -> Result<Vec<RawMediaMessage>, TgError> {
+        let (messages, users, chats) = self.fetch_message(peer, chat, request).await?;
+        self.described(users, chats);
+        Ok(messages.into_iter().filter_map(raw_media_message).collect())
+    }
+
+    /// The messages, users and chats of one `channels.getMessages` /
+    /// `messages.getMessages` call for one id.
+    async fn fetch_message(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        MessageRequest { id }: MessageRequest,
+    ) -> Result<
+        (
+            Vec<tl::enums::Message>,
+            Vec<tl::enums::User>,
+            Vec<tl::enums::Chat>,
+        ),
+        TgError,
+    > {
         let id = vec![tl::enums::InputMessage::Id(tl::types::InputMessageId {
             id,
         })];
@@ -717,16 +881,11 @@ impl LiveClient {
                     .await?
             }
         };
-        let (messages, chats, users) = match answer {
-            tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+        Ok(match answer {
+            tl::enums::messages::Messages::Messages(m) => (m.messages, m.users, m.chats),
+            tl::enums::messages::Messages::Slice(m) => (m.messages, m.users, m.chats),
+            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.users, m.chats),
             tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
-        };
-        let peers = self.described(users, chats);
-        Ok(MessageAnswer {
-            messages: messages.into_iter().filter_map(raw_found_message).collect(),
-            peers,
         })
     }
 
@@ -982,6 +1141,30 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
     }
 }
 
+/// A message reduced to where it is, its media (described as get_messages
+/// describes it) and that media's file.
+fn raw_media_message(message: tl::enums::Message) -> Option<RawMediaMessage> {
+    match message {
+        tl::enums::Message::Message(m) => Some(RawMediaMessage {
+            at: MessageAt {
+                chat: chat_id(&m.peer_id),
+                id: m.id,
+            },
+            media: media::describe(m.media.as_ref()),
+            file: media::file(m.media.as_ref()),
+        }),
+        tl::enums::Message::Service(m) => Some(RawMediaMessage {
+            at: MessageAt {
+                chat: chat_id(&m.peer_id),
+                id: m.id,
+            },
+            media: None,
+            file: None,
+        }),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
 /// A search result: the message and the Chat it is in.
 fn raw_found_message(message: tl::enums::Message) -> Option<RawFoundMessage> {
     let chat = match &message {
@@ -1043,6 +1226,37 @@ fn direct_input_peer(id: ChatRef) -> Option<tl::enums::InputPeer> {
         (chat @ ChatId::Chat(_), _) => Some(input_peer(chat, None)),
         (chat, Some(hash)) => Some(input_peer(chat, Some(hash))),
         (_, None) => None,
+    }
+}
+
+/// `FILE_MIGRATE_X`'s error code (grammers' own downloader matches on it).
+const FILE_MIGRATE: i32 = 303;
+
+fn input_file_location(location: FileLocation) -> tl::enums::InputFileLocation {
+    let FileLocation {
+        file,
+        id,
+        access_hash,
+        file_reference,
+        dc_id: _,
+    } = location;
+    match file {
+        StoredFile::Photo { thumb_size } => tl::enums::InputFileLocation::InputPhotoFileLocation(
+            tl::types::InputPhotoFileLocation {
+                id,
+                access_hash,
+                file_reference,
+                thumb_size,
+            },
+        ),
+        StoredFile::Document => tl::enums::InputFileLocation::InputDocumentFileLocation(
+            tl::types::InputDocumentFileLocation {
+                id,
+                access_hash,
+                file_reference,
+                thumb_size: String::new(),
+            },
+        ),
     }
 }
 
@@ -1593,6 +1807,54 @@ mod tests {
     }
 
     #[test]
+    fn a_messages_file_comes_with_the_media_get_messages_describes() {
+        use crate::tg::media::fixtures::{
+            audio, doc, doc_media, full_photo, geo, photo_media, video,
+        };
+        let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 });
+        let with = |media: Option<tl::enums::MessageMedia>| {
+            let tl::enums::Message::Message(mut m) = tl_message(30, channel.clone(), None) else {
+                unreachable!()
+            };
+            m.media = media;
+            tl::enums::Message::Message(m)
+        };
+        let medias = [
+            Some(photo_media(Some(full_photo()), None)),
+            Some(doc_media(Some(doc(
+                "audio/ogg",
+                23_211,
+                vec![audio(true, 9)],
+            )))),
+            Some(doc_media(Some(doc(
+                "video/mp4",
+                900_000,
+                vec![video(true, 12.0, 384, 384)],
+            )))),
+            Some(photo_media(None, Some(10))),
+            Some(tl::enums::MessageMedia::Geo(tl::types::MessageMediaGeo {
+                geo: geo(),
+            })),
+            None,
+        ];
+        for media in medias {
+            let message = with(media.clone());
+            let history = raw_history_message(message.clone()).unwrap();
+            let found = raw_media_message(message).unwrap();
+            assert_eq!(
+                found.at,
+                MessageAt {
+                    chat: ChatId::Channel(5),
+                    id: 30
+                }
+            );
+            // The very description get_messages gives, kind included.
+            assert_eq!(found.media, history.media, "{media:?}");
+            assert_eq!(found.file, media::file(media.as_ref()));
+        }
+    }
+
+    #[test]
     fn media_is_described_beside_the_text_never_in_it() {
         use crate::tg::{
             media::fixtures::{audio, doc, doc_media, full_photo, photo_media},
@@ -1662,6 +1924,36 @@ mod tests {
             ),
             (Some(7), Some(23_211), Some("audio/ogg"))
         );
+    }
+
+    #[test]
+    fn a_refused_file_part_says_what_to_do() {
+        type GetFile = tl::functions::upload::GetFile;
+        let refusal = |code, message, dc_id| file_refusal(&rpc::<GetFile>(code, message), dc_id, 2);
+        assert_eq!(
+            refusal(303, "FILE_MIGRATE_4", 2),
+            FileRefusal::Migrate(Some(4))
+        );
+        for expired in ["FILE_REFERENCE_EXPIRED", "FILE_REFERENCE_INVALID"] {
+            assert_eq!(refusal(400, expired, 4), FileRefusal::ReferenceExpired);
+        }
+        // Not logged in to the file's DC yet; in the home DC it's a dead session.
+        assert_eq!(
+            refusal(401, "AUTH_KEY_UNREGISTERED", 4),
+            FileRefusal::NotAuthorizedInDc
+        );
+        assert_eq!(refusal(401, "AUTH_KEY_UNREGISTERED", 2), FileRefusal::Other);
+        for other in [
+            (400, "FILE_ID_INVALID"),
+            (400, "LIMIT_INVALID"),
+            (420, "FLOOD_WAIT_30"),
+        ] {
+            assert_eq!(
+                refusal(other.0, other.1, 4),
+                FileRefusal::Other,
+                "{other:?}"
+            );
+        }
     }
 
     #[test]
@@ -2587,6 +2879,10 @@ mod resolve_tests {
             live.call(&download(), None).await,
             Err(TgError::FloodWait { .. })
         ));
+        assert!(!matches!(
+            live.get_file(file_request()).await,
+            Err(FileError::Failed(TgError::FloodWait { .. }))
+        ));
         let reached: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
         assert_eq!(
             reached,
@@ -2594,6 +2890,129 @@ mod resolve_tests {
                 // None of the reads: they never reached Telegram.
                 tl::functions::contacts::Search::CONSTRUCTOR_ID,
                 tl::functions::upload::GetCdnFile::CONSTRUCTOR_ID,
+                tl::functions::upload::GetFile::CONSTRUCTOR_ID,
+            ]
+        );
+    }
+
+    fn file_request() -> FileRequest {
+        FileRequest {
+            location: FileLocation {
+                file: StoredFile::Document,
+                id: 6_000_000_001,
+                access_hash: -99,
+                file_reference: b"ref".to_vec(),
+                dc_id: 4,
+            },
+            dc_id: 4,
+            offset: 1024 * 1024,
+            limit: download::PART_SIZE,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_part_is_one_get_file_to_the_files_dc_through_the_limiter() {
+        let (live, _dir) = cold_client().await;
+        let mut photo = file_request();
+        photo.location.file = StoredFile::Photo {
+            thumb_size: "y".into(),
+        };
+        for request in [file_request(), photo] {
+            // Offline: it fails, after reaching `call_in_dc` under the limiter.
+            assert!(matches!(
+                live.get_file(request).await,
+                Err(FileError::Failed(TgError::Upstream(_)))
+            ));
+        }
+        let get_file = |location| {
+            tl::functions::upload::GetFile {
+                precise: false,
+                cdn_supported: false,
+                location,
+                offset: 1024 * 1024,
+                limit: 512 * 1024,
+            }
+            .to_bytes()
+        };
+        assert_eq!(
+            sent(&live),
+            [
+                get_file(tl::enums::InputFileLocation::InputDocumentFileLocation(
+                    tl::types::InputDocumentFileLocation {
+                        id: 6_000_000_001,
+                        access_hash: -99,
+                        file_reference: b"ref".to_vec(),
+                        thumb_size: String::new(),
+                    }
+                )),
+                get_file(tl::enums::InputFileLocation::InputPhotoFileLocation(
+                    tl::types::InputPhotoFileLocation {
+                        id: 6_000_000_001,
+                        access_hash: -99,
+                        file_reference: b"ref".to_vec(),
+                        thumb_size: "y".into(),
+                    }
+                )),
+            ]
+        );
+        assert!(!live.is_dead(), "an offline DC is no dead session");
+    }
+
+    #[tokio::test]
+    async fn a_files_flood_holds_back_downloads_but_reading_still_reaches_telegram() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(7));
+        flood_once::<tl::functions::upload::GetFile>(&live).await;
+
+        for _ in 0..2 {
+            match live.get_file(file_request()).await {
+                Err(FileError::Failed(TgError::FloodWait {
+                    seconds,
+                    class: MethodClass::Files,
+                })) => assert!(seconds > 290, "{seconds}"),
+                other => panic!("expected the download to fail fast, got {other:?}"),
+            }
+        }
+        assert!(sent(&live).is_empty(), "no download reached Telegram");
+        // Finding a message's file is reading: it still goes.
+        assert!(live.media_file(channel, 500).await.is_err());
+        assert!(live.get_messages(channel, query()).await.is_err());
+        let reached: Vec<u32> = sent(&live).iter().map(|r| constructor(r)).collect();
+        assert_eq!(
+            reached,
+            [
+                tl::functions::channels::GetMessages::CONSTRUCTOR_ID,
+                tl::functions::messages::GetHistory::CONSTRUCTOR_ID,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_messages_file_is_looked_up_like_a_chain_message() {
+        let (live, _dir) = cold_client().await;
+        let id = || {
+            vec![tl::enums::InputMessage::Id(tl::types::InputMessageId {
+                id: 500,
+            })]
+        };
+        let channel = ChatRef::new(ChatId::Channel(5), Some(-77));
+        let user = ChatRef::new(ChatId::User(7), Some(88));
+        for chat in [channel, user, ChatId::Chat(4).into()] {
+            assert!(live.media_file(chat, 500).await.is_err());
+        }
+        assert_eq!(
+            sent(&live),
+            [
+                tl::functions::channels::GetMessages {
+                    channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: 5,
+                        access_hash: -77,
+                    }),
+                    id: id(),
+                }
+                .to_bytes(),
+                tl::functions::messages::GetMessages { id: id() }.to_bytes(),
+                tl::functions::messages::GetMessages { id: id() }.to_bytes(),
             ]
         );
     }

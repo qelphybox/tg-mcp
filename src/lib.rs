@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod limits;
+pub mod links;
 pub mod mcp;
 pub mod sessions;
 pub mod tg;
@@ -20,6 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::{
     auth::{AuthState, clients::ClientRegistry},
     config::Config,
+    links::MediaLinks,
     mcp::TgMcp,
     sessions::Vault,
     tg::{Connector, Login},
@@ -38,18 +40,20 @@ pub struct Deps {
 /// Serve it with `into_make_service_with_connect_info::<SocketAddr>()`: the rate
 /// limits of the OAuth endpoints need the peer address.
 pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
+    let links = Arc::new(MediaLinks::new(&config.base_url()));
     let auth = Arc::new(AuthState::new(
         config.base_url(),
         deps.vault,
         deps.clients,
         deps.login,
         deps.connector,
+        links.clone(),
         config.oauth_limits,
     ));
     auth::spawn_flow_sweeper(&auth);
 
     let mcp = StreamableHttpService::new(
-        || Ok(TgMcp::new()),
+        move || Ok(TgMcp::new(links.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_allowed_hosts(config.allowed_hosts())
@@ -76,6 +80,9 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(mcp)
-        .merge(auth::router(auth))
+        .merge(auth::router(auth.clone()))
         .layer(cors)
+        // Media links are for curl in an agent's shell, never for a page:
+        // merged after the CORS layer, so no browser may read them cross-origin.
+        .merge(links::router(auth))
 }

@@ -473,12 +473,17 @@ where
     loop {
         let answer = get_message(MessageRequest { id: next }).await?;
         peers.extend(answer.peers);
-        // Outside channels the id may name another Chat's message: not ours.
-        let Some(found) = answer
-            .messages
-            .into_iter()
-            .find(|f| f.chat == chat.chat() && f.message.id == next)
-        else {
+        let Some(found) = in_chat(
+            answer.messages,
+            MessageAt {
+                chat: chat.chat(),
+                id: next,
+            },
+            |f| MessageAt {
+                chat: f.chat,
+                id: f.message.id,
+            },
+        ) else {
             if chain.is_empty() {
                 return Err(TgError::InvalidInput(format!(
                     "message {start} not found in this chat (deleted, or the id is from another \
@@ -530,6 +535,19 @@ where
         broken_at,
         ..MessagePage::new(issuer.chat_id(chat), messages)
     })
+}
+
+/// The message at `at` among the messages a `messages.getMessages` /
+/// `channels.getMessages` call for its id found (`found_at` says where each
+/// one is). Outside channels the id counts across the Account's private
+/// chats and basic groups, so it may name another Chat's message: that one
+/// is not the one asked for.
+pub fn in_chat<T>(
+    found: impl IntoIterator<Item = T>,
+    at: MessageAt,
+    found_at: impl Fn(&T) -> MessageAt,
+) -> Option<T> {
+    found.into_iter().find(|f| found_at(f) == at)
 }
 
 impl MessagePage {

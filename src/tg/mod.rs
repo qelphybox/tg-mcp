@@ -9,6 +9,7 @@
 //! real Telegram (QR login + Client pool).
 
 pub mod chats;
+pub mod download;
 pub mod fake;
 pub mod find;
 pub mod grammers;
@@ -115,6 +116,24 @@ pub trait Telegram: Send + Sync + 'static {
     /// each once, at most `limit`. Public Chats the Account isn't in are never
     /// returned.
     async fn find_chats(&self, query: &str, limit: usize) -> Result<find::FoundChats, TgError>;
+
+    /// The file of message `message_id`'s media in a Chat, fetched by id
+    /// ([`download::locate`]): what it is (as get_messages describes it),
+    /// its size and where it is. Not found, no media, or media without a
+    /// file is [`TgError::InvalidInput`].
+    async fn media_file(
+        &self,
+        chat: chats::ChatRef,
+        message_id: i32,
+    ) -> Result<download::MediaFile, TgError>;
+
+    /// One `upload.getFile` call, in method class Files: through the
+    /// Account's limiter, its `FLOOD_WAIT` honoured. [`download::Download`]
+    /// makes these calls.
+    async fn get_file(
+        &self,
+        request: download::FileRequest,
+    ) -> Result<download::FilePart, download::FileError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

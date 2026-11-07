@@ -104,8 +104,8 @@ pub async fn start_with_login(login: Arc<dyn Login>) -> TestServer {
     start_with_env(login, &[]).await
 }
 
-/// Every test talks from 127.0.0.1, so the per-IP rate limits of the OAuth
-/// endpoints are lifted unless a test sets them (`env` wins over these).
+/// Every test talks from 127.0.0.1, so the per-IP rate limits of the
+/// anonymous endpoints are lifted unless a test sets them (`env` wins over these).
 const RELAXED_LIMITS: &[(&str, &str)] = &[
     ("TG_MCP_AUTHORIZE_PER_MINUTE", "10000"),
     ("TG_MCP_AUTHORIZE_BURST", "10000"),
@@ -113,6 +113,8 @@ const RELAXED_LIMITS: &[(&str, &str)] = &[
     ("TG_MCP_REGISTER_BURST", "10000"),
     ("TG_MCP_TOKEN_PER_MINUTE", "10000"),
     ("TG_MCP_TOKEN_BURST", "10000"),
+    ("TG_MCP_MEDIA_PER_MINUTE", "10000"),
+    ("TG_MCP_MEDIA_BURST", "10000"),
 ];
 
 /// A server with extra environment variables on top of the test defaults.

@@ -25,6 +25,7 @@ use std::{cmp::Ordering, sync::Arc};
 use super::{
     Account, Telegram, TgError,
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
+    download::{FileError, FilePart, FileRequest, MediaFile},
     find::{FoundChat, FoundChats},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
@@ -416,6 +417,17 @@ impl Untrusted for FoundChats {
     }
 }
 
+impl Untrusted for MediaFile {
+    fn sanitise(&mut self) {
+        let MediaFile {
+            media,
+            location: _,
+            size: _,
+        } = self;
+        clean_media(media);
+    }
+}
+
 fn sanitised<T: Untrusted>(mut value: T) -> T {
     value.sanitise();
     value
@@ -466,6 +478,15 @@ impl Telegram for Sanitised {
 
     async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
         self.0.find_chats(query, limit).await.map(sanitised)
+    }
+
+    async fn media_file(&self, chat: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {
+        self.0.media_file(chat, message_id).await.map(sanitised)
+    }
+
+    /// File bytes are the file, not text for the model: passed on as they are.
+    async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
+        self.0.get_file(request).await
     }
 }
 

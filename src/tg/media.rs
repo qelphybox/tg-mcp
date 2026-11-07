@@ -51,25 +51,138 @@ fn photo(photo: Option<&tl::enums::Photo>) -> Media {
     let Some(tl::enums::Photo::Photo(photo)) = photo else {
         return media;
     };
-    // Inline thumbnails (cached, stripped, path) are no size of the photo.
-    let largest = photo
+    if let Some(largest) = largest_size(photo) {
+        media.width = dimension(largest.w);
+        media.height = dimension(largest.h);
+        media.size_bytes = largest
+            .size
+            .and_then(|s| u64::try_from(s).ok())
+            .filter(|&s| s > 0);
+    }
+    media
+}
+
+/// One size of a photo that is a file of its own (not an inline thumbnail).
+struct PhotoSize<'a> {
+    /// Telegram's name for the size (`m`, `x`, `y`, …): what getFile asks for.
+    r#type: &'a str,
+    w: i32,
+    h: i32,
+    /// Bytes; a progressive size's last (full) one.
+    size: Option<i32>,
+}
+
+/// The largest size of `photo`, by pixels: what the photo is, and what
+/// get_media downloads. Inline thumbnails (cached, stripped, path) are no
+/// size of the photo.
+fn largest_size(photo: &tl::types::Photo) -> Option<PhotoSize<'_>> {
+    photo
         .sizes
         .iter()
         .filter_map(|size| match size {
-            tl::enums::PhotoSize::Size(s) => Some((s.w, s.h, Some(s.size))),
-            tl::enums::PhotoSize::Progressive(s) => Some((s.w, s.h, s.sizes.iter().copied().max())),
+            tl::enums::PhotoSize::Size(s) => Some(PhotoSize {
+                r#type: &s.r#type,
+                w: s.w,
+                h: s.h,
+                size: Some(s.size),
+            }),
+            tl::enums::PhotoSize::Progressive(s) => Some(PhotoSize {
+                r#type: &s.r#type,
+                w: s.w,
+                h: s.h,
+                size: s.sizes.iter().copied().max(),
+            }),
             tl::enums::PhotoSize::Empty(_)
             | tl::enums::PhotoSize::PhotoCachedSize(_)
             | tl::enums::PhotoSize::PhotoStrippedSize(_)
             | tl::enums::PhotoSize::PhotoPathSize(_) => None,
         })
-        .max_by_key(|&(w, h, _)| i64::from(w) * i64::from(h));
-    if let Some((w, h, size)) = largest {
-        media.width = dimension(w);
-        media.height = dimension(h);
-        media.size_bytes = size.and_then(|s| u64::try_from(s).ok()).filter(|&s| s > 0);
+        .max_by_key(|s| i64::from(s.w) * i64::from(s.h))
+}
+
+/// Where a file Telegram keeps is and what it is, for `upload.getFile`
+/// (#36). It stays on the server: its access hash and file reference let
+/// whoever holds this Account's session fetch the file, so it is never
+/// serialised, and `Debug` leaves them out.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FileLocation {
+    pub file: StoredFile,
+    pub id: i64,
+    pub access_hash: i64,
+    /// Telegram's proof that this Account saw the file in a message; it
+    /// expires, and fetching the message again gives a fresh one.
+    pub file_reference: Vec<u8>,
+    /// The DC the message says the file is in.
+    pub dc_id: i32,
+}
+
+/// Which of Telegram's file stores a file is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredFile {
+    /// A photo, at one of its sizes.
+    Photo { thumb_size: String },
+    /// A document: any other file.
+    Document,
+}
+
+impl FileLocation {
+    /// The same file (a fresh file reference doesn't make another one).
+    pub fn same_file(&self, other: &FileLocation) -> bool {
+        self.file == other.file && self.id == other.id
     }
-    media
+}
+
+impl std::fmt::Debug for FileLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileLocation")
+            .field("file", &self.file)
+            .field("dc_id", &self.dc_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The file of a message's media and its size in bytes, if it has one:
+/// a photo (its largest size, as [`describe`] reports it) or a document.
+/// The size is `None` when Telegram doesn't say it. Everything else
+/// (locations, contacts, polls, …) and media that is gone has no file.
+pub fn file(media: Option<&tl::enums::MessageMedia>) -> Option<(FileLocation, Option<u64>)> {
+    use tl::enums::MessageMedia as M;
+    match media? {
+        M::Photo(p) => {
+            let Some(tl::enums::Photo::Photo(photo)) = &p.photo else {
+                return None;
+            };
+            let largest = largest_size(photo)?;
+            Some((
+                FileLocation {
+                    file: StoredFile::Photo {
+                        thumb_size: largest.r#type.to_string(),
+                    },
+                    id: photo.id,
+                    access_hash: photo.access_hash,
+                    file_reference: photo.file_reference.clone(),
+                    dc_id: photo.dc_id,
+                },
+                largest.size.and_then(|s| u64::try_from(s).ok()),
+            ))
+        }
+        M::Document(d) => {
+            let Some(tl::enums::Document::Document(doc)) = &d.document else {
+                return None;
+            };
+            Some((
+                FileLocation {
+                    file: StoredFile::Document,
+                    id: doc.id,
+                    access_hash: doc.access_hash,
+                    file_reference: doc.file_reference.clone(),
+                    dc_id: doc.dc_id,
+                },
+                u64::try_from(doc.size).ok(),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// A file: its kind from its attributes (the flags on the message when the
@@ -852,6 +965,74 @@ mod tests {
             assert_eq!(kind(media), *expected, "{name}");
         }
         assert_eq!(describe(None), None);
+    }
+
+    #[test]
+    fn a_photos_file_is_its_largest_size_and_a_documents_the_document() {
+        let (location, size) = file(Some(&photo_media(Some(full_photo()), None))).unwrap();
+        assert_eq!(
+            location,
+            FileLocation {
+                file: StoredFile::Photo {
+                    thumb_size: "y".into()
+                },
+                id: 5_000_000_001,
+                access_hash: HASH,
+                file_reference: FILE_REFERENCE.to_vec(),
+                dc_id: 2,
+            }
+        );
+        // The size describe() reports for the photo.
+        assert_eq!(size, Some(152_331));
+
+        let voice = doc_media(Some(doc("audio/ogg", 23_211, vec![audio(true, 7)])));
+        let (location, size) = file(Some(&voice)).unwrap();
+        assert_eq!(
+            (location.file, location.id, location.dc_id, size),
+            (StoredFile::Document, 6_000_000_001, 4, Some(23_211))
+        );
+        assert_eq!(location.file_reference, FILE_REFERENCE);
+    }
+
+    #[test]
+    fn media_without_a_file_has_none() {
+        let gone = [
+            photo_media(None, Some(10)),
+            photo_media(Some(enums::Photo::Empty(types::PhotoEmpty { id: 1 })), None),
+            doc_media(None),
+            // A photo with only an inline thumbnail has no size to fetch.
+            photo_media(
+                Some(photo_of(vec![enums::PhotoSize::PhotoStrippedSize(
+                    types::PhotoStrippedSize {
+                        r#type: "i".into(),
+                        bytes: vec![1; 40],
+                    },
+                )])),
+                None,
+            ),
+        ];
+        for media in &gone {
+            assert_eq!(file(Some(media)), None, "{media:?}");
+        }
+        let geo = enums::MessageMedia::Geo(types::MessageMediaGeo { geo: geo() });
+        for media in [geo, poll(false, false, false), enums::MessageMedia::Empty] {
+            assert_eq!(file(Some(&media)), None);
+        }
+        assert_eq!(file(None), None);
+    }
+
+    #[test]
+    fn a_file_location_prints_no_hash_or_reference() {
+        let (location, _) = file(Some(&photo_media(Some(full_photo()), None))).unwrap();
+        let printed = format!("{location:?}");
+        for leak in [
+            HASH.to_string(),
+            "secret-file-reference".into(),
+            "5000000001".into(),
+        ] {
+            assert!(!printed.contains(&leak), "{leak} in {printed}");
+        }
+        assert!(printed.contains("dc_id: 2"), "{printed}");
     }
 
     #[test]

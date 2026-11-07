@@ -322,3 +322,20 @@ Needs a chat (Saved Messages will do) whose latest messages include a photo with
 6. None of the old placeholders (`[photo]`, `[voice]`, `[video message]`, `[file]`, …) appears anywhere. (`[10 photos]`-style lines inside a Rich message, §17, are its content and stay.)
 
 `kamal app logs | grep -F '<the PDF's file name>'` finds nothing: file names are content and never logged.
+
+## 19. get_media hands out a Media link that curl downloads, for one file, 3 times, for 5 minutes
+
+Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with a voice message (525381, 9 s), a round video message (525380), a PDF `tickets.pdf` (525384) and a photo (525379), and a shell with `curl`, `file` and, for step 3, `ffmpeg` and a local Whisper (or any local speech-to-text). In Claude Code, with the server added as in §1, run:
+
+```text
+Через Telegram MCP, в чате user:408551275~0xo8DFRPKC4. 1) get_messages с around_id=525381 и limit=12: выведи для 525379, 525380, 525381, 525384 только id и media целиком, и id одного сообщения без media. 2) get_media с mode="download" для 525379, 525380, 525381, 525384, затем ещё раз для 525381. Для каждого ответа выведи kind и download без url (mime_type, size_bytes, duration_s, suggested_filename, expires_at). url никуда не вставляй и не выводи, используй только в команде curl. Скачай каждый файл по ссылке из первого вызова: curl -fsS -D headers-<id>.txt -o <suggested_filename> '<url>', потом выведи wc -c <suggested_filename>, строки Content-Type, Content-Length, Content-Disposition, Cache-Control, X-Content-Type-Options из headers-<id>.txt и вывод file <suggested_filename>. 3) Расшифруй голосовое локально (ffmpeg в wav 16 кГц, затем whisper) и выведи первые слова; из кружка вытащи звук так же и расшифруй. 4) По первой ссылке на 525381 (она уже скачана один раз) сделай ещё три запроса: curl -s -o /dev/null -w '%{http_code}\n' '<url>'. Запроси <база сервера>/media/ и 43 буквы A тем же способом. 5) get_media для сообщения без media из шага 1 и выведи текст ошибки. 6) Через 6 минут после шага 2 запроси вторую ссылку на 525381 (её ещё не скачивали) и выведи HTTP-код.
+```
+
+1. `get_media` answers `kind` exactly as `get_messages` describes the message: 525379 `photo` with `mime_type: "image/jpeg"`, 525380 `video_note` with `video/mp4`, 525381 `voice` with `audio/ogg` and `duration_s: 9`, 525384 `document` with `application/pdf` and `suggested_filename: "tickets.pdf"`; `size_bytes` equals the message's `media.size_bytes` for each. Others get `<kind>-<id>.<ext>` names (`voice-525381.ogg`, `video_note-525380.mp4`, `photo-525379.jpg`). `expires_at` is 5 minutes after the call. No answer has a file reference, access hash or DC id; the URL is `https://tgmcp.qelphybox.space/media/` + 43 characters.
+2. Each download's `wc -c` equals `size_bytes` and `Content-Length`; `Content-Type` equals `mime_type`; `Content-Disposition: attachment; filename="…"; filename*=UTF-8''…`; `Cache-Control: no-store`; `X-Content-Type-Options: nosniff`. `file` says Ogg data, Opus audio (voice), ISO Media MP4 (video note), PDF document (tickets.pdf), JPEG image data (photo), and the PDF and photo open as the app shows them.
+3. Both transcribe locally into what was said; nothing was converted on the server.
+4. The three extra requests answer `200 200 404` (3 downloads per link); the made-up ticket `404`; neither 404 has a body.
+5. The message without media is a tool error saying it has no media (nothing is issued).
+6. The unused link answers `404` after its 5 minutes.
+
+Then on the server: `kamal app logs | grep 'media link'` shows `media link issued`, `download started` and `download finished` lines with `grant_id` and `size_bytes`/`bytes` only; `kamal app logs | grep -F tickets.pdf` and `kamal app logs | grep -F '<any ticket from the URLs>'` find nothing. (`kamal proxy logs` records request paths, tickets included: accepted, see `docs/deploy.md`.)

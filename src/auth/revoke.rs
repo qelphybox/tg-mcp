@@ -60,6 +60,11 @@ pub async fn revoke(State(auth): State<Arc<AuthState>>, Form(form): Form<RevokeF
     // Delete first: from here on no Token of this Grant opens anything, whatever
     // Telegram does next.
     let grant_id = grant.grant_id.clone();
+    // Its Media links go first: they download without a Token.
+    let links = auth.links.revoke_grant(&grant_id);
+    if links > 0 {
+        tracing::info!(grant_id = %grant_id, links, "media links of a revoked grant dropped");
+    }
     if let Err(err) = auth.vault.delete_grant(&grant_id).await {
         tracing::error!(grant_id = %grant_id, error = %err, "deleting revoked grant failed");
         return no_store(

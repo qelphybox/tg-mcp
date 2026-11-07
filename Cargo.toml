@@ -9,6 +9,7 @@ async-trait = "0.1.92"
 axum = "0.8"
 base64 = "0.23.1"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
 grammers-client = { version = "=0.11.0", default-features = false }
 grammers-mtsender = "=0.11.0"

@@ -114,6 +114,7 @@ impl Config {
             authorize: rate("AUTHORIZE", defaults.authorize)?,
             register: rate("REGISTER", defaults.register)?,
             token: rate("TOKEN", defaults.token)?,
+            media: rate("MEDIA", defaults.media)?,
             max_pending_logins: number(
                 "TG_MCP_MAX_PENDING_LOGINS",
                 defaults.max_pending_logins as u32,
@@ -218,6 +219,7 @@ mod tests {
         );
         assert_eq!((limits.register.per_minute, limits.register.burst), (5, 5));
         assert_eq!((limits.token.per_minute, limits.token.burst), (30, 10));
+        assert_eq!((limits.media.per_minute, limits.media.burst), (30, 10));
         assert_eq!(limits.max_pending_logins, 50);
         assert_eq!(limits.max_pending_logins_per_client, 3);
 
@@ -226,6 +228,7 @@ mod tests {
             ("TG_MCP_TRUST_FORWARDED_FOR", "1"),
             ("TG_MCP_AUTHORIZE_PER_MINUTE", "20"),
             ("TG_MCP_TOKEN_BURST", "3"),
+            ("TG_MCP_MEDIA_PER_MINUTE", "12"),
             ("TG_MCP_MAX_PENDING_LOGINS", "7"),
             ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "2"),
         ]))
@@ -234,6 +237,7 @@ mod tests {
         assert!(limits.trust_forwarded_for);
         assert_eq!(limits.authorize.per_minute, 20);
         assert_eq!(limits.token.burst, 3);
+        assert_eq!(limits.media.per_minute, 12);
         assert_eq!(limits.max_pending_logins, 7);
         assert_eq!(limits.max_pending_logins_per_client, 2);
         assert!(

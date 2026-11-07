@@ -19,10 +19,12 @@ use super::{
         ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
         chat_info, fallback_kind,
     },
+    download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
+    media::{FileLocation, StoredFile},
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MediaKind, MediaSummary, MessageAnswer,
-        MessagePage, MessageRequest, RawHistoryMessage, read_history,
+        MessageAt, MessagePage, MessageRequest, RawHistoryMessage, read_history,
     },
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
@@ -489,6 +491,155 @@ fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
 pub struct FakeTelegram {
     data: FakeData,
     known: KnownPeers,
+    files: Arc<FakeFiles>,
+}
+
+/// The DC every fake message says its file is in.
+pub const FAKE_FILE_DC: i32 = 2;
+
+/// Telegram's file servers as the fake models them (`upload.getFile`), shared
+/// by every Account like Telegram is: what a file reference is worth, which
+/// DC the files are really in, and every request they got.
+#[derive(Debug, Default)]
+pub struct FakeFiles {
+    state: Mutex<FilesState>,
+}
+
+#[derive(Debug, Default)]
+struct FilesState {
+    /// File references handed out before the last expiry are refused.
+    generation: u64,
+    /// Every file reference is refused, however fresh.
+    references_never_last: bool,
+    /// The DC the files are in, when not [`FAKE_FILE_DC`] as messages say.
+    dc_id: Option<i32>,
+    /// `(parts, seconds)`: once this many parts were served, every getFile
+    /// answers `FLOOD_WAIT_<seconds>`.
+    flood_after: Option<(usize, u32)>,
+    served: usize,
+    /// Files end after this many bytes, whatever size their message gives.
+    cut_at: Option<u64>,
+    requests: Vec<FileRequestSeen>,
+    lookups: usize,
+}
+
+/// One `upload.getFile` the fake received: where it was sent and which part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileRequestSeen {
+    pub dc_id: i32,
+    pub offset: i64,
+    pub limit: i32,
+}
+
+impl FakeFiles {
+    fn state(&self) -> std::sync::MutexGuard<'_, FilesState> {
+        self.state.lock().unwrap()
+    }
+
+    /// Every file reference handed out so far expires (Telegram does this
+    /// after some hours); fetching the message again gives a fresh one.
+    pub fn expire_references(&self) {
+        self.state().generation += 1;
+    }
+
+    /// Refuse every file reference, as if each one expired at once.
+    pub fn references_never_last(&self) {
+        self.state().references_never_last = true;
+    }
+
+    /// The files are really in DC `dc_id`: requests to any other DC are
+    /// answered `FILE_MIGRATE_<dc_id>`.
+    pub fn move_to_dc(&self, dc_id: i32) {
+        self.state().dc_id = Some(dc_id);
+    }
+
+    /// Once `parts` parts were served, every getFile is answered
+    /// `FLOOD_WAIT_<seconds>` (method class Files).
+    pub fn flood_after(&self, parts: usize, seconds: u32) {
+        self.state().flood_after = Some((parts, seconds));
+    }
+
+    /// Every file ends after `bytes`, shorter than its message says.
+    pub fn cut_files_at(&self, bytes: u64) {
+        self.state().cut_at = Some(bytes);
+    }
+
+    /// Every getFile so far, in order.
+    pub fn requests(&self) -> Vec<FileRequestSeen> {
+        self.state().requests.clone()
+    }
+
+    /// How many times a message was fetched for its file.
+    pub fn lookups(&self) -> usize {
+        self.state().lookups
+    }
+}
+
+impl FilesState {
+    /// The file reference Telegram hands out (and accepts) now.
+    fn reference(&self) -> Vec<u8> {
+        format!("fake-file-reference-{}", self.generation).into_bytes()
+    }
+}
+
+/// The id of the fake file in message `id` of `chat`.
+pub fn fake_file_id(chat: ChatId, id: i32) -> i64 {
+    peer_key(chat)
+        .wrapping_mul(1_000_003)
+        .wrapping_add(i64::from(id))
+}
+
+/// The bytes of fake file `file_id`, `size` long: each 4-byte word holds its
+/// own index (mixed with the file id), so a part served twice, out of order
+/// or from another file shows.
+pub fn fake_file_bytes(file_id: i64, size: u64) -> Vec<u8> {
+    fake_file_range(file_id, 0..size)
+}
+
+/// Bytes `range` of fake file `file_id`.
+fn fake_file_range(file_id: i64, range: std::ops::Range<u64>) -> Vec<u8> {
+    let seed = (file_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u32;
+    range
+        .map(|i| (((i / 4) as u32) ^ seed).to_le_bytes()[(i % 4) as usize])
+        .collect()
+}
+
+/// The file of a fake message's media: kinds with a file whose size the
+/// fixture gives. Without a size it is gone, as an expired self-destructing
+/// photo is.
+fn fake_file(
+    file_reference: &[u8],
+    chat: ChatId,
+    message: &RawHistoryMessage,
+) -> Option<(FileLocation, Option<u64>)> {
+    let media = message.media.as_ref()?;
+    let file = match media.kind {
+        MediaKind::Photo => StoredFile::Photo {
+            thumb_size: "y".into(),
+        },
+        MediaKind::Video
+        | MediaKind::VideoNote
+        | MediaKind::Voice
+        | MediaKind::Audio
+        | MediaKind::Document
+        | MediaKind::Sticker
+        | MediaKind::Gif => StoredFile::Document,
+        MediaKind::Location | MediaKind::Contact | MediaKind::Poll | MediaKind::Other => {
+            return None;
+        }
+    };
+    let size = media.size_bytes?;
+    let id = fake_file_id(chat, message.id);
+    Some((
+        FileLocation {
+            file,
+            id,
+            access_hash: id.wrapping_mul(31),
+            file_reference: file_reference.to_vec(),
+            dc_id: FAKE_FILE_DC,
+        },
+        Some(size),
+    ))
 }
 
 /// Access hashes of the users and channels a Grant's answers described, like
@@ -500,7 +651,13 @@ impl FakeTelegram {
         Self {
             data,
             known: Arc::default(),
+            files: Arc::default(),
         }
+    }
+
+    /// The file servers this Account's downloads go to.
+    pub fn files(&self) -> &Arc<FakeFiles> {
+        &self.files
     }
 }
 
@@ -734,6 +891,109 @@ impl Telegram for FakeTelegram {
             std::future::ready(Ok(answer))
         })
         .await
+    }
+
+    /// The same getMessages call as the Live client (and a reply chain),
+    /// answered by [`get_message`], each message with its [`fake_file`].
+    async fn media_file(&self, id: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {
+        self.flood()?;
+        self.check_hash(id)?;
+        let chat = id.chat();
+        if !self.knows(chat) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        let reference = {
+            let mut state = self.files.state();
+            state.lookups += 1;
+            state.reference()
+        };
+        download::locate(id, message_id, |request| {
+            let found = get_message(&self.data.messages, chat, &request)
+                .into_iter()
+                .map(|f| RawMediaMessage {
+                    at: MessageAt {
+                        chat: f.chat,
+                        id: f.message.id,
+                    },
+                    file: fake_file(&reference, f.chat, &f.message),
+                    media: f.message.media,
+                })
+                .collect();
+            std::future::ready(Ok(found))
+        })
+        .await
+    }
+
+    /// `upload.getFile` as Telegram answers it (core.telegram.org/api/files):
+    /// `FILE_MIGRATE_X` from any DC but the file's, `FLOOD_WAIT_X` when
+    /// flooded, `FILE_REFERENCE_EXPIRED` for a stale reference, the limit
+    /// divisible by 4 KB and dividing 1 MB, the offset divisible by 4 KB, no
+    /// part across a 1 MB boundary, and then the bytes from `offset`: up to
+    /// `limit`, fewer (or none) at the end of the file. Only this Account's
+    /// files are served.
+    async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
+        const MB: i64 = 1024 * 1024;
+        // A round trip: other tasks (and timeouts) get to run.
+        tokio::task::yield_now().await;
+        let FileRequest {
+            location,
+            dc_id,
+            offset,
+            limit,
+        } = request;
+        let mut state = self.files.state();
+        state.requests.push(FileRequestSeen {
+            dc_id,
+            offset,
+            limit,
+        });
+        let home = state.dc_id.unwrap_or(FAKE_FILE_DC);
+        if dc_id != home {
+            return Err(FileError::Migrate(home));
+        }
+        if let Some((parts, seconds)) = state.flood_after
+            && state.served >= parts
+        {
+            return Err(FileError::Failed(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Files,
+            }));
+        }
+        let current = state.reference();
+        let file = self.data.messages.iter().find_map(|(&chat, messages)| {
+            messages.iter().find_map(|m| {
+                let (stored, size) = fake_file(&current, chat, m)?;
+                (stored.same_file(&location) && stored.access_hash == location.access_hash)
+                    .then_some((stored.id, size.unwrap_or(0)))
+            })
+        });
+        let Some((file_id, size)) = file else {
+            return Err(FileError::Failed(TgError::Upstream(
+                "rpc error 400: FILE_ID_INVALID".into(),
+            )));
+        };
+        if state.references_never_last || location.file_reference != current {
+            return Err(FileError::ReferenceExpired);
+        }
+        if limit <= 0 || limit % 4096 != 0 || MB % i64::from(limit) != 0 {
+            return Err(FileError::Failed(TgError::Upstream(
+                "rpc error 400: LIMIT_INVALID".into(),
+            )));
+        }
+        if offset < 0 || offset % 4096 != 0 || offset / MB != (offset + i64::from(limit) - 1) / MB {
+            return Err(FileError::Failed(TgError::Upstream(
+                "rpc error 400: OFFSET_INVALID".into(),
+            )));
+        }
+        state.served += 1;
+        let size = state.cut_at.map_or(size, |cut| cut.min(size)) as i64;
+        let (start, end) = (offset.min(size), (offset + i64::from(limit)).min(size));
+        Ok(FilePart::Bytes(fake_file_range(
+            file_id,
+            start as u64..end as u64,
+        )))
     }
 }
 
@@ -1145,6 +1405,8 @@ struct FakeTelegramSide {
     /// Each Grant's peer cache, kept across requests as the Live client
     /// pool keeps a Grant's Live client.
     known: Mutex<std::collections::HashMap<String, KnownPeers>>,
+    /// Telegram's file servers, the same for every Grant.
+    files: Arc<FakeFiles>,
 }
 
 impl FakeConnector {
@@ -1163,6 +1425,11 @@ impl FakeConnector {
         self.telegram
             .shutdowns
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Telegram's file servers, where every Grant's downloads go.
+    pub fn files(&self) -> Arc<FakeFiles> {
+        self.telegram.files.clone()
     }
 
     /// Make every call to Telegram fail as if it were down.
@@ -1211,7 +1478,11 @@ impl Connector for FakeConnector {
             .entry(grant.grant_id.as_str().to_string())
             .or_default()
             .clone();
-        Ok(Arc::new(FakeTelegram { data, known }))
+        Ok(Arc::new(FakeTelegram {
+            data,
+            known,
+            files: self.telegram.files.clone(),
+        }))
     }
 
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
