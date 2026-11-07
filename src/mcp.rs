@@ -679,9 +679,10 @@ find_chats gave it (`channel:N~H` or `chat:N`, passed verbatim; not a user). Eac
 and `is_self: true` for the account itself. `query` keeps only members whose name or \
 @username matches it (up to 64 characters; in a supergroup or channel Telegram's member search, \
 which matches the beginning of a word); `admins_only: true` lists only the creator and admins. \
-`total` is how many members match as Telegram counts them. Paginated: `limit` 1-200 (default \
+`total` is how many members match as Telegram counts them: approximate, it changes as people \
+join and leave and may be a little more than can be listed. Paginated: `limit` 1-200 (default \
 50); pass `next_cursor` back as `cursor` with the same `chat_id`, `query` and `admins_only`; no \
-`next_cursor` means this was the last page. The list may be incomplete: Telegram hides members \
+`next_cursor` means this was the last page, and the last page may be empty. The list may be incomplete: Telegram hides members \
 in some groups (`members_hidden: true`: only the admins and bots are listed to this account), \
 shows a channel's subscribers only to its admins (an error says so; `admins_only` may still \
 work in a group), and stops listing a large group after about 10,000 members even when \
