@@ -22,6 +22,7 @@ use std::{cmp::Ordering, sync::Arc};
 use super::{
     Account, Telegram, TgError,
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
+    find::{FoundChat, FoundChats},
     messages::{ChatMessage, HistoryQuery, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
 };
@@ -252,6 +253,22 @@ impl Untrusted for SearchPage {
     }
 }
 
+impl Untrusted for FoundChats {
+    fn sanitise(&mut self) {
+        let FoundChats { chats } = self;
+        for chat in chats {
+            let FoundChat {
+                id: _,
+                title,
+                kind: _,
+                username,
+            } = chat;
+            clean(title);
+            clean_opt(username);
+        }
+    }
+}
+
 fn sanitised<T: Untrusted>(mut value: T) -> T {
     value.sanitise();
     value
@@ -298,6 +315,10 @@ impl Telegram for Sanitised {
 
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
         self.0.search_messages(query).await.map(sanitised)
+    }
+
+    async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
+        self.0.find_chats(query, limit).await.map(sanitised)
     }
 }
 
@@ -531,5 +552,21 @@ mod tests {
         );
         assert_eq!(hit.sender.as_ref().unwrap().name, "Bob");
         assert_eq!(hit.chat.id, "channel:2~AAAAAAAAAAE");
+
+        let mut chats = FoundChats {
+            chats: vec![FoundChat {
+                id: "user:1~AAAAAAAAAAE".into(),
+                title: "Ca\u{200B}rol \u{202E}lorac".into(),
+                kind: ChatKind::Private,
+                username: Some("ca\u{2060}rol".into()),
+            }],
+        };
+        chats.sanitise();
+        let chat = &chats.chats[0];
+        assert_eq!(
+            (chat.title.as_str(), chat.username.as_deref()),
+            ("Carol lorac", Some("carol"))
+        );
+        assert_eq!(chat.id, "user:1~AAAAAAAAAAE");
     }
 }

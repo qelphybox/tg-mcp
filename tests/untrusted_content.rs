@@ -197,6 +197,25 @@ async fn search_messages_strips_snippets_chat_titles_and_sender_names() {
 }
 
 #[tokio::test]
+async fn find_chats_strips_titles_and_usernames() {
+    let (_server, client) = client().await;
+    let found = call(&client, "find_chats", json!({ "query": "lennahc" })).await;
+    assert_eq!(
+        found["chats"],
+        json!([{
+            "id": fake_issued_id(NEWS),
+            "title": format!("News lennahc {EMOJI}"),
+            "type": "channel",
+            "username": "news",
+        }])
+    );
+    // The cap counts what is left: 128 visible characters fit exactly.
+    let found = call(&client, "find_chats", json!({ "query": "t" })).await;
+    assert_eq!(found["chats"][0]["id"], fake_issued_id(LONG));
+    assert_eq!(found["chats"][0]["title"], "T".repeat(128));
+}
+
+#[tokio::test]
 async fn get_chat_info_strips_title_username_and_description() {
     let (_server, client) = client().await;
     let info = call(
@@ -240,6 +259,7 @@ async fn the_model_is_told_that_content_is_untrusted() {
         "get_messages",
         "get_chat_info",
         "search_messages",
+        "find_chats",
     ] {
         let tool = tools.iter().find(|t| t.name == name).unwrap();
         let description = tool.description.as_deref().unwrap_or_default();

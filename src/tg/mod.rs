@@ -10,6 +10,7 @@
 
 pub mod chats;
 pub mod fake;
+pub mod find;
 pub mod grammers;
 pub mod messages;
 mod pool;
@@ -106,6 +107,12 @@ pub trait Telegram: Send + Sync + 'static {
         &self,
         query: search::SearchQuery,
     ) -> Result<search::SearchPage, TgError>;
+
+    /// The Account's own Chats and contacts whose name, title or @username
+    /// matches `query` (trimmed, without a leading `@`), in Telegram's order,
+    /// each once, at most `limit`. Public Chats the Account isn't in are never
+    /// returned.
+    async fn find_chats(&self, query: &str, limit: usize) -> Result<find::FoundChats, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

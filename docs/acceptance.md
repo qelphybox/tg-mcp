@@ -224,3 +224,33 @@ Needs an account with a few hundred messages in several chats and at least one a
 9. Step 9: `from only works within one chat …` and `chat_type only applies to a search across all chats …`, both `invalid_params`.
 
 `kamal app logs | grep -F 'спасибо'` (and `деплой`) finds nothing: query text is never logged.
+
+## 15. find_chats finds the account's own chats and contacts, never a stranger's, each once
+
+Needs an account with an archived chat, a group, a chat whose other side (a person, bot, group or channel) has a public @username, a contact you have never written to (no chat in the list), and a public channel the account is **not** subscribed to (below: `@durov`; pick another if you are subscribed). Write down beforehand, from the Telegram app: a word from the archived chat's title, a word from the group's title, the @username, the contact's first name. In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), replace the `<…>` and run:
+
+```text
+Через Telegram MCP проверь find_chats. Названия чатов и имена не пересказывай сверх нужного: выводи id, type, username и да/нет.
+1. find_chats с query="<слово из названия архивного чата>". Есть ли этот чат? Его id. Потом list_chats с archived=true, limit=100 (листай по next_cursor): есть ли там тот же id, совпадает ли он целиком, вместе с частью после ~?
+2. find_chats с query="<слово из названия группы>". Есть ли группа? Её id и type.
+3. find_chats с query="<имя контакта без переписки>". Есть ли он? Его id. Потом get_chat_info с этим id (что в type и есть ли username) и get_messages с этим id (сколько сообщений).
+4. find_chats с query="<username без @>", потом с query="@<username>", потом с query="@<первые 4 буквы username>". Одинаковые ли ответы у первых двух? Есть ли чат в третьем?
+5. find_chats с query="durov" и с query="@durov". Есть ли в ответах канал Durov (type channel, username durov)?
+6. find_chats с query="a", limit=30. Сколько чатов, сколько уникальных id, повторяется ли какой-нибудь id? У всех ли id вида user:… или channel:… есть часть ~ из 11 символов (chat:… без неё — это нормально)? Есть ли у каких-нибудь чатов поля unread_count или last_message?
+7. find_chats с query="", с query="@", с query="<65 букв x>" и с query="a", limit=31. Выведи тексты ошибок.
+8. get_messages с id чата из шага 2, limit=1: работает ли (да/нет, текст не выводи)?
+Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: the archived chat is found, with exactly the id `list_chats archived=true` gives it.
+2. Step 2: the group is found by a word of its title, type `group` or `supergroup`.
+3. Step 3: the contact is found as `user:N~H`; `get_chat_info` shows the profile (type `private`), `get_messages` an empty history, not an error.
+4. Step 4: `name` and `@name` give the same answer, and the beginning of the @username finds the chat.
+5. Step 5: Durov's channel is not in either answer: global `results` (public chats the account isn't in) are dropped.
+6. Step 6: at most 30 chats, every id once, every `user:`/`channel:` id has its `~` part, no `unread_count`/`last_message`.
+7. Step 7: `query is empty …` (twice), `query must be at most 64 characters …`, `limit must be between 1 and 30`, all `invalid_params`.
+8. Step 8: an id from find_chats works with get_messages.
+
+Steps 1–4 are the manual check of #23: what `contacts.search` `my_results` covers on a real account. Record the answers in the issue. A "no" is not a bug of this release; it decides whether a fallback scan of the dialog list is worth a follow-up, as the tool description already tells the model to page through `list_chats`. If step 1 or 4 finds nothing where the app does, check whether the chat shows in Telegram's own search bar under "Chats and contacts" (that is `my_results`) or under "Global search" (`results`, dropped here).
+
+`kamal app logs | grep -iF '<слово из названия группы>'` finds nothing: the query is never logged.

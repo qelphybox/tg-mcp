@@ -20,6 +20,7 @@ use super::{
         self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, Listing, RawDialog,
         RawMessage, RawPeer,
     },
+    find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessagePage, RawHistoryMessage,
         read_history,
@@ -432,6 +433,8 @@ impl LiveClient {
             TgError::BadSession(err.to_string())
         } else if err.is("SEARCH_QUERY_EMPTY") {
             TgError::InvalidInput(QUERY_REQUIRED.into())
+        } else if err.is("QUERY_TOO_SHORT") {
+            TgError::InvalidInput(QUERY_TOO_SHORT.into())
         } else if err.is("FROM_PEER_INVALID") {
             TgError::InvalidInput("from: Telegram can't search for this sender here".into())
         } else {
@@ -624,6 +627,10 @@ impl Telegram for LiveClient {
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
         search::search(&query, |request| self.search(request)).await
     }
+
+    async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
+        find::find_chats(query, limit, |request| self.contacts_search(request)).await
+    }
 }
 
 /// How far `resolve` pages through the dialogs (per folder) looking for an unknown Chat.
@@ -795,6 +802,24 @@ impl LiveClient {
         })
     }
 
+    /// One `contacts.search` call (method class Search).
+    async fn contacts_search(&self, request: FindRequest) -> Result<FoundAnswer, TgError> {
+        let tl::enums::contacts::Found::Found(found) = self
+            .call(
+                &tl::functions::contacts::Search {
+                    broadcasts: false,
+                    bots: false,
+                    q: request.q,
+                    limit: request.limit,
+                },
+                None,
+            )
+            .await?;
+        let answer = found_answer(found);
+        self.remember(&answer.peers);
+        Ok(answer)
+    }
+
     fn remember(&self, peers: &[RawPeer]) {
         self.peers
             .lock()
@@ -909,6 +934,20 @@ fn raw_found_message(message: tl::enums::Message) -> Option<RawFoundMessage> {
         chat,
         message: raw_history_message(message)?,
     })
+}
+
+/// Both lists of a `contacts.found` and the peers that describe them.
+fn found_answer(found: tl::types::contacts::Found) -> FoundAnswer {
+    FoundAnswer {
+        my_results: found.my_results.iter().map(chat_id).collect(),
+        results: found.results.iter().map(chat_id).collect(),
+        peers: found
+            .users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(found.chats.into_iter().filter_map(raw_chat))
+            .collect(),
+    }
 }
 
 /// Description and member count from a group's or channel's full info.
@@ -1358,6 +1397,28 @@ mod tests {
         let (user, channel) = tl_peers(false);
         assert_eq!(raw_user(user).unwrap().access_hash, Some(99));
         assert_eq!(raw_chat(channel).unwrap().access_hash, Some(99));
+    }
+
+    #[test]
+    fn a_contacts_search_answer_keeps_both_lists_and_no_min_hash() {
+        let user = tl::enums::Peer::User(tl::types::PeerUser { user_id: 7 });
+        let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 7 });
+        let (min_user, _) = tl_peers(true);
+        let (_, full_channel) = tl_peers(false);
+        let answer = found_answer(tl::types::contacts::Found {
+            my_results: vec![user.clone()],
+            results: vec![channel, user],
+            chats: vec![full_channel],
+            users: vec![min_user],
+        });
+        assert_eq!(answer.my_results, [ChatId::User(7)]);
+        assert_eq!(answer.results, [ChatId::Channel(7), ChatId::User(7)]);
+        let hashes: Vec<(ChatId, Option<i64>)> =
+            answer.peers.iter().map(|p| (p.id, p.access_hash)).collect();
+        assert_eq!(
+            hashes,
+            [(ChatId::User(7), None), (ChatId::Channel(7), Some(99))]
+        );
     }
 
     #[test]
@@ -2114,6 +2175,29 @@ mod resolve_tests {
             ),
             TgError::InvalidInput(_)
         ));
+        match live.classify(
+            rpc::<tl::functions::contacts::Search>(400, "QUERY_TOO_SHORT"),
+            MethodClass::Search,
+        ) {
+            TgError::InvalidInput(message) => assert_eq!(message, find::QUERY_TOO_SHORT),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_chats_asks_contacts_search_for_more_than_the_caller_wants() {
+        let (live, _dir) = cold_client().await;
+        assert!(live.find_chats("acc", 10).await.is_err(), "offline");
+        assert_eq!(
+            sent(&live),
+            [tl::functions::contacts::Search {
+                broadcasts: false,
+                bots: false,
+                q: "acc".into(),
+                limit: find::TELEGRAM_LIMIT,
+            }
+            .to_bytes()]
+        );
     }
 
     #[tokio::test]
@@ -2144,6 +2228,13 @@ mod resolve_tests {
                 }) => {}
                 other => panic!("expected {scope:?} to fail fast, got {other:?}"),
             }
+        }
+        match live.find_chats("alice", 10).await {
+            Err(TgError::FloodWait {
+                class: MethodClass::Search,
+                ..
+            }) => {}
+            other => panic!("expected find_chats to fail fast, got {other:?}"),
         }
         // The offline connection fails them, but they went out: not held back.
         assert!(!matches!(

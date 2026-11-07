@@ -18,6 +18,7 @@ use super::{
         ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
         chat_info, fallback_kind,
     },
+    find::{self, FindRequest, FoundAnswer, FoundChats},
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessagePage, RawHistoryMessage,
         read_history,
@@ -46,6 +47,18 @@ pub struct FakeData {
     /// Chats in the Archive; the rest are in the main list.
     #[serde(default)]
     pub archived: Vec<ChatId>,
+    /// Contacts the Account has no chat with: not in list_chats, but found by
+    /// find_chats, with a profile (get_chat_info) and an empty history.
+    #[serde(default)]
+    pub contacts: Vec<ChatSummary>,
+    /// Public Chats and bots the Account isn't in: only the global part of
+    /// `contacts.search` knows them.
+    #[serde(default)]
+    pub public: Vec<ChatSummary>,
+    /// Peers `contacts.search` describes as "min": their access hash only
+    /// works within that answer.
+    #[serde(default)]
+    pub min_peers: Vec<ChatId>,
     /// When set, every reading call (method class Default) answers like
     /// Telegram's FLOOD_WAIT_<seconds>.
     #[serde(default)]
@@ -135,6 +148,9 @@ impl FakeData {
             messages: Default::default(),
             details: Default::default(),
             archived: Vec::new(),
+            contacts: Vec::new(),
+            public: Vec::new(),
+            min_peers: Vec::new(),
             flood_wait: None,
             search_flood_wait: None,
             past_newest: PastNewest::default(),
@@ -163,6 +179,21 @@ impl FakeData {
 
     pub fn with_archived(mut self, chats: Vec<ChatId>) -> Self {
         self.archived = chats;
+        self
+    }
+
+    pub fn with_contacts(mut self, contacts: Vec<ChatSummary>) -> Self {
+        self.contacts = contacts;
+        self
+    }
+
+    pub fn with_public(mut self, chats: Vec<ChatSummary>) -> Self {
+        self.public = chats;
+        self
+    }
+
+    pub fn with_min_peers(mut self, peers: Vec<ChatId>) -> Self {
+        self.min_peers = peers;
         self
     }
 }
@@ -311,6 +342,64 @@ pub fn search_answer(chats: &[FakeSearchChat], me: i64, request: &SearchRequest)
         complete,
         messages: page,
         peers: Vec::new(),
+    }
+}
+
+/// Whether `contacts.search` finds `peer` for `q`: every word of `q` begins
+/// a word of the name or title, or `q` begins the @username, ignoring case.
+/// Taken literally: `@alice` begins no username (the tool strips the `@`).
+fn peer_matches(peer: &RawPeer, q: &str) -> bool {
+    let q = q.to_lowercase();
+    search::text_matches(&peer.title, &q)
+        || peer
+            .username
+            .as_deref()
+            .is_some_and(|u| u.to_lowercase().starts_with(&q))
+}
+
+/// `contacts.search` as Telegram answers it (core.telegram.org/method/contacts.search,
+/// /constructor/contacts.found; how the lists are filled is not documented,
+/// so this is the least polite reading):
+///
+/// - `my_results`: the Account's own Chats (main list and Archive) and
+///   contacts that match, in the given order;
+/// - `results`: public peers that match, the Account's own public Chats among
+///   them (so a peer can be in both lists), and public ones it isn't in;
+/// - each list holds at most `limit` peers; `users`/`chats` describe them all,
+///   `min` ones without a hash.
+pub fn contacts_search(
+    own: &[RawPeer],
+    public: &[RawPeer],
+    min: &[ChatId],
+    request: &FindRequest,
+) -> FoundAnswer {
+    let limit = request.limit.max(0) as usize;
+    let found = |peers: &mut dyn Iterator<Item = &RawPeer>| -> Vec<RawPeer> {
+        peers
+            .filter(|p| peer_matches(p, &request.q))
+            .take(limit)
+            .cloned()
+            .collect()
+    };
+    let mine = found(&mut own.iter());
+    let global = found(
+        &mut own
+            .iter()
+            .filter(|p| p.username.is_some())
+            .chain(public.iter()),
+    );
+    let peers = mine
+        .iter()
+        .chain(&global)
+        .map(|p| RawPeer {
+            access_hash: p.access_hash.filter(|_| !min.contains(&p.id)),
+            ..p.clone()
+        })
+        .collect();
+    FoundAnswer {
+        my_results: mine.iter().map(|p| p.id).collect(),
+        results: global.iter().map(|p| p.id).collect(),
+        peers,
     }
 }
 
@@ -514,6 +603,33 @@ impl Telegram for FakeTelegram {
         })
         .await
     }
+
+    /// The same `contacts.search` call as the Live client, answered by
+    /// [`contacts_search`].
+    async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
+        if let Some(seconds) = self.data.search_flood_wait {
+            return Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Search,
+            });
+        }
+        let me = self.data.account.id;
+        let own: Vec<RawPeer> = self
+            .peers()
+            .into_iter()
+            .filter(|p| p.id != ChatId::User(me))
+            .collect();
+        let public = Self::raw_peers(&self.data.public);
+        find::find_chats(query, limit, |request| {
+            std::future::ready(Ok(contacts_search(
+                &own,
+                &public,
+                &self.data.min_peers,
+                &request,
+            )))
+        })
+        .await
+    }
 }
 
 fn foreign_cursor() -> TgError {
@@ -542,20 +658,20 @@ impl FakeTelegram {
         }
     }
 
-    /// The fake knows a Chat if it lists it or has history for it.
+    /// The fake knows a Chat if it lists it, has history for it or it is a
+    /// contact.
     fn knows(&self, chat: ChatId) -> bool {
         self.data.messages.contains_key(&chat)
             || self
                 .data
                 .chats
                 .iter()
+                .chain(&self.data.contacts)
                 .any(|c| c.id.parse::<ChatRef>().is_ok_and(|id| id.chat() == chat))
     }
 
-    fn peers(&self) -> Vec<RawPeer> {
-        let me = &self.data.account;
-        self.data
-            .chats
+    fn raw_peers(chats: &[ChatSummary]) -> Vec<RawPeer> {
+        chats
             .iter()
             .filter_map(|c| {
                 let id = c.id.parse::<ChatRef>().ok()?.chat();
@@ -568,6 +684,15 @@ impl FakeTelegram {
                     is_self: c.is_self,
                 })
             })
+            .collect()
+    }
+
+    /// The Account's Chats, its contacts and itself.
+    fn peers(&self) -> Vec<RawPeer> {
+        let me = &self.data.account;
+        Self::raw_peers(&self.data.chats)
+            .into_iter()
+            .chain(Self::raw_peers(&self.data.contacts))
             .chain(std::iter::once(RawPeer {
                 id: ChatId::User(me.id),
                 title: me.display_name(),
