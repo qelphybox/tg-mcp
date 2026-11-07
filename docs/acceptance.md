@@ -396,9 +396,9 @@ Needs, in `list_chats` or found with `find_chats`: a contact `<C>` who shows you
 ```
 
 1. Step 1: `type: "private"`, `bio` the same as in the app, no `description` and no `member_count`; `status` matches the app's "last seen" line (`online`; `last_seen` with `last_seen_at` in UTC, the app's local time converted; or `recently` / `last_week` / `last_month` / `long_ago` for "last seen recently / within a week / within a month / a long time ago"); `phone` starts with `+` and is the number the app shows; `birthday` = `{ day, month, year }` as the app shows it (no `year` if the app shows none), absent if the app shows none; `verified`/`premium` only if true; `common_chats_count` = the app's "Groups in common" (0 when there are none, never absent).
-2. Step 2: `type: "bot"`, `bot: true`, `bot_description` = the bot's "What can this bot do?" text; no `status`.
+2. Step 2: `type: "bot"`, `bot: true`, `bot_description` = the bot's "What can this bot do?" text; no `status`; `bio` (the bot's About) only when it differs from `bot_description`.
 3. Step 3: no `phone` field at all (not empty, not null), no `birthday` or `bio` unless the app shows them; `status` matches the app (usually an approximate one), `common_chats_count` present.
 4. Step 4: `common_chats` lists the groups and channels of the app's "Groups in common" (at most 20; `common_chats_count` may be larger), each with an `id` (`chat:N`, or `channel:N~H` with an 11-character `~` part) and a `type`; the first id works with get_messages.
-5. Step 5: the group is an `invalid_params` error `common_chats is only for users …`; the account itself gives `common_chats: []`.
+5. Step 5: the group is an `invalid_params` error `common_chats is only for users …`; the account itself gives `common_chats: []` and has no `status` or `last_seen_at`.
 
 `kamal app logs | grep -F '<the last 4 digits of C's phone>'` and `kamal app logs | grep -iF '<a word of C's bio>'` find nothing: profile content is never logged.

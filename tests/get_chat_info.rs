@@ -221,7 +221,7 @@ async fn describes_channels_people_and_groups() {
     assert_eq!(me["title"], "Me");
     assert_eq!(me["is_self"], true);
     assert_eq!(me["bio"], "my own bio");
-    assert_eq!(me["status"], "online");
+    assert_eq!(me.get("status"), None, "its own status is noise");
     assert_eq!(
         channel.get("is_self"),
         None,
@@ -320,7 +320,10 @@ async fn a_bot_has_its_description() {
     let helper = info(&client, &fake_issued_id(HELPER)).await.unwrap();
     assert_eq!(helper["type"], "bot");
     assert_eq!(helper["bot"], true);
-    assert_eq!(helper["bio"], "I help.");
+    assert_eq!(
+        helper["bio"], "I help.",
+        "an About unlike the description is kept"
+    );
     let description = helper["bot_description"].as_str().unwrap();
     assert!(description.starts_with("What can this bot do?\nEverything."));
     assert_eq!(description.chars().count(), 1000, "cut like a description");
