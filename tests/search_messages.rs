@@ -50,6 +50,7 @@ fn message(id: i32, minute: i32, text: &str) -> RawHistoryMessage {
         text: text.into(),
         media: None,
         reply_to: None,
+        reply_elsewhere: None,
         forwarded: false,
         edited: false,
     }

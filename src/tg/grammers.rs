@@ -22,8 +22,8 @@ use super::{
     },
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessagePage, RawHistoryMessage,
-        read_history,
+        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessageAnswer, MessageAt, MessagePage,
+        MessageRequest, RawHistoryMessage, read_history,
     },
     pool::{Evicted, Live, Pool},
     search::{
@@ -553,9 +553,12 @@ impl Telegram for LiveClient {
     async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
         let peer = self.resolve(id).await?;
         let peer = &peer;
-        read_history(id, &query, |request| {
-            self.get_history(peer, id.chat(), request)
-        })
+        read_history(
+            id,
+            &query,
+            |request| self.get_history(peer, id.chat(), request),
+            |request| self.get_message(peer, id.chat(), request),
+        )
         .await
     }
 
@@ -687,6 +690,53 @@ impl LiveClient {
         Ok(HistoryAnswer {
             messages,
             returned,
+            peers,
+        })
+    }
+
+    /// One `channels.getMessages` (channels and supergroups) or
+    /// `messages.getMessages` (anywhere else: it takes no peer, the id is the
+    /// Account's) call for one message id.
+    async fn get_message(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        MessageRequest { id }: MessageRequest,
+    ) -> Result<MessageAnswer, TgError> {
+        let id = vec![tl::enums::InputMessage::Id(tl::types::InputMessageId {
+            id,
+        })];
+        let answer = match peer {
+            tl::enums::InputPeer::Channel(c) => {
+                let channel = tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: c.channel_id,
+                    access_hash: c.access_hash,
+                });
+                self.call(
+                    &tl::functions::channels::GetMessages { channel, id },
+                    Some(chat),
+                )
+                .await?
+            }
+            _ => {
+                self.call(&tl::functions::messages::GetMessages { id }, Some(chat))
+                    .await?
+            }
+        };
+        let (messages, chats, users) = match answer {
+            tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
+        };
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        self.remember(&peers);
+        Ok(MessageAnswer {
+            messages: messages.into_iter().filter_map(raw_found_message).collect(),
             peers,
         })
     }
@@ -889,12 +939,19 @@ impl LiveClient {
 fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage> {
     match message {
         tl::enums::Message::Message(m) => {
-            let reply_to = match m.reply_to {
-                // Replies into another chat aren't addressable here.
-                Some(tl::enums::MessageReplyHeader::Header(h)) if h.reply_to_peer_id.is_none() => {
-                    h.reply_to_msg_id
+            let (reply_to, reply_elsewhere) = match m.reply_to {
+                Some(tl::enums::MessageReplyHeader::Header(h)) => {
+                    // reply_to_peer_id: the replied message is in another
+                    // Chat (unless it names this one).
+                    match (h.reply_to_msg_id, h.reply_to_peer_id.as_ref().map(chat_id)) {
+                        (Some(id), Some(other)) if other != chat_id(&m.peer_id) => {
+                            (None, Some(MessageAt { chat: other, id }))
+                        }
+                        (id, _) => (id, None),
+                    }
                 }
-                _ => None,
+                // A story reply, or none.
+                _ => (None, None),
             };
             Some(RawHistoryMessage {
                 id: m.id,
@@ -904,6 +961,7 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 text: m.message,
                 media: media_kind(m.media.as_ref()),
                 reply_to,
+                reply_elsewhere,
                 forwarded: m.fwd_from.is_some(),
                 edited: m.edit_date.is_some(),
             })
@@ -916,6 +974,7 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
             text: "[service message]".into(),
             media: None,
             reply_to: None,
+            reply_elsewhere: None,
             forwarded: false,
             edited: false,
         }),
@@ -1421,6 +1480,88 @@ mod tests {
         );
     }
 
+    /// Message `id` in `peer`, replying as `reply_to` says (only the fields
+    /// that aren't optional, plus `reply_to`).
+    fn tl_message(
+        id: i32,
+        peer: tl::enums::Peer,
+        reply_to: Option<tl::enums::MessageReplyHeader>,
+    ) -> tl::enums::Message {
+        use grammers_client::tl::{Deserializable, Identifiable, Serializable};
+        let mut bytes = tl::types::Message::CONSTRUCTOR_ID.to_le_bytes().to_vec();
+        let flags: u32 = if reply_to.is_some() { 1 << 3 } else { 0 };
+        bytes.extend(flags.to_bytes());
+        bytes.extend(0u32.to_bytes());
+        bytes.extend(id.to_bytes());
+        bytes.extend(peer.to_bytes());
+        if let Some(reply_to) = reply_to {
+            bytes.extend(reply_to.to_bytes());
+        }
+        bytes.extend(100i32.to_bytes());
+        bytes.extend(String::from("text").to_bytes());
+        tl::enums::Message::from_bytes(&bytes).unwrap()
+    }
+
+    fn header(msg_id: Option<i32>, peer: Option<tl::enums::Peer>) -> tl::enums::MessageReplyHeader {
+        tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: false,
+            quote: false,
+            reply_to_ephemeral: false,
+            reply_to_msg_id: msg_id,
+            reply_to_peer_id: peer,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            todo_item_id: None,
+            poll_option: None,
+        })
+    }
+
+    #[test]
+    fn a_reply_into_another_chat_is_kept_apart_from_reply_to() {
+        let channel = |channel_id| tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id });
+        let reply = |reply_to| {
+            let found = raw_found_message(tl_message(30, channel(5), reply_to)).unwrap();
+            assert_eq!(found.chat, ChatId::Channel(5));
+            (found.message.reply_to, found.message.reply_elsewhere)
+        };
+        assert_eq!(reply(None), (None, None));
+        assert_eq!(reply(Some(header(Some(20), None))), (Some(20), None));
+        // reply_to_peer_id naming the chat itself is still this chat.
+        assert_eq!(
+            reply(Some(header(Some(20), Some(channel(5))))),
+            (Some(20), None)
+        );
+        assert_eq!(
+            reply(Some(header(Some(7), Some(channel(9))))),
+            (
+                None,
+                Some(MessageAt {
+                    chat: ChatId::Channel(9),
+                    id: 7
+                })
+            )
+        );
+        // A story reply is no message reply.
+        let story = tl::enums::MessageReplyHeader::MessageReplyStoryHeader(
+            tl::types::MessageReplyStoryHeader {
+                peer: channel(9),
+                story_id: 3,
+            },
+        );
+        assert_eq!(reply(Some(story)), (None, None));
+        // messageEmpty (deleted, or not there) is no message.
+        let empty = tl::enums::Message::Empty(tl::types::MessageEmpty {
+            id: 30,
+            peer_id: Some(channel(5)),
+        });
+        assert!(raw_found_message(empty).is_none());
+    }
+
     #[test]
     fn qr_url_is_tg_login_with_base64url_token() {
         assert_eq!(qr_url(&[0xfb, 0xff, 0x01]), "tg://login?token=-_8B");
@@ -1522,8 +1663,10 @@ mod tests {
             method_class::<users::GetFullUser>(),
             method_class::<messages::GetFullChat>(),
             method_class::<channels::GetFullChannel>(),
+            method_class::<messages::GetMessages>(),
+            method_class::<channels::GetMessages>(),
         ];
-        assert_eq!(default, [MethodClass::Default; 6]);
+        assert_eq!(default, [MethodClass::Default; 8]);
     }
 
     #[test]
@@ -1790,6 +1933,42 @@ mod resolve_tests {
                 request(500, -15, 0),
                 // The 30 at and above 501, nothing at or below 500.
                 request(501, -30, 500),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_asks_channels_get_messages_in_a_channel_and_messages_get_messages_elsewhere() {
+        let (live, _dir) = cold_client().await;
+        let chain = HistoryQuery {
+            thread_of: Some(500),
+            limit: 11,
+            ..HistoryQuery::default()
+        };
+        let id = || {
+            vec![tl::enums::InputMessage::Id(tl::types::InputMessageId {
+                id: 500,
+            })]
+        };
+        let channel = ChatRef::new(ChatId::Channel(5), Some(-77));
+        let user = ChatRef::new(ChatId::User(7), Some(88));
+        for chat in [channel, user, ChatId::Chat(4).into()] {
+            // Offline: the first call fails, and the walk with it.
+            assert!(live.get_messages(chat, chain).await.is_err());
+        }
+        assert_eq!(
+            sent(&live),
+            [
+                tl::functions::channels::GetMessages {
+                    channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: 5,
+                        access_hash: -77,
+                    }),
+                    id: id(),
+                }
+                .to_bytes(),
+                tl::functions::messages::GetMessages { id: id() }.to_bytes(),
+                tl::functions::messages::GetMessages { id: id() }.to_bytes(),
             ]
         );
     }

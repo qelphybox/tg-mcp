@@ -511,6 +511,7 @@ mod tests {
             text: text.into(),
             media: None,
             reply_to: None,
+            reply_elsewhere: None,
             forwarded: false,
             edited: false,
         }

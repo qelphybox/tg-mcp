@@ -83,6 +83,7 @@ fn data() -> FakeData {
                 text: "hi".into(),
                 media: None,
                 reply_to: None,
+                reply_elsewhere: None,
                 forwarded: false,
                 edited: false,
             }],

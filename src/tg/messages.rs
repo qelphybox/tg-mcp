@@ -1,11 +1,12 @@
 //! Chat history as the tools see it, independent of grammers/TL.
 //!
 //! [`read_history`] decides which `messages.getHistory` calls a query takes
-//! ([`HistoryRequest`]s); the adapter sends them and turns each answer into
+//! ([`HistoryRequest`]s), or for a reply chain which messages to fetch by id
+//! ([`MessageRequest`]s); the adapter sends them and turns each answer into
 //! [`RawHistoryMessage`]s and [`RawPeer`]s. Who sent what, the date window,
-//! where a window around a message lies and whether there is more on either
-//! side are decided here. The fake answers the same requests with a model of
-//! Telegram's paging.
+//! where a window around a message lies, whether there is more on either
+//! side and where a reply chain ends are decided here. The fake answers the
+//! same requests with a model of Telegram.
 
 use std::collections::HashMap;
 
@@ -15,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatRef, RawPeer, rfc3339},
+    search::RawFoundMessage,
 };
 
 /// What to fetch. Messages come newest first. At most one of `before_id`,
-/// `around_id` and `after_id` is set, and `since`/`until` only go with
-/// `before_id` (or none of them).
+/// `around_id`, `after_id` and `thread_of` is set, and `since`/`until` only go
+/// with `before_id` (or none of them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HistoryQuery {
     pub limit: usize,
@@ -33,6 +35,9 @@ pub struct HistoryQuery {
     pub since: Option<i64>,
     /// Only messages at or before this time (unix seconds).
     pub until: Option<i64>,
+    /// The reply chain of this message: it, the message it replies to, that
+    /// one's parent, …, at most `limit` messages in all.
+    pub thread_of: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -61,9 +66,20 @@ pub struct ChatMessage {
     pub forwarded: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub edited: bool,
-    /// The message an `around_id` window was asked around.
+    /// The message an `around_id` window or a `thread_of` chain was asked for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub target: bool,
+    /// Only in a `thread_of` chain: its root, a message that replies to nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_root: bool,
+}
+
+/// A message in some Chat, as the tools name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MessageLink {
+    /// A chat id as the other tools take it.
+    pub chat_id: String,
+    pub message_id: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -79,6 +95,14 @@ pub struct MessagePage {
     /// messages; absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_after_id: Option<i32>,
+    /// Only for `thread_of`: the oldest message of the chain replies to this
+    /// message in another chat, where the chain goes on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues_in: Option<MessageLink>,
+    /// Only for `thread_of`: the oldest message of the chain replies to this
+    /// id, which is deleted or can't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broken_at: Option<i32>,
 }
 
 /// What a message carries besides its text. Never the media itself.
@@ -141,12 +165,24 @@ pub struct RawHistoryMessage {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<Media>,
+    /// The message it replies to, in the same Chat.
     #[serde(default)]
     pub reply_to: Option<i32>,
+    /// Instead of `reply_to`: the message it replies to is in another Chat
+    /// (`reply_to_peer_id`, e.g. a comment reply forwarded to `@replies`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_elsewhere: Option<MessageAt>,
     #[serde(default)]
     pub forwarded: bool,
     #[serde(default)]
     pub edited: bool,
+}
+
+/// A message by its Chat and id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageAt {
+    pub chat: ChatId,
+    pub id: i32,
 }
 
 /// One `messages.getHistory` call, as its TL parameters (0 = not set, as in TL).
@@ -181,22 +217,54 @@ pub struct HistoryAnswer {
     pub peers: Vec<RawPeer>,
 }
 
+/// One `messages.getMessages` call (`channels.getMessages` in a channel) for
+/// one message id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageRequest {
+    pub id: i32,
+}
+
+/// What Telegram answered to one [`MessageRequest`].
+#[derive(Debug, Clone, Default)]
+pub struct MessageAnswer {
+    /// Each with the Chat it is in (its `peer_id`), `messageEmpty` left out.
+    /// Outside channels ids count across all of the Account's private chats
+    /// and basic groups, so a message here may be another Chat's.
+    pub messages: Vec<RawFoundMessage>,
+    pub peers: Vec<RawPeer>,
+}
+
 /// Answer `query` with as many `messages.getHistory` calls as it takes (one,
-/// or two for a window at the newest message), sent through `get_history`.
-pub async fn read_history<F, Fut>(
+/// or two for a window at the newest message), sent through `get_history`;
+/// a `thread_of` chain with one `get_message` per message of the chain.
+pub async fn read_history<F, Fut, G, GFut>(
     chat: ChatRef,
     query: &HistoryQuery,
     mut get_history: F,
+    get_message: G,
 ) -> Result<MessagePage, TgError>
 where
     F: FnMut(HistoryRequest) -> Fut,
     Fut: Future<Output = Result<HistoryAnswer, TgError>>,
+    G: FnMut(MessageRequest) -> GFut,
+    GFut: Future<Output = Result<MessageAnswer, TgError>>,
 {
     let limit = i32::try_from(query.limit)
         .ok()
         .filter(|&l| l >= 1)
         .ok_or_else(|| TgError::InvalidInput("limit is out of range".into()))?;
     let dated = query.since.is_some() || query.until.is_some();
+    if let Some(start) = query.thread_of {
+        let positioned =
+            query.before_id.is_some() || query.around_id.is_some() || query.after_id.is_some();
+        if positioned || dated {
+            return Err(TgError::InvalidInput(
+                "thread_of doesn't combine with before_id, around_id, after_id, since or until"
+                    .into(),
+            ));
+        }
+        return read_thread(chat, start, query.limit, get_message).await;
+    }
     match (query.before_id, query.around_id, query.after_id) {
         (_, None, None) => {
             let answer = get_history(HistoryRequest {
@@ -238,10 +306,11 @@ where
                 .flatten();
             let issuer = Issuer::new(&answer.peers);
             Ok(MessagePage {
-                chat_id: issuer.chat_id(chat),
-                messages: window.iter().map(|m| issuer.message(chat, m)).collect(),
-                next_before_id: None,
                 next_after_id,
+                ..MessagePage::new(
+                    issuer.chat_id(chat),
+                    window.iter().map(|m| issuer.message(chat, m)).collect(),
+                )
             })
         }
         _ => Err(TgError::InvalidInput(
@@ -304,17 +373,115 @@ where
     }
     let issuer = Issuer::new(&peers);
     Ok(MessagePage {
-        chat_id: issuer.chat_id(chat),
-        messages: window
-            .iter()
-            .map(|m| ChatMessage {
-                target: m.id == target,
-                ..issuer.message(chat, m)
-            })
-            .collect(),
         next_before_id: more_older.then(|| window.last().map(|m| m.id)).flatten(),
         next_after_id: (!at_newest).then(|| window.first().map(|m| m.id)).flatten(),
+        ..MessagePage::new(
+            issuer.chat_id(chat),
+            window
+                .iter()
+                .map(|m| ChatMessage {
+                    target: m.id == target,
+                    ..issuer.message(chat, m)
+                })
+                .collect(),
+        )
     })
+}
+
+/// The reply chain of `start`, newest first: `start` and its ancestors, at
+/// most `limit` messages, fetched one by one (each parent's id is only known
+/// once its child is). The walk ends at the root (a message that replies to
+/// nothing), at `limit`, at a parent in another Chat (`continues_in`) or at a
+/// parent that is deleted or can't be read (`broken_at`). `start` itself
+/// missing from this Chat is an error.
+async fn read_thread<G, GFut>(
+    chat: ChatRef,
+    start: i32,
+    limit: usize,
+    mut get_message: G,
+) -> Result<MessagePage, TgError>
+where
+    G: FnMut(MessageRequest) -> GFut,
+    GFut: Future<Output = Result<MessageAnswer, TgError>>,
+{
+    let mut peers = Vec::new();
+    let mut chain: Vec<RawHistoryMessage> = Vec::new();
+    let (mut root, mut broken_at, mut elsewhere) = (false, None, None);
+    let mut next = start;
+    loop {
+        let answer = get_message(MessageRequest { id: next }).await?;
+        peers.extend(answer.peers);
+        // Outside channels the id may name another Chat's message: not ours.
+        let Some(found) = answer
+            .messages
+            .into_iter()
+            .find(|f| f.chat == chat.chat() && f.message.id == next)
+        else {
+            if chain.is_empty() {
+                return Err(TgError::InvalidInput(format!(
+                    "message {start} not found in this chat (deleted, or the id is from another \
+                     chat)"
+                )));
+            }
+            broken_at = Some(next);
+            break;
+        };
+        let message = found.message;
+        let parent = message.reply_to;
+        let other_chat = message.reply_elsewhere.filter(|at| at.chat != chat.chat());
+        chain.push(message);
+        if let Some(at) = other_chat {
+            elsewhere = Some(at);
+            break;
+        }
+        match parent {
+            None => {
+                root = true;
+                break;
+            }
+            Some(_) if chain.len() >= limit => break,
+            // A reply always points to an older message, so this can't
+            // happen; if it did, the link can't be followed.
+            Some(parent) if chain.iter().any(|m| m.id == parent) => {
+                broken_at = Some(parent);
+                break;
+            }
+            Some(parent) => next = parent,
+        }
+    }
+    let issuer = Issuer::new(&peers);
+    let last = chain.len() - 1;
+    let messages = chain
+        .iter()
+        .enumerate()
+        .map(|(i, m)| ChatMessage {
+            target: i == 0,
+            thread_root: root && i == last,
+            ..issuer.message(chat, m)
+        })
+        .collect();
+    Ok(MessagePage {
+        continues_in: elsewhere.map(|at| MessageLink {
+            chat_id: issuer.issue(at.chat, chat).to_string(),
+            message_id: at.id,
+        }),
+        broken_at,
+        ..MessagePage::new(issuer.chat_id(chat), messages)
+    })
+}
+
+impl MessagePage {
+    /// A page of `messages` with no cursors and no chain ends.
+    pub fn new(chat_id: String, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            chat_id,
+            messages,
+            next_before_id: None,
+            next_after_id: None,
+            continues_in: None,
+            broken_at: None,
+        }
+    }
 }
 
 /// Newest first, each id once, only ids that `keep`.
@@ -387,6 +554,7 @@ impl<'a> Issuer<'a> {
             forwarded: m.forwarded,
             edited: m.edited,
             target: false,
+            thread_root: false,
         }
     }
 }
@@ -418,10 +586,8 @@ fn assemble_history(
         .then(|| raw.last().map(|m| m.id))
         .flatten();
     MessagePage {
-        chat_id: issuer.chat_id(chat),
-        messages,
         next_before_id,
-        next_after_id: None,
+        ..MessagePage::new(issuer.chat_id(chat), messages)
     }
 }
 
@@ -448,7 +614,7 @@ mod tests {
     use super::*;
     use crate::tg::{
         chats::ChatKind,
-        fake::{PastNewest, get_history},
+        fake::{PastNewest, get_history, get_message},
     };
 
     fn msg(id: i32, date: i32) -> RawHistoryMessage {
@@ -460,6 +626,7 @@ mod tests {
             text: format!("m{id}"),
             media: None,
             reply_to: None,
+            reply_elsewhere: None,
             forwarded: false,
             edited: false,
         }
@@ -633,15 +800,22 @@ mod tests {
         past_newest: PastNewest,
     ) -> (Result<MessagePage, TgError>, Vec<HistoryRequest>) {
         let mut sent = Vec::new();
-        let page = futures_executor(read_history(ChatId::Channel(1).into(), &query, |request| {
-            sent.push(request);
-            let messages = get_history(history, &request, past_newest);
-            std::future::ready(Ok(HistoryAnswer {
-                returned: messages.len(),
-                messages,
-                peers: Vec::new(),
-            }))
-        }));
+        let page = futures_executor(read_history(
+            ChatId::Channel(1).into(),
+            &query,
+            |request| {
+                sent.push(request);
+                let messages = get_history(history, &request, past_newest);
+                std::future::ready(Ok(HistoryAnswer {
+                    returned: messages.len(),
+                    messages,
+                    peers: Vec::new(),
+                }))
+            },
+            |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
+                unreachable!("history pages fetch no message by id")
+            },
+        ));
         (page, sent)
     }
 
@@ -817,6 +991,27 @@ mod tests {
                 ..query(3)
             },
             around(1, 0),
+            HistoryQuery {
+                thread_of: Some(1),
+                ..around(1, 3)
+            },
+            HistoryQuery {
+                before_id: Some(2),
+                ..thread(1, 3)
+            },
+            HistoryQuery {
+                after_id: Some(1),
+                ..thread(1, 3)
+            },
+            HistoryQuery {
+                since: Some(0),
+                ..thread(1, 3)
+            },
+            HistoryQuery {
+                until: Some(5),
+                ..thread(1, 3)
+            },
+            thread(1, 0),
         ] {
             let (page, sent) = read(&history, bad, PastNewest::Shorten);
             assert!(
@@ -825,6 +1020,206 @@ mod tests {
             );
             assert!(sent.is_empty(), "nothing is asked of Telegram");
         }
+    }
+
+    fn thread(start: i32, limit: usize) -> HistoryQuery {
+        HistoryQuery {
+            thread_of: Some(start),
+            ..query(limit)
+        }
+    }
+
+    fn reply(id: i32, to: i32) -> RawHistoryMessage {
+        RawHistoryMessage {
+            reply_to: Some(to),
+            ..msg(id, id)
+        }
+    }
+
+    type Histories = HashMap<ChatId, Vec<RawHistoryMessage>>;
+
+    /// Reads the chain of `start` in `chat` through the fake's model of
+    /// getMessages, recording the requests sent.
+    fn read_chain(
+        histories: &Histories,
+        chat: ChatId,
+        start: i32,
+        limit: usize,
+    ) -> (Result<MessagePage, TgError>, Vec<MessageRequest>) {
+        let mut sent = Vec::new();
+        let page = futures_executor(read_history(
+            chat.into(),
+            &thread(start, limit),
+            |_| -> std::future::Ready<Result<HistoryAnswer, TgError>> {
+                unreachable!("a chain reads no history")
+            },
+            |request| {
+                sent.push(request);
+                std::future::ready(Ok(MessageAnswer {
+                    messages: get_message(histories, chat, &request),
+                    peers: Vec::new(),
+                }))
+            },
+        ));
+        (page, sent)
+    }
+
+    fn flagged(page: &MessagePage, flag: fn(&ChatMessage) -> bool) -> Vec<i32> {
+        page.messages
+            .iter()
+            .filter(|m| flag(m))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    const GROUP: ChatId = ChatId::Channel(1);
+
+    /// A busy supergroup: a 60-hop chain (each `10 * k` replies to
+    /// `10 * (k - 1)`, 10 is the root) between unrelated messages.
+    fn busy_group() -> Histories {
+        let mut history: Vec<RawHistoryMessage> = (1..=600)
+            .filter(|id| id % 10 != 0)
+            .map(|id| msg(id, id))
+            .collect();
+        history.push(msg(10, 10));
+        history.extend((2..=60).map(|k| reply(10 * k, 10 * (k - 1))));
+        HashMap::from([(GROUP, history)])
+    }
+
+    #[test]
+    fn a_chain_is_the_message_and_its_ancestors_newest_first() {
+        let histories = busy_group();
+        for start in [10, 20, 50, 300, 600] {
+            for limit in 1..=8 {
+                let case = format!("thread_of {start}, {limit} messages");
+                let (page, sent) = read_chain(&histories, GROUP, start, limit);
+                let page = page.unwrap();
+                let ancestors = (start / 10 - 1) as usize;
+                let expected: Vec<i32> = (0..=ancestors.min(limit - 1) as i32)
+                    .map(|k| start - 10 * k)
+                    .collect();
+                assert_eq!(page_ids(&page), expected, "{case}");
+                // One getMessages per message of the chain, none beyond it.
+                let asked: Vec<i32> = sent.iter().map(|r| r.id).collect();
+                assert_eq!(asked, expected, "{case}");
+                assert_eq!(flagged(&page, |m| m.target), [start], "{case}");
+                let reached_root = ancestors < limit;
+                let roots: &[i32] = if reached_root { &[10] } else { &[] };
+                assert_eq!(flagged(&page, |m| m.thread_root), roots, "{case}");
+                // A chain cut by the cap says where it goes on: its oldest
+                // message still names its parent.
+                let oldest = page.messages.last().unwrap();
+                assert_eq!(oldest.reply_to.is_some(), !reached_root, "{case}");
+                assert_eq!(page.broken_at, None, "{case}");
+                assert_eq!(page.continues_in, None, "{case}");
+                assert_eq!(
+                    (page.next_before_id, page.next_after_id),
+                    (None, None),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_deleted_parent_ends_the_chain_and_is_named() {
+        let mut histories = busy_group();
+        // 300's parent, 290, is deleted: messageEmpty.
+        histories.get_mut(&GROUP).unwrap().retain(|m| m.id != 290);
+        let (page, sent) = read_chain(&histories, GROUP, 320, 10);
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [320, 310, 300]);
+        assert_eq!(page.broken_at, Some(290));
+        assert!(flagged(&page, |m| m.thread_root).is_empty());
+        assert_eq!(page.messages[2].reply_to, Some(290), "the link is shown");
+        assert_eq!(sent.len(), 4, "the deleted parent was asked for once");
+
+        // The message itself replying to a deleted one: just it.
+        let (page, _) = read_chain(&histories, GROUP, 300, 10);
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [300]);
+        assert_eq!(page.broken_at, Some(290));
+    }
+
+    #[test]
+    fn a_parent_in_another_chat_ends_the_chain_and_says_where() {
+        let other = ChatId::Channel(9);
+        let mut histories = busy_group();
+        let history = histories.get_mut(&GROUP).unwrap();
+        let at = history.iter().position(|m| m.id == 30).unwrap();
+        // 30 replies to message 7 of another chat (reply_to_peer_id).
+        history[at] = RawHistoryMessage {
+            reply_elsewhere: Some(MessageAt { chat: other, id: 7 }),
+            ..msg(30, 30)
+        };
+        histories.insert(other, vec![msg(7, 7)]);
+        let peers = [RawPeer {
+            access_hash: Some(-5),
+            ..peer(other, "News")
+        }];
+        let mut sent = Vec::new();
+        let page = futures_executor(read_history(
+            GROUP.into(),
+            &thread(50, 20),
+            |_| -> std::future::Ready<Result<HistoryAnswer, TgError>> { unreachable!() },
+            |request| {
+                sent.push(request.id);
+                std::future::ready(Ok(MessageAnswer {
+                    messages: get_message(&histories, GROUP, &request),
+                    peers: peers.to_vec(),
+                }))
+            },
+        ))
+        .unwrap();
+        assert_eq!(page_ids(&page), [50, 40, 30]);
+        assert_eq!(sent, [50, 40, 30], "nothing is fetched in the other chat");
+        assert_eq!(
+            page.continues_in,
+            Some(MessageLink {
+                chat_id: ChatRef::new(other, Some(-5)).to_string(),
+                message_id: 7,
+            })
+        );
+        assert_eq!(page.broken_at, None);
+        assert!(flagged(&page, |m| m.thread_root).is_empty());
+        assert_eq!(page.messages[2].reply_to, None, "reply_to is this chat's");
+    }
+
+    #[test]
+    fn outside_channels_an_id_from_another_chat_is_not_this_chats_message() {
+        // messages.getMessages takes no peer: ids count across all private
+        // chats and basic groups, so asking for Bob's id finds Bob's message.
+        let (alice, bob) = (ChatId::User(1), ChatId::User(2));
+        let histories = HashMap::from([
+            (alice, vec![msg(3, 3), reply(9, 3)]),
+            (bob, vec![msg(5, 5), reply(8, 5)]),
+        ]);
+        for missing in [5, 8, 100] {
+            let (page, sent) = read_chain(&histories, alice, missing, 5);
+            let err = page.unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("message {missing} not found in this chat")),
+                "{err}"
+            );
+            assert_eq!(sent.len(), 1);
+        }
+        let (page, _) = read_chain(&histories, alice, 9, 5);
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [9, 3]);
+        assert_eq!(flagged(&page, |m| m.thread_root), [3]);
+        let (page, _) = read_chain(&histories, ChatId::Chat(4), 8, 5);
+        assert!(page.is_err(), "a basic group is no different");
+    }
+
+    #[test]
+    fn a_loop_ends_the_walk_without_repeating_a_message() {
+        // Telegram can't produce this (replies point to older messages).
+        let histories = HashMap::from([(GROUP, vec![reply(5, 9), reply(9, 7), reply(7, 9)])]);
+        let (page, sent) = read_chain(&histories, GROUP, 5, 50);
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [5, 9, 7]);
+        assert_eq!(page.broken_at, Some(9));
+        assert_eq!(sent.len(), 3);
     }
 
     #[test]

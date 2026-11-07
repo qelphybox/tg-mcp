@@ -20,8 +20,8 @@ use super::{
     },
     find::{self, FindRequest, FoundAnswer, FoundChats},
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessagePage, RawHistoryMessage,
-        read_history,
+        HistoryAnswer, HistoryQuery, HistoryRequest, Media, MessageAnswer, MessagePage,
+        MessageRequest, RawHistoryMessage, read_history,
     },
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
@@ -125,6 +125,47 @@ pub fn get_history(
         .take(take as usize)
         .filter(|m| request.max_id == 0 || m.id < request.max_id)
         .filter(|m| request.min_id == 0 || m.id > request.min_id)
+        .collect()
+}
+
+/// `messages.getMessages` / `channels.getMessages` for one id as Telegram
+/// answers it (core.telegram.org/method/messages.getMessages,
+/// /method/channels.getMessages, /constructor/messageEmpty), on the
+/// Account's histories:
+///
+/// - in a channel or supergroup (`channels.getMessages`), the id is looked up
+///   in that Chat only;
+/// - anywhere else (`messages.getMessages`, which takes no peer), ids count
+///   across all of the Account's private chats and basic groups, so the
+///   message found may be another Chat's: the caller has to check its Chat;
+/// - a deleted or unknown id is a `messageEmpty`, i.e. no message.
+///
+/// Real ids outside channels are unique across those Chats; should a fixture
+/// repeat one, it is always the same Chat's (by [`peer_key`]).
+pub fn get_message(
+    histories: &std::collections::HashMap<ChatId, Vec<RawHistoryMessage>>,
+    chat: ChatId,
+    request: &MessageRequest,
+) -> Vec<RawFoundMessage> {
+    let mut chats: Vec<ChatId> = match chat {
+        ChatId::Channel(_) => vec![chat],
+        _ => histories
+            .keys()
+            .copied()
+            .filter(|c| !matches!(c, ChatId::Channel(_)))
+            .collect(),
+    };
+    chats.sort_by_key(|&c| peer_key(c));
+    chats
+        .into_iter()
+        .find_map(|c| {
+            let message = histories.get(&c)?.iter().find(|m| m.id == request.id)?;
+            Some(RawFoundMessage {
+                chat: c,
+                message: message.clone(),
+            })
+        })
+        .into_iter()
         .collect()
 }
 
@@ -520,14 +561,24 @@ impl Telegram for FakeTelegram {
         }
         let history = self.data.messages.get(&chat).map_or(&[][..], Vec::as_slice);
         let peers = self.peers();
-        read_history(id, &query, |request| {
-            let messages = get_history(history, &request, self.data.past_newest);
-            std::future::ready(Ok(HistoryAnswer {
-                returned: messages.len(),
-                messages,
-                peers: peers.clone(),
-            }))
-        })
+        read_history(
+            id,
+            &query,
+            |request| {
+                let messages = get_history(history, &request, self.data.past_newest);
+                std::future::ready(Ok(HistoryAnswer {
+                    returned: messages.len(),
+                    messages,
+                    peers: peers.clone(),
+                }))
+            },
+            |request| {
+                std::future::ready(Ok(MessageAnswer {
+                    messages: get_message(&self.data.messages, chat, &request),
+                    peers: peers.clone(),
+                }))
+            },
+        )
         .await
     }
 
@@ -988,6 +1039,7 @@ mod tests {
                 text: String::new(),
                 media: None,
                 reply_to: None,
+                reply_elsewhere: None,
                 forwarded: false,
                 edited: false,
             })
@@ -1065,6 +1117,44 @@ mod tests {
             ..by_date
         };
         assert_eq!(ids(both, PastNewest::Shorten), [9, 3]);
+    }
+
+    #[test]
+    fn get_messages_looks_in_the_channel_or_across_all_other_chats() {
+        let message = |id| RawHistoryMessage {
+            id,
+            ..history()[0].clone()
+        };
+        let (alice, bob, group, channel) = (
+            ChatId::User(1),
+            ChatId::User(2),
+            ChatId::Chat(3),
+            ChatId::Channel(4),
+        );
+        let histories = std::collections::HashMap::from([
+            (alice, vec![message(10)]),
+            (bob, vec![message(11)]),
+            (group, vec![message(12)]),
+            (channel, vec![message(10), message(11)]),
+        ]);
+        let found = |chat, id| -> Vec<(ChatId, i32)> {
+            get_message(&histories, chat, &MessageRequest { id })
+                .into_iter()
+                .map(|f| (f.chat, f.message.id))
+                .collect()
+        };
+        // messages.getMessages: the Account's ids, whichever chat asks.
+        for asking in [alice, bob, group] {
+            assert_eq!(found(asking, 10), [(alice, 10)]);
+            assert_eq!(found(asking, 11), [(bob, 11)]);
+            assert_eq!(found(asking, 12), [(group, 12)]);
+        }
+        // channels.getMessages: that channel only.
+        assert_eq!(found(channel, 10), [(channel, 10)]);
+        assert_eq!(found(channel, 12), []);
+        assert_eq!(found(ChatId::Channel(5), 10), []);
+        // Deleted or never there: messageEmpty.
+        assert_eq!(found(alice, 13), []);
     }
 
     #[test]

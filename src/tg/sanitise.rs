@@ -178,6 +178,8 @@ impl Untrusted for MessagePage {
             messages,
             next_before_id: _,
             next_after_id: _,
+            continues_in: _,
+            broken_at: _,
         } = self;
         for message in messages {
             let ChatMessage {
@@ -190,6 +192,7 @@ impl Untrusted for MessagePage {
                 forwarded: _,
                 edited: _,
                 target: _,
+                thread_root: _,
             } = message;
             clean(text);
             if let Some(Sender { id: _, name }) = sender {
@@ -499,9 +502,9 @@ mod tests {
             ("Me", Some("Last"), Some("me"))
         );
 
-        let mut history = MessagePage {
-            chat_id: "user:1".into(),
-            messages: vec![ChatMessage {
+        let mut history = MessagePage::new(
+            "user:1".into(),
+            vec![ChatMessage {
                 id: 1,
                 date: "2026-11-06T00:00:00Z".into(),
                 sender: Some(Sender {
@@ -514,10 +517,9 @@ mod tests {
                 forwarded: false,
                 edited: false,
                 target: false,
+                thread_root: false,
             }],
-            next_before_id: None,
-            next_after_id: None,
-        };
+        );
         history.sanitise();
         assert_eq!(history.messages[0].text, "a\nb");
         assert_eq!(history.messages[0].sender.as_ref().unwrap().name, "Bob");

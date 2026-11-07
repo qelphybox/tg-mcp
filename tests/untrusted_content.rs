@@ -55,6 +55,7 @@ fn message(id: i32, text: String) -> RawHistoryMessage {
         text,
         media: None,
         reply_to: None,
+        reply_elsewhere: None,
         forwarded: false,
         edited: false,
     }
