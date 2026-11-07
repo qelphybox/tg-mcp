@@ -9,9 +9,9 @@
 //! zero-width spaces, bidi overrides and isolates, BOM, invisible operators,
 //! tag characters, …), control characters other than line breaks and tabs,
 //! the invisible characters that are not `Cf` (Hangul fillers, the combining
-//! grapheme joiner) and variation selectors that modify nothing. Message text
-//! with nothing visible left reads `[no visible text]`. Detecting injection
-//! attempts by their content is not attempted.
+//! grapheme joiner, the braille blank) and variation selectors that modify
+//! nothing. Message text with nothing visible left reads `[no visible text]`.
+//! Detecting injection attempts by their content is not attempted.
 //!
 //! The seam is the [`Telegram`] trait itself: tools read through [`Sanitised`],
 //! which sanitises every answer of the Live client or the fake before a tool
@@ -57,9 +57,12 @@ const FORMAT: &[(char, char)] = &[
     ('\u{E0020}', '\u{E007F}'), // tag characters ("ASCII smuggling")
 ];
 
-/// Invisible characters that are not `Cf`: the combining grapheme joiner and
-/// the Hangul fillers, which render as nothing (blank "names" use them).
-const INVISIBLE: [char; 5] = ['\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}'];
+/// Invisible characters that are not `Cf`: the combining grapheme joiner, the
+/// Hangul fillers and the braille blank (U+2800, `So`, a common spacer line),
+/// which render as nothing (blank "names" use them).
+const INVISIBLE: [char; 6] = [
+    '\u{034F}', '\u{115F}', '\u{1160}', '\u{2800}', '\u{3164}', '\u{FFA0}',
+];
 
 const ZWJ: char = '\u{200D}';
 const TEXT_PRESENTATION: char = '\u{FE0E}';
@@ -593,6 +596,14 @@ mod tests {
     }
 
     #[test]
+    fn the_braille_blank_is_removed() {
+        // U+2800 is `So`, not `Cf`, but renders as nothing: a common spacer.
+        assert_eq!(sanitise("a\n\u{2800}\nb\u{2800}c"), "a\n\nbc");
+        assert!(is_blank("\u{2800}\u{2800} \n\u{2800}"));
+        assert_eq!(sanitise("\u{2801}"), "\u{2801}", "other braille stays");
+    }
+
+    #[test]
     fn line_and_paragraph_separators_follow_the_field() {
         assert_eq!(sanitise("a\u{2028}b\u{2029}c"), "a\nb\nc");
         assert_eq!(sanitise_line("a\u{2028}b\u{2029}c"), "a b c");
@@ -859,6 +870,7 @@ mod tests {
                 "",
                 "[photo]",
                 "hi\u{2063}",
+                "\u{2800}\n\u{2800}",
             ]
             .map(message)
             .into(),
@@ -873,7 +885,8 @@ mod tests {
                 NO_VISIBLE_TEXT,
                 "",
                 "[photo]",
-                "hi"
+                "hi",
+                NO_VISIBLE_TEXT
             ]
         );
 

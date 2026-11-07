@@ -20,9 +20,10 @@ type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::Clien
 
 const ESTATE: ChatId = ChatId::Channel(1804);
 
-/// What the listing reads as: its lines, the hidden characters in the
-/// "Кондиционеры" cell gone.
-const LISTING: &str = "🏡 Аренда: 4 комнаты, Ваке\n\
+/// What the listing reads as: its lines, the ten photos on one line, the
+/// spacer line and the hidden characters in the "Кондиционеры" cell gone.
+const LISTING: &str = "[10 photos]\n\
+                       🏡 Аренда: 4 комнаты, Ваке\n\
                        📍 Тбилиси, ул. Абашидзе, 12\n\
                        Сдается светлая, чистая квартира с видом на парк.\n\
                        Параметры и удобства\n\

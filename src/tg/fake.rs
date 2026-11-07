@@ -807,18 +807,26 @@ pub fn sample_chats() -> Vec<ChatSummary> {
     ]
 }
 
-/// A Rich message shaped like a real-estate channel's post (#50): a bold title,
-/// an address with a link, a paragraph, a collapsible "Параметры и удобства"
-/// section with a two-column table and a line, and a collapsible "Теги" section
-/// with an id and hashtags. Its `message.message` is empty. The "Кондиционеры"
-/// cell hides a zero-width space and the word "ignore" in tag characters, which
-/// the flattened text keeps for the sanitiser to strip.
+/// A Rich message shaped like a real-estate channel's post (#50): a collage of
+/// ten photos without a caption, a bold title, an address with a link, a
+/// spacer line of only U+2800 (braille blank), a paragraph, a collapsible
+/// "Параметры и удобства" section with a two-column table and a line, and a
+/// collapsible "Теги" section with an id and hashtags. Its `message.message`
+/// is empty. The "Кондиционеры" cell hides a zero-width space and the word
+/// "ignore" in tag characters, which the flattened text keeps for the
+/// sanitiser to strip.
 pub fn rich_listing() -> tl::enums::RichMessage {
     use tl::{enums::PageBlock as B, enums::RichText as T, types};
     let plain = |text: &str| T::TextPlain(types::TextPlain { text: text.into() });
     let concat = |texts: Vec<T>| T::TextConcat(types::TextConcat { texts });
     let bold = |text: T| T::TextBold(Box::new(types::TextBold { text }));
     let paragraph = |text: T| B::Paragraph(types::PageBlockParagraph { text });
+    let no_caption = || {
+        tl::enums::PageCaption::Caption(types::PageCaption {
+            text: T::TextEmpty,
+            credit: T::TextEmpty,
+        })
+    };
     let hashtag = |tag: &str| T::TextHashtag(Box::new(types::TextHashtag { text: plain(tag) }));
     let cell = |text: T| {
         tl::enums::PageTableCell::Cell(types::PageTableCell {
@@ -845,6 +853,20 @@ pub fn rich_listing() -> tl::enums::RichMessage {
         rtl: false,
         part: false,
         blocks: vec![
+            B::Collage(types::PageBlockCollage {
+                items: (1..=10)
+                    .map(|id| {
+                        B::Photo(types::PageBlockPhoto {
+                            spoiler: false,
+                            photo_id: id,
+                            caption: no_caption(),
+                            url: None,
+                            webpage_id: None,
+                        })
+                    })
+                    .collect(),
+                caption: no_caption(),
+            }),
             paragraph(bold(plain("🏡 Аренда: 4 комнаты, Ваке"))),
             paragraph(concat(vec![
                 plain("📍 "),
@@ -854,6 +876,7 @@ pub fn rich_listing() -> tl::enums::RichMessage {
                     webpage_id: 0,
                 })),
             ])),
+            paragraph(plain("\u{2800}")),
             paragraph(concat(vec![
                 plain("Сдается светлая, чистая квартира "),
                 T::TextItalic(Box::new(types::TextItalic {

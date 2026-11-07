@@ -297,7 +297,7 @@ Some channels post Rich messages: the Telegram app shows a table, collapsible se
 Через Telegram MCP: get_messages для <id канала> с before_id=<P + 1>, limit=1. Выведи id сообщения, число строк в text и строки, в которых есть « | ». Потом search_messages с query=<одно слово из таблицы или раздела, например «Кондиционеры»> и chat_id=<id канала>: есть ли среди hits сообщение P, и есть ли это слово в его snippet? Текст поста целиком не выводи.
 ```
 
-1. The message is `P`, its `text` is not empty and has the post's lines in the app's order: title, address, paragraph, then each collapsed section's title followed by its content, each table row on its own line with cells joined by ` | ` (`Комнаты | 4`, `Кондиционеры | 1`, …). Nothing is hidden behind a collapsed section. Buttons are not shown.
+1. The message is `P`, its `text` is not empty and has the post's lines in the app's order: title, address, paragraph, then each collapsed section's title followed by its content, each table row on its own line with cells joined by ` | ` (`Комнаты | 4`, `Кондиционеры | 1`, …). Nothing is hidden behind a collapsed section. Buttons are not shown. An album without captions is one line with a count (`[10 photos]`), not a `[photo]` line per photo, and spacer lines with nothing visible (such as only `⠀`, U+2800) are left out.
 2. The hit for `P` is there and its snippet holds the word, on one line. If the channel's latest post is a rich one, its `list_chats` preview is its first line(s), not empty.
 
 `kamal app logs | grep -F 'Кондиционеры'` finds nothing: message text is never logged.

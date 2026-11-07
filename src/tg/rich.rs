@@ -53,7 +53,7 @@ pub fn message_text(message: String, rich: Option<&tl::enums::RichMessage>) -> S
 /// | table | its title, then a row per line, cells joined by ` \| ` |
 /// | details (collapsible) | its title, then its blocks, whether open or not |
 /// | blockquote (collapsed or not), pullquote, blockquote of blocks | its text or blocks, then its caption |
-/// | photo, video, audio, document, embed, map | `[photo]`, `[video]`, `[audio]`, `[file]`, `[media]`, `[location]` with its caption |
+/// | photo, video, audio, document, embed, map | `[photo]`, `[video]`, `[audio]`, `[file]`, `[media]`, `[location]` with its caption; a run of the same marker without captions is one line, `[10 photos]` |
 /// | collage, slideshow, cover, embedded post | the author of a post, its blocks, then its caption |
 /// | channel | `[channel]` |
 /// | related articles | its title, then `- title` per article |
@@ -61,7 +61,8 @@ pub fn message_text(message: String, rich: Option<&tl::enums::RichMessage>) -> S
 ///
 /// Text styles read as their text (a link's text, not its URL; a custom
 /// emoji as its emoji; a diff as the new text; math as its source); an inline
-/// image is nothing. Blank lines are left out. Blocks deeper than
+/// image is nothing. Lines with nothing visible (blank, or only hidden
+/// characters such as a U+2800 spacer) are left out. Blocks deeper than
 /// [`MAX_DEPTH`] and text deeper than [`MAX_TEXT_DEPTH`] are left out. A
 /// Rich message sent only in part (`part`) ends with [`MORE`]: the rest needs
 /// `messages.getRichMessage`, which no tool calls.
@@ -90,6 +91,49 @@ struct Lines {
     indent: String,
     /// What starts the next line instead: a list item's marker.
     bullet: Option<String>,
+    /// The last line, if it is a media marker without a caption.
+    run: Option<Run>,
+}
+
+/// Media markers without a caption on one line, `[photo]` or `[10 photos]`.
+struct Run {
+    media: Media,
+    count: usize,
+    /// The indent the line is under.
+    indent: String,
+    /// Where the marker starts in the text, in bytes and in characters.
+    start: usize,
+    chars: usize,
+}
+
+/// What a media block shows as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Media {
+    Photo,
+    Video,
+    Audio,
+    File,
+    Embed,
+    Location,
+}
+
+impl Media {
+    /// The marker for `count` of them: `[photo]`, `[3 photos]`.
+    fn marker(self, count: usize) -> String {
+        let (one, many) = match self {
+            Media::Photo => ("photo", "photos"),
+            Media::Video => ("video", "videos"),
+            Media::Audio => ("audio", "audio"),
+            Media::File => ("file", "files"),
+            Media::Embed => ("media", "media"),
+            Media::Location => ("location", "locations"),
+        };
+        if count == 1 {
+            format!("[{one}]")
+        } else {
+            format!("[{count} {many}]")
+        }
+    }
 }
 
 impl Lines {
@@ -204,13 +248,13 @@ impl Lines {
                 self.blocks(&b.blocks, inner);
                 self.text(&b.caption);
             }
-            B::Photo(b) => self.media("[photo]", &b.caption),
-            B::Video(b) => self.media("[video]", &b.caption),
-            B::Audio(b) => self.media("[audio]", &b.caption),
-            B::Document(b) => self.media("[file]", &b.caption),
-            B::Embed(b) => self.media("[media]", &b.caption),
-            B::Map(b) => self.media("[location]", &b.caption),
-            B::InputPageBlockMap(b) => self.media("[location]", &b.caption),
+            B::Photo(b) => self.media(Media::Photo, &b.caption),
+            B::Video(b) => self.media(Media::Video, &b.caption),
+            B::Audio(b) => self.media(Media::Audio, &b.caption),
+            B::Document(b) => self.media(Media::File, &b.caption),
+            B::Embed(b) => self.media(Media::Embed, &b.caption),
+            B::Map(b) => self.media(Media::Location, &b.caption),
+            B::InputPageBlockMap(b) => self.media(Media::Location, &b.caption),
             B::Collage(b) => {
                 self.blocks(&b.items, inner);
                 self.line(&caption(&b.caption));
@@ -248,21 +292,55 @@ impl Lines {
         self.indent.truncate(indent);
     }
 
-    fn media(&mut self, marker: &str, of: &tl::enums::PageCaption) {
+    /// A media marker with its caption. Without one (or with nothing visible
+    /// in it), it joins the run of the same marker on the line before, if
+    /// there is one (not across list items or indents).
+    fn media(&mut self, media: Media, of: &tl::enums::PageCaption) {
         let caption = caption(of);
-        self.line(format!("{marker} {caption}").trim_end());
+        if !is_blank(&caption) {
+            self.line(&format!("{} {caption}", media.marker(1)));
+            return;
+        }
+        if self.cut {
+            return;
+        }
+        let extends = self.bullet.is_none()
+            && self
+                .run
+                .as_ref()
+                .is_some_and(|run| run.media == media && run.indent == self.indent);
+        if let Some(run) = self.run.as_mut().filter(|_| extends) {
+            run.count += 1;
+            let (start, chars, marker) = (run.start, run.chars, media.marker(run.count));
+            self.text.truncate(start);
+            self.chars = chars;
+            self.push(&marker);
+            return;
+        }
+        let marker = media.marker(1);
+        self.line(&marker);
+        if !self.cut {
+            self.run = Some(Run {
+                media,
+                count: 1,
+                indent: self.indent.clone(),
+                start: self.text.len() - marker.len(),
+                chars: self.chars - marker.chars().count(),
+            });
+        }
     }
 
     fn text(&mut self, text: &tl::enums::RichText) {
         self.line(&plain(text));
     }
 
-    /// `text` line by line, blank lines left out.
+    /// `text` line by line, lines with nothing visible left out.
     fn line(&mut self, text: &str) {
         for line in text.lines() {
-            if line.trim().is_empty() {
+            if is_blank(line) {
                 continue;
             }
+            self.run = None;
             if !self.text.is_empty() {
                 self.push("\n");
             }
@@ -450,7 +528,8 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "🏡 Аренда: 4 комнаты, Ваке\n\
+                "[10 photos]\n\
+                 🏡 Аренда: 4 комнаты, Ваке\n\
                  📍 Тбилиси, ул. Абашидзе, 12\n\
                  Сдается светлая, чистая квартира с видом на парк.\n\
                  Параметры и удобства\n\
@@ -656,8 +735,117 @@ mod tests {
         assert_eq!(
             text,
             "[photo] Кухня\n[video]\n[audio] гимн\n[file] договор.pdf\n[media]\n\
-             [location] здесь\n[photo]\n[photo]\nколлаж\n[photo] слайд\n\
+             [location] здесь\n[2 photos]\nколлаж\n[photo] слайд\n\
              [photo] обложка\nАвтор\nтекст поста\n[channel]"
+        );
+    }
+
+    fn photo(text: &str) -> B {
+        B::Photo(types::PageBlockPhoto {
+            spoiler: false,
+            photo_id: 1,
+            caption: caption(text),
+            url: None,
+            webpage_id: None,
+        })
+    }
+
+    fn photos(n: usize) -> Vec<B> {
+        (0..n).map(|_| photo("")).collect()
+    }
+
+    #[test]
+    fn a_run_of_the_same_media_without_captions_is_one_line_with_a_count() {
+        let collage = |items, text: &str| {
+            B::Collage(types::PageBlockCollage {
+                items,
+                caption: caption(text),
+            })
+        };
+        // An album: a collage, a slideshow, or photo blocks in a row.
+        assert_eq!(flat(vec![collage(photos(10), "")]), "[10 photos]");
+        assert_eq!(flat(photos(10)), "[10 photos]");
+        assert_eq!(
+            flat(vec![B::Slideshow(types::PageBlockSlideshow {
+                items: photos(3),
+                caption: caption("слайды"),
+            })]),
+            "[3 photos]\nслайды"
+        );
+        // One is still singular; back-to-back collages are one run.
+        assert_eq!(flat(photos(1)), "[photo]");
+        assert_eq!(
+            flat(vec![collage(photos(2), ""), collage(photos(3), "")]),
+            "[5 photos]"
+        );
+        let video = || {
+            B::Video(types::PageBlockVideo {
+                autoplay: false,
+                r#loop: false,
+                spoiler: false,
+                video_id: 2,
+                caption: caption(""),
+            })
+        };
+        let file = || {
+            B::Document(types::PageBlockDocument {
+                document_id: 4,
+                caption: caption(""),
+            })
+        };
+        assert_eq!(
+            flat(vec![video(), video(), video(), file(), file(), photo("")]),
+            "[3 videos]\n[2 files]\n[photo]"
+        );
+    }
+
+    #[test]
+    fn a_captioned_marker_or_other_text_breaks_a_run() {
+        assert_eq!(
+            flat(vec![
+                photo(""),
+                photo(""),
+                photo("Кухня"),
+                photo(""),
+                photo("Спальня"),
+                photo("Спальня"),
+                paragraph("текст"),
+                photo(""),
+                // A spacer with nothing visible is no text, nor no caption.
+                paragraph("\u{2800}"),
+                photo("\u{2800}"),
+            ]),
+            "[2 photos]\n[photo] Кухня\n[photo]\n[photo] Спальня\n[photo] Спальня\n\
+             текст\n[2 photos]"
+        );
+        // Each list item keeps its own marker.
+        let item = |blocks| {
+            tl::enums::PageListItem::Blocks(types::PageListItemBlocks {
+                checkbox: false,
+                checked: false,
+                blocks,
+            })
+        };
+        assert_eq!(
+            flat(vec![
+                B::List(types::PageBlockList {
+                    items: vec![item(photos(2)), item(photos(1))],
+                }),
+                photo(""),
+            ]),
+            "- [2 photos]\n- [photo]\n[photo]"
+        );
+    }
+
+    #[test]
+    fn lines_with_nothing_visible_are_left_out() {
+        assert_eq!(
+            flat(vec![
+                paragraph("до\n\u{2800}\n\u{200B}\u{3164}\nпосле"),
+                paragraph("\u{2800}"),
+                paragraph("конец"),
+            ]),
+            "до\nпосле\nконец"
         );
     }
 
