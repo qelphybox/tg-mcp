@@ -414,20 +414,27 @@ pub fn user_info(peer: &RawPeer, profile: RawProfile, now: i64) -> ChatInfo {
         birthday,
         common_chats_count,
     } = profile;
+    // The Account's own status is always "online now" while it is being used:
+    // noise, not information.
+    let status = status.filter(|_| !peer.is_self);
     let (status, last_seen_at) = match status.map(|s| s.shown(now)) {
         Some((status, at)) => (Some(status), at),
         None => (None, None),
     };
+    // A bot's About and its "What can this bot do?" text are often the same;
+    // show it once, as the description.
+    let bot_description = non_empty(bot_description);
+    let bio = non_empty(bio).filter(|b| bot_description.as_ref() != Some(b));
     let phone = non_empty(phone).map(|p| match p.strip_prefix('+') {
         Some(_) => p,
         None => format!("+{p}"),
     });
     ChatInfo {
-        bio: non_empty(bio),
+        bio,
         status,
         last_seen_at,
         bot,
-        bot_description: non_empty(bot_description),
+        bot_description,
         verified,
         premium,
         scam,
@@ -906,6 +913,43 @@ mod tests {
             Some("What can this bot do?\nEverything.")
         );
         assert_eq!(info.status, None, "bots have no status");
+        assert_eq!(info.bio.as_deref(), Some("I help"), "a bot's About is kept");
+    }
+
+    #[test]
+    fn a_bots_about_that_repeats_its_description_is_shown_once() {
+        let bot = peer(ChatId::User(9), "Helper", ChatKind::Bot, Some(1));
+        let info = user_info(
+            &bot,
+            RawProfile {
+                bot: true,
+                bio: Some(" Does everything. ".into()),
+                bot_description: Some("Does everything.".into()),
+                ..RawProfile::default()
+            },
+            1,
+        );
+        assert_eq!(info.bio, None);
+        assert_eq!(info.bot_description.as_deref(), Some("Does everything."));
+    }
+
+    #[test]
+    fn the_account_itself_has_no_last_seen_status() {
+        let me = RawPeer {
+            is_self: true,
+            ..peer(ChatId::User(5), "Me", ChatKind::Private, Some(1))
+        };
+        let info = user_info(
+            &me,
+            RawProfile {
+                status: Some(RawUserStatus::Offline { was_online: 100 }),
+                ..RawProfile::default()
+            },
+            200,
+        );
+        assert!(info.is_self);
+        assert_eq!(info.status, None);
+        assert_eq!(info.last_seen_at, None);
     }
 
     #[test]
