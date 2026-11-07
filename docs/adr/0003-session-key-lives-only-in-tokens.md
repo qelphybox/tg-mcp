@@ -4,7 +4,7 @@ A database dump must not give access to any Telegram session, yet a server resta
 
 ## Consequences
 
-- Refresh rotates Tokens; each new Token gets its own Wrapped key, the old one is deleted with its Token.
+- Refresh rotates Tokens; each new Token gets its own Wrapped key. The old refresh Token stays fully usable for a 60-second grace window (so two client processes refreshing at once, or a retry after a lost response, both work), then its Wrapped key is deleted and only its id and verifier remain until its original expiry. Presenting it after the grace window (or a genuine refresh Token from another client) is treated as theft and revokes the whole Grant. Its Telegram session is logged out only if a Live client still holds it; otherwise it stays a dead entry in Active sessions, since no one holds its auth key any more.
 - The authorization code is short-lived and held in memory only (with the Session key); a restart mid-login means logging in again.
 - Revoking a Grant (and calling `auth.logOut`) needs a live Token, since only a Token can decrypt the Telegram session.
 - Losing every Token of a Grant makes its Telegram session unrecoverable by design; the user logs in again.
