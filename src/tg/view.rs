@@ -252,6 +252,12 @@ pub fn choices(item: &AlbumItem, want: ViewSize) -> Result<Vec<&PictureSize>, St
             MediaKind::Document => format!(
                 "message {id}'s file has no thumbnail to view; mode download gets the file itself"
             ),
+            // Seen in production: a GIF from the GIF panel whose only
+            // thumbnail is the inline blurred placeholder (`i`, ~40 px).
+            _ if item.picture.as_ref().is_some_and(|p| !p.sizes.is_empty()) => format!(
+                "Telegram keeps only a tiny blurred placeholder for message {id}'s {what}, no \
+                 thumbnail to view; mode download gets the file"
+            ),
             _ => format!(
                 "Telegram has no thumbnail for message {id}'s {what}; mode download gets the file"
             ),
@@ -607,6 +613,20 @@ mod tests {
             ..item(MediaKind::Gif, vec![])
         };
         assert_eq!(sizes_summary(&bare), "none");
+    }
+
+    #[test]
+    fn a_gif_with_only_its_blurred_placeholder_says_so() {
+        // As Telegram sent it in production: `sizes=i:Stripped:0x0:137b`.
+        let gif = item(
+            MediaKind::Gif,
+            vec![size("i", SizeForm::Stripped, 0, 0, 137)],
+        );
+        let error = choices(&gif, ViewSize::Standard).unwrap_err();
+        assert!(
+            error.contains("blurred placeholder") && error.contains("mode download"),
+            "{error}"
+        );
     }
 
     #[test]
