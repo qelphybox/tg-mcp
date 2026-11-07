@@ -14,6 +14,7 @@ pub mod fake;
 pub mod find;
 pub mod grammers;
 pub mod media;
+pub mod members;
 pub mod messages;
 mod pool;
 pub mod rich;
@@ -114,6 +115,16 @@ pub trait Telegram: Send + Sync + 'static {
         user: chats::ChatRef,
         limit: usize,
     ) -> Result<find::FoundChats, TgError>;
+
+    /// One page of a group's, supergroup's or channel's members
+    /// ([`members::get_members`]): Telegram's listing for a supergroup or
+    /// channel, ours over the whole list for a basic group and for admins. A
+    /// user is [`TgError::InvalidInput`], and so is a Chat whose members
+    /// Telegram doesn't show the Account.
+    async fn get_members(
+        &self,
+        query: members::MembersQuery,
+    ) -> Result<members::MemberPage, TgError>;
 
     /// One page of Search hits, Telegram's search across the Account's Chats or
     /// in one of them, newest first. At most `query.limit` hits; `next_cursor`

@@ -27,6 +27,7 @@ use super::{
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
     download::{FileError, FilePart, FileRequest, MediaFile},
     find::{FoundChat, FoundChats},
+    members::{Member, MemberPage, MembersQuery},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
     view::{Album, AlbumItem},
@@ -441,6 +442,29 @@ fn clean_found_chat(chat: &mut FoundChat) {
     clean_opt(username);
 }
 
+impl Untrusted for MemberPage {
+    fn sanitise(&mut self) {
+        let MemberPage {
+            members,
+            total: _,
+            members_hidden: _,
+            next_cursor: _,
+        } = self;
+        for member in members {
+            let Member {
+                id: _,
+                name,
+                username,
+                role: _,
+                bot: _,
+                is_self: _,
+            } = member;
+            clean(name);
+            clean_opt_visible(username);
+        }
+    }
+}
+
 impl Untrusted for MediaFile {
     fn sanitise(&mut self) {
         let MediaFile {
@@ -512,6 +536,10 @@ impl Telegram for Sanitised {
 
     async fn common_chats(&self, user: ChatRef, limit: usize) -> Result<FoundChats, TgError> {
         self.0.common_chats(user, limit).await.map(sanitised)
+    }
+
+    async fn get_members(&self, query: MembersQuery) -> Result<MemberPage, TgError> {
+        self.0.get_members(query).await.map(sanitised)
     }
 
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
@@ -738,6 +766,29 @@ mod tests {
             is_self: false,
         };
         chat_info(&peer, None, None)
+    }
+
+    #[test]
+    fn members_names_and_usernames_are_sanitised() {
+        use crate::tg::members::Role;
+        let mut page = MemberPage {
+            members: vec![Member {
+                id: "user:1~AAAAAAAAAAE".into(),
+                name: "An\u{202E}na\u{2028}Lee".into(),
+                username: Some("\u{200B}".into()),
+                role: Role::Admin,
+                bot: false,
+                is_self: false,
+            }],
+            total: Some(1),
+            members_hidden: false,
+            next_cursor: None,
+        };
+        page.sanitise();
+        let member = &page.members[0];
+        assert_eq!(member.name, "Anna Lee");
+        assert_eq!(member.username, None, "nothing visible is no username");
+        assert_eq!(member.id, "user:1~AAAAAAAAAAE");
     }
 
     #[test]

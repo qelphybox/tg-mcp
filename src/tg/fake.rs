@@ -22,6 +22,10 @@ use super::{
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
     media::{FileLocation, StoredFile},
+    members::{
+        self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
+        ParticipantsAnswer, ParticipantsFilter, ParticipantsRequest, RawMember, Role,
+    },
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MediaKind, MediaSummary, MessageAnswer,
         MessageAt, MessagePage, MessageRequest, RawHistoryMessage, read_history,
@@ -54,6 +58,10 @@ pub struct FakeData {
     /// get_chat_info. A user without one has an empty profile.
     #[serde(default)]
     pub profiles: std::collections::HashMap<ChatId, FakeProfile>,
+    /// Members of groups, supergroups and channels, for get_members. A Chat
+    /// of the Account's without them has none listed.
+    #[serde(default)]
+    pub members: std::collections::HashMap<ChatId, FakeMembers>,
     /// Chats in the Archive; the rest are in the main list.
     #[serde(default)]
     pub archived: Vec<ChatId>,
@@ -305,6 +313,57 @@ pub struct FakeProfile {
     pub common_chats: Vec<ChatId>,
 }
 
+/// A group's members as Telegram shows them to the Account
+/// (`channels.getParticipants`, `messages.getFullChat`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FakeMembers {
+    /// In Telegram's order: most recent first.
+    #[serde(default)]
+    pub members: Vec<FakeMember>,
+    /// A broadcast channel the Account doesn't administer: Telegram shows its
+    /// members (admins too) only to admins, `CHAT_ADMIN_REQUIRED`.
+    #[serde(default)]
+    pub admins_required: bool,
+    /// The group hides its members (`participants_hidden`) and the Account is
+    /// no admin: Telegram lists only the admins and bots.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Telegram lists no more than this many of a large group's members,
+    /// whatever its count says.
+    #[serde(default)]
+    pub cap: Option<usize>,
+    /// A basic group the Account left: `chatParticipantsForbidden`.
+    #[serde(default)]
+    pub forbidden: bool,
+}
+
+/// One member: a user, and what they are in the group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeMember {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub bot: bool,
+    pub role: Role,
+}
+
+impl FakeMember {
+    /// Telegram's member search: the beginning of a word of the name, or of
+    /// the @username, ignoring case.
+    fn found_by(&self, q: &str) -> bool {
+        let q = q.to_lowercase();
+        self.name
+            .split_whitespace()
+            .any(|word| word.to_lowercase().starts_with(&q))
+            || self
+                .username
+                .as_deref()
+                .is_some_and(|u| u.to_lowercase().starts_with(&q))
+    }
+}
+
 impl From<Account> for FakeData {
     fn from(account: Account) -> Self {
         Self::new(account)
@@ -319,6 +378,7 @@ impl FakeData {
             messages: Default::default(),
             details: Default::default(),
             profiles: Default::default(),
+            members: Default::default(),
             archived: Vec::new(),
             contacts: Vec::new(),
             public: Vec::new(),
@@ -353,6 +413,11 @@ impl FakeData {
 
     pub fn with_profile(mut self, user: ChatId, profile: FakeProfile) -> Self {
         self.profiles.insert(user, profile);
+        self
+    }
+
+    pub fn with_members(mut self, chat: ChatId, members: FakeMembers) -> Self {
+        self.members.insert(chat, members);
         self
     }
 
@@ -1056,6 +1121,11 @@ impl Telegram for FakeTelegram {
         Ok(find::common_chats(&peers, &|chat| self.known(chat), limit))
     }
 
+    /// The same calls as the Live client, answered by [`MemberSource`] below.
+    async fn get_members(&self, query: MembersQuery) -> Result<MemberPage, TgError> {
+        members::get_members(&query, &|chat| self.known(chat), self).await
+    }
+
     /// The same search calls as the Live client, answered by [`search_answer`].
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
         if let Some(seconds) = self.data.search_flood_wait {
@@ -1303,6 +1373,82 @@ impl Telegram for FakeTelegram {
     }
 }
 
+/// `channels.getFullChannel`, `channels.getParticipants` and
+/// `messages.getFullChat` as Telegram answers them, on [`FakeMembers`].
+#[async_trait::async_trait]
+impl MemberSource for FakeTelegram {
+    async fn channel_access(&self, channel: ChatRef) -> Result<ChannelAccess, TgError> {
+        let group = self.group(channel)?;
+        Ok(ChannelAccess {
+            can_list: !group.admins_required,
+            hidden: group.hidden,
+        })
+    }
+
+    async fn participants(
+        &self,
+        request: ParticipantsRequest,
+    ) -> Result<ParticipantsAnswer, TgError> {
+        let group = self.group(request.channel)?;
+        let chat = request.channel.chat();
+        let admins = request.filter == ParticipantsFilter::Admins;
+        if group.admins_required {
+            return Err(members::admin_required(chat, admins));
+        }
+        let matching: Vec<&FakeMember> = group
+            .members
+            .iter()
+            .filter(|m| !group.hidden || m.bot || m.role != Role::Member)
+            .filter(|m| match &request.filter {
+                ParticipantsFilter::Recent => true,
+                ParticipantsFilter::Search(q) => m.found_by(q),
+                ParticipantsFilter::Admins => m.role != Role::Member,
+            })
+            .collect();
+        let listable = group.cap.unwrap_or(usize::MAX).min(matching.len());
+        let start = usize::try_from(request.offset).unwrap_or(0).min(listable);
+        // Telegram's largest limit.
+        let limit = usize::try_from(request.limit).unwrap_or(0).min(200);
+        let page = &matching[start..(start + limit).min(listable)];
+        let peers = self.member_peers(page.iter().copied());
+        self.remember(&peers);
+        Ok(ParticipantsAnswer {
+            count: i32::try_from(matching.len()).unwrap_or(i32::MAX),
+            returned: page.len(),
+            members: page
+                .iter()
+                .map(|m| RawMember {
+                    user: m.id,
+                    role: m.role,
+                })
+                .collect(),
+            peers,
+        })
+    }
+
+    async fn group_members(&self, chat_id: i64) -> Result<GroupAnswer, TgError> {
+        let group = self.group(ChatId::Chat(chat_id).into())?;
+        if group.forbidden {
+            return Ok(GroupAnswer::default());
+        }
+        let peers = self.member_peers(group.members.iter());
+        self.remember(&peers);
+        Ok(GroupAnswer {
+            members: Some(
+                group
+                    .members
+                    .iter()
+                    .map(|m| RawMember {
+                        user: m.id,
+                        role: m.role,
+                    })
+                    .collect(),
+            ),
+            peers,
+        })
+    }
+}
+
 fn foreign_cursor() -> TgError {
     TgError::InvalidInput("cursor is not one this server returned".into())
 }
@@ -1353,6 +1499,43 @@ impl FakeTelegram {
         self.known.lock().unwrap().get(&chat).copied()
     }
 
+    /// One call's worth of a group's members: like any reading call, a
+    /// flood or a wrong hash first; a Chat the fake doesn't know is not the
+    /// Account's.
+    fn group(&self, chat: ChatRef) -> Result<FakeMembers, TgError> {
+        self.flood()?;
+        self.check_hash(chat)?;
+        let id = chat.chat();
+        match self.data.members.get(&id) {
+            Some(group) => Ok(group.clone()),
+            None if self.knows(id) => Ok(FakeMembers::default()),
+            None => Err(TgError::InvalidInput(format!(
+                "{id} can't be read by this account"
+            ))),
+        }
+    }
+
+    /// Members as an answer's `users` describes them.
+    fn member_peers<'a>(&self, members: impl Iterator<Item = &'a FakeMember>) -> Vec<RawPeer> {
+        members.map(|m| self.member_peer(m)).collect()
+    }
+
+    fn member_peer(&self, m: &FakeMember) -> RawPeer {
+        let id = ChatId::User(m.id);
+        RawPeer {
+            id,
+            title: m.name.clone(),
+            kind: if m.bot {
+                ChatKind::Bot
+            } else {
+                ChatKind::Private
+            },
+            username: m.username.clone(),
+            access_hash: fake_access_hash(id),
+            is_self: m.id == self.data.account.id,
+        }
+    }
+
     fn raw_peers(chats: &[ChatSummary]) -> Vec<RawPeer> {
         chats
             .iter()
@@ -1384,6 +1567,14 @@ impl FakeTelegram {
                 access_hash: fake_access_hash(ChatId::User(me.id)),
                 is_self: true,
             }))
+            // Telegram describes every user a member list named.
+            .chain(
+                self.data
+                    .members
+                    .values()
+                    .flat_map(|group| group.members.iter())
+                    .map(|m| self.member_peer(m)),
+            )
             .collect()
     }
 }

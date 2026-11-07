@@ -24,6 +24,10 @@ use super::{
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     media,
     media::{FileLocation, StoredFile},
+    members::{
+        self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
+        ParticipantsAnswer, ParticipantsFilter, ParticipantsRequest, RawMember, Role,
+    },
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MessageAnswer, MessageAt, MessagePage,
         MessageRequest, RawHistoryMessage, read_history,
@@ -457,6 +461,18 @@ impl LiveClient {
         request: &R,
         chat: Option<ChatId>,
     ) -> Result<R::Return, TgError> {
+        self.call_refusing(request, chat, |_| None).await
+    }
+
+    /// Like [`Self::call`], but `refusal` first turns this request's own
+    /// refusals (an error code that means something only here) into the
+    /// caller's error. Floods still go to the limiter.
+    async fn call_refusing<R: tl::RemoteCall + tl::Identifiable>(
+        &self,
+        request: &R,
+        chat: Option<ChatId>,
+        refusal: impl Fn(&InvocationError) -> Option<TgError> + Send + Sync,
+    ) -> Result<R::Return, TgError> {
         let class = method_class::<R>();
         self.limiter
             .run(class, || async {
@@ -465,10 +481,14 @@ impl LiveClient {
                     .lock()
                     .unwrap()
                     .push(tl::Serializable::to_bytes(request));
-                self.client.invoke(request).await.map_err(|err| match chat {
-                    Some(chat) => self.classify_chat_error(err, chat, class),
-                    None => self.classify(err, class),
-                })
+                self.client
+                    .invoke(request)
+                    .await
+                    .map_err(|err| match (refusal(&err), chat) {
+                        (Some(refused), _) => refused,
+                        (None, Some(chat)) => self.classify_chat_error(err, chat, class),
+                        (None, None) => self.classify(err, class),
+                    })
             })
             .await
     }
@@ -729,6 +749,10 @@ impl Telegram for LiveClient {
         };
         let peers = self.described(Vec::new(), chats);
         Ok(find::common_chats(&peers, &|chat| self.cached(chat), limit))
+    }
+
+    async fn get_members(&self, query: MembersQuery) -> Result<MemberPage, TgError> {
+        members::get_members(&query, &|chat| self.cached(chat), self).await
     }
 
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
@@ -1167,6 +1191,156 @@ impl LiveClient {
         }
         self.classify(err, class)
     }
+}
+
+#[async_trait::async_trait]
+impl MemberSource for LiveClient {
+    async fn channel_access(&self, id: ChatRef) -> Result<ChannelAccess, TgError> {
+        let chat = id.chat();
+        let channel = self.input_channel(id).await?;
+        let tl::enums::messages::ChatFull::Full(full) = self
+            .call(
+                &tl::functions::channels::GetFullChannel { channel },
+                Some(chat),
+            )
+            .await?;
+        // Admins see hidden members; the channel object says whether the
+        // Account is one.
+        let admin = full.chats.iter().any(|c| match c {
+            tl::enums::Chat::Channel(c) if ChatId::Channel(c.id) == chat => {
+                c.creator || c.admin_rights.is_some()
+            }
+            _ => false,
+        });
+        self.described(full.users, full.chats);
+        match full.full_chat {
+            tl::enums::ChatFull::ChannelFull(c) => Ok(ChannelAccess {
+                can_list: c.can_view_participants,
+                hidden: c.participants_hidden && !admin,
+            }),
+            _ => Err(TgError::Upstream(format!(
+                "Telegram didn't describe {chat} as a channel"
+            ))),
+        }
+    }
+
+    async fn participants(
+        &self,
+        request: ParticipantsRequest,
+    ) -> Result<ParticipantsAnswer, TgError> {
+        let chat = request.channel.chat();
+        let admins_only = request.filter == ParticipantsFilter::Admins;
+        let channel = self.input_channel(request.channel).await?;
+        let answer = self
+            .call_refusing(
+                &tl::functions::channels::GetParticipants {
+                    channel,
+                    filter: participants_filter(request.filter),
+                    offset: request.offset,
+                    limit: request.limit,
+                    hash: 0,
+                },
+                Some(chat),
+                |err| {
+                    err.is("CHAT_ADMIN_REQUIRED")
+                        .then(|| members::admin_required(chat, admins_only))
+                },
+            )
+            .await?;
+        match answer {
+            tl::enums::channels::ChannelParticipants::Participants(p) => Ok(ParticipantsAnswer {
+                count: p.count,
+                returned: p.participants.len(),
+                members: p
+                    .participants
+                    .into_iter()
+                    .filter_map(raw_channel_member)
+                    .collect(),
+                peers: self.described(p.users, p.chats),
+            }),
+            // Only an answer to a request with a hash; ours has none.
+            tl::enums::channels::ChannelParticipants::NotModified => Err(TgError::Upstream(
+                "Telegram answered channelParticipantsNotModified without a hash".into(),
+            )),
+        }
+    }
+
+    async fn group_members(&self, chat_id: i64) -> Result<GroupAnswer, TgError> {
+        let chat = ChatId::Chat(chat_id);
+        let tl::enums::messages::ChatFull::Full(full) = self
+            .call(
+                &tl::functions::messages::GetFullChat { chat_id },
+                Some(chat),
+            )
+            .await?;
+        let peers = self.described(full.users, full.chats);
+        let members = match full.full_chat {
+            tl::enums::ChatFull::Full(c) => match c.participants {
+                tl::enums::ChatParticipants::Participants(p) => {
+                    Some(p.participants.into_iter().map(raw_chat_member).collect())
+                }
+                tl::enums::ChatParticipants::Forbidden(_) => None,
+            },
+            _ => {
+                return Err(TgError::Upstream(format!(
+                    "Telegram didn't describe {chat} as a basic group"
+                )));
+            }
+        };
+        Ok(GroupAnswer { members, peers })
+    }
+}
+
+impl LiveClient {
+    /// The InputChannel for a channel id; anything else can't have one.
+    async fn input_channel(&self, id: ChatRef) -> Result<tl::enums::InputChannel, TgError> {
+        match self.resolve(id).await? {
+            tl::enums::InputPeer::Channel(c) => {
+                Ok(tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: c.channel_id,
+                    access_hash: c.access_hash,
+                }))
+            }
+            _ => Err(TgError::InvalidInput(format!(
+                "{} is not a supergroup or channel",
+                id.chat()
+            ))),
+        }
+    }
+}
+
+fn participants_filter(filter: ParticipantsFilter) -> tl::enums::ChannelParticipantsFilter {
+    use tl::enums::ChannelParticipantsFilter as F;
+    match filter {
+        ParticipantsFilter::Recent => F::ChannelParticipantsRecent,
+        ParticipantsFilter::Admins => F::ChannelParticipantsAdmins,
+        ParticipantsFilter::Search(q) => {
+            F::ChannelParticipantsSearch(tl::types::ChannelParticipantsSearch { q })
+        }
+    }
+}
+
+/// A supergroup's or channel's member; banned and left participants aren't.
+fn raw_channel_member(participant: tl::enums::ChannelParticipant) -> Option<RawMember> {
+    use tl::enums::ChannelParticipant as P;
+    let (user, role) = match participant {
+        P::Participant(p) => (p.user_id, Role::Member),
+        P::ParticipantSelf(p) => (p.user_id, Role::Member),
+        P::Creator(p) => (p.user_id, Role::Creator),
+        P::Admin(p) => (p.user_id, Role::Admin),
+        P::Banned(_) | P::Left(_) => return None,
+    };
+    Some(RawMember { user, role })
+}
+
+fn raw_chat_member(participant: tl::enums::ChatParticipant) -> RawMember {
+    use tl::enums::ChatParticipant as P;
+    let (user, role) = match participant {
+        P::Participant(p) => (p.user_id, Role::Member),
+        P::Creator(p) => (p.user_id, Role::Creator),
+        P::Admin(p) => (p.user_id, Role::Admin),
+    };
+    RawMember { user, role }
 }
 
 fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage> {
@@ -1820,6 +1994,106 @@ mod tests {
             user.status = Some(status);
             assert_eq!(raw_profile(&user).status, Some(raw));
         }
+    }
+
+    #[test]
+    fn members_roles_come_from_the_participant_kind_and_the_rest_are_no_members() {
+        use tl::{enums::ChannelParticipant as P, types};
+        let admin_rights = || {
+            tl::enums::ChatAdminRights::Rights(types::ChatAdminRights {
+                change_info: false,
+                post_messages: false,
+                edit_messages: false,
+                delete_messages: false,
+                ban_users: false,
+                invite_users: false,
+                pin_messages: false,
+                add_admins: false,
+                anonymous: false,
+                manage_call: false,
+                other: false,
+                manage_topics: false,
+                post_stories: false,
+                edit_stories: false,
+                delete_stories: false,
+                manage_direct_messages: false,
+                manage_ranks: false,
+                manage_linked_peers: false,
+                manage_welcome_messages: false,
+            })
+        };
+        let channel = [
+            P::Participant(types::ChannelParticipant {
+                user_id: 1,
+                date: 0,
+                subscription_until_date: None,
+                rank: None,
+            }),
+            P::ParticipantSelf(types::ChannelParticipantSelf {
+                via_request: false,
+                user_id: 2,
+                inviter_id: 1,
+                date: 0,
+                subscription_until_date: None,
+                rank: None,
+            }),
+            P::Creator(types::ChannelParticipantCreator {
+                user_id: 3,
+                admin_rights: admin_rights(),
+                rank: None,
+            }),
+            P::Admin(types::ChannelParticipantAdmin {
+                can_edit: false,
+                is_self: false,
+                user_id: 4,
+                inviter_id: None,
+                promoted_by: 3,
+                date: 0,
+                admin_rights: admin_rights(),
+                rank: Some("boss".into()),
+            }),
+            P::Left(types::ChannelParticipantLeft {
+                peer: tl::enums::Peer::User(types::PeerUser { user_id: 5 }),
+            }),
+        ];
+        let members: Vec<RawMember> = channel.into_iter().filter_map(raw_channel_member).collect();
+        let member = |user, role| RawMember { user, role };
+        assert_eq!(
+            members,
+            [
+                member(1, Role::Member),
+                member(2, Role::Member),
+                member(3, Role::Creator),
+                member(4, Role::Admin),
+            ]
+        );
+
+        use tl::enums::ChatParticipant as C;
+        assert_eq!(
+            raw_chat_member(C::Creator(types::ChatParticipantCreator {
+                user_id: 9,
+                rank: None
+            })),
+            member(9, Role::Creator)
+        );
+        assert_eq!(
+            raw_chat_member(C::Admin(types::ChatParticipantAdmin {
+                user_id: 8,
+                inviter_id: 9,
+                date: 0,
+                rank: None
+            })),
+            member(8, Role::Admin)
+        );
+        assert_eq!(
+            raw_chat_member(C::Participant(types::ChatParticipant {
+                user_id: 7,
+                inviter_id: 9,
+                date: 0,
+                rank: None
+            })),
+            member(7, Role::Member)
+        );
     }
 
     #[test]
@@ -2646,6 +2920,97 @@ mod resolve_tests {
                 }),
                 max_id: 0,
                 limit: 20,
+            }
+            .to_bytes()]
+        );
+    }
+
+    fn members_query(chat: ChatRef, admins_only: bool) -> MembersQuery {
+        MembersQuery {
+            chat,
+            query: None,
+            admins_only,
+            limit: 50,
+            cursor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn members_are_asked_for_with_the_channels_hash_or_the_groups_id() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(-77));
+        let input = || {
+            tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                channel_id: 5,
+                access_hash: -77,
+            })
+        };
+        // The first page asks whether members are hidden before listing them.
+        assert!(
+            live.get_members(members_query(channel, false))
+                .await
+                .is_err()
+        );
+        // Admins are listed whole, in one call.
+        assert!(
+            live.get_members(members_query(channel, true))
+                .await
+                .is_err()
+        );
+        assert!(
+            live.get_members(members_query(ChatId::Chat(4).into(), false))
+                .await
+                .is_err()
+        );
+        // A user: refused before anything is sent.
+        assert!(matches!(
+            live.get_members(members_query(ChatRef::new(ChatId::User(7), Some(1)), false))
+                .await,
+            Err(TgError::InvalidInput(_))
+        ));
+        assert_eq!(
+            sent(&live),
+            [
+                tl::functions::channels::GetFullChannel { channel: input() }.to_bytes(),
+                tl::functions::channels::GetParticipants {
+                    channel: input(),
+                    filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins,
+                    offset: 0,
+                    limit: 200,
+                    hash: 0,
+                }
+                .to_bytes(),
+                tl::functions::messages::GetFullChat { chat_id: 4 }.to_bytes(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_search_is_telegrams_with_its_offset() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(-77));
+        let page = live
+            .participants(ParticipantsRequest {
+                channel,
+                filter: ParticipantsFilter::Search("ann".into()),
+                offset: 400,
+                limit: 200,
+            })
+            .await;
+        assert!(page.is_err());
+        assert_eq!(
+            sent(&live),
+            [tl::functions::channels::GetParticipants {
+                channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: 5,
+                    access_hash: -77,
+                }),
+                filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsSearch(
+                    tl::types::ChannelParticipantsSearch { q: "ann".into() }
+                ),
+                offset: 400,
+                limit: 200,
+                hash: 0,
             }
             .to_bytes()]
         );
