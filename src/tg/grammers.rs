@@ -35,6 +35,7 @@ use super::{
         SearchFrom, SearchPage, SearchQuery, SearchRequest,
     },
     session::SessionStore,
+    view::{self, Album, RawViewMessage},
 };
 use crate::sessions::{OpenedGrant, Vault};
 
@@ -697,6 +698,14 @@ impl Telegram for LiveClient {
         .await
     }
 
+    async fn media_album(&self, id: ChatRef, message_id: i32) -> Result<Album, TgError> {
+        let peer = self.resolve(id).await?;
+        view::locate_album(id, message_id, |ids| {
+            self.get_view_messages(&peer, id.chat(), ids)
+        })
+        .await
+    }
+
     async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
         let FileRequest {
             location,
@@ -825,7 +834,7 @@ impl LiveClient {
         chat: ChatId,
         request: MessageRequest,
     ) -> Result<MessageAnswer, TgError> {
-        let (messages, users, chats) = self.fetch_message(peer, chat, request).await?;
+        let (messages, users, chats) = self.fetch_messages(peer, chat, vec![request.id]).await?;
         let peers = self.described(users, chats);
         Ok(MessageAnswer {
             messages: messages.into_iter().filter_map(raw_found_message).collect(),
@@ -841,18 +850,31 @@ impl LiveClient {
         chat: ChatId,
         request: MessageRequest,
     ) -> Result<Vec<RawMediaMessage>, TgError> {
-        let (messages, users, chats) = self.fetch_message(peer, chat, request).await?;
+        let (messages, users, chats) = self.fetch_messages(peer, chat, vec![request.id]).await?;
         self.described(users, chats);
         Ok(messages.into_iter().filter_map(raw_media_message).collect())
     }
 
-    /// The messages, users and chats of one `channels.getMessages` /
-    /// `messages.getMessages` call for one id.
-    async fn fetch_message(
+    /// One `channels.getMessages` / `messages.getMessages` call for the ids
+    /// around a message, each message reduced to what a view needs (#34).
+    async fn get_view_messages(
         &self,
         peer: &tl::enums::InputPeer,
         chat: ChatId,
-        MessageRequest { id }: MessageRequest,
+        ids: Vec<i32>,
+    ) -> Result<Vec<RawViewMessage>, TgError> {
+        let (messages, users, chats) = self.fetch_messages(peer, chat, ids).await?;
+        self.described(users, chats);
+        Ok(messages.into_iter().filter_map(raw_view_message).collect())
+    }
+
+    /// The messages, users and chats of one `channels.getMessages` /
+    /// `messages.getMessages` call for `ids`.
+    async fn fetch_messages(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        ids: Vec<i32>,
     ) -> Result<
         (
             Vec<tl::enums::Message>,
@@ -861,9 +883,10 @@ impl LiveClient {
         ),
         TgError,
     > {
-        let id = vec![tl::enums::InputMessage::Id(tl::types::InputMessageId {
-            id,
-        })];
+        let id = ids
+            .into_iter()
+            .map(|id| tl::enums::InputMessage::Id(tl::types::InputMessageId { id }))
+            .collect();
         let answer = match peer {
             tl::enums::InputPeer::Channel(c) => {
                 let channel = tl::enums::InputChannel::Channel(tl::types::InputChannel {
@@ -1165,6 +1188,32 @@ fn raw_media_message(message: tl::enums::Message) -> Option<RawMediaMessage> {
     }
 }
 
+/// A message reduced to where it is, its album, its media and what a view
+/// can show of it.
+fn raw_view_message(message: tl::enums::Message) -> Option<RawViewMessage> {
+    match message {
+        tl::enums::Message::Message(m) => Some(RawViewMessage {
+            at: MessageAt {
+                chat: chat_id(&m.peer_id),
+                id: m.id,
+            },
+            grouped_id: m.grouped_id,
+            media: media::describe(m.media.as_ref()),
+            picture: media::picture(m.media.as_ref()),
+        }),
+        tl::enums::Message::Service(m) => Some(RawViewMessage {
+            at: MessageAt {
+                chat: chat_id(&m.peer_id),
+                id: m.id,
+            },
+            grouped_id: None,
+            media: None,
+            picture: None,
+        }),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
 /// A search result: the message and the Chat it is in.
 fn raw_found_message(message: tl::enums::Message) -> Option<RawFoundMessage> {
     let chat = match &message {
@@ -1257,6 +1306,16 @@ fn input_file_location(location: FileLocation) -> tl::enums::InputFileLocation {
                 thumb_size: String::new(),
             },
         ),
+        StoredFile::DocumentThumb { thumb_size } => {
+            tl::enums::InputFileLocation::InputDocumentFileLocation(
+                tl::types::InputDocumentFileLocation {
+                    id,
+                    access_hash,
+                    file_reference,
+                    thumb_size,
+                },
+            )
+        }
     }
 }
 
@@ -1852,6 +1911,74 @@ mod tests {
             assert_eq!(found.media, history.media, "{media:?}");
             assert_eq!(found.file, media::file(media.as_ref()));
         }
+    }
+
+    #[test]
+    fn a_view_message_has_its_album_media_and_every_size_of_its_picture() {
+        use crate::tg::{
+            media::fixtures::{doc, doc_media, full_photo, photo_media, video},
+            view::{PictureSize, SizeForm},
+        };
+        let user = tl::enums::Peer::User(tl::types::PeerUser { user_id: 7 });
+        let with = |grouped_id, media: Option<tl::enums::MessageMedia>| {
+            let tl::enums::Message::Message(mut m) = tl_message(31, user.clone(), None) else {
+                unreachable!()
+            };
+            m.grouped_id = grouped_id;
+            m.media = media;
+            tl::enums::Message::Message(m)
+        };
+        let photo = Some(photo_media(Some(full_photo()), None));
+        let found = raw_view_message(with(Some(-5_000_000_000_123), photo.clone())).unwrap();
+        assert_eq!(
+            found.at,
+            MessageAt {
+                chat: ChatId::User(7),
+                id: 31
+            }
+        );
+        assert_eq!(found.grouped_id, Some(-5_000_000_000_123));
+        assert_eq!(found.media, media::describe(photo.as_ref()));
+        let picture = found.picture.unwrap();
+        assert_eq!(picture, media::picture(photo.as_ref()).unwrap());
+        // The stripped size is there, marked as such; `y` is progressive.
+        let forms: Vec<(&str, SizeForm)> = picture
+            .sizes
+            .iter()
+            .map(|s| (s.r#type.as_str(), s.form))
+            .collect();
+        assert_eq!(
+            forms,
+            [
+                ("i", SizeForm::Stripped),
+                ("m", SizeForm::File),
+                ("x", SizeForm::File),
+                ("y", SizeForm::Progressive)
+            ]
+        );
+
+        // A video note with its thumbnail, in no album.
+        let mut round = doc("video/mp4", 900_000, vec![video(true, 9.0, 384, 384)]);
+        round.thumbs = Some(vec![tl::enums::PhotoSize::Size(tl::types::PhotoSize {
+            r#type: "m".into(),
+            w: 320,
+            h: 320,
+            size: 12_000,
+        })]);
+        let found = raw_view_message(with(None, Some(doc_media(Some(round))))).unwrap();
+        assert_eq!(found.grouped_id, None);
+        assert_eq!(
+            found.picture.unwrap().sizes,
+            [PictureSize {
+                r#type: "m".into(),
+                form: SizeForm::File,
+                w: 320,
+                h: 320,
+                bytes: 12_000,
+            }]
+        );
+        let plain = raw_view_message(with(None, None)).unwrap();
+        assert_eq!((plain.media, plain.picture), (None, None));
     }
 
     #[test]
@@ -2984,6 +3111,64 @@ mod resolve_tests {
                 tl::functions::channels::GetMessages::CONSTRUCTOR_ID,
                 tl::functions::messages::GetHistory::CONSTRUCTOR_ID,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_is_looked_up_with_one_get_messages_over_the_ids_around_it() {
+        let (live, _dir) = cold_client().await;
+        let ids = || {
+            (491..=509)
+                .map(|id| tl::enums::InputMessage::Id(tl::types::InputMessageId { id }))
+                .collect::<Vec<_>>()
+        };
+        let channel = ChatRef::new(ChatId::Channel(5), Some(-77));
+        let user = ChatRef::new(ChatId::User(7), Some(88));
+        for chat in [channel, user] {
+            // Offline: it fails, after one request.
+            assert!(live.media_album(chat, 500).await.is_err());
+        }
+        assert_eq!(
+            sent(&live),
+            [
+                tl::functions::channels::GetMessages {
+                    channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: 5,
+                        access_hash: -77,
+                    }),
+                    id: ids(),
+                }
+                .to_bytes(),
+                tl::functions::messages::GetMessages { id: ids() }.to_bytes(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_thumbnail_is_asked_for_by_its_size() {
+        let (live, _dir) = cold_client().await;
+        let mut thumb = file_request();
+        thumb.location.file = StoredFile::DocumentThumb {
+            thumb_size: "m".into(),
+        };
+        assert!(live.get_file(thumb).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [tl::functions::upload::GetFile {
+                precise: false,
+                cdn_supported: false,
+                location: tl::enums::InputFileLocation::InputDocumentFileLocation(
+                    tl::types::InputDocumentFileLocation {
+                        id: 6_000_000_001,
+                        access_hash: -99,
+                        file_reference: b"ref".to_vec(),
+                        thumb_size: "m".into(),
+                    }
+                ),
+                offset: 1024 * 1024,
+                limit: 512 * 1024,
+            }
+            .to_bytes()]
         );
     }
 

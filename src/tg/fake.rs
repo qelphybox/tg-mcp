@@ -30,6 +30,7 @@ use super::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
+    view::{self, Album, Picture, PictureSize, RawViewMessage, SizeForm},
 };
 use crate::{limits::MethodClass, sessions::OpenedGrant};
 
@@ -79,6 +80,98 @@ pub struct FakeData {
     /// "min" (no hash to hand out), as Telegram did in production (#51).
     #[serde(default)]
     pub min_past_newest: bool,
+    /// Each Chat's messages' albums and picture sizes (#34), beyond their
+    /// `media`.
+    #[serde(default)]
+    pub pictures: std::collections::HashMap<ChatId, Vec<FakePicture>>,
+}
+
+/// What a fake message's media shows (#34), beyond its [`Media`]: the
+/// album it is in, and the sizes Telegram keeps of its photo or the
+/// thumbnails of its document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakePicture {
+    pub message_id: i32,
+    #[serde(default)]
+    pub grouped_id: Option<i64>,
+    /// `None`: a photo has the sizes Telegram makes of a photo its size
+    /// ([`fake_photo_sizes`]), anything else none.
+    #[serde(default)]
+    pub sizes: Option<Vec<FakeSize>>,
+}
+
+/// One size or thumbnail, and what its bytes are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeSize {
+    pub size: PictureSize,
+    pub format: FakeFormat,
+}
+
+/// What a fake picture's bytes start like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FakeFormat {
+    Jpeg,
+    Webp,
+    Png,
+    /// An animated sticker's Lottie, gzipped: no image.
+    Tgs,
+}
+
+impl FakeFormat {
+    fn magic(self) -> &'static [u8] {
+        match self {
+            Self::Jpeg => b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00",
+            Self::Webp => b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+            Self::Png => b"\x89PNG\r\n\x1a\n",
+            Self::Tgs => b"\x1F\x8B\x08\x00",
+        }
+    }
+}
+
+impl FakeSize {
+    pub fn new(r#type: &str, form: SizeForm, (w, h): (u32, u32), bytes: u64) -> Self {
+        Self {
+            size: PictureSize {
+                r#type: r#type.into(),
+                form,
+                w,
+                h,
+                bytes,
+            },
+            format: FakeFormat::Jpeg,
+        }
+    }
+
+    pub fn as_format(mut self, format: FakeFormat) -> Self {
+        self.format = format;
+        self
+    }
+}
+
+/// The sizes Telegram makes of a `w`×`h` photo of `bytes`: a stripped `i`
+/// thumbnail, then `m` (320 px on the longer side), `x` (800), `y` (1280)
+/// and `w` (2560) up to the photo's own size, which is the last one at its
+/// full dimensions (progressive from `y` on). No `x` or `y` for a photo
+/// smaller than their box.
+pub fn fake_photo_sizes(w: u32, h: u32, bytes: u64) -> Vec<FakeSize> {
+    let mut sizes = vec![FakeSize::new("i", SizeForm::Stripped, (0, 0), 40)];
+    let long = w.max(h).max(1);
+    let pixels = u64::from(w) * u64::from(h);
+    for (r#type, side) in [("m", 320), ("x", 800), ("y", 1280), ("w", 2560)] {
+        let form = if side >= 1280 {
+            SizeForm::Progressive
+        } else {
+            SizeForm::File
+        };
+        if long <= side {
+            sizes.push(FakeSize::new(r#type, form, (w, h), bytes));
+            break;
+        }
+        let (sw, sh) = (w * side / long, h * side / long);
+        let scaled = bytes * u64::from(sw) * u64::from(sh) / pixels.max(1);
+        sizes.push(FakeSize::new(r#type, form, (sw, sh), scaled.max(1_000)));
+    }
+    sizes
 }
 
 /// What Telegram does when `add_offset` puts a getHistory slice's start above
@@ -218,7 +311,13 @@ impl FakeData {
             search_flood_wait: None,
             past_newest: PastNewest::default(),
             min_past_newest: false,
+            pictures: Default::default(),
         }
+    }
+
+    pub fn with_pictures(mut self, chat: ChatId, pictures: Vec<FakePicture>) -> Self {
+        self.pictures.insert(chat, pictures);
+        self
     }
 
     pub fn with_past_newest(mut self, past_newest: PastNewest) -> Self {
@@ -521,6 +620,8 @@ struct FilesState {
     cut_at: Option<u64>,
     requests: Vec<FileRequestSeen>,
     lookups: usize,
+    /// The ids of each `getMessages` an album lookup made.
+    album_fetches: Vec<Vec<i32>>,
 }
 
 /// One `upload.getFile` the fake received: where it was sent and which part.
@@ -573,6 +674,11 @@ impl FakeFiles {
     pub fn lookups(&self) -> usize {
         self.state().lookups
     }
+
+    /// The ids each album lookup asked for, in order.
+    pub fn album_fetches(&self) -> Vec<Vec<i32>> {
+        self.state().album_fetches.clone()
+    }
 }
 
 impl FilesState {
@@ -602,6 +708,94 @@ fn fake_file_range(file_id: i64, range: std::ops::Range<u64>) -> Vec<u8> {
     range
         .map(|i| (((i / 4) as u32) ^ seed).to_le_bytes()[(i % 4) as usize])
         .collect()
+}
+
+/// The bytes of size `type` of fake picture `file_id`, `size` long: the
+/// first bytes of a `format` file, then the same pattern as a file's.
+pub fn fake_picture_bytes(file_id: i64, r#type: &str, size: u64, format: FakeFormat) -> Vec<u8> {
+    let seed = r#type.bytes().fold(file_id, |seed, b| {
+        seed.wrapping_mul(131).wrapping_add(i64::from(b))
+    });
+    let magic = format.magic();
+    let mut bytes = magic.to_vec();
+    bytes.extend(fake_file_range(
+        seed,
+        magic.len() as u64..size.max(magic.len() as u64),
+    ));
+    bytes.truncate(size as usize);
+    bytes
+}
+
+/// The fake message's picture entry, if the fixture has one.
+fn fake_picture_entry(data: &FakeData, chat: ChatId, id: i32) -> Option<&FakePicture> {
+    data.pictures
+        .get(&chat)?
+        .iter()
+        .find(|p| p.message_id == id)
+}
+
+/// The sizes of a fake message's picture, with what their bytes are: the
+/// fixture's, or a photo's by its size.
+fn fake_sizes(data: &FakeData, chat: ChatId, message: &RawHistoryMessage) -> Vec<FakeSize> {
+    let Some(media) = &message.media else {
+        return Vec::new();
+    };
+    if let Some(sizes) = fake_picture_entry(data, chat, message.id).and_then(|p| p.sizes.clone()) {
+        return sizes;
+    }
+    match (media.kind, media.width, media.height, media.size_bytes) {
+        (MediaKind::Photo, Some(w), Some(h), Some(bytes)) => fake_photo_sizes(w, h, bytes),
+        _ => Vec::new(),
+    }
+}
+
+/// What a view can show of a fake message's media, like
+/// [`super::media::picture`]: its photo's sizes or its document's
+/// thumbnails, at the message's file.
+fn fake_picture(
+    data: &FakeData,
+    file_reference: &[u8],
+    chat: ChatId,
+    message: &RawHistoryMessage,
+) -> Option<Picture> {
+    let file = match message.media.as_ref()?.kind {
+        MediaKind::Photo => StoredFile::Photo {
+            thumb_size: String::new(),
+        },
+        MediaKind::Location | MediaKind::Contact | MediaKind::Poll | MediaKind::Other => {
+            return None;
+        }
+        _ => StoredFile::DocumentThumb {
+            thumb_size: String::new(),
+        },
+    };
+    let sizes: Vec<PictureSize> = fake_sizes(data, chat, message)
+        .into_iter()
+        .map(|s| s.size)
+        .collect();
+    if sizes.is_empty() {
+        return None;
+    }
+    let id = fake_file_id(chat, message.id);
+    Some(Picture {
+        location: FileLocation {
+            file,
+            id,
+            access_hash: id.wrapping_mul(31),
+            file_reference: file_reference.to_vec(),
+            dc_id: FAKE_FILE_DC,
+        },
+        sizes,
+    })
+}
+
+/// What a fake file's bytes are.
+#[derive(Debug, Clone, Copy)]
+enum FakeContent<'a> {
+    /// The message's file: [`fake_file_bytes`].
+    File,
+    /// A size of its picture: [`fake_picture_bytes`].
+    Picture(&'a str, FakeFormat),
 }
 
 /// The file of a fake message's media: kinds with a file whose size the
@@ -926,13 +1120,52 @@ impl Telegram for FakeTelegram {
         .await
     }
 
+    /// The same getMessages call as the Live client, for the ids around the
+    /// message (outside channels each id is the Account's, so it may find
+    /// another Chat's message, as [`get_message`] models), each message with
+    /// its album and [`fake_picture`].
+    async fn media_album(&self, id: ChatRef, message_id: i32) -> Result<Album, TgError> {
+        self.flood()?;
+        self.check_hash(id)?;
+        let chat = id.chat();
+        if !self.knows(chat) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        view::locate_album(id, message_id, |ids| {
+            let reference = {
+                let mut state = self.files.state();
+                state.album_fetches.push(ids.clone());
+                state.reference()
+            };
+            let found = ids
+                .iter()
+                .flat_map(|&id| get_message(&self.data.messages, chat, &MessageRequest { id }))
+                .map(|f| RawViewMessage {
+                    at: MessageAt {
+                        chat: f.chat,
+                        id: f.message.id,
+                    },
+                    grouped_id: fake_picture_entry(&self.data, f.chat, f.message.id)
+                        .and_then(|p| p.grouped_id),
+                    picture: fake_picture(&self.data, &reference, f.chat, &f.message),
+                    media: f.message.media,
+                })
+                .collect();
+            std::future::ready(Ok(found))
+        })
+        .await
+    }
+
     /// `upload.getFile` as Telegram answers it (core.telegram.org/api/files):
     /// `FILE_MIGRATE_X` from any DC but the file's, `FLOOD_WAIT_X` when
     /// flooded, `FILE_REFERENCE_EXPIRED` for a stale reference, the limit
     /// divisible by 4 KB and dividing 1 MB, the offset divisible by 4 KB, no
     /// part across a 1 MB boundary, and then the bytes from `offset`: up to
     /// `limit`, fewer (or none) at the end of the file. Only this Account's
-    /// files are served.
+    /// files are served: a message's file, a photo's sizes and a document's
+    /// thumbnails, never an inline size (stripped, cached, path).
     async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
         const MB: i64 = 1024 * 1024;
         // A round trip: other tasks (and timeouts) get to run.
@@ -964,12 +1197,33 @@ impl Telegram for FakeTelegram {
         let current = state.reference();
         let file = self.data.messages.iter().find_map(|(&chat, messages)| {
             messages.iter().find_map(|m| {
-                let (stored, size) = fake_file(&current, chat, m)?;
-                (stored.same_file(&location) && stored.access_hash == location.access_hash)
-                    .then_some((stored.id, size.unwrap_or(0)))
+                let sizes = fake_sizes(&self.data, chat, m);
+                let picture = fake_picture(&self.data, &current, chat, m);
+                let pictures = picture.iter().flat_map(|p| {
+                    sizes
+                        .iter()
+                        .filter(|s| matches!(s.size.form, SizeForm::File | SizeForm::Progressive))
+                        .map(|s| {
+                            let content = FakeContent::Picture(&s.size.r#type, s.format);
+                            (p.at(&s.size), s.size.bytes, content)
+                        })
+                });
+                let whole = fake_file(&current, chat, m)
+                    .map(|(stored, size)| (stored, size.unwrap_or(0), FakeContent::File));
+                pictures
+                    .chain(whole)
+                    .find(|(stored, _, _)| {
+                        stored.same_file(&location) && stored.access_hash == location.access_hash
+                    })
+                    .map(|(stored, size, content)| match content {
+                        FakeContent::File => (stored.id, size, None),
+                        FakeContent::Picture(r#type, format) => {
+                            (stored.id, size, Some((r#type.to_string(), format)))
+                        }
+                    })
             })
         });
-        let Some((file_id, size)) = file else {
+        let Some((file_id, size, picture)) = file else {
             return Err(FileError::Failed(TgError::Upstream(
                 "rpc error 400: FILE_ID_INVALID".into(),
             )));
@@ -990,10 +1244,12 @@ impl Telegram for FakeTelegram {
         state.served += 1;
         let size = state.cut_at.map_or(size, |cut| cut.min(size)) as i64;
         let (start, end) = (offset.min(size), (offset + i64::from(limit)).min(size));
-        Ok(FilePart::Bytes(fake_file_range(
-            file_id,
-            start as u64..end as u64,
-        )))
+        Ok(FilePart::Bytes(match picture {
+            None => fake_file_range(file_id, start as u64..end as u64),
+            Some((r#type, format)) => fake_picture_bytes(file_id, &r#type, size as u64, format)
+                [start as usize..end as usize]
+                .to_vec(),
+        }))
     }
 }
 

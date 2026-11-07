@@ -20,6 +20,7 @@ pub mod rich;
 pub mod sanitise;
 pub mod search;
 mod session;
+pub mod view;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
 
@@ -126,6 +127,16 @@ pub trait Telegram: Send + Sync + 'static {
         chat: chats::ChatRef,
         message_id: i32,
     ) -> Result<download::MediaFile, TgError>;
+
+    /// Message `message_id` of a Chat and, when it is in an album, the
+    /// album's other messages, each with what a view can show of its media
+    /// ([`view::locate_album`]: one `getMessages` call for the ids around
+    /// it). Not found or no media is [`TgError::InvalidInput`].
+    async fn media_album(
+        &self,
+        chat: chats::ChatRef,
+        message_id: i32,
+    ) -> Result<view::Album, TgError>;
 
     /// One `upload.getFile` call, in method class Files: through the
     /// Account's limiter, its `FLOOD_WAIT` honoured. [`download::Download`]

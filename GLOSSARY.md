@@ -94,6 +94,10 @@ _Avoid_: Instant View (that is a web page's preview), formatted message
 A short-lived URL that lets whoever holds it download the media of one message, without a Token.
 _Avoid_: download token, file URL
 
+**Album**:
+Messages sent together as one post (Telegram's `grouped_id`): up to 10 photos, videos or files with consecutive ids in one Chat. get_media `view` shows an album, not just the one message.
+_Avoid_: media group, gallery
+
 **Search hit**:
 One message found by a search, together with its Chat and a snippet of its text around the match.
 _Avoid_: result, match

@@ -162,6 +162,26 @@ pub struct Media {
     pub height: Option<u32>,
 }
 
+impl MediaKind {
+    /// The name the tools give it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Video => "video",
+            Self::VideoNote => "video_note",
+            Self::Voice => "voice",
+            Self::Audio => "audio",
+            Self::Document => "document",
+            Self::Sticker => "sticker",
+            Self::Gif => "gif",
+            Self::Location => "location",
+            Self::Contact => "contact",
+            Self::Poll => "poll",
+            Self::Other => "other",
+        }
+    }
+}
+
 impl From<MediaKind> for Media {
     /// Media Telegram says nothing more about.
     fn from(kind: MediaKind) -> Self {
@@ -720,6 +740,19 @@ pub fn parse_bound(s: &str, end_of_day: bool) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use super::MediaKind;
+
+    #[test]
+    fn a_media_kinds_name_is_its_name_in_the_tools_answers() {
+        use MediaKind::*;
+        for kind in [
+            Photo, Video, VideoNote, Voice, Audio, Document, Sticker, Gif, Location, Contact, Poll,
+            Other,
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.name());
+        }
+    }
+
     use super::*;
     use crate::tg::{
         chats::ChatKind,

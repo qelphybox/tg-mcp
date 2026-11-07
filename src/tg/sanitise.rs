@@ -29,6 +29,7 @@ use super::{
     find::{FoundChat, FoundChats},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
+    view::{Album, AlbumItem},
 };
 
 /// Unicode general category `Cf` (format characters), sorted. Identical in
@@ -428,6 +429,20 @@ impl Untrusted for MediaFile {
     }
 }
 
+impl Untrusted for Album {
+    fn sanitise(&mut self) {
+        let Album { asked: _, items } = self;
+        for item in items {
+            let AlbumItem {
+                message_id: _,
+                media,
+                picture: _,
+            } = item;
+            clean_media(media);
+        }
+    }
+}
+
 fn sanitised<T: Untrusted>(mut value: T) -> T {
     value.sanitise();
     value
@@ -482,6 +497,10 @@ impl Telegram for Sanitised {
 
     async fn media_file(&self, chat: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {
         self.0.media_file(chat, message_id).await.map(sanitised)
+    }
+
+    async fn media_album(&self, chat: ChatRef, message_id: i32) -> Result<Album, TgError> {
+        self.0.media_album(chat, message_id).await.map(sanitised)
     }
 
     /// File bytes are the file, not text for the model: passed on as they are.

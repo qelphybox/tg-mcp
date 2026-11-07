@@ -14,7 +14,10 @@
 
 use grammers_client::tl;
 
-use super::messages::{Media, MediaKind};
+use super::{
+    messages::{Media, MediaKind},
+    view::{Picture, PictureSize, SizeForm},
+};
 
 /// The media `media` describes; none for no media, `messageMediaEmpty` and a
 /// link preview (`messageMediaWebPage`: the link is in the text).
@@ -123,12 +126,27 @@ pub enum StoredFile {
     Photo { thumb_size: String },
     /// A document: any other file.
     Document,
+    /// One of a document's thumbnails (#34).
+    DocumentThumb { thumb_size: String },
+}
+
+impl StoredFile {
+    /// Photos and documents are numbered apart.
+    fn is_photo(&self) -> bool {
+        matches!(self, Self::Photo { .. })
+    }
 }
 
 impl FileLocation {
     /// The same file (a fresh file reference doesn't make another one).
     pub fn same_file(&self, other: &FileLocation) -> bool {
         self.file == other.file && self.id == other.id
+    }
+
+    /// The same photo or document, at any of its sizes: one file reference
+    /// is good for all of them.
+    pub fn same_object(&self, other: &FileLocation) -> bool {
+        self.file.is_photo() == other.file.is_photo() && self.id == other.id
     }
 }
 
@@ -183,6 +201,102 @@ pub fn file(media: Option<&tl::enums::MessageMedia>) -> Option<(FileLocation, Op
         }
         _ => None,
     }
+}
+
+/// What can be shown of a message's media (#34): a photo's sizes, or a
+/// document's thumbnails, each as Telegram describes it, inline ones
+/// included (a view never picks those). None for media without either.
+pub fn picture(media: Option<&tl::enums::MessageMedia>) -> Option<Picture> {
+    use tl::enums::MessageMedia as M;
+    let (location, sizes) = match media? {
+        M::Photo(p) => {
+            let Some(tl::enums::Photo::Photo(photo)) = &p.photo else {
+                return None;
+            };
+            (
+                FileLocation {
+                    file: StoredFile::Photo {
+                        thumb_size: String::new(),
+                    },
+                    id: photo.id,
+                    access_hash: photo.access_hash,
+                    file_reference: photo.file_reference.clone(),
+                    dc_id: photo.dc_id,
+                },
+                &photo.sizes,
+            )
+        }
+        M::Document(d) => {
+            let Some(tl::enums::Document::Document(doc)) = &d.document else {
+                return None;
+            };
+            (
+                FileLocation {
+                    file: StoredFile::DocumentThumb {
+                        thumb_size: String::new(),
+                    },
+                    id: doc.id,
+                    access_hash: doc.access_hash,
+                    file_reference: doc.file_reference.clone(),
+                    dc_id: doc.dc_id,
+                },
+                doc.thumbs.as_ref()?,
+            )
+        }
+        _ => return None,
+    };
+    let sizes: Vec<PictureSize> = sizes.iter().filter_map(picture_size).collect();
+    (!sizes.is_empty()).then_some(Picture { location, sizes })
+}
+
+fn picture_size(size: &tl::enums::PhotoSize) -> Option<PictureSize> {
+    use tl::enums::PhotoSize as P;
+    let pixels = |p: i32| u32::try_from(p).unwrap_or(0);
+    let bytes = |b: usize| b as u64;
+    Some(match size {
+        P::Empty(_) => return None,
+        P::Size(s) => PictureSize {
+            r#type: s.r#type.clone(),
+            form: SizeForm::File,
+            w: pixels(s.w),
+            h: pixels(s.h),
+            bytes: u64::try_from(s.size).unwrap_or(0),
+        },
+        P::Progressive(s) => PictureSize {
+            r#type: s.r#type.clone(),
+            form: SizeForm::Progressive,
+            w: pixels(s.w),
+            h: pixels(s.h),
+            bytes: s
+                .sizes
+                .iter()
+                .copied()
+                .max()
+                .and_then(|b| u64::try_from(b).ok())
+                .unwrap_or(0),
+        },
+        P::PhotoCachedSize(s) => PictureSize {
+            r#type: s.r#type.clone(),
+            form: SizeForm::Cached,
+            w: pixels(s.w),
+            h: pixels(s.h),
+            bytes: bytes(s.bytes.len()),
+        },
+        P::PhotoStrippedSize(s) => PictureSize {
+            r#type: s.r#type.clone(),
+            form: SizeForm::Stripped,
+            w: 0,
+            h: 0,
+            bytes: bytes(s.bytes.len()),
+        },
+        P::PhotoPathSize(s) => PictureSize {
+            r#type: s.r#type.clone(),
+            form: SizeForm::Path,
+            w: 0,
+            h: 0,
+            bytes: bytes(s.bytes.len()),
+        },
+    })
 }
 
 /// A file: its kind from its attributes (the flags on the message when the
@@ -992,6 +1106,131 @@ mod tests {
             (StoredFile::Document, 6_000_000_001, 4, Some(23_211))
         );
         assert_eq!(location.file_reference, FILE_REFERENCE);
+    }
+
+    #[test]
+    fn a_pictures_sizes_are_every_size_of_the_photo_or_thumbnail_of_the_document() {
+        let size = |r#type: &str, form, w, h, bytes| PictureSize {
+            r#type: r#type.into(),
+            form,
+            w,
+            h,
+            bytes,
+        };
+        let photo = picture(Some(&photo_media(Some(full_photo()), None))).unwrap();
+        assert_eq!(
+            photo.location,
+            FileLocation {
+                file: StoredFile::Photo {
+                    thumb_size: String::new()
+                },
+                id: 5_000_000_001,
+                access_hash: HASH,
+                file_reference: FILE_REFERENCE.to_vec(),
+                dc_id: 2,
+            }
+        );
+        assert_eq!(
+            photo.sizes,
+            [
+                // Inline: kept, but marked so (a view never sends it).
+                size("i", SizeForm::Stripped, 0, 0, 40),
+                size("m", SizeForm::File, 320, 240, 15_000),
+                size("x", SizeForm::File, 800, 600, 70_000),
+                // Progressive: the whole file is its largest size.
+                size("y", SizeForm::Progressive, 1280, 960, 152_331),
+            ]
+        );
+        let at = photo.at(&photo.sizes[2]);
+        assert_eq!(
+            at.file,
+            StoredFile::Photo {
+                thumb_size: "x".into()
+            }
+        );
+        assert!(
+            at.same_object(
+                &file(Some(&photo_media(Some(full_photo()), None)))
+                    .unwrap()
+                    .0
+            )
+        );
+
+        // A video and an animated sticker, with the thumbnails Telegram sends.
+        let mut video = doc(
+            "video/mp4",
+            8_000_000,
+            vec![video(false, 12.6, 1280, 720), file_name("clip.mp4")],
+        );
+        video.thumbs = Some(vec![
+            enums::PhotoSize::PhotoStrippedSize(types::PhotoStrippedSize {
+                r#type: "i".into(),
+                bytes: vec![1; 30],
+            }),
+            enums::PhotoSize::Size(types::PhotoSize {
+                r#type: "m".into(),
+                w: 320,
+                h: 180,
+                size: 9_000,
+            }),
+        ]);
+        let thumbs = picture(Some(&doc_media(Some(video)))).unwrap();
+        assert_eq!(
+            thumbs.location.file,
+            StoredFile::DocumentThumb {
+                thumb_size: String::new()
+            }
+        );
+        assert_eq!(
+            (thumbs.location.id, thumbs.location.dc_id),
+            (6_000_000_001, 4)
+        );
+        assert_eq!(
+            thumbs.sizes,
+            [
+                size("i", SizeForm::Stripped, 0, 0, 30),
+                size("m", SizeForm::File, 320, 180, 9_000),
+            ]
+        );
+        assert_eq!(
+            thumbs.at(&thumbs.sizes[1]).file,
+            StoredFile::DocumentThumb {
+                thumb_size: "m".into()
+            }
+        );
+        let mut tgs = doc(
+            "application/x-tgsticker",
+            12_000,
+            vec![image_size(512, 512), sticker("🐱")],
+        );
+        tgs.thumbs = Some(vec![
+            enums::PhotoSize::PhotoPathSize(types::PhotoPathSize {
+                r#type: "j".into(),
+                bytes: vec![2; 50],
+            }),
+            enums::PhotoSize::PhotoCachedSize(types::PhotoCachedSize {
+                r#type: "s".into(),
+                w: 100,
+                h: 100,
+                bytes: vec![3; 700],
+            }),
+            enums::PhotoSize::Empty(types::PhotoSizeEmpty { r#type: "z".into() }),
+        ]);
+        assert_eq!(
+            picture(Some(&doc_media(Some(tgs)))).unwrap().sizes,
+            [
+                size("j", SizeForm::Path, 0, 0, 50),
+                size("s", SizeForm::Cached, 100, 100, 700),
+            ]
+        );
+
+        // No thumbnails, a gone photo, no file: no picture.
+        let pdf = doc_media(Some(doc("application/pdf", 1, vec![file_name("a.pdf")])));
+        let geo = enums::MessageMedia::Geo(types::MessageMediaGeo { geo: geo() });
+        for media in [pdf, photo_media(None, Some(10)), doc_media(None), geo] {
+            assert_eq!(picture(Some(&media)), None, "{media:?}");
+        }
+        assert_eq!(picture(None), None);
     }
 
     #[test]

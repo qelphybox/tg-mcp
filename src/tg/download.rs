@@ -273,7 +273,10 @@ impl Download {
     }
 
     /// A fresh file reference from the message, once per download. The
-    /// message must still carry the same file: a link is for one file.
+    /// message must still carry the same photo or document (a link is for
+    /// one file), and the same file at the same size when this download is
+    /// of the file itself rather than of one of its sizes or thumbnails
+    /// (#34). One file reference is good for all of them.
     async fn refresh(&mut self) -> Result<(), TgError> {
         if self.refreshed {
             return Err(TgError::Upstream(
@@ -282,12 +285,13 @@ impl Download {
         }
         self.refreshed = true;
         let fresh = self.telegram.media_file(self.chat, self.message_id).await?;
-        if !fresh.location.same_file(&self.location) || fresh.size != self.size {
+        let resized = fresh.location.file == self.location.file && fresh.size != self.size;
+        if !fresh.location.same_object(&self.location) || resized {
             return Err(TgError::InvalidInput(
                 "the message's media changed since the link was made".into(),
             ));
         }
-        self.location = fresh.location;
+        self.location.file_reference = fresh.location.file_reference;
         Ok(())
     }
 }
@@ -431,6 +435,48 @@ mod tests {
         assert!(bytes == fake_file_bytes(fake_file_id(ALICE, 1), size));
         assert_eq!(fake.files().lookups(), 2, "found, then refreshed once");
         assert_eq!(fake.files().requests().len(), 4, "the refused part again");
+    }
+
+    #[tokio::test]
+    async fn a_thumbnails_expired_reference_is_refreshed_from_the_message_too() {
+        use crate::tg::{
+            fake::{FakeFormat, FakePicture, FakeSize, fake_picture_bytes},
+            view::SizeForm,
+        };
+        let video = Media {
+            mime_type: Some("video/mp4".into()),
+            size_bytes: Some(3 * PART_SIZE as u64),
+            ..Media::from(MediaKind::Video)
+        };
+        let fake = Arc::new(FakeTelegram::new(
+            FakeData::new(default_account())
+                .with_messages(ALICE, vec![message(1, Some(video))])
+                .with_pictures(
+                    ALICE,
+                    vec![FakePicture {
+                        message_id: 1,
+                        grouped_id: None,
+                        sizes: Some(vec![FakeSize::new("m", SizeForm::File, (320, 180), 9_000)]),
+                    }],
+                ),
+        ));
+        let album = fake.media_album(alice(), 1).await.unwrap();
+        let picture = album.items[0].picture.clone().unwrap();
+        let file = MediaFile {
+            media: album.items[0].media.clone(),
+            location: picture.at(&picture.sizes[0]),
+            size: 9_000,
+        };
+        // Telegram expires it between the lookup and the download.
+        fake.files().expire_references();
+        let mut download = Download::new(fake.clone(), alice(), 1, &file);
+        let bytes = download.next_part().await.unwrap().unwrap();
+        assert!(
+            bytes == fake_picture_bytes(fake_file_id(ALICE, 1), "m", 9_000, FakeFormat::Jpeg),
+            "the thumbnail, not the video"
+        );
+        assert_eq!(fake.files().lookups(), 1, "refreshed once");
+        assert_eq!(fake.files().requests().len(), 2, "the refused part again");
     }
 
     #[tokio::test]

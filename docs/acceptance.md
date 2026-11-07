@@ -339,3 +339,27 @@ Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with a voice message (525381
 6. The unused link answers `404` after its 5 minutes.
 
 Then on the server: `kamal app logs | grep 'media link'` shows `media link issued`, `download started` and `download finished` lines with `grant_id` and `size_bytes`/`bytes` only; `kamal app logs | grep -F tickets.pdf` and `kamal app logs | grep -F '<any ticket from the URLs>'` find nothing. (`kamal proxy logs` records request paths, tickets included: accepted, see `docs/deploy.md`.)
+
+## 20. get_media `view` puts the picture itself in front of the model, in claude.ai too
+
+This is the mode for clients without a shell, so the primary check is **claude.ai on the web** with the connector added (Settings → Connectors → Add custom connector → `https://tgmcp.qelphybox.space/mcp`); run the same prompt in Claude Code afterwards and note whether both show and describe the images (and, if you try them, which other clients do: Claude desktop, the Claude mobile apps, Cursor).
+
+Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with the photo 525379 (960×1280, 135013 bytes) and the round video message 525380 (it has a thumbnail), as in §19. **Prepare before the run** (send them to Saved Messages yourself and note their ids):
+
+- `<A>`: an album of 6 photos sent as one message (select 6 photos at once, "group items"), each with something easy to tell apart (e.g. a number written on paper); `<A1>` its first id, `<A5>` its fifth.
+- `<G>`: a GIF (from the GIF tab), `<S>`: a plain sticker (a static one, not animated), `<T>`: an animated sticker (the moving kind), and `<P>`: a PDF without a preview (e.g. `tickets.pdf` 525384).
+- `<V>`: a voice message (e.g. 525381).
+
+Then run:
+
+```text
+Через Telegram MCP, в чате user:408551275~0xo8DFRPKC4. 1) get_media с mode="view" для 525379: опиши, что на картинке, в двух предложениях, и выведи поле view целиком (JSON как есть) и текстовый блок ответа. 2) То же с size="large" для 525379: выведи только view.images. 3) get_media view для 525380 (кружок), <G> (GIF) и <S> (стикер): что на каждой картинке, одним предложением, и view.images. 4) get_media view для <A5>: сколько картинок пришло, что на каждой (например, какое число), view целиком и текстовый блок; потом view для <A1>: какие message_id в images. 5) get_media view для <T>, <P> и <V> и mode="download" с size="large" для 525379: для каждого выведи текст ошибки. Не выдумывай содержимое картинок: если картинки не видишь, так и скажи.
+```
+
+1. The answer describes the photo correctly (compare with the app): the image reached the model, not just the JSON. `view.images` = one image of message 525379, `kind: "photo"`, `mime_type: "image/jpeg"`, `width: 600`, `height: 800` (Telegram's `x` size), its `size_bytes` well under 135013; `album_truncated: false`, no `album_message_ids`. The text block says `Message 525379 (photo): 1 image.` and `Image 1: message 525379, photo, image/jpeg, 600x800, … bytes.`
+2. `size: "large"`: `width: 960`, `height: 1280`, `size_bytes: 135013` (the photo's full size, which is Telegram's `y`).
+3. The video message, the GIF and the sticker each come as one image (their thumbnail: a still frame, ~320 px for the video message and GIF, `image/jpeg`; the sticker's usually `image/webp`) that the answer describes plausibly; `kind` is `video_note`, `gif`, `sticker`.
+4. `<A5>`: 4 images, those of the 2nd to the 5th photo of the album, in album order (the numbers read back in order), `album_message_ids` = the 6 ids of the album, `album_truncated: true`, and the text block names the message not shown. `<A1>`: the first 4 ids of the album.
+5. `<T>`: a tool error saying the thumbnail isn't an image clients can show (or that Telegram has no thumbnail for it), or, if Telegram gives the animated sticker a WebP thumbnail, one `image/webp` image; any of these is fine, a mislabelled or broken image is not. `<P>`: a tool error saying the file has no thumbnail and to use mode `download`. `<V>`: a tool error saying it is audio with no picture. `download` with `size`: an invalid-params error `size only applies to mode view`.
+
+Then on the server: `kamal app logs | grep 'media view served'` shows one line per successful view with `message_id`, `images` and `bytes` only; nothing else of the images (no base64, no file names) is in the logs.
