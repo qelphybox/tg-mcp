@@ -1,22 +1,34 @@
 //! Chat history as the tools see it, independent of grammers/TL.
 //!
-//! The adapter turns a `messages.getHistory` answer into [`RawHistoryMessage`]s
-//! and [`RawPeer`]s; who sent what, the date window and whether there is a next
-//! page are decided here. The fake uses the same assembly.
+//! [`read_history`] decides which `messages.getHistory` calls a query takes
+//! ([`HistoryRequest`]s); the adapter sends them and turns each answer into
+//! [`RawHistoryMessage`]s and [`RawPeer`]s. Who sent what, the date window,
+//! where a window around a message lies and whether there is more on either
+//! side are decided here. The fake answers the same requests with a model of
+//! Telegram's paging.
 
 use std::collections::HashMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::chats::{ChatId, ChatRef, RawPeer, rfc3339};
+use super::{
+    TgError,
+    chats::{ChatId, ChatRef, RawPeer, rfc3339},
+};
 
-/// What to fetch. Messages come newest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What to fetch. Messages come newest first. At most one of `before_id`,
+/// `around_id` and `after_id` is set, and `since`/`until` only go with
+/// `before_id` (or none of them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HistoryQuery {
     pub limit: usize,
     /// Only messages older than this id (the previous page's `next_before_id`).
     pub before_id: Option<i32>,
+    /// A window of `limit` messages centred on this one, which it includes.
+    pub around_id: Option<i32>,
+    /// Only the `limit` messages right after this id (a `next_after_id`).
+    pub after_id: Option<i32>,
     /// Only messages at or after this time (unix seconds).
     pub since: Option<i64>,
     /// Only messages at or before this time (unix seconds).
@@ -49,6 +61,9 @@ pub struct ChatMessage {
     pub forwarded: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub edited: bool,
+    /// The message an `around_id` window was asked around.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub target: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -60,6 +75,10 @@ pub struct MessagePage {
     /// (or the `since` bound was reached).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_before_id: Option<i32>,
+    /// Only for `around_id` and `after_id`: pass back as `after_id` for newer
+    /// messages; absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after_id: Option<i32>,
 }
 
 /// One message as extracted from TL.
@@ -83,23 +102,249 @@ pub struct RawHistoryMessage {
     pub edited: bool,
 }
 
+/// One `messages.getHistory` call, as its TL parameters (0 = not set, as in TL).
+///
+/// Telegram slices the Chat's history, newest first, at
+/// `position(offset_id) + add_offset`, where `position` counts the messages
+/// down to `offset_id` inclusive (so `add_offset: 0` starts strictly below it
+/// and a negative `add_offset` takes in that many messages at and above it),
+/// keeps `limit` of them and only then drops ids outside `min_id`/`max_id`
+/// (core.telegram.org/api/offsets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryRequest {
+    pub offset_id: i32,
+    /// Unix seconds; the slice starts strictly before it. Used without `offset_id`.
+    pub offset_date: i32,
+    pub add_offset: i32,
+    pub limit: i32,
+    /// Only ids strictly below it.
+    pub max_id: i32,
+    /// Only ids strictly above it.
+    pub min_id: i32,
+}
+
+/// What Telegram answered to one [`HistoryRequest`].
+#[derive(Debug, Clone, Default)]
+pub struct HistoryAnswer {
+    /// As Telegram sent them (newest first), `messageEmpty` left out.
+    pub messages: Vec<RawHistoryMessage>,
+    /// How many messages Telegram sent, `messageEmpty` included: a slice is
+    /// full when this reaches its `limit`.
+    pub returned: usize,
+    pub peers: Vec<RawPeer>,
+}
+
+/// Answer `query` with as many `messages.getHistory` calls as it takes (one,
+/// or two for a window at the newest message), sent through `get_history`.
+pub async fn read_history<F, Fut>(
+    chat: ChatRef,
+    query: &HistoryQuery,
+    mut get_history: F,
+) -> Result<MessagePage, TgError>
+where
+    F: FnMut(HistoryRequest) -> Fut,
+    Fut: Future<Output = Result<HistoryAnswer, TgError>>,
+{
+    let limit = i32::try_from(query.limit)
+        .ok()
+        .filter(|&l| l >= 1)
+        .ok_or_else(|| TgError::InvalidInput("limit is out of range".into()))?;
+    let dated = query.since.is_some() || query.until.is_some();
+    match (query.before_id, query.around_id, query.after_id) {
+        (_, None, None) => {
+            let answer = get_history(HistoryRequest {
+                offset_id: query.before_id.unwrap_or(0),
+                // getHistory returns messages strictly before offset_date.
+                offset_date: query
+                    .until
+                    .map(|until| i32::try_from(until.saturating_add(1)).unwrap_or(i32::MAX))
+                    .unwrap_or(0),
+                limit,
+                ..HistoryRequest::default()
+            })
+            .await?;
+            let full_page = answer.returned >= query.limit;
+            Ok(assemble_history(
+                chat,
+                &answer.messages,
+                &answer.peers,
+                query,
+                full_page,
+            ))
+        }
+        (None, Some(target), None) if !dated => around(chat, target, limit, get_history).await,
+        (None, None, Some(after)) if !dated => {
+            // Everything at and above after+1, i.e. strictly newer; min_id drops
+            // older ones should Telegram fill a slice that reaches past the
+            // newest message from below.
+            let answer = get_history(HistoryRequest {
+                offset_id: after.saturating_add(1),
+                add_offset: -limit,
+                limit,
+                min_id: after,
+                ..HistoryRequest::default()
+            })
+            .await?;
+            let window = newest_first(answer.messages, |id| id > after);
+            let next_after_id = (answer.returned >= query.limit)
+                .then(|| window.first().map(|m| m.id))
+                .flatten();
+            let issuer = Issuer::new(chat, &answer.peers);
+            Ok(MessagePage {
+                chat_id: issuer.chat_id(),
+                messages: window.iter().map(|m| issuer.message(m)).collect(),
+                next_before_id: None,
+                next_after_id,
+            })
+        }
+        _ => Err(TgError::InvalidInput(
+            "before_id, around_id and after_id exclude each other, and since/until don't go \
+             with around_id or after_id"
+                .into(),
+        )),
+    }
+}
+
+/// `limit` messages around `target`: (limit-1)/2 newer, the rest older, more
+/// older ones where there aren't enough newer.
+async fn around<F, Fut>(
+    chat: ChatRef,
+    target: i32,
+    limit: i32,
+    mut get_history: F,
+) -> Result<MessagePage, TgError>
+where
+    F: FnMut(HistoryRequest) -> Fut,
+    Fut: Future<Output = Result<HistoryAnswer, TgError>>,
+{
+    let size = limit as usize;
+    let newer_wanted = (size - 1) / 2;
+    let older_wanted = size - 1 - newer_wanted;
+    // The target and the newer_wanted messages above it, then older ones.
+    let answer = get_history(HistoryRequest {
+        offset_id: target,
+        add_offset: -(newer_wanted as i32 + 1),
+        limit,
+        ..HistoryRequest::default()
+    })
+    .await?;
+    let mut peers = answer.peers;
+    let mut window = newest_first(answer.messages, |_| true);
+    let Some(at) = window.iter().position(|m| m.id == target) else {
+        return Err(TgError::InvalidInput(format!(
+            "message {target} not found in this chat (deleted, or the id is from another chat)"
+        )));
+    };
+    let newer = at;
+    let older = window.len() - at - 1;
+    // Fewer newer messages than asked for: the slice reached past the newest one.
+    let at_newest = newer < newer_wanted;
+    let mut more_older = older >= older_wanted;
+    // Telegram may answer such a slice short (it keeps its older end) or full
+    // (it moves down); if short, fill it up from below.
+    if at_newest && more_older && window.len() < size {
+        let oldest = window.last().map_or(target, |m| m.id);
+        let missing = size - window.len();
+        let fill = get_history(HistoryRequest {
+            offset_id: oldest,
+            limit: missing as i32,
+            ..HistoryRequest::default()
+        })
+        .await?;
+        more_older = fill.returned >= missing;
+        window.extend(newest_first(fill.messages, |id| id < oldest));
+        peers.extend(fill.peers);
+    }
+    let issuer = Issuer::new(chat, &peers);
+    Ok(MessagePage {
+        chat_id: issuer.chat_id(),
+        messages: window
+            .iter()
+            .map(|m| ChatMessage {
+                target: m.id == target,
+                ..issuer.message(m)
+            })
+            .collect(),
+        next_before_id: more_older.then(|| window.last().map(|m| m.id)).flatten(),
+        next_after_id: (!at_newest).then(|| window.first().map(|m| m.id)).flatten(),
+    })
+}
+
+/// Newest first, each id once, only ids that `keep`.
+fn newest_first(
+    mut messages: Vec<RawHistoryMessage>,
+    keep: impl Fn(i32) -> bool,
+) -> Vec<RawHistoryMessage> {
+    messages.retain(|m| keep(m.id));
+    messages.sort_by_key(|m| std::cmp::Reverse(m.id));
+    messages.dedup_by_key(|m| m.id);
+    messages
+}
+
+/// Turns raw messages into the tools' shape, handing out chat ids.
+struct Issuer<'a> {
+    chat: ChatRef,
+    peers: HashMap<ChatId, &'a RawPeer>,
+}
+
+impl<'a> Issuer<'a> {
+    fn new(chat: ChatRef, peers: &'a [RawPeer]) -> Self {
+        Self {
+            chat,
+            peers: peers.iter().map(|p| (p.id, p)).collect(),
+        }
+    }
+
+    /// Ids handed out carry the access hash Telegram just sent along; the chat
+    /// itself keeps the one it was asked with if Telegram didn't describe it.
+    fn issue(&self, id: ChatId) -> ChatRef {
+        match self.peers.get(&id).and_then(|p| p.access_hash) {
+            Some(hash) => ChatRef::new(id, Some(hash)),
+            None if id == self.chat.chat() => self.chat,
+            None => ChatRef::from(id),
+        }
+    }
+
+    fn chat_id(&self) -> String {
+        self.issue(self.chat.chat()).to_string()
+    }
+
+    fn message(&self, m: &RawHistoryMessage) -> ChatMessage {
+        let sender = (!m.out).then(|| {
+            let id = m.from.unwrap_or(self.chat.chat());
+            Sender {
+                id: self.issue(id).to_string(),
+                name: self
+                    .peers
+                    .get(&id)
+                    .map(|p| p.title.clone())
+                    .unwrap_or_else(|| id.to_string()),
+            }
+        });
+        ChatMessage {
+            id: m.id,
+            date: rfc3339(m.date),
+            sender,
+            outgoing: m.out,
+            text: m.text.clone(),
+            reply_to: m.reply_to,
+            forwarded: m.forwarded,
+            edited: m.edited,
+            target: false,
+        }
+    }
+}
+
 /// Build a page from what Telegram returned for `query` (newest first).
 /// `full_page` = Telegram returned as many messages as asked for.
-pub fn assemble_history(
+fn assemble_history(
     chat: ChatRef,
     raw: &[RawHistoryMessage],
     peers: &[RawPeer],
     query: &HistoryQuery,
     full_page: bool,
 ) -> MessagePage {
-    let peers: HashMap<ChatId, &RawPeer> = peers.iter().map(|p| (p.id, p)).collect();
-    // Ids handed out carry the access hash Telegram just sent along; the chat
-    // itself keeps the one it was asked with if Telegram didn't describe it.
-    let issue = |id: ChatId| match peers.get(&id).and_then(|p| p.access_hash) {
-        Some(hash) => ChatRef::new(id, Some(hash)),
-        None if id == chat.chat() => chat,
-        None => ChatRef::from(id),
-    };
+    let issuer = Issuer::new(chat, peers);
     let mut reached_since = false;
     let mut messages = Vec::new();
     for m in raw {
@@ -111,34 +356,16 @@ pub fn assemble_history(
             reached_since = true;
             break;
         }
-        let sender = (!m.out).then(|| {
-            let id = m.from.unwrap_or(chat.chat());
-            Sender {
-                id: issue(id).to_string(),
-                name: peers
-                    .get(&id)
-                    .map(|p| p.title.clone())
-                    .unwrap_or_else(|| id.to_string()),
-            }
-        });
-        messages.push(ChatMessage {
-            id: m.id,
-            date: rfc3339(m.date),
-            sender,
-            outgoing: m.out,
-            text: m.text.clone(),
-            reply_to: m.reply_to,
-            forwarded: m.forwarded,
-            edited: m.edited,
-        });
+        messages.push(issuer.message(m));
     }
     let next_before_id = (full_page && !reached_since)
         .then(|| raw.last().map(|m| m.id))
         .flatten();
     MessagePage {
-        chat_id: issue(chat.chat()).to_string(),
+        chat_id: issuer.chat_id(),
         messages,
         next_before_id,
+        next_after_id: None,
     }
 }
 
@@ -163,7 +390,10 @@ pub fn parse_bound(s: &str, end_of_day: bool) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tg::chats::ChatKind;
+    use crate::tg::{
+        chats::ChatKind,
+        fake::{PastNewest, get_history},
+    };
 
     fn msg(id: i32, date: i32) -> RawHistoryMessage {
         RawHistoryMessage {
@@ -181,9 +411,7 @@ mod tests {
     fn query(limit: usize) -> HistoryQuery {
         HistoryQuery {
             limit,
-            before_id: None,
-            since: None,
-            until: None,
+            ..HistoryQuery::default()
         }
     }
 
@@ -309,6 +537,208 @@ mod tests {
             page.next_before_id, None,
             "older pages are all before `since`"
         );
+    }
+
+    /// Reads `query` from `history` through the fake's model of getHistory,
+    /// recording the requests sent.
+    fn read(
+        history: &[RawHistoryMessage],
+        query: HistoryQuery,
+        past_newest: PastNewest,
+    ) -> (Result<MessagePage, TgError>, Vec<HistoryRequest>) {
+        let mut sent = Vec::new();
+        let page = futures_executor(read_history(ChatId::Channel(1).into(), &query, |request| {
+            sent.push(request);
+            let messages = get_history(history, &request, past_newest);
+            std::future::ready(Ok(HistoryAnswer {
+                returned: messages.len(),
+                messages,
+                peers: Vec::new(),
+            }))
+        }));
+        (page, sent)
+    }
+
+    /// The futures here never wait: poll once.
+    fn futures_executor<T>(future: impl Future<Output = T>) -> T {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(future).poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => unreachable!("fake history never waits"),
+        }
+    }
+
+    fn page_ids(page: &MessagePage) -> Vec<i32> {
+        page.messages.iter().map(|m| m.id).collect()
+    }
+
+    fn around(target: i32, limit: usize) -> HistoryQuery {
+        HistoryQuery {
+            around_id: Some(target),
+            ..query(limit)
+        }
+    }
+
+    /// Histories with gaps of every size: deleted messages in a channel, or a
+    /// private chat's ids, which count all of the account's chats.
+    fn gapped_histories() -> Vec<Vec<RawHistoryMessage>> {
+        let mut seed: u64 = 0x5EED;
+        let mut next = move |bound: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % bound
+        };
+        let mut histories = vec![vec![msg(1, 1)], (1..=12).map(|i| msg(i, i)).collect()];
+        for _ in 0..30 {
+            let len = 1 + next(40) as i32;
+            let mut id = 0;
+            histories.push(
+                (0..len)
+                    .map(|_| {
+                        id += 1 + next(4) as i32 * next(3) as i32;
+                        msg(id, id)
+                    })
+                    .collect(),
+            );
+        }
+        histories
+    }
+
+    #[test]
+    fn a_window_is_the_stretch_of_history_around_its_target() {
+        for past_newest in [PastNewest::Shorten, PastNewest::ShiftOlder] {
+            for history in gapped_histories() {
+                // Newest first, as the window must read.
+                let all: Vec<i32> = history.iter().rev().map(|m| m.id).collect();
+                for (i, &target) in all.iter().enumerate() {
+                    for limit in 1..=9 {
+                        let (page, _) = read(&history, around(target, limit), past_newest);
+                        let page = page.unwrap();
+                        let got = page_ids(&page);
+                        // Up to (limit-1)/2 newer, the rest older, more older ones
+                        // where the newer run out.
+                        let newer = ((limit - 1) / 2).min(i);
+                        let older = (limit - 1 - newer).min(all.len() - 1 - i);
+                        let expected = &all[i - newer..=i + older];
+                        let case = format!("{past_newest:?} {all:?} around {target} limit {limit}");
+                        assert_eq!(got, expected, "{case}");
+                        let flagged: Vec<i32> = page
+                            .messages
+                            .iter()
+                            .filter(|m| m.target)
+                            .map(|m| m.id)
+                            .collect();
+                        assert_eq!(flagged, [target], "{case}");
+                        // A cursor on a side unless that side reached the end
+                        // of the history before filling up.
+                        let newer_full = newer == (limit - 1) / 2;
+                        assert_eq!(page.next_after_id.is_some(), newer_full, "{case}");
+                        assert_eq!(
+                            page.next_before_id.is_some(),
+                            older == limit - 1 - newer,
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_costs_one_call_unless_telegram_shortens_it_at_the_newest_message() {
+        let history: Vec<RawHistoryMessage> = (1..=20).map(|i| msg(i, i)).collect();
+        // Mid-history: exactly the "around" example of the offsets page.
+        let (_, sent) = read(&history, around(10, 5), PastNewest::Shorten);
+        assert_eq!(
+            sent,
+            [HistoryRequest {
+                offset_id: 10,
+                add_offset: -3,
+                limit: 5,
+                ..HistoryRequest::default()
+            }]
+        );
+        let (_, sent) = read(&history, around(19, 5), PastNewest::ShiftOlder);
+        assert_eq!(sent.len(), 1);
+        // Shortened at the newest message (20, 19, 18, 17): one more page
+        // below it for what is missing.
+        let (page, sent) = read(&history, around(19, 5), PastNewest::Shorten);
+        assert_eq!(page_ids(&page.unwrap()), [20, 19, 18, 17, 16]);
+        assert_eq!(
+            sent[1..],
+            [HistoryRequest {
+                offset_id: 17,
+                limit: 1,
+                ..HistoryRequest::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn after_id_reads_the_messages_right_after_it() {
+        let history: Vec<RawHistoryMessage> = [1, 2, 5, 6, 9, 11, 12].map(|i| msg(i, i)).into();
+        let after = |id, limit| HistoryQuery {
+            after_id: Some(id),
+            ..query(limit)
+        };
+        for past_newest in [PastNewest::Shorten, PastNewest::ShiftOlder] {
+            let (page, _) = read(&history, after(2, 3), past_newest);
+            let page = page.unwrap();
+            assert_eq!(page_ids(&page), [9, 6, 5]);
+            assert_eq!(page.next_after_id, Some(9));
+            assert_eq!(page.next_before_id, None);
+            // Near the newest: only newer ones, and no cursor.
+            let (page, _) = read(&history, after(6, 5), past_newest);
+            let page = page.unwrap();
+            assert_eq!(page_ids(&page), [12, 11, 9], "{past_newest:?}");
+            assert_eq!(page.next_after_id, None);
+            let (page, _) = read(&history, after(12, 5), past_newest);
+            assert!(page.unwrap().messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_missing_target_is_an_error_not_an_empty_window() {
+        let history: Vec<RawHistoryMessage> = [1, 2, 5, 6].map(|i| msg(i, i)).into();
+        for target in [3, 4, 7, 1000] {
+            let (page, _) = read(&history, around(target, 5), PastNewest::Shorten);
+            let err = page.unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("message {target} not found")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn positions_exclude_each_other() {
+        let history = [msg(1, 1)];
+        for bad in [
+            HistoryQuery {
+                before_id: Some(2),
+                ..around(1, 3)
+            },
+            HistoryQuery {
+                after_id: Some(1),
+                ..around(1, 3)
+            },
+            HistoryQuery {
+                since: Some(0),
+                ..around(1, 3)
+            },
+            HistoryQuery {
+                until: Some(5),
+                after_id: Some(1),
+                ..query(3)
+            },
+            around(1, 0),
+        ] {
+            let (page, sent) = read(&history, bad, PastNewest::Shorten);
+            assert!(
+                matches!(page, Err(TgError::InvalidInput(_))),
+                "{bad:?}: {page:?}"
+            );
+            assert!(sent.is_empty(), "nothing is asked of Telegram");
+        }
     }
 
     #[test]

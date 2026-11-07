@@ -20,7 +20,9 @@ use super::{
         self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, Cursor, Listing, RawDialog,
         RawMessage, RawPeer,
     },
-    messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
+    messages::{
+        HistoryAnswer, HistoryQuery, HistoryRequest, MessagePage, RawHistoryMessage, read_history,
+    },
     pool::{Evicted, Live, Pool},
     session::SessionStore,
 };
@@ -538,44 +540,11 @@ impl Telegram for LiveClient {
 
     async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
         let peer = self.resolve(id).await?;
-        let chat = id.chat();
-        let answer = self
-            .call(
-                &tl::functions::messages::GetHistory {
-                    peer,
-                    offset_id: query.before_id.unwrap_or(0),
-                    // getHistory returns messages strictly before offset_date.
-                    offset_date: query
-                        .until
-                        .map(|until| i32::try_from(until.saturating_add(1)).unwrap_or(i32::MAX))
-                        .unwrap_or(0),
-                    add_offset: 0,
-                    limit: query.limit as i32,
-                    max_id: 0,
-                    min_id: 0,
-                    hash: 0,
-                },
-                Some(chat),
-            )
-            .await?;
-        let (messages, chats, users) = match answer {
-            tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
-            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
-        };
-        let full_page = messages.len() >= query.limit;
-        let raw: Vec<RawHistoryMessage> = messages
-            .into_iter()
-            .filter_map(raw_history_message)
-            .collect();
-        let peers: Vec<RawPeer> = users
-            .into_iter()
-            .filter_map(raw_user)
-            .chain(chats.into_iter().filter_map(raw_chat))
-            .collect();
-        self.remember(&peers);
-        Ok(assemble_history(id, &raw, &peers, &query, full_page))
+        let peer = &peer;
+        read_history(id, &query, |request| {
+            self.get_history(peer, id.chat(), request)
+        })
+        .await
     }
 
     async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
@@ -648,6 +617,60 @@ impl Telegram for LiveClient {
 const RESOLVE_MAX_PAGES: usize = 5;
 
 impl LiveClient {
+    /// One `messages.getHistory` call.
+    async fn get_history(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        request: HistoryRequest,
+    ) -> Result<HistoryAnswer, TgError> {
+        let HistoryRequest {
+            offset_id,
+            offset_date,
+            add_offset,
+            limit,
+            max_id,
+            min_id,
+        } = request;
+        let answer = self
+            .call(
+                &tl::functions::messages::GetHistory {
+                    peer: peer.clone(),
+                    offset_id,
+                    offset_date,
+                    add_offset,
+                    limit,
+                    max_id,
+                    min_id,
+                    hash: 0,
+                },
+                Some(chat),
+            )
+            .await?;
+        let (messages, chats, users) = match answer {
+            tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+            tl::enums::messages::Messages::NotModified(_) => (vec![], vec![], vec![]),
+        };
+        let returned = messages.len();
+        let messages: Vec<RawHistoryMessage> = messages
+            .into_iter()
+            .filter_map(raw_history_message)
+            .collect();
+        let peers: Vec<RawPeer> = users
+            .into_iter()
+            .filter_map(raw_user)
+            .chain(chats.into_iter().filter_map(raw_chat))
+            .collect();
+        self.remember(&peers);
+        Ok(HistoryAnswer {
+            messages,
+            returned,
+            peers,
+        })
+    }
+
     fn remember(&self, peers: &[RawPeer]) {
         self.peers
             .lock()
@@ -1462,9 +1485,7 @@ mod resolve_tests {
     fn query() -> HistoryQuery {
         HistoryQuery {
             limit: 30,
-            before_id: None,
-            since: None,
-            until: None,
+            ..HistoryQuery::default()
         }
     }
 
@@ -1519,6 +1540,45 @@ mod resolve_tests {
                     }),
                 }
                 .to_bytes(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_and_newer_pages_send_negative_add_offsets() {
+        let (live, _dir) = cold_client().await;
+        let chat = ChatRef::from(ChatId::Chat(4));
+        let peer = tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: 4 });
+        let around = HistoryQuery {
+            around_id: Some(500),
+            ..query()
+        };
+        let after = HistoryQuery {
+            after_id: Some(500),
+            ..query()
+        };
+        assert!(live.get_messages(chat, around).await.is_err());
+        assert!(live.get_messages(chat, after).await.is_err());
+        let request = |offset_id, add_offset, min_id| {
+            tl::functions::messages::GetHistory {
+                peer: peer.clone(),
+                offset_id,
+                offset_date: 0,
+                add_offset,
+                limit: 30,
+                max_id: 0,
+                min_id,
+                hash: 0,
+            }
+            .to_bytes()
+        };
+        assert_eq!(
+            sent(&live),
+            [
+                // 500 and the 14 above it, then 15 below.
+                request(500, -15, 0),
+                // The 30 at and above 501, nothing at or below 500.
+                request(501, -30, 500),
             ]
         );
     }

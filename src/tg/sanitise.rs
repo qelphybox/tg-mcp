@@ -175,6 +175,7 @@ impl Untrusted for MessagePage {
             chat_id: _,
             messages,
             next_before_id: _,
+            next_after_id: _,
         } = self;
         for message in messages {
             let ChatMessage {
@@ -186,6 +187,7 @@ impl Untrusted for MessagePage {
                 reply_to: _,
                 forwarded: _,
                 edited: _,
+                target: _,
             } = message;
             clean(text);
             if let Some(Sender { id: _, name }) = sender {
@@ -452,8 +454,10 @@ mod tests {
                 reply_to: None,
                 forwarded: false,
                 edited: false,
+                target: false,
             }],
             next_before_id: None,
+            next_after_id: None,
         };
         history.sanitise();
         assert_eq!(history.messages[0].text, "a\nb");

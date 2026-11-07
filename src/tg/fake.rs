@@ -18,7 +18,9 @@ use super::{
         ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
         chat_info,
     },
-    messages::{HistoryQuery, MessagePage, RawHistoryMessage, assemble_history},
+    messages::{
+        HistoryAnswer, HistoryQuery, HistoryRequest, MessagePage, RawHistoryMessage, read_history,
+    },
 };
 use crate::{limits::MethodClass, sessions::OpenedGrant};
 
@@ -39,6 +41,65 @@ pub struct FakeData {
     /// When set, every call answers like Telegram's FLOOD_WAIT_<seconds>.
     #[serde(default)]
     pub flood_wait: Option<u32>,
+    /// How getHistory answers a slice that reaches past the newest message.
+    #[serde(default)]
+    pub past_newest: PastNewest,
+}
+
+/// What Telegram does when `add_offset` puts a getHistory slice's start above
+/// the newest message. Its docs don't say, so the server must cope with both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PastNewest {
+    /// The slice keeps its older end and starts at the newest message: fewer
+    /// than `limit` messages.
+    #[default]
+    Shorten,
+    /// The slice starts at the newest message and still holds `limit`, so it
+    /// reaches further down than asked.
+    ShiftOlder,
+}
+
+/// Telegram's largest getHistory `limit`; larger ones are cut to it.
+const HISTORY_MAX_LIMIT: i64 = 100;
+
+/// `messages.getHistory` as Telegram answers it (core.telegram.org/api/offsets),
+/// on a history given in any order: newest first, slice at
+/// `position(offset_id) + add_offset` (`position` counts the messages down to
+/// `offset_id` inclusive, whether or not that id exists; `offset_id` wins over
+/// `offset_date`), keep `limit`, then drop ids outside `min_id`/`max_id`.
+pub fn get_history(
+    history: &[RawHistoryMessage],
+    request: &HistoryRequest,
+    past_newest: PastNewest,
+) -> Vec<RawHistoryMessage> {
+    let mut list = history.to_vec();
+    list.sort_by_key(|m| std::cmp::Reverse(m.id));
+    let position = if request.offset_id != 0 {
+        list.iter()
+            .take_while(|m| m.id >= request.offset_id)
+            .count()
+    } else if request.offset_date != 0 {
+        list.iter()
+            .take_while(|m| m.date >= request.offset_date)
+            .count()
+    } else {
+        0
+    };
+    let limit = i64::from(request.limit).clamp(0, HISTORY_MAX_LIMIT);
+    let mut start = position as i64 + i64::from(request.add_offset);
+    let mut take = limit;
+    if start < 0 {
+        if past_newest == PastNewest::Shorten {
+            take = (take + start).max(0);
+        }
+        start = 0;
+    }
+    list.into_iter()
+        .skip(start as usize)
+        .take(take as usize)
+        .filter(|m| request.max_id == 0 || m.id < request.max_id)
+        .filter(|m| request.min_id == 0 || m.id > request.min_id)
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,7 +122,13 @@ impl FakeData {
             messages: Default::default(),
             details: Default::default(),
             flood_wait: None,
+            past_newest: PastNewest::default(),
         }
+    }
+
+    pub fn with_past_newest(mut self, past_newest: PastNewest) -> Self {
+        self.past_newest = past_newest;
+        self
     }
 
     pub fn with_details(mut self, chat: ChatId, details: FakeDetails) -> Self {
@@ -161,7 +228,7 @@ impl Telegram for FakeTelegram {
         })
     }
 
-    /// Emulates getHistory: `before_id` and `until` are applied before `limit`.
+    /// The same getHistory calls as the Live client, answered by [`get_history`].
     async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
         self.flood()?;
         self.check_hash(id)?;
@@ -171,16 +238,17 @@ impl Telegram for FakeTelegram {
                 "{chat} is not one of your chats; chat ids come from list_chats"
             )));
         }
-        let mut history = self.data.messages.get(&chat).cloned().unwrap_or_default();
-        history.sort_by_key(|m| std::cmp::Reverse(m.id));
-        let window: Vec<RawHistoryMessage> = history
-            .into_iter()
-            .filter(|m| query.before_id.is_none_or(|before| m.id < before))
-            .filter(|m| query.until.is_none_or(|until| i64::from(m.date) <= until))
-            .take(query.limit)
-            .collect();
-        let full = window.len() == query.limit;
-        Ok(assemble_history(id, &window, &self.peers(), &query, full))
+        let history = self.data.messages.get(&chat).map_or(&[][..], Vec::as_slice);
+        let peers = self.peers();
+        read_history(id, &query, |request| {
+            let messages = get_history(history, &request, self.data.past_newest);
+            std::future::ready(Ok(HistoryAnswer {
+                returned: messages.len(),
+                messages,
+                peers: peers.clone(),
+            }))
+        })
+        .await
     }
 
     async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
@@ -524,5 +592,115 @@ impl Connector for FakeConnector {
         self.telegram
             .shutdowns
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ids with gaps (deleted messages, or a private chat's account-wide ids),
+    /// shuffled: the model must not rely on the order it is given.
+    fn history() -> Vec<RawHistoryMessage> {
+        [3, 50, 1, 9, 40, 10, 2, 30, 20]
+            .into_iter()
+            .map(|id| RawHistoryMessage {
+                id,
+                date: 1000 + id,
+                from: None,
+                out: false,
+                text: String::new(),
+                reply_to: None,
+                forwarded: false,
+                edited: false,
+            })
+            .collect()
+    }
+
+    fn ids(request: HistoryRequest, past_newest: PastNewest) -> Vec<i32> {
+        get_history(&history(), &request, past_newest)
+            .iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn slice(offset_id: i32, add_offset: i32, limit: i32) -> HistoryRequest {
+        HistoryRequest {
+            offset_id,
+            add_offset,
+            limit,
+            ..HistoryRequest::default()
+        }
+    }
+
+    #[test]
+    fn the_offsets_page_examples() {
+        // core.telegram.org/api/offsets: older than MSGID, newer than MSGID
+        // (it counts MSGID itself in), around MSGID.
+        let shorten = PastNewest::Shorten;
+        assert_eq!(ids(slice(10, 0, 3), shorten), [9, 3, 2]);
+        assert_eq!(ids(slice(10, -3, 3), shorten), [30, 20, 10]);
+        assert_eq!(ids(slice(10, -2, 4), shorten), [20, 10, 9, 3]);
+        // No offset: from the newest.
+        assert_eq!(ids(slice(0, 0, 2), shorten), [50, 40]);
+    }
+
+    #[test]
+    fn a_missing_offset_id_counts_like_the_next_older_one() {
+        // 15 doesn't exist: it sits between 20 and 10.
+        let shorten = PastNewest::Shorten;
+        assert_eq!(ids(slice(15, 0, 2), shorten), [10, 9]);
+        assert_eq!(ids(slice(15, -1, 2), shorten), [20, 10]);
+    }
+
+    #[test]
+    fn a_slice_past_the_newest_message_shortens_or_shifts() {
+        // Only 50 is above 40: four at and above 40 reach past the newest.
+        assert_eq!(ids(slice(40, -4, 5), PastNewest::Shorten), [50, 40, 30]);
+        assert_eq!(
+            ids(slice(40, -4, 5), PastNewest::ShiftOlder),
+            [50, 40, 30, 20, 10]
+        );
+        // Past the oldest: just ends.
+        assert_eq!(ids(slice(2, 0, 5), PastNewest::Shorten), [1]);
+    }
+
+    #[test]
+    fn min_and_max_id_apply_after_the_slice() {
+        let request = HistoryRequest {
+            min_id: 9,
+            max_id: 40,
+            ..slice(0, 0, 4)
+        };
+        // The slice is 50, 40, 30, 20; the bounds leave 30 and 20, not 4 messages.
+        assert_eq!(ids(request, PastNewest::Shorten), [30, 20]);
+    }
+
+    #[test]
+    fn offset_date_starts_strictly_before_it_unless_an_id_is_given() {
+        let by_date = HistoryRequest {
+            offset_date: 1030,
+            ..slice(0, 0, 2)
+        };
+        assert_eq!(ids(by_date, PastNewest::Shorten), [20, 10]);
+        let both = HistoryRequest {
+            offset_id: 10,
+            ..by_date
+        };
+        assert_eq!(ids(both, PastNewest::Shorten), [9, 3]);
+    }
+
+    #[test]
+    fn limit_is_cut_to_telegrams_maximum() {
+        let long: Vec<RawHistoryMessage> = (1..=150)
+            .map(|id| RawHistoryMessage {
+                id,
+                ..history()[0].clone()
+            })
+            .collect();
+        assert_eq!(
+            get_history(&long, &slice(0, 0, 500), PastNewest::Shorten).len(),
+            100
+        );
     }
 }

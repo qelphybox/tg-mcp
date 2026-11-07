@@ -7,7 +7,7 @@ use rmcp::model::{CallToolRequestParams, ErrorCode};
 use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary},
-    fake::{FakeData, fake_issued_id},
+    fake::{FakeData, PastNewest, fake_issued_id},
     messages::RawHistoryMessage,
 };
 
@@ -47,15 +47,22 @@ fn message(id: i32, text: &str) -> RawHistoryMessage {
     }
 }
 
-async fn client_with(
+type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
+
+async fn client_with(messages: Vec<RawHistoryMessage>) -> (common::TestServer, Client) {
+    client_on(messages, PastNewest::default()).await
+}
+
+/// A client whose fake Telegram answers a getHistory slice that reaches past
+/// the newest message the way `past_newest` says.
+async fn client_on(
     messages: Vec<RawHistoryMessage>,
-) -> (
-    common::TestServer,
-    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
-) {
+    past_newest: PastNewest,
+) -> (common::TestServer, Client) {
     let data = FakeData::new(account(42, "Me"))
         .with_chats(vec![alice_chat()])
-        .with_messages(ALICE, messages);
+        .with_messages(ALICE, messages)
+        .with_past_newest(past_newest);
     let server = start_with(vec![data]).await;
     let (_, tokens) = server.login().await;
     let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
@@ -253,4 +260,281 @@ async fn tool_is_read_only_and_requires_a_chat() {
     assert!(tool.output_schema.is_some());
     assert_eq!(tool.input_schema["required"], json!(["chat_id"]));
     assert_eq!(tool.input_schema["properties"]["limit"]["maximum"], 100);
+    for position in ["before_id", "around_id", "after_id"] {
+        assert_eq!(
+            tool.input_schema["properties"][position]["minimum"], 1,
+            "{position}"
+        );
+    }
+    let description = tool.description.as_deref().unwrap();
+    assert!(
+        description.contains("around_id") && description.contains("next_after_id"),
+        "{description}"
+    );
+}
+
+/// Ids 1..=20 with 7 and 12 deleted: the gaps a real history has.
+fn gapped_history(text: &str) -> Vec<RawHistoryMessage> {
+    (1..=20)
+        .filter(|id| ![7, 12].contains(id))
+        .map(|i| message(i, text))
+        .collect()
+}
+
+const BOTH_EDGES: [PastNewest; 2] = [PastNewest::Shorten, PastNewest::ShiftOlder];
+
+fn targets(page: &Value) -> Vec<i64> {
+    page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m.get("target").is_some())
+        .inspect(|m| assert_eq!(m["target"], true, "{m}"))
+        .map(|m| m["id"].as_i64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_window_around_a_message_is_centred_on_it_and_flags_it() {
+    let (_server, client) = client_with(gapped_history("x")).await;
+
+    let page = call(
+        &client,
+        json!({ "chat_id": alice_id(), "around_id": 10, "limit": 5 }),
+    )
+    .await
+    .unwrap();
+    // Two newer, the message, two older; deleted 12 is simply not there.
+    assert_eq!(ids(&page), [13, 11, 10, 9, 8]);
+    assert_eq!(targets(&page), [10]);
+    assert_eq!(page["next_before_id"], 8);
+    assert_eq!(page["next_after_id"], 13);
+
+    // An even window gives the older side the extra message.
+    let page = call(
+        &client,
+        json!({ "chat_id": alice_id(), "around_id": 10, "limit": 4 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), [11, 10, 9, 8]);
+
+    // A window of one is the message itself, with both ways on.
+    let page = call(
+        &client,
+        json!({ "chat_id": alice_id(), "around_id": 10, "limit": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), [10]);
+    assert_eq!(targets(&page), [10]);
+    assert_eq!(page["next_before_id"], 10);
+    assert_eq!(page["next_after_id"], 10);
+}
+
+#[tokio::test]
+async fn a_window_at_the_newest_message_is_filled_from_older_ones() {
+    for past_newest in BOTH_EDGES {
+        let (_server, client) = client_on(gapped_history("x"), past_newest).await;
+        for (around, expected) in [(19, [20, 19, 18, 17, 16]), (20, [20, 19, 18, 17, 16])] {
+            let page = call(
+                &client,
+                json!({ "chat_id": alice_id(), "around_id": around, "limit": 5 }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ids(&page), expected, "{past_newest:?} around {around}");
+            assert_eq!(targets(&page), [around]);
+            assert_eq!(page.get("next_after_id"), None, "nothing is newer");
+            assert_eq!(page["next_before_id"], 16);
+        }
+        // Exactly enough newer ones: like a full page, the cursor stays (and
+        // leads to an empty page).
+        let page = call(
+            &client,
+            json!({ "chat_id": alice_id(), "around_id": 18, "limit": 5 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(&page), [20, 19, 18, 17, 16]);
+        assert_eq!(page["next_after_id"], 20);
+    }
+}
+
+#[tokio::test]
+async fn a_window_at_the_oldest_message_has_nothing_older() {
+    let (_server, client) = client_with(gapped_history("x")).await;
+    let page = call(
+        &client,
+        json!({ "chat_id": alice_id(), "around_id": 2, "limit": 5 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), [4, 3, 2, 1]);
+    assert_eq!(page.get("next_before_id"), None);
+    assert_eq!(page["next_after_id"], 4);
+}
+
+/// Everything reachable from a window by following both cursors to the end,
+/// oldest first, each page newest first as the tool returns it.
+async fn walk_from_window(client: &Client, around: i64, limit: u32) -> Vec<i64> {
+    let window = call(
+        client,
+        json!({ "chat_id": alice_id(), "around_id": around, "limit": limit }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(targets(&window), [around]);
+    let mut seen = ids(&window);
+
+    let mut before = window.get("next_before_id").and_then(Value::as_i64);
+    for _ in 0..50 {
+        let Some(b) = before else { break };
+        let page = call(
+            client,
+            json!({ "chat_id": alice_id(), "before_id": b, "limit": limit }),
+        )
+        .await
+        .unwrap();
+        seen.extend(ids(&page));
+        before = page.get("next_before_id").and_then(Value::as_i64);
+    }
+    let mut after = window.get("next_after_id").and_then(Value::as_i64);
+    for _ in 0..50 {
+        let Some(a) = after else { break };
+        let page = call(
+            client,
+            json!({ "chat_id": alice_id(), "after_id": a, "limit": limit }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.get("next_before_id"), None, "older is the window");
+        assert!(targets(&page).is_empty());
+        let mut newer = ids(&page);
+        assert!(newer.iter().all(|&id| id > a), "{newer:?} after {a}");
+        newer.extend(seen);
+        seen = newer;
+        after = page.get("next_after_id").and_then(Value::as_i64);
+    }
+    seen.reverse();
+    seen
+}
+
+#[tokio::test]
+async fn both_cursors_continue_the_window_without_gaps_or_overlap() {
+    let history = gapped_history("x");
+    let all: Vec<i64> = history.iter().map(|m| i64::from(m.id)).collect();
+    for past_newest in BOTH_EDGES {
+        let (_server, client) = client_on(history.clone(), past_newest).await;
+        for around in [1, 2, 9, 10, 13, 19, 20] {
+            for limit in [1, 2, 3, 5] {
+                assert_eq!(
+                    walk_from_window(&client, around, limit).await,
+                    all,
+                    "{past_newest:?} around {around} limit {limit}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_missing_message_is_a_clear_error_not_an_empty_window() {
+    let (_server, client) = client_with(gapped_history("x")).await;
+    for missing in [7, 12, 21, 5000] {
+        match call(
+            &client,
+            json!({ "chat_id": alice_id(), "around_id": missing }),
+        )
+        .await
+        {
+            Err(rmcp::ServiceError::McpError(err)) => assert!(
+                err.message
+                    .contains(&format!("message {missing} not found")),
+                "{err:?}"
+            ),
+            other => panic!("around_id {missing} answered {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_budget_cuts_a_window_at_its_ends_never_the_target() {
+    let long = "y".repeat(5000);
+    let (_server, client) = client_with((1..=200).map(|i| message(i, &long)).collect()).await;
+
+    let page = call(
+        &client,
+        json!({ "chat_id": alice_id(), "around_id": 100, "limit": 100 }),
+    )
+    .await
+    .unwrap();
+    let kept = ids(&page);
+    assert!(kept.len() < 100, "a 100 x 1000-char window must be cut");
+    assert_eq!(targets(&page), [100]);
+    let at = kept.iter().position(|&id| id == 100).unwrap();
+    let (newer, older) = (at, kept.len() - at - 1);
+    assert!(newer.abs_diff(older) <= 1, "still centred: {kept:?}");
+    assert!(
+        kept.windows(2).all(|w| w[0] == w[1] + 1),
+        "contiguous: {kept:?}"
+    );
+    assert_eq!(page["next_after_id"], kept[0]);
+    assert_eq!(page["next_before_id"], *kept.last().unwrap());
+
+    // after_id pages are cut at their newest end, so the next one follows on.
+    let after = call(
+        &client,
+        json!({ "chat_id": alice_id(), "after_id": kept[0], "limit": 100 }),
+    )
+    .await
+    .unwrap();
+    let newer = ids(&after);
+    assert!(newer.len() < 100);
+    assert_eq!(*newer.last().unwrap(), kept[0] + 1, "starts right after");
+    assert_eq!(after["next_after_id"], newer[0]);
+}
+
+#[tokio::test]
+async fn around_and_after_take_no_other_position() {
+    let (_server, client) = client_with(gapped_history("x")).await;
+    for bad in [
+        json!({ "chat_id": alice_id(), "around_id": 10, "before_id": 11 }),
+        json!({ "chat_id": alice_id(), "around_id": 10, "after_id": 9 }),
+        json!({ "chat_id": alice_id(), "around_id": 10, "since": "2026-11-06" }),
+        json!({ "chat_id": alice_id(), "around_id": 10, "until": "2026-11-06" }),
+        json!({ "chat_id": alice_id(), "after_id": 9, "before_id": 11 }),
+        json!({ "chat_id": alice_id(), "after_id": 9, "since": "2026-11-06" }),
+        json!({ "chat_id": alice_id(), "after_id": 9, "until": "2026-11-06" }),
+    ] {
+        match call(&client, bad.clone()).await {
+            Err(rmcp::ServiceError::McpError(err)) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{bad}: {err:?}");
+                assert!(err.message.contains("can't be combined with"), "{err:?}");
+            }
+            other => panic!("{bad} was accepted: {other:?}"),
+        }
+    }
+    for bad in [
+        json!({ "chat_id": alice_id(), "around_id": 0 }),
+        json!({ "chat_id": alice_id(), "after_id": 0 }),
+    ] {
+        match call(&client, bad.clone()).await {
+            Err(rmcp::ServiceError::McpError(err)) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{bad}: {err:?}")
+            }
+            other => panic!("{bad} was accepted: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn plain_pages_have_no_newer_cursor_and_no_target() {
+    let (_server, client) = client_with(gapped_history("x")).await;
+    let page = call(&client, json!({ "chat_id": alice_id(), "limit": 3 }))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), [20, 19, 18]);
+    assert_eq!(page.get("next_after_id"), None);
+    assert!(targets(&page).is_empty());
 }

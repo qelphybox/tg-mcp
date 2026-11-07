@@ -171,3 +171,26 @@ Needs an account with pinned chats in the main list, some archived chats, and mo
 4. Pinned chats push nothing off page 1. Call `list_chats` with `limit=5`, then again with its `next_cursor` and `limit=5`, and the same with `archived=true`. Page 1 has at most 5 chats, and the first chat of page 2 is the next chat after the last one of page 1 by date, as the app lists them. Nothing is skipped in between. Before this was fixed, the gap was as many chats as there are pinned ones.
 
 A chat that gets a new message while you page moves to the top, above the cursor: it can be missing from the later pages, but never shows twice.
+
+## 13. A window around a message is the stretch of history around it, and its cursors continue it
+
+Needs a private chat and a group or channel, each with at least 30 messages. Message ids in a private chat (or basic group) count all of the account's private chats and basic groups, so they have gaps; in a supergroup or channel they run on, gaps only where messages were deleted. Either way the window must equal the same stretch of plain history, not "ids ±N". In Claude Code, with the server added as in §1:
+
+```text
+Через Telegram MCP возьми из list_chats один личный чат и одну группу или канал, в каждом минимум 30 сообщений. Текст сообщений не выводи и не пересказывай, только id. Для каждого из двух чатов:
+1. get_messages с limit=30 (без других параметров). Запомни список id P (новые первыми). Индексы с 0, диапазоны P[a..b] включительно. Пусть M = P[14], N = P[0] (самое новое).
+2. get_messages с around_id=M, limit=9. Выведи id и у какого сообщения target=true, next_before_id, next_after_id. Сравни с P[10..18] (9 id подряд, M в середине).
+3. get_messages с after_id=<next_after_id из шага 2>, limit=4 и с before_id=<next_before_id из шага 2>, limit=4. Сравни с P[6..9] и P[19..22].
+4. get_messages с around_id=N, limit=9. Сравни с P[0..8]; есть ли next_after_id?
+5. get_messages с around_id=N+1000, потом с around_id=M и since=2020-01-01. Выведи текст ошибок.
+Для каждого шага напиши: совпало / не совпало (и чем отличается).
+```
+
+Ranges are inclusive, indexes from 0. Pick quiet chats: a message arriving between the steps shifts `P` (redo step 1 then).
+
+1. Step 2 equals `P[10]`…`P[18]` exactly: four newer, M, four older, newest first, no id skipped or repeated. `target: true` is on M only. Both `next_before_id` and `next_after_id` are there.
+2. Step 3: the `after_id` page is `P[6]`…`P[9]` (the four right above the window, newest first) and the `before_id` page is `P[19]`…`P[22]`. Together with the window that is `P[6]`…`P[22]` with nothing missing or doubled.
+3. Step 4 equals `P[0]`…`P[8]`: the newest message has nothing newer, so the window is filled from older ones, and there is no `next_after_id`.
+4. Step 5: `around_id` that isn't in the chat is an error saying `message … not found in this chat`, not an empty page. `around_id` with `since` is `invalid_params` (`around_id can't be combined with since`).
+
+If step 2 is off by one (five newer and three older, or three and five) or fails with `not found` for an M that is in `P`, Telegram's `add_offset` doesn't count the way `core.telegram.org/api/offsets` says, which is what the window relies on (`src/tg/messages.rs`, `read_history`).
