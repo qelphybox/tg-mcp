@@ -653,6 +653,8 @@ mod tests {
             forwarded: false,
             forwarded_from: None,
             edited: false,
+            reactions: Vec::new(),
+            pinned: false,
         };
         Arc::new(FakeTelegram::new(
             FakeData::new(default_account()).with_messages(ALICE, vec![message]),

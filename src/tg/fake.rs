@@ -203,7 +203,8 @@ pub enum PastNewest {
 const HISTORY_MAX_LIMIT: i64 = 100;
 
 /// `messages.getHistory` as Telegram answers it (core.telegram.org/api/offsets),
-/// on a history given in any order: newest first, slice at
+/// or `messages.search` with the pinned filter (`request.pinned`) on the
+/// pinned messages only, on a history given in any order: newest first, slice at
 /// `position(offset_id) + add_offset` (`position` counts the messages down to
 /// `offset_id` inclusive, whether or not that id exists; `offset_id` wins over
 /// `offset_date`), keep `limit`, then drop ids outside `min_id`/`max_id`.
@@ -213,6 +214,9 @@ pub fn get_history(
     past_newest: PastNewest,
 ) -> Vec<RawHistoryMessage> {
     let mut list = history.to_vec();
+    // `messages.search` with the pinned filter: the same slicing, among the
+    // pinned messages only.
+    list.retain(|m| m.pinned || !request.pinned);
     list.sort_by_key(|m| std::cmp::Reverse(m.id));
     let limit = i64::from(request.limit).clamp(0, HISTORY_MAX_LIMIT);
     let mut start = slice_start(&list, request);
@@ -1038,6 +1042,13 @@ impl Telegram for FakeTelegram {
             &query,
             &|chat| self.known(chat),
             |request| {
+                // The pinned messages are a search (method class Search).
+                if let Some(seconds) = self.data.search_flood_wait.filter(|_| request.pinned) {
+                    return std::future::ready(Err(TgError::FloodWait {
+                        seconds,
+                        class: MethodClass::Search,
+                    }));
+                }
                 let messages = get_history(history, &request, self.data.past_newest);
                 // The Chat, the senders of these messages and the original
                 // authors of forwarded ones, as Telegram describes them in a
@@ -2020,6 +2031,8 @@ mod tests {
                 forwarded: false,
                 forwarded_from: None,
                 edited: false,
+                reactions: Vec::new(),
+                pinned: false,
             })
             .collect()
     }

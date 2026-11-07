@@ -364,6 +364,23 @@ Then run:
 
 Then on the server: `kamal app logs | grep 'media view served'` shows one line per successful view with `message_id`, `images` and `bytes` only; nothing else of the images (no base64, no file names) is in the logs.
 
+## 30. Messages show their reactions, a link that opens them and their pin; `pinned_only` reads the pinned ones
+
+Needs, among the account's chats (replace the `<…>`): a public channel `<K>` (it has an @username) with recent posts that carry reactions, ideally one with a custom-emoji reaction and one with paid Stars (⭐) reactions; a private supergroup or private channel `<G>` (no @username) the account is a member of, with at least 3 pinned messages (pin some yourself if you can; the app's pinned bar lists them, "All pinned messages"); a private chat `<P>` with one pinned message; a basic group `<B>` if the account has one (old small groups that were never upgraded; `type: "group"` in `list_chats`). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи и не пересказывай. 1) get_messages для <K> с limit=20: для каждого сообщения с reactions выведи id, reactions (JSON как есть), link, pinned. 2) То же для <G> с limit=20: id, link, pinned. 3) get_messages для <P> и для <B> с limit=10: есть ли хоть у одного сообщения поле link (да/нет), и id сообщений с pinned. 4) get_messages для <G> с pinned_only=true и limit=1, потом с before_id=<next_before_id> и так далее, пока next_before_id не пропадёт: выведи id каждой страницы и pinned у каждого сообщения. 5) Ошибки, выведи тексты: для <G> pinned_only=true вместе с around_id=<любой id из шага 2>; с thread_of=<тот же id>; с after_id=<тот же id>; с since="2026-01-01". 6) search_messages с chat_id=<K> и query=<слово из подписи поста с реакциями из шага 1>: для хита этого поста выведи id, reactions, link, pinned. Ссылки из шагов 1 и 2 выведи списком, чтобы их можно было открыть.
+```
+
+1. Step 1: every post with reactions has `reactions` as the app shows them under the post: each standard emoji with its count (`{"👍": 12, "🔥": 3, …}`), all custom-emoji reactions summed under `custom`, the Stars under `paid` (the number the app shows next to ⭐); a post without reactions has no `reactions` field. No list of who reacted, nothing marks the account's own reaction. `link` is `https://t.me/<K's username>/<id>`.
+2. Open two links from step 1 and two from step 2 (`https://t.me/c/<channel id>/<id>`) on a phone or desktop with Telegram where the account is logged in: each opens `<K>` / `<G>` scrolled to exactly that message (compare the date and the first words with the app). The `t.me/c/` ones open only for members, as expected.
+3. Step 3: no `link` anywhere in `<P>` or `<B>`; the pinned message of `<P>` (and of `<B>`, if it has one) is `pinned: true`, the others have no `pinned` field.
+4. Step 4: the pages walk back through exactly the messages the app lists as pinned in `<G>`, newest first, one per page, no repeats, each `pinned: true`; the last page (possibly empty) has no `next_before_id`.
+5. Step 5: `pinned_only can't be combined with around_id`, `… with thread_of`, `… with after_id`, `… with since`, all `invalid_params`.
+6. Step 6: the hit has the same `reactions`, `link` and `pinned` as the message in step 1.
+
+`pinned_only` is Telegram's search with the pinned filter: a `FLOOD_WAIT` on it blocks searches (search_messages, find_chats, pinned_only) for the account, not reading. `kamal app logs | grep -F 't.me/'` finds nothing: links and reactions are never logged.
+
 ## 40. get_chat_info on a user shows the profile Telegram shows the account, and common chats on request
 
 Needs, in `list_chats` or found with `find_chats`: a contact `<C>` who shows you their bio and phone number (a mutual contact with default privacy settings; ideally also a birthday), a bot `<B>` (e.g. `@BotFather`), a person `<H>` who hides their phone number from you (someone who isn't your contact; check in the app: their profile shows no number), and a group `<G>`. Write down beforehand, from the Telegram app: `<C>`'s bio, phone, birthday and "last seen" line, the number of "Groups in common" in `<C>`'s profile, and `<H>`'s "last seen" line. In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), replace the `<…>` and run:

@@ -333,6 +333,12 @@ impl Untrusted for MessagePage {
                 reply_to: _,
                 forwarded: _,
                 edited: _,
+                // Emoji from Telegram's own list, counts, and a link built
+                // from a channel id or an @username Telegram restricts to
+                // letters, digits and `_` (checked in `message_link`).
+                reactions: _,
+                link: _,
+                pinned: _,
                 target: _,
                 thread_root: _,
             } = message;
@@ -412,6 +418,10 @@ impl Untrusted for SearchPage {
                 reply_to: _,
                 forwarded: _,
                 edited: _,
+                // As in a get_messages message.
+                reactions: _,
+                link: _,
+                pinned: _,
             } = hit;
             clean(title);
             clean_text(snippet, sanitise_line, media.is_some());
@@ -919,6 +929,9 @@ mod tests {
                 edited: false,
                 target: false,
                 thread_root: false,
+                reactions: None,
+                link: None,
+                pinned: false,
             }],
         );
         history.sanitise();
@@ -944,6 +957,9 @@ mod tests {
                 reply_to: None,
                 forwarded: false,
                 edited: false,
+                reactions: None,
+                link: None,
+                pinned: false,
             }],
             next_cursor: None,
         };
@@ -989,6 +1005,9 @@ mod tests {
             edited: false,
             target: false,
             thread_root: false,
+            reactions: None,
+            link: None,
+            pinned: false,
         }
     }
 
@@ -1008,6 +1027,9 @@ mod tests {
             reply_to: None,
             forwarded: false,
             edited: false,
+            reactions: None,
+            link: None,
+            pinned: false,
         }
     }
 

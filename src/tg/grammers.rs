@@ -30,7 +30,7 @@ use super::{
     },
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MessageAnswer, MessageAt, MessagePage,
-        MessageRequest, RawHistoryMessage, read_history,
+        MessageRequest, RawHistoryMessage, RawReaction, Reaction, read_history,
     },
     pool::{Evicted, Live, Pool},
     rich::message_text,
@@ -855,7 +855,8 @@ fn file_refusal(err: &InvocationError, dc_id: i32, home_dc: i32) -> FileRefusal 
 const RESOLVE_MAX_PAGES: usize = 5;
 
 impl LiveClient {
-    /// One `messages.getHistory` call.
+    /// One `messages.getHistory` call; for pinned messages one
+    /// `messages.search` call with the pinned filter (method class Search).
     async fn get_history(
         &self,
         peer: &tl::enums::InputPeer,
@@ -869,9 +870,32 @@ impl LiveClient {
             limit,
             max_id,
             min_id,
+            pinned,
         } = request;
-        let answer = self
-            .call(
+        let answer = if pinned {
+            self.call(
+                &tl::functions::messages::Search {
+                    peer: peer.clone(),
+                    q: String::new(),
+                    from_id: None,
+                    saved_peer_id: None,
+                    saved_reaction: None,
+                    top_msg_id: None,
+                    filter: tl::enums::MessagesFilter::InputMessagesFilterPinned,
+                    min_date: 0,
+                    max_date: 0,
+                    offset_id,
+                    add_offset,
+                    limit,
+                    max_id,
+                    min_id,
+                    hash: 0,
+                },
+                Some(chat),
+            )
+            .await?
+        } else {
+            self.call(
                 &tl::functions::messages::GetHistory {
                     peer: peer.clone(),
                     offset_id,
@@ -884,7 +908,8 @@ impl LiveClient {
                 },
                 Some(chat),
             )
-            .await?;
+            .await?
+        };
         let (messages, chats, users) = match answer {
             tl::enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
             tl::enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
@@ -1374,6 +1399,8 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                     |tl::enums::MessageFwdHeader::Header(h)| h.from_id.as_ref().map(chat_id),
                 ),
                 edited: m.edit_date.is_some(),
+                reactions: raw_reactions(m.reactions),
+                pinned: m.pinned,
             })
         }
         tl::enums::Message::Service(m) => Some(RawHistoryMessage {
@@ -1388,9 +1415,36 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
             forwarded: false,
             forwarded_from: None,
             edited: false,
+            reactions: raw_reactions(m.reactions),
+            // A service message is never pinned.
+            pinned: false,
         }),
         tl::enums::Message::Empty(_) => None,
     }
+}
+
+/// A message's reactions as Telegram counts them (`reactions.results`);
+/// who reacted (`recent_reactions`, `top_reactors`) is left in TL.
+fn raw_reactions(reactions: Option<tl::enums::MessageReactions>) -> Vec<RawReaction> {
+    let Some(tl::enums::MessageReactions::Reactions(reactions)) = reactions else {
+        return Vec::new();
+    };
+    reactions
+        .results
+        .into_iter()
+        .filter_map(|tl::enums::ReactionCount::Count(c)| {
+            let reaction = match c.reaction {
+                tl::enums::Reaction::Emoji(e) => Reaction::Emoji(e.emoticon),
+                tl::enums::Reaction::CustomEmoji(_) => Reaction::Custom,
+                tl::enums::Reaction::Paid => Reaction::Paid,
+                tl::enums::Reaction::Empty => return None,
+            };
+            Some(RawReaction {
+                reaction,
+                count: c.count,
+            })
+        })
+        .collect()
 }
 
 /// A message reduced to where it is, its media (described as get_messages
@@ -2384,6 +2438,67 @@ mod tests {
     }
 
     #[test]
+    fn reactions_and_the_pin_are_read_from_the_message_itself() {
+        let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 });
+        let count = |reaction, count| {
+            tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                chosen_order: Some(1),
+                reaction,
+                count,
+            })
+        };
+        let emoji =
+            |e: &str| tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: e.into() });
+        let custom = |document_id| {
+            tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id })
+        };
+        let reactions = tl::enums::MessageReactions::Reactions(tl::types::MessageReactions {
+            min: false,
+            can_see_list: true,
+            reactions_as_tags: false,
+            results: vec![
+                count(emoji("👍"), 5),
+                count(custom(77), 2),
+                count(tl::enums::Reaction::Paid, 40),
+                count(custom(78), 1),
+                count(tl::enums::Reaction::Empty, 9),
+            ],
+            recent_reactions: Some(vec![]),
+            top_reactors: Some(vec![]),
+        });
+        let tl::enums::Message::Message(mut m) = tl_message(30, channel.clone(), None) else {
+            unreachable!()
+        };
+        m.reactions = Some(reactions);
+        m.pinned = true;
+        let raw = raw_history_message(tl::enums::Message::Message(m)).unwrap();
+        assert!(raw.pinned);
+        assert_eq!(
+            raw.reactions,
+            [
+                RawReaction {
+                    reaction: Reaction::Emoji("👍".into()),
+                    count: 5
+                },
+                RawReaction {
+                    reaction: Reaction::Custom,
+                    count: 2
+                },
+                RawReaction {
+                    reaction: Reaction::Paid,
+                    count: 40
+                },
+                RawReaction {
+                    reaction: Reaction::Custom,
+                    count: 1
+                },
+            ]
+        );
+        let plain = raw_history_message(tl_message(31, channel, None)).unwrap();
+        assert_eq!((plain.reactions, plain.pinned), (vec![], false));
+    }
+
+    #[test]
     fn media_is_described_beside_the_text_never_in_it() {
         use crate::tg::{
             media::fixtures::{audio, doc, doc_media, full_photo, photo_media},
@@ -2818,6 +2933,48 @@ mod resolve_tests {
                 }
                 .to_bytes(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_messages_are_telegrams_search_with_the_pinned_filter() {
+        let (live, _dir) = cold_client().await;
+        let chat = ChatRef::new(ChatId::Channel(5), Some(7));
+        let pinned = |before_id| HistoryQuery {
+            pinned_only: true,
+            before_id,
+            ..query()
+        };
+        assert!(live.get_messages(chat, pinned(None)).await.is_err());
+        assert!(live.get_messages(chat, pinned(Some(40))).await.is_err());
+        let search = |offset_id| {
+            tl::functions::messages::Search {
+                peer: tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                    channel_id: 5,
+                    access_hash: 7,
+                }),
+                q: String::new(),
+                from_id: None,
+                saved_peer_id: None,
+                saved_reaction: None,
+                top_msg_id: None,
+                filter: tl::enums::MessagesFilter::InputMessagesFilterPinned,
+                min_date: 0,
+                max_date: 0,
+                offset_id,
+                add_offset: 0,
+                limit: 30,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            }
+            .to_bytes()
+        };
+        assert_eq!(sent(&live), [search(0), search(40)]);
+        // Under the Account's limiter in the Search class, like any search.
+        assert_eq!(
+            method_class::<tl::functions::messages::Search>(),
+            MethodClass::Search
         );
     }
 

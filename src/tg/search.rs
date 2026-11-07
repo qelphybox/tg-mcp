@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind},
-    messages::{Issuer, KnownHashes, Media, MediaSummary, RawHistoryMessage, Sender},
+    messages::{
+        Issuer, KnownHashes, MAX_LINK_CHARS, Media, MediaSummary, RawHistoryMessage, Reactions,
+        Sender,
+    },
 };
 
 /// Which kind of Chats a search across all of them looks in.
@@ -126,6 +129,15 @@ pub struct SearchHit {
     pub forwarded: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub edited: bool,
+    /// As in get_messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Reactions>,
+    /// As in get_messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = MAX_LINK_CHARS))]
+    pub link: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// A page of Search hits, newest first. No total: Telegram's isn't reliable
@@ -344,6 +356,9 @@ fn assemble(
                 reply_to: message.reply_to,
                 forwarded: message.forwarded,
                 edited: message.edited,
+                reactions: message.reactions,
+                link: message.link,
+                pinned: message.pinned,
             }
         })
         .collect();
@@ -527,6 +542,8 @@ mod tests {
             forwarded: false,
             forwarded_from: None,
             edited: false,
+            reactions: Vec::new(),
+            pinned: false,
         }
     }
 
