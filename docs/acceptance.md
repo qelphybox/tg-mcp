@@ -772,3 +772,65 @@ Needs Telegram open on a phone and on Telegram Desktop with the account, a priva
 9. **The Writes budget** is §52 step 4, run with `telegram-drafts`.
 
 10. **Clean up.** `claude mcp remove telegram-drafts`, and end its session in Telegram → Settings → Devices.
+
+## 54. Send allow-list: chosen on Consent from folders, recent chats and a search, refused empty, sealed in the database, counted in the logs
+
+Needs an account with at least one Chat folder that is a plain list of chats ("Work" below; one defined by rules, such as "Unread", if you have one too), more than 100 chats, an old chat that is not among the 100 most recent ("Old" below), a contact you never wrote to (no chat with them: "Carol" below), and the name of a public channel you are not in. No tool sends yet (#46), so nothing here can send a message. The boundaries are also covered by fake-backed tests: `cargo test --test send_allow_list` (exactly the chosen chats come back, empty is refused, strangers never offered, folders read into their chats, logs) and `cargo test --lib sessions::` (the dump test covers the list's blob).
+
+1. **The migration.** After the deploy, dump the database as in §51 step 1:
+
+   ```sh
+   python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+   import sqlite3, sys
+   db = sqlite3.connect(sys.argv[1])
+   print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 5
+   print(db.execute("SELECT count(*) FROM grants WHERE send_allow_list IS NOT NULL").fetchone()[0])
+   # expect 0: no Grant from before has a list (run this before step 4)
+   PY
+   ```
+
+2. **Read-only is unchanged and asks Telegram nothing more.** `python3 scripts/scope-check.py - read` (expect every line [PASS]). On its Consent screen "Send messages as you, react and mark chats as read, only in the chats you choose below." is offered and **unticked**, and no chat list is shown; leave it so and Allow. Then `logs | grep -c 'consent chat pickers loaded'` (as in step 7) is 0.
+
+3. **The pickers.** `claude mcp add --transport http telegram-send https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-send` → Authenticate, scan the QR. On the Consent screen:
+   - "Send messages" is unticked even though Claude Code may have asked for every Scope (§51 step 7). Tick it: "Chats it may send to" appears with a "Choose chats" button, and the line under the boxes reads "It can't send anywhere else, and can't edit or delete messages."
+   - Press **Choose chats**. The page comes back with "Send messages" still ticked, "Send to these chats **without asking me** each time" **unticked**, then:
+     - **Chat folders**: one box per folder that is a list ("Work"), none for a folder by rules ("Unread"); compare with `whoami`'s `chat_folders` (`rules: false` ones only).
+     - **Recent chats**: 100 boxes, in the order of the app's main chat list (pinned first), Saved Messages as "Saved Messages"; "Old" is not among them.
+   - **Find a chat by name**: type part of Old's name and press Enter (Enter searches, it never allows): "Found 1 of your chats." (or more) and Old under the box. Type Carol's name: "None of your chats has that name." (a contact without a chat is never offered). Type the public channel's name: it is not offered either. Tick Old, then search for something else: Old is still listed, ticked.
+
+4. **Empty is refused.** Untick every chat and folder, keep "Send messages" ticked, press **Allow**: the same page comes back (HTTP 422 in the browser's network tab) with "Choose at least one chat it may send to, or untick “Send messages”." and nothing reaches Claude Code. Now tick the "Work" folder, one recent chat ("A") and Old, leave auto-send unticked, and **Allow**. In a new Claude Code session, `/mcp` lists `telegram-send` connected; ask "who am I on Telegram": `whoami` answers. Its tool list is the regular connector's (no send tool until #46), and its instructions begin "… Read-only access to the connected Telegram account …" (no tool can write yet). Note the numeric ids of A, Old and one chat of Work (`list_chats`, and `list_chats` with `chat_folder`: `user:N~…` → N).
+
+5. **The database holds only an opaque blob.** Dump it again (§51 step 1), then, with the ids of step 4:
+
+   ```sh
+   python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+   import sqlite3, sys
+   db = sqlite3.connect(sys.argv[1])
+   for scopes, n in db.execute("SELECT scopes, length(send_allow_list) FROM grants WHERE send_allow_list IS NOT NULL"):
+       print(scopes, n, n % 512)   # expect: read send, a length, 40 (nonce + tag around a 512-byte multiple)
+   PY
+   python3 - /tmp/tgmcp-dump A_ID OLD_ID WORK_ID <<'PY'
+   import pathlib, struct, sys
+   dump = b"".join(p.read_bytes() for p in pathlib.Path(sys.argv[1]).rglob("*") if p.is_file())
+   for n in map(int, sys.argv[2:]):
+       for needle in (str(n).encode(), struct.pack("<q", n), struct.pack(">q", n)):
+           print(n, needle in dump)   # expect False every time: no chosen chat's id is in the files
+   PY
+   ```
+
+6. **Auto-send is stored only when ticked.** Connect once more: `claude mcp add --transport http telegram-send2 https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-send2` → Authenticate, scan the QR; tick "Send messages", Choose chats, tick one chat **and** "without asking me", Allow.
+
+7. **The server's side**, within 15 minutes of steps 2-6:
+
+   ```sh
+   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -E 'consent chat pickers loaded|consent chat search'
+   # expect folders=N recent=100 per Choose chats, and found=N offered=N per search: counts only
+   logs | grep -E 'authorization code issued|grant created' | grep 'read send'
+   # expect step 4's pair with send_chats=N (A, Old and Work's chats) auto_send=false, and step 6's with send_chats=1 auto_send=true
+   logs | grep -cE "consent with send refused"   # expect 1 (step 4's empty Allow)
+   logs | grep -cE 'user:A_ID|user:OLD_ID|<Old title>|<Carol name>|<Work title>'   # expect 0: no chat id, title or search term
+   logs | grep -c 'tgm_'                         # expect 0: no Token is ever logged
+   ```
+
+8. **Clean up.** `claude mcp remove telegram-send` and `claude mcp remove telegram-send2`, and end both sessions (and step 2's, if the script left one) in Telegram → Settings → Devices.

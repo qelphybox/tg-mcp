@@ -17,7 +17,7 @@ The serialized grammers/MTProto state (auth key, DC, peer data) that lets the se
 _Avoid_: session (unqualified), login
 
 **Session key**:
-The random per-Grant symmetric key that encrypts the Telegram session. Never stored in plaintext; recoverable only from a Token.
+The random per-Grant symmetric key that encrypts the Telegram session (and, with `send`, the Send allow-list). Never stored in plaintext; recoverable only from a Token.
 _Avoid_: master key, secret
 
 **Token**:
@@ -54,8 +54,12 @@ A kind of access a Grant has: `read` (always), `draft`, `send`, `organize`. Aske
 _Avoid_: permission, role, right
 
 **Send allow-list**:
-The Chats a Grant with the `send` Scope may send to, react in or mark as read, chosen on the Consent screen. Nothing outside it can be written to.
+The Chats a Grant with the `send` Scope may send to, react in or mark as read, chosen on the Consent screen from the Account's existing dialogs: Chat folders that are explicit lists (read into their Chats there and then), the 100 most recent Chats, and its own Chats found by name. Never empty; sealed with the Session key together with Auto-send, so only a Token opens it. Nothing outside it can be written to, and changing it means a new Grant.
 _Avoid_: whitelist, allowed chats
+
+**Auto-send**:
+A Grant's choice, made on the Consent screen and off unless ticked, to send to its Send allow-list without the user confirming each message. Stored sealed with the list. Reactions and marking as read never ask either way.
+_Avoid_: auto-confirm, trusted mode
 
 **Writes budget**:
 How many writes (Drafts, sent messages, reactions, marking as read) an Account may make in any 10 minutes, 20 by default, on top of the request budget every call to Telegram shares. A write over it fails at once with the wait; it never waits or queues.

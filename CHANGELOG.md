@@ -11,9 +11,13 @@
 - `tools/list` lists only the tools a connection's Scopes allow; calling another one is an error that names the missing Scope. The server's `instructions` and the consent screen say "read-only" only while no write Scope is granted.
 - Connections made before Scopes become `read` and keep working: no re-login.
 - MCP clients that ask for every advertised Scope (the MCP spec's default when the 401 names none) open the consent screen with "Write Drafts" ticked; untick it to stay read-only.
+- **`send` is offered on the consent screen, with its Send allow-list.** Ticking "Send messages" and pressing "Choose chats" lists the account's Chat folders that are explicit lists (rule-based ones are left out), its 100 most recent chats, and a search by name that shows only the account's own chats with an existing dialog (never a contact it never wrote to, nor a public chat it isn't in). A ticked folder is read into its chats when you allow. Allow with "Send messages" ticked and no chat chosen is refused and the page says why. "Send to these chats without asking me each time" is off unless ticked. "Send messages" never starts ticked, even when the client asks for `send`. Changing the chats means connecting again.
+- No tool sends yet (`send_message`, `react` and `mark_read` come next): a `send` Grant lists the same tools as one without, and the server's `instructions` describe only what the listed tools can do, so it reads as read-only (or Drafts) until then.
 
 ### Security
 
+- **The Send allow-list is sealed with the Session key.** A `send` Grant's chats and its auto-send choice are one blob encrypted like its Telegram session (its own AAD, `tg-mcp/send-allow-list/v1:` + Grant id; plaintext padded to 512 bytes): a database dump without a Token shows neither the chats nor, beyond a rough size, how many; a database writer can't turn confirmation off or move a list to another Grant. Logs carry counts (`send_chats`, `auto_send`), never chat ids, titles or search terms.
+- The consent screen's chat pickers reach Telegram before any Token exists: they need the login's cookie and a finished Telegram login, go through the account's own request budget, and are rate-limited per client IP (new settings below) and to 30 searches per login.
 - **A reused refresh Token revokes its Grant.** A refresh Token keeps working for 60 seconds after its first use (two client processes refreshing at once, or a retry after a lost response, both get a working pair). Presented after that, or by a client it wasn't issued to, it revokes the whole Grant: every Token stops working (`/mcp` → 401) and, if the server holds a Live client for it, its Telegram session is logged out. The client sees the usual `invalid_grant`; the server logs `refresh_reuse` or `foreign_client` with the Grant id, never a Token. A wrong secret for a used Token revokes nothing.
 - A used refresh Token's Wrapped key is deleted from the database within a few minutes; SQLite's `secure_delete` is on, so deleted keys leave the file.
 
@@ -21,6 +25,8 @@
 
 - Migration `0003_consumed_refresh_tokens` rebuilds the `tokens` table. An image built before it does not start on a database that ran it, so `kamal rollback` past this release fails: fix forward instead.
 - Migration `0004_grant_scopes` adds `grants.scopes` (plaintext, `read` for every existing Grant). Same rollback rule.
+- Migration `0005_send_allow_list` adds `grants.send_allow_list` (a sealed blob, NULL for every existing Grant and for Grants without `send`). Same rollback rule.
+- New settings: `TG_MCP_CONSENT_CHATS_PER_MINUTE` (default 20), `TG_MCP_CONSENT_CHATS_BURST` (default 10), the per-IP rate limit of the consent screen's chat pickers (`/login/{id}/consent/chats`).
 - New settings for the write tools: `TG_MCP_ACCOUNT_WRITES_PER_10_MIN` (default 20), the Writes budget, writes per account in any 10 minutes on top of the request budget (`save_draft` is the first write to spend it); `TG_MCP_CHAT_SENDS_PER_MINUTE` (default 5), the Send cap, messages sent to one chat in any minute. A write over either, or in a `FLOOD_WAIT` of writes, fails at once with "retry in N s": writes never wait inside a call, are never retried and never queued. Telegram's `PEER_FLOOD` (the account is limited for spam) is reported as such, never retried. Reading is unaffected.
 
 ## 0.1.3
