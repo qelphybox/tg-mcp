@@ -591,3 +591,40 @@ impl Write for Sink {
         Ok(())
     }
 }
+
+/// No tool sends yet (#46): a `send` Grant lists the tools a read Grant does,
+/// and is told it is read-only, which is what it can do so far.
+#[tokio::test]
+async fn a_send_grant_is_told_only_what_it_can_do_today() {
+    let server = server().await;
+    let (_, reader) = server.login_scoped(None, &[ALLOW]).await;
+    let flow = on_consent(&server).await;
+    flow.post(&server, &flow.chats, &[SEND]).await;
+    let sender = flow
+        .allow(&server, &[SEND, ("chat", &id(friend(1))), ALLOW])
+        .await;
+    assert_eq!(sender["scope"], "read send");
+
+    let reader = server.mcp(reader["access_token"].as_str().unwrap()).await;
+    let sender = server.mcp(sender["access_token"].as_str().unwrap()).await;
+    let names = |tools: Vec<rmcp::model::Tool>| {
+        tools
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(sender.list_all_tools().await.unwrap()),
+        names(reader.list_all_tools().await.unwrap())
+    );
+    let said = sender
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .unwrap();
+    assert!(
+        said.contains("Read-only access to the connected Telegram account"),
+        "{said}"
+    );
+    reader.cancel().await.unwrap();
+    sender.cancel().await.unwrap();
+}

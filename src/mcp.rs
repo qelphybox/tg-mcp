@@ -143,8 +143,9 @@ pub struct Whoami {
     pub chat_folders: Option<Vec<ChatFolder>>,
 }
 
-/// The server's `instructions` for a Grant with `scopes`: what it can and can't
-/// do, exactly. The read-only wording stays until a write Scope is granted.
+/// The server's `instructions` for a Grant that can use `scopes` (those it was
+/// granted that some tool needs, [`ScopedTools::usable`]): what it can and can't
+/// do, exactly. The read-only wording stays while it can write nothing.
 pub fn instructions(scopes: Scopes) -> String {
     let access = if scopes.writes() {
         let mut can = vec!["read chats, messages and media"];
@@ -1933,7 +1934,7 @@ impl ServerHandler for TgMcp {
     ) -> Result<InitializeResult, ErrorData> {
         context.peer.set_peer_info(request.clone());
         let mut result = self.negotiate_initialize(&request)?;
-        result.instructions = Some(instructions(caller_scopes(&context)));
+        result.instructions = Some(instructions(self.tools.usable(caller_scopes(&context))));
         Ok(result)
     }
 
@@ -1943,7 +1944,7 @@ impl ServerHandler for TgMcp {
     ) -> Result<DiscoverResult, ErrorData> {
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
-            server_info(caller_scopes(&context)),
+            server_info(self.tools.usable(caller_scopes(&context))),
         ))
     }
 

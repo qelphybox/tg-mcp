@@ -52,6 +52,16 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
             .is_some_and(|scope| scopes.contains(*scope))
     }
 
+    /// Those of `scopes` that some tool needs, and `read`: what a Grant with
+    /// `scopes` can do on this server. A Scope granted before any tool uses it
+    /// (`send` until a tool sends) adds nothing yet.
+    pub fn usable(&self, scopes: Scopes) -> Scopes {
+        scopes
+            .iter()
+            .filter(|scope| self.required.values().any(|needed| needed == scope))
+            .collect()
+    }
+
     /// Err when a Grant with `scopes` may not call `name`. An unknown name passes:
     /// the router answers it as any unknown tool.
     pub fn check(&self, name: &str, scopes: Scopes) -> Result<(), ErrorData> {
@@ -278,6 +288,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_scopes_with_tools_are_usable() {
+        let tools = tools();
+        let all: Scopes = Scope::ALL.into_iter().collect();
+        // No tool sends or organizes yet: such a Grant can read and write Drafts.
+        assert_eq!(tools.usable(all), drafts());
+        assert_eq!(tools.usable(drafts()), drafts());
+        assert_eq!(tools.usable(Scopes::READ_ONLY), Scopes::READ_ONLY);
+        let sending: Scopes = [Scope::Send].into_iter().collect();
+        assert_eq!(tools.usable(sending), Scopes::READ_ONLY);
+    }
+
     #[tokio::test]
     async fn instructions_follow_the_callers_scopes() {
         let (reader, _guard) = serve(Scopes::READ_ONLY).await;
@@ -291,5 +313,10 @@ mod tests {
         assert_eq!(said(&reader), crate::mcp::instructions(Scopes::READ_ONLY));
         assert_eq!(said(&drafter), crate::mcp::instructions(drafts()));
         assert_ne!(said(&reader), said(&drafter));
+
+        // Granted `send` while no tool sends: told only what it can do.
+        let (sender, _guard3) = serve(drafts().with(Scope::Send)).await;
+        assert_eq!(said(&sender), crate::mcp::instructions(drafts()));
+        assert!(said(&sender).contains("you cannot send, edit or delete messages"));
     }
 }
