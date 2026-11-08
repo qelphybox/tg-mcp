@@ -13,6 +13,7 @@ mod pages;
 mod pkce;
 pub mod rate_limit;
 mod revoke;
+mod send_list;
 mod token;
 
 use std::sync::Arc;
@@ -34,16 +35,18 @@ use self::{
     rate_limit::{Endpoint, OAuthLimits, RateLimiter},
 };
 use crate::{
+    allow_list::{SendAllowList, WriteRefused, may_write},
     links::MediaLinks,
     scope::{Scope, Scopes},
     sessions::{GrantId, Vault, VaultError},
+    tg::chats::ChatId,
     tg::{Connector, Login, Telegram, TgError},
 };
 
 /// The Scopes the Consent screen offers besides `read`, which is always granted.
-/// `send` comes with the Send allow-list; `organize` has no tools yet, so both
-/// are advertised but not offered, and a request for them grants nothing more.
-pub const CONSENT_OFFERS: &[Scope] = &[Scope::Draft];
+/// `send` comes with the Send allow-list chosen there. `organize` has no tools
+/// yet: it is advertised but not offered, and a request for it grants nothing.
+pub const CONSENT_OFFERS: &[Scope] = &[Scope::Draft, Scope::Send];
 
 /// `scopes_supported` of both metadata documents: every Scope there is.
 fn scopes_supported() -> Vec<&'static str> {
@@ -130,7 +133,18 @@ pub struct Caller {
     pub grant_id: GrantId,
     /// The Grant's Scopes: which tools this caller sees and may call.
     pub scopes: Scopes,
+    /// With `send`: the Chats the Grant may write to, opened with its Token.
+    pub send_allow_list: Option<Arc<SendAllowList>>,
     pub telegram: Arc<dyn Telegram>,
+}
+
+impl Caller {
+    /// May this caller write to `chat` (send, react, mark as read)? Only with
+    /// the `send` Scope and only into its Grant's Send allow-list. Every tool
+    /// of the `send` Scope asks this before it writes.
+    pub fn may_write_to(&self, chat: ChatId) -> Result<(), WriteRefused> {
+        may_write(self.scopes, self.send_allow_list.as_deref(), chat)
+    }
 }
 
 /// All OAuth endpoints and Login flow pages. Only the anonymous OAuth endpoints are
@@ -177,6 +191,10 @@ pub fn router(auth: Arc<AuthState>) -> Router {
             "/login/{id}/consent",
             get(authorize::consent_page).post(authorize::consent_submit),
         )
+        .route(
+            "/login/{id}/consent/chats",
+            post(authorize::consent_chats).route_layer(limited(Endpoint::ConsentChats)),
+        )
         .route("/login/assets/login.js", get(login_js))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(auth)
@@ -209,6 +227,7 @@ pub async fn require_bearer(
     };
     let grant_id = grant.grant_id.clone();
     let scopes = grant.scopes;
+    let send_allow_list = grant.send_allow_list.clone().map(Arc::new);
     let telegram = match auth.connector.connect(grant).await {
         Ok(telegram) => telegram,
         Err(err @ TgError::BadSession(_)) => {
@@ -229,6 +248,7 @@ pub async fn require_bearer(
     request.extensions_mut().insert(Caller {
         grant_id,
         scopes,
+        send_allow_list,
         telegram,
     });
     next.run(request).await

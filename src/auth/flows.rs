@@ -8,8 +8,9 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
-use super::rate_limit::ClientIp;
+use super::{rate_limit::ClientIp, send_list::Pickers};
 use crate::{
+    allow_list::SendAllowList,
     scope::Scopes,
     tg::{LoggedIn, LoginAttempt},
 };
@@ -39,6 +40,10 @@ pub struct PendingLogin {
     pub progress: tokio::sync::Mutex<Progress>,
     /// Only touched while `progress` is locked.
     pub password_gate: Mutex<PasswordGate>,
+    /// The Consent screen's chat pickers, once loaded: they hold a Live client
+    /// for the logged-in session, closed when the login goes. Locked after
+    /// `progress`, never before.
+    pub send_pickers: tokio::sync::Mutex<Option<Pickers>>,
     client: ClientIp,
     created: Instant,
 }
@@ -56,6 +61,8 @@ pub struct IssuedCode {
     pub logged_in: LoggedIn,
     /// What the user allowed on Consent: the new Grant's Scopes.
     pub scopes: Scopes,
+    /// With `send`: the Chats chosen on Consent, to seal with the new Grant.
+    pub send_allow_list: Option<SendAllowList>,
     expires: Instant,
 }
 
@@ -170,6 +177,7 @@ impl Flows {
                 request,
                 progress: tokio::sync::Mutex::new(Progress::InProgress(attempt)),
                 password_gate: Mutex::default(),
+                send_pickers: tokio::sync::Mutex::default(),
                 client,
                 created: Instant::now(),
             }),
@@ -199,7 +207,13 @@ impl Flows {
             .filter(|l| l.created.elapsed() < LOGIN_TTL)
     }
 
-    pub fn issue_code(&self, request: AuthRequest, logged_in: LoggedIn, scopes: Scopes) -> String {
+    pub fn issue_code(
+        &self,
+        request: AuthRequest,
+        logged_in: LoggedIn,
+        scopes: Scopes,
+        send_allow_list: Option<SendAllowList>,
+    ) -> String {
         let mut codes = self.codes.lock().expect("flows lock");
         codes.retain(|_, c| c.expires > Instant::now());
         let code = new_id();
@@ -209,6 +223,7 @@ impl Flows {
                 request,
                 logged_in,
                 scopes,
+                send_allow_list,
                 expires: Instant::now() + CODE_TTL,
             },
         );

@@ -126,6 +126,7 @@ impl Config {
             register: rate("REGISTER", defaults.register)?,
             token: rate("TOKEN", defaults.token)?,
             media: rate("MEDIA", defaults.media)?,
+            consent_chats: rate("CONSENT_CHATS", defaults.consent_chats)?,
             max_pending_logins: number(
                 "TG_MCP_MAX_PENDING_LOGINS",
                 defaults.max_pending_logins as u32,

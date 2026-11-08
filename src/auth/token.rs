@@ -79,11 +79,12 @@ async fn authorization_code(auth: &AuthState, form: TokenForm) -> Response {
     let account_id = issued.logged_in.account.id;
     match auth
         .vault
-        .create_grant_with_scopes(
+        .create_grant_with_send(
             &request.client_id,
             account_id,
             &issued.logged_in.telegram_session,
             issued.scopes,
+            issued.send_allow_list.as_ref(),
         )
         .await
     {

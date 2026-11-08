@@ -196,6 +196,7 @@ mod tests {
         let caller = Caller {
             grant_id: grant.grant_id.clone(),
             scopes: grant.scopes,
+            send_allow_list: None,
             telegram: FakeConnector::default().connect(grant).await.unwrap(),
         };
 

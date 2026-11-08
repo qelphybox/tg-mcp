@@ -1,8 +1,9 @@
 //! Per-client-IP limits on the anonymous endpoints (`/register`, `/authorize`,
-//! `/token`, `/revoke`, and `/media/{ticket}` for Media links): a token bucket
-//! per endpoint and client, answered with `429 Too Many Requests` +
-//! `Retry-After` when empty. Everything else (`/mcp`, `/healthz`,
-//! `.well-known/*`, the Login flow pages) is not limited here.
+//! `/token`, `/revoke`, `/media/{ticket}` for Media links, and the Consent
+//! screen's chat pickers, which reach Telegram before any Token exists): a
+//! token bucket per endpoint and client, answered with `429 Too Many
+//! Requests` + `Retry-After` when empty. Everything else (`/mcp`, `/healthz`,
+//! `.well-known/*`, the other Login flow pages) is not limited here.
 //!
 //! The client is the TCP peer, or, when [`OAuthLimits::trust_forwarded_for`] is on
 //! (behind kamal-proxy), the right-most `X-Forwarded-For` entry: the one our own
@@ -52,6 +53,9 @@ pub struct OAuthLimits {
     pub token: Rate,
     /// `/media/{ticket}`: Media link downloads (and guesses).
     pub media: Rate,
+    /// `/login/{id}/consent/chats`: loading and searching the Consent
+    /// screen's chats, each a call or two to Telegram.
+    pub consent_chats: Rate,
     /// Login flows pending at once, server-wide. Each holds a Telegram connection.
     pub max_pending_logins: usize,
     /// Login flows pending at once from one client.
@@ -76,6 +80,10 @@ impl Default for OAuthLimits {
             },
             media: Rate {
                 per_minute: 30,
+                burst: 10,
+            },
+            consent_chats: Rate {
+                per_minute: 20,
                 burst: 10,
             },
             max_pending_logins: 50,
@@ -141,6 +149,7 @@ pub enum Endpoint {
     Token,
     Revoke,
     Media,
+    ConsentChats,
 }
 
 impl Endpoint {
@@ -150,8 +159,9 @@ impl Endpoint {
             Self::Authorize => "/authorize",
             Self::Token => "/token",
             Self::Revoke => "/revoke",
-            // Never the ticket: it is a credential.
+            // Never the ticket: it is a credential. Nor the login id.
             Self::Media => "/media",
+            Self::ConsentChats => "/login/consent/chats",
         }
     }
 
@@ -161,6 +171,7 @@ impl Endpoint {
             Self::Authorize => limits.authorize,
             Self::Token | Self::Revoke => limits.token,
             Self::Media => limits.media,
+            Self::ConsentChats => limits.consent_chats,
         }
     }
 }
@@ -280,6 +291,11 @@ fn too_many_requests(endpoint: Endpoint, wait: Duration) -> Response {
             StatusCode::TOO_MANY_REQUESTS,
             "Too many requests",
             "Too many sign-in attempts from your network. Wait a minute and start again from your app.",
+        ),
+        Endpoint::ConsentChats => pages::error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "Too many chat searches from your network. Wait a minute, then go back and try again.",
         ),
         _ => (
             StatusCode::TOO_MANY_REQUESTS,

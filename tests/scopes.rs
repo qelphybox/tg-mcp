@@ -47,7 +47,8 @@ async fn the_token_response_says_what_consent_granted() {
         (Some("draft"), &[ALLOW], "read"),
         // Checked by the user though the app didn't ask.
         (None, &[DRAFT, ALLOW], "read draft"),
-        // Every Scope advertised: send and organize are not offered yet.
+        // Every Scope advertised: organize is not offered yet, and send
+        // never starts ticked (it needs chats: tests/send_allow_list.rs).
         (
             Some("read draft send organize"),
             &[DRAFT, ALLOW],
@@ -56,12 +57,7 @@ async fn the_token_response_says_what_consent_granted() {
         // A hand-made form can't add what the screen doesn't offer.
         (
             Some("send organize"),
-            &[
-                ("scope", "send"),
-                ("scope", "organize"),
-                ("scope", "read"),
-                ALLOW,
-            ],
+            &[("scope", "organize"), ("scope", "read"), ALLOW],
             "read",
         ),
     ] {
@@ -100,7 +96,8 @@ async fn asked_scopes_are_checked_on_the_consent_screen() {
             html.contains(r#"<span class="read-only">read-only </span>"#),
             "{asked:?}: {html}"
         );
-        assert!(!html.contains(r#"value="send""#), "{html}");
+        // Offered, never ticked from the start: it means choosing chats.
+        assert!(html.contains(r#"name="scope" value="send">"#), "{html}");
         assert!(!html.contains(r#"value="organize""#), "{html}");
     }
 }

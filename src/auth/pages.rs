@@ -6,10 +6,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::CONSENT_OFFERS;
+use super::{
+    CONSENT_OFFERS,
+    send_list::{ChatChoice, Choices, FolderChoice, MAX_QUERY_CHARS, Picked},
+};
 use crate::{
     scope::{Scope, Scopes},
-    tg::sanitise::sanitise,
+    tg::{chats::ChatKind, sanitise::sanitise},
 };
 
 /// Applied to every page. No framing (the Consent button must not be clickjackable),
@@ -69,6 +72,18 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
   main:not(:has(input.write:checked)) p.writes {{ display:none; }}
   main:not(:has(input.write:checked)) span.read-only {{ display:inline; }}
   main:not(:has(input.write:checked)) p.read-only {{ display:block; }}
+  main:has(input.send:checked) p.writes {{ display:none; }}
+  main:has(input.send:checked) p.sends, main:has(input.send:checked) section.send {{ display:block; }}
+  main:not(:has(input.send:checked)) p.sends, main:not(:has(input.send:checked)) section.send {{ display:none; }}
+  section.send {{ margin:0 0 14px; padding:14px; border:1px solid var(--line); border-radius:12px; }}
+  h2 {{ font-size:16px; margin:0 0 8px; }}
+  fieldset.pick {{ border:0; padding:0; margin:14px 0 0; min-width:0; }}
+  fieldset.pick legend {{ font-weight:600; padding:0; margin:0 0 6px; }}
+  .chats {{ max-height:260px; overflow:auto; }}
+  label.chat {{ display:flex; gap:8px; align-items:flex-start; font-weight:400; margin:0 0 6px; overflow-wrap:anywhere; }}
+  label.chat input {{ width:auto; padding:0; margin:5px 0 0; flex:none; }}
+  .search {{ display:flex; gap:8px; margin:0 0 8px; }}
+  .search button, .row button.pick {{ flex:none; }}
   footer {{ margin-top:22px; font-size:12px; color:var(--muted); }}
 </style>
 </head>
@@ -167,8 +182,27 @@ pub struct ConsentView<'a> {
     pub account_name: &'a str,
     pub account_username: Option<&'a str>,
     /// The boxes checked when the page opens: what the client asked for, of
-    /// what the screen offers ([`CONSENT_OFFERS`]).
+    /// what the screen offers ([`CONSENT_OFFERS`]), but never `send`; or, when
+    /// the page comes back from its own form, what was ticked there.
     pub checked: Scopes,
+    /// The Send allow-list part, shown while `send` is ticked.
+    pub send: SendView<'a>,
+}
+
+/// The Consent screen's Send allow-list: the chats it may send to.
+#[derive(Default)]
+pub struct SendView<'a> {
+    /// What the screen offers, once loaded for this Login flow; until then a
+    /// button loads it.
+    pub choices: Option<Choices<'a>>,
+    /// What is ticked.
+    pub picked: Picked,
+    /// The name last searched for, shown back in the search box.
+    pub query: &'a str,
+    /// What the last search found, said under the search box.
+    pub notice: Option<&'a str>,
+    /// Why Allow was refused, or why the chats couldn't be loaded or searched.
+    pub error: Option<&'a str>,
 }
 
 /// What a Scope's box on the Consent screen says it allows.
@@ -179,7 +213,10 @@ fn scope_label(scope: Scope) -> &'static str {
             "<b>Write Drafts</b>: put text in a chat's message field on all your devices, \
              replacing a draft that is there. Only you can send it."
         }
-        Scope::Send => "<b>Send messages</b> to the chats you choose.",
+        Scope::Send => {
+            "<b>Send messages</b> as you, react and mark chats as read, only in the chats \
+             you choose below."
+        }
         Scope::Organize => "<b>Organize</b> your chats.",
     }
 }
@@ -195,7 +232,8 @@ fn scope_boxes(checked: Scopes) -> String {
     for &scope in CONSENT_OFFERS {
         boxes.push_str(&format!(
             r#"
-    <label class="scope"><input type="checkbox" class="write" name="scope" value="{value}"{checked}> <span>{label}</span></label>"#,
+    <label class="scope"><input type="checkbox" class="{class}" name="scope" value="{value}"{checked}> <span>{label}</span></label>"#,
+            class = if scope == Scope::Send { "write send" } else { "write" },
             value = scope.as_str(),
             checked = if checked.contains(scope) { " checked" } else { "" },
             label = scope_label(scope),
@@ -223,11 +261,11 @@ fn consent_body(view: &ConsentView<'_>) -> String {
         name => format!("The app calls itself “{}” (not verified).", esc(name)),
     };
     // Shown as the boxes are checked when the page opens; CSS keeps them in step.
-    let (read_only, writes) = if view.checked.writes() {
-        (" hidden", "")
-    } else {
-        ("", " hidden")
-    };
+    let hidden = |shown: bool| if shown { "" } else { " hidden" };
+    let sends = view.checked.contains(Scope::Send);
+    let read_only = hidden(!view.checked.writes());
+    let writes = hidden(view.checked.writes() && !sends);
+    let send_hidden = hidden(sends);
     format!(
         r#"<h1 class="ask">Allow <b>{recipient}</b> <span class="read-only"{read_only}>read-only </span>access to all chats of <b>{account}</b>{username}?</h1>
 <p class="muted">{client}</p>
@@ -236,8 +274,10 @@ fn consent_body(view: &ConsentView<'_>) -> String {
     <legend class="muted">It may:</legend>
     {boxes}
   </fieldset>
+  {send_section}
   <p class="muted read-only"{read_only}>It can only read: it can't send, edit or delete anything.</p>
   <p class="muted writes"{writes}>It can't send, edit or delete messages.</p>
+  <p class="muted sends"{send_hidden}>It can't send anywhere else, and can't edit or delete messages.</p>
   <p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in the app alone does not end that session.</p>
   <p class="muted">If you didn't just connect an app to this Telegram account, deny.</p>
   <div class="row">
@@ -248,11 +288,120 @@ fn consent_body(view: &ConsentView<'_>) -> String {
         account = esc(&sanitise(view.account_name)),
         id = esc(view.login_id),
         boxes = scope_boxes(view.checked),
+        send_section = send_section(view.login_id, &view.send, send_hidden),
     )
 }
 
-pub fn consent(view: &ConsentView<'_>) -> Response {
-    page(StatusCode::OK, "Allow access", &consent_body(view))
+/// The chats it may send to: loaded on request (a form round-trip, no
+/// script), then Chat folders, recent chats and a search by name, each a box.
+/// Its buttons come before Allow, so Enter in the search box searches.
+fn send_section(login_id: &str, send: &SendView<'_>, hidden: &str) -> String {
+    let action = format!("/login/{}/consent/chats", esc(login_id));
+    let error = send
+        .error
+        .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, esc(e)))
+        .unwrap_or_default();
+    let Some(choices) = send.choices else {
+        return format!(
+            r#"<section class="send"{hidden}>
+    <h2>Chats it may send to</h2>
+    {error}<p class="muted">Choose from your chat folders, your recent chats, or find a chat by name. Only chats you already have.</p>
+    <div class="row"><button type="submit" class="pick" formaction="{action}" formmethod="post">Choose chats</button></div>
+  </section>"#
+        );
+    };
+    let folders = if choices.folders.is_empty() {
+        r#"<p class="muted">No chat folders that are a list of chats.</p>"#.to_string()
+    } else {
+        choices
+            .folders
+            .iter()
+            .map(|folder| folder_box(folder, send.picked.folders.contains(&folder.id)))
+            .collect()
+    };
+    let recent: String = choices
+        .recent
+        .iter()
+        .map(|chat| chat_box(chat, &send.picked))
+        .collect();
+    let found: String = choices
+        .found
+        .iter()
+        .map(|chat| chat_box(chat, &send.picked))
+        .collect();
+    let notice = send
+        .notice
+        .map(|n| format!(r#"<p class="muted" role="status">{}</p>"#, esc(n)))
+        .unwrap_or_default();
+    format!(
+        r#"<section class="send"{hidden}>
+    <h2>Chats it may send to</h2>
+    {error}<p class="muted">Only these chats. To change them later, connect again.</p>
+    <label class="chat"><input type="checkbox" name="auto_send" value="on"{auto_send}> <span>Send to these chats <b>without asking me</b> each time</span></label>
+    <p class="muted">Unticked, each message waits until you confirm it in this browser.</p>
+    <fieldset class="pick"><legend>Chat folders</legend>
+      {folders}
+    </fieldset>
+    <fieldset class="pick"><legend>Recent chats</legend>
+      <div class="chats">{recent}</div>
+    </fieldset>
+    <fieldset class="pick"><legend>Find a chat by name</legend>
+      <div class="search"><input type="search" name="q" maxlength="{max_query}" value="{query}" aria-label="Chat name"><button type="submit" formaction="{action}" formmethod="post">Search</button></div>
+      {notice}<div class="chats">{found}</div>
+    </fieldset>
+  </section>"#,
+        auto_send = if send.picked.auto_send {
+            " checked"
+        } else {
+            ""
+        },
+        max_query = MAX_QUERY_CHARS,
+        query = esc(send.query),
+    )
+}
+
+fn folder_box(folder: &FolderChoice, checked: bool) -> String {
+    let emoji = folder
+        .emoji
+        .as_deref()
+        .map(|e| format!("{} ", esc(&sanitise(e))))
+        .unwrap_or_default();
+    format!(
+        r#"<label class="chat"><input type="checkbox" name="folder" value="{id}"{checked}> <span>{emoji}{title} <span class="muted">folder, its chats as they are now</span></span></label>"#,
+        id = folder.id,
+        checked = if checked { " checked" } else { "" },
+        title = esc(&sanitise(&folder.title)),
+    )
+}
+
+fn chat_box(chat: &ChatChoice, picked: &Picked) -> String {
+    let (title, kind) = if chat.is_self {
+        ("Saved Messages".to_string(), "yours")
+    } else {
+        (esc(&sanitise(&chat.title)), kind_label(chat.kind))
+    };
+    format!(
+        r#"<label class="chat"><input type="checkbox" name="chat" value="{id}"{checked}> <span>{title} <span class="muted">{kind}</span></span></label>"#,
+        id = esc(&chat.id.to_string()),
+        checked = if picked.has_chat(chat.id.chat()) {
+            " checked"
+        } else {
+            ""
+        },
+    )
+}
+
+fn kind_label(kind: ChatKind) -> &'static str {
+    match kind {
+        ChatKind::Private => "person",
+        ChatKind::Bot => "bot",
+        ChatKind::Group | ChatKind::Supergroup => "group",
+        ChatKind::Channel => "channel",
+    }
+}
+
+pub fn consent(status: StatusCode, view: &ConsentView<'_>) -> Response {
+    page(status, "Allow access", &consent_body(view))
 }
 
 /// Polls the login status and swaps the QR; moves on to Consent when logged in.
@@ -321,6 +470,7 @@ mod tests {
             account_name: "Alice",
             account_username: Some("alice"),
             checked: Scopes::READ_ONLY,
+            send: SendView::default(),
         }
     }
 
@@ -425,6 +575,7 @@ mod tests {
             account_name: "<i>Mallory</i>",
             account_username: Some("m&m"),
             checked: Scopes::READ_ONLY,
+            send: SendView::default(),
         });
         assert!(!html.contains("<script>"), "{html}");
         assert!(
@@ -448,6 +599,7 @@ mod tests {
             account_name: "Al\u{202E}ice\u{2066}",
             account_username: Some("ali\u{200F}ce"),
             checked: Scopes::READ_ONLY,
+            send: SendView::default(),
         });
         assert!(html.contains("Claude"), "{html}");
         assert!(html.contains("edoC"), "{html}");
@@ -548,5 +700,170 @@ mod tests {
             );
         }
         assert!(!html.contains(r#"value="read""#), "{html}");
+    }
+
+    fn sending() -> Scopes {
+        [Scope::Send].into_iter().collect()
+    }
+
+    fn choice(id: &str, title: &str, kind: ChatKind) -> ChatChoice {
+        ChatChoice {
+            id: id.parse().unwrap(),
+            title: title.into(),
+            kind,
+            is_self: false,
+        }
+    }
+
+    #[test]
+    fn the_send_part_shows_only_with_send_ticked() {
+        let html = consent_body(&view("Claude", "claude.ai", false));
+        let page = text(&shown(&html));
+        assert!(!page.contains("Chats it may send to"), "{page}");
+        assert!(html.contains(r#"<section class="send" hidden>"#), "{html}");
+        assert!(
+            html.contains(r#"class="write send" name="scope" value="send">"#),
+            "the Send box starts unticked: {html}"
+        );
+
+        let html = consent_body(&ConsentView {
+            checked: sending(),
+            ..view("Claude", "claude.ai", false)
+        });
+        let page = text(&shown(&html));
+        assert!(
+            page.starts_with("Allow claude.ai access to all chats of Alice (@alice)?"),
+            "{page}"
+        );
+        assert!(page.contains("Chats it may send to"), "{page}");
+        assert!(
+            page.contains("Send messages as you, react and mark chats as read, only in the chats you choose below."),
+            "{page}"
+        );
+        assert!(
+            page.contains("It can't send anywhere else, and can't edit or delete messages."),
+            "{page}"
+        );
+        assert!(
+            !page.contains("It can't send, edit or delete messages."),
+            "{page}"
+        );
+        assert!(!page.contains("can only read"), "{page}");
+    }
+
+    #[test]
+    fn until_chats_are_loaded_a_button_loads_them_before_allow() {
+        let html = consent_body(&ConsentView {
+            checked: sending(),
+            ..view("Claude", "claude.ai", false)
+        });
+        let button = r#"<button type="submit" class="pick" formaction="/login/L/consent/chats" formmethod="post">Choose chats</button>"#;
+        assert!(html.contains(button), "{html}");
+        // Enter submits the first button: never Allow.
+        assert!(html.find(button).unwrap() < html.find(r#"value="allow""#).unwrap());
+        assert!(!html.contains(r#"name="chat""#), "{html}");
+        assert!(!html.contains(r#"name="auto_send""#), "{html}");
+    }
+
+    #[test]
+    fn loaded_chats_are_boxes_ticked_as_posted() {
+        let folders = [FolderChoice {
+            id: 3,
+            title: "Work".into(),
+            emoji: Some("💼".into()),
+        }];
+        let recent = [
+            ChatChoice {
+                is_self: true,
+                ..choice("user:42~AAAAAAAAACo", "Alice", ChatKind::Private)
+            },
+            choice("user:7~AAAAAAAAAAc", "Bob <b>", ChatKind::Private),
+            choice("chat:8", "Family", ChatKind::Group),
+        ];
+        let found = [choice(
+            "channel:9~AAAAAAAAAAk",
+            "Team\u{202E}",
+            ChatKind::Channel,
+        )];
+        let html = consent_body(&ConsentView {
+            checked: sending(),
+            send: SendView {
+                choices: Some(Choices {
+                    folders: &folders,
+                    recent: &recent,
+                    found: &found,
+                }),
+                picked: Picked {
+                    folders: vec![3],
+                    chats: vec!["channel:9~AAAAAAAAAAk".parse().unwrap()],
+                    auto_send: false,
+                },
+                query: "Te\"am",
+                notice: Some("Found 1 of your chats."),
+                error: None,
+            },
+            ..view("Claude", "claude.ai", false)
+        });
+        assert!(
+            html.contains(r#"<input type="checkbox" name="auto_send" value="on"> "#),
+            "auto-send is off unless ticked: {html}"
+        );
+        assert!(
+            html.contains(r#"name="folder" value="3" checked>"#),
+            "{html}"
+        );
+        assert!(html.contains("💼 Work"), "{html}");
+        assert!(
+            html.contains(r#"name="chat" value="user:7~AAAAAAAAAAc"> <span>Bob &lt;b&gt; <span class="muted">person</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"value="user:42~AAAAAAAAACo"> <span>Saved Messages"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"value="chat:8"> <span>Family <span class="muted">group</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="chat" value="channel:9~AAAAAAAAAAk" checked> <span>Team <span class="muted">channel</span>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"value="Te&quot;am""#), "{html}");
+        assert!(html.contains("Found 1 of your chats."), "{html}");
+        let search = r#"formaction="/login/L/consent/chats" formmethod="post">Search</button>"#;
+        assert!(html.contains(search), "{html}");
+        assert!(html.find(search).unwrap() < html.find(r#"value="allow""#).unwrap());
+        assert!(!html.contains("Choose chats</button>"), "{html}");
+
+        let ticked = consent_body(&ConsentView {
+            checked: sending(),
+            send: SendView {
+                choices: Some(Choices {
+                    folders: &[],
+                    recent: &recent,
+                    found: &[],
+                }),
+                picked: Picked {
+                    auto_send: true,
+                    ..Picked::default()
+                },
+                error: Some("Choose at least one chat"),
+                ..SendView::default()
+            },
+            ..view("Claude", "claude.ai", false)
+        });
+        assert!(
+            ticked.contains(r#"name="auto_send" value="on" checked>"#),
+            "{ticked}"
+        );
+        assert!(
+            ticked.contains("No chat folders that are a list of chats."),
+            "{ticked}"
+        );
+        assert!(
+            ticked.contains(r#"<p class="error" role="alert">Choose at least one chat</p>"#),
+            "{ticked}"
+        );
     }
 }

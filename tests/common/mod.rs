@@ -40,6 +40,8 @@ pub struct TestServer {
     pub http: reqwest::Client,
     /// The fake Telegram side every Grant of this server connects to.
     pub connector: FakeConnector,
+    /// The server's vault, to look at what a Grant holds.
+    pub vault: Arc<Vault>,
     shutdown: CancellationToken,
     _dir: TempDir,
 }
@@ -123,6 +125,8 @@ const RELAXED_LIMITS: &[(&str, &str)] = &[
     ("TG_MCP_TOKEN_BURST", "10000"),
     ("TG_MCP_MEDIA_PER_MINUTE", "10000"),
     ("TG_MCP_MEDIA_BURST", "10000"),
+    ("TG_MCP_CONSENT_CHATS_PER_MINUTE", "10000"),
+    ("TG_MCP_CONSENT_CHATS_BURST", "10000"),
 ];
 
 /// A server with extra environment variables on top of the test defaults.
@@ -161,8 +165,9 @@ async fn serve(
     if let Some(clock) = clock {
         vault = vault.with_clock(clock);
     }
+    let vault = Arc::new(vault);
     let deps = Deps {
-        vault: Arc::new(vault),
+        vault: vault.clone(),
         clients: ClientRegistry::new(pool),
         login,
         connector: Arc::new(connector.clone()),
@@ -187,6 +192,7 @@ async fn serve(
         base,
         http,
         connector,
+        vault,
         shutdown,
         _dir: dir,
     }
