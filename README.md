@@ -18,7 +18,7 @@ Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser op
 
 1. Scan the QR code with Telegram on your phone: **Settings → Devices → Link Desktop Device**.
 2. If your account has a cloud password (two-step verification), type it on the same page. It goes only to this server's login page, never through the AI client or the chat.
-3. **Allow** read-only access on the consent screen.
+3. **Allow** on the consent screen. Reading is always included; leave **Write Drafts** unticked to keep the connection read-only (no tool writes Drafts yet).
 
 **Claude (web/desktop):** Settings → Connectors → Add custom connector → the same URL. **Other MCP clients:** add it as a streamable-HTTP server; they discover OAuth on their own.
 
@@ -49,6 +49,7 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 - **Restarts don't need a re-login**, because the encrypted session survives in the database and your client's token unlocks it again.
 - **No messages on disk.** Chats and messages pass through memory only; the session at rest is just the auth keys and home datacenter. Logs carry ids and sizes, never message content or tokens.
 - **Media links are short-lived credentials.** A `get_media` download link is 256 random bits, lives in memory only, works for 5 minutes and 3 downloads, and only for the one file it was made for; revoking the login ends it at once, and a restart ends them all. The file streams from Telegram into the response without touching disk. A `view` holds its images (at most ~1 MB) in memory only for the one call.
+- **Scopes.** A connection gets only what you tick on the consent screen: `read` always, `draft` if you allow it (`send` and `organize` are not offered yet). Tools outside a connection's Scopes are neither listed nor callable, and changing Scopes means connecting again. ([ADR-0005](docs/adr/0005-write-access.md))
 - **Your password never reaches the AI.** QR login and the cloud password happen on this server's own pages.
 - **OAuth 2.1** with PKCE (S256), dynamic client registration, single-use authorization codes, rotating refresh tokens bound to their client, and a consent screen that leads with where the login is sent, names the account, and shows the self-declared client name as unverified.
 - **Telegram limits are respected.** Requests per account are rate-limited, and Telegram's `FLOOD_WAIT` blocks that account's calls of the same kind (reading, search, file downloads or transcription) until it passes instead of being retried around.
