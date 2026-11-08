@@ -27,6 +27,7 @@ use super::{
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
     download::{FileError, FilePart, FileRequest, MediaFile},
     find::{FoundChat, FoundChats},
+    folders::ChatFolder,
     members::{Member, MemberPage, MembersQuery},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
@@ -280,6 +281,22 @@ impl Untrusted for Account {
         clean(first_name);
         clean_opt(last_name);
         clean_opt(username);
+    }
+}
+
+/// Chat folders' titles and emoji are written by the user.
+impl Untrusted for Vec<ChatFolder> {
+    fn sanitise(&mut self) {
+        for ChatFolder {
+            id: _,
+            title,
+            emoji,
+            rules: _,
+        } in self
+        {
+            clean(title);
+            clean_opt_visible(emoji);
+        }
     }
 }
 
@@ -564,6 +581,10 @@ impl Sanitised {
 impl Telegram for Sanitised {
     async fn whoami(&self) -> Result<Account, TgError> {
         self.0.whoami().await.map(sanitised)
+    }
+
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
+        self.0.chat_folders().await.map(sanitised)
     }
 
     async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {

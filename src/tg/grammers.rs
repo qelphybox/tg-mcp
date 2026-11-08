@@ -22,6 +22,7 @@ use super::{
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
+    folders::{self, ChatFolder, RawChatFolder},
     media,
     media::{FileLocation, StoredFile},
     members::{
@@ -588,7 +589,25 @@ impl Telegram for LiveClient {
                 .ok_or_else(|| TgError::Upstream("no self user".into()))?,
         )
     }
+
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
+        Ok(self
+            .dialog_filters()
+            .await?
+            .into_iter()
+            .map(|f| f.folder)
+            .collect())
+    }
     async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {
+        if let Some(folder) = query.chat_folder {
+            return folders::list_folder_chats(
+                &query,
+                folder,
+                || self.dialog_filters(),
+                |peers| self.peer_dialogs(peers),
+            )
+            .await;
+        }
         chats::list_chats(&query, |request| self.get_dialogs(request)).await
     }
 
@@ -1351,6 +1370,7 @@ impl LiveClient {
                         cursor: cursor.clone(),
                         archived,
                         unread_only: false,
+                        chat_folder: None,
                     })
                     .await?;
                 if let Some(hash) = self.cached(chat) {
@@ -1972,6 +1992,130 @@ impl LiveClient {
             messages: messages.into_iter().filter_map(raw_message).collect(),
         })
     }
+}
+
+impl LiveClient {
+    /// One `messages.getDialogFilters` call: the Account's Chat folders.
+    async fn dialog_filters(&self) -> Result<Vec<RawChatFolder>, TgError> {
+        let tl::enums::messages::DialogFilters::Filters(answer) = self
+            .call(&tl::functions::messages::GetDialogFilters {}, None)
+            .await?;
+        let me = self.grant.account_id;
+        Ok(answer
+            .filters
+            .into_iter()
+            .filter_map(|filter| raw_chat_folder(filter, me))
+            .collect())
+    }
+
+    /// One `messages.getPeerDialogs` call for [`folders::list_folder_chats`]:
+    /// the dialogs Telegram has of `peers`. A Chat named without its access
+    /// hash is asked for with the peer cache's, the Account's own Saved
+    /// Messages as `inputPeerSelf`, or not at all (no call when none is left).
+    async fn peer_dialogs(&self, peers: Vec<ChatRef>) -> Result<DialogsAnswer, TgError> {
+        let me = ChatId::User(self.grant.account_id);
+        let peers: Vec<tl::enums::InputDialogPeer> = peers
+            .into_iter()
+            .filter_map(|id| {
+                let peer = direct_input_peer(id)
+                    .or_else(|| (id.chat() == me).then_some(tl::enums::InputPeer::PeerSelf))
+                    .or_else(|| Some(input_peer(id.chat(), Some(self.cached(id.chat())?))))?;
+                Some(tl::enums::InputDialogPeer::Peer(
+                    tl::types::InputDialogPeer { peer },
+                ))
+            })
+            .collect();
+        if peers.is_empty() {
+            return Ok(DialogsAnswer::default());
+        }
+        let tl::enums::messages::PeerDialogs::Dialogs(answer) = self
+            .call(&tl::functions::messages::GetPeerDialogs { peers }, None)
+            .await?;
+        let now = unix_now();
+        Ok(DialogsAnswer {
+            sent: answer.dialogs.len(),
+            dialogs: answer
+                .dialogs
+                .into_iter()
+                .filter_map(|d| raw_dialog(d, now))
+                .collect(),
+            peers: self.described(answer.users, answer.chats),
+            messages: answer
+                .messages
+                .into_iter()
+                .filter_map(raw_message)
+                .collect(),
+        })
+    }
+}
+
+/// A Chat folder as whoami and list_chats read it; the "All chats" entry
+/// (`dialogFilterDefault`) is none. `me` is the Account, for a folder that
+/// names its own Saved Messages as `inputPeerSelf`.
+fn raw_chat_folder(filter: tl::enums::DialogFilter, me: i64) -> Option<RawChatFolder> {
+    let refs = |peers: Vec<tl::enums::InputPeer>| -> Vec<ChatRef> {
+        peers.iter().filter_map(|p| folder_peer(p, me)).collect()
+    };
+    let title = |title: tl::enums::TextWithEntities| {
+        let tl::enums::TextWithEntities::Entities(title) = title;
+        title.text
+    };
+    match filter {
+        tl::enums::DialogFilter::Filter(f) => Some(RawChatFolder {
+            folder: ChatFolder {
+                id: f.id,
+                title: title(f.title),
+                emoji: f.emoticon,
+                // Every flag that adds or drops Chats by what they are.
+                rules: f.contacts
+                    || f.non_contacts
+                    || f.groups
+                    || f.broadcasts
+                    || f.bots
+                    || f.exclude_muted
+                    || f.exclude_read
+                    || f.exclude_archived,
+            },
+            pinned: refs(f.pinned_peers),
+            included: refs(f.include_peers),
+            excluded: refs(f.exclude_peers)
+                .into_iter()
+                .map(|r| r.chat())
+                .collect(),
+        }),
+        // A shared Chat folder (chatlist) is a list by construction.
+        tl::enums::DialogFilter::Chatlist(f) => Some(RawChatFolder {
+            folder: ChatFolder {
+                id: f.id,
+                title: title(f.title),
+                emoji: f.emoticon,
+                rules: false,
+            },
+            pinned: refs(f.pinned_peers),
+            included: refs(f.include_peers),
+            excluded: Vec::new(),
+        }),
+        tl::enums::DialogFilter::Default => None,
+    }
+}
+
+/// A Chat a folder names, with its access hash when the folder carries one.
+/// A peer known only from a message has none: it is addressed through the
+/// peer cache, if at all.
+fn folder_peer(peer: &tl::enums::InputPeer, me: i64) -> Option<ChatRef> {
+    Some(match peer {
+        tl::enums::InputPeer::User(u) => ChatRef::new(ChatId::User(u.user_id), Some(u.access_hash)),
+        tl::enums::InputPeer::Chat(c) => ChatRef::new(ChatId::Chat(c.chat_id), None),
+        tl::enums::InputPeer::Channel(c) => {
+            ChatRef::new(ChatId::Channel(c.channel_id), Some(c.access_hash))
+        }
+        tl::enums::InputPeer::PeerSelf => ChatRef::new(ChatId::User(me), None),
+        tl::enums::InputPeer::UserFromMessage(u) => ChatRef::new(ChatId::User(u.user_id), None),
+        tl::enums::InputPeer::ChannelFromMessage(c) => {
+            ChatRef::new(ChatId::Channel(c.channel_id), None)
+        }
+        tl::enums::InputPeer::Empty => return None,
+    })
 }
 
 /// A dialog as list_chats reads it, muted or not at Unix time `now`.
@@ -3838,6 +3982,7 @@ mod resolve_tests {
             cursor: cursor.map(String::from),
             archived,
             unread_only: false,
+            chat_folder: None,
         }
     }
 
@@ -5034,5 +5179,216 @@ mod topic_tests {
             ],
             [MethodClass::Default; 4]
         );
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use grammers_client::tl::Serializable;
+
+    use super::*;
+    use crate::sessions::{TokenTtl, Vault};
+
+    const ACCOUNT: i64 = 42;
+
+    async fn cold_client() -> (LiveClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let issued = vault.create_grant("client", ACCOUNT, b"").await.unwrap();
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        (offline_live(grant, Arc::new(SessionStore::new())), dir)
+    }
+
+    fn sent(live: &LiveClient) -> Vec<Vec<u8>> {
+        live.sent.lock().unwrap().clone()
+    }
+
+    fn title(text: &str) -> tl::enums::TextWithEntities {
+        tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+            text: text.into(),
+            entities: Vec::new(),
+        })
+    }
+
+    fn channel(id: i64, access_hash: i64) -> tl::enums::InputPeer {
+        tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: id,
+            access_hash,
+        })
+    }
+
+    /// Folder 4 "Work" without a rule: pins channel 5, includes basic group
+    /// 6, the Account's Saved Messages and user 7 known only from a message,
+    /// excludes channel 8.
+    fn work() -> tl::types::DialogFilter {
+        tl::types::DialogFilter {
+            contacts: false,
+            non_contacts: false,
+            groups: false,
+            broadcasts: false,
+            bots: false,
+            exclude_muted: false,
+            exclude_read: false,
+            exclude_archived: false,
+            title_noanimate: true,
+            id: 4,
+            title: title("Work"),
+            emoticon: Some("💼".into()),
+            color: Some(3),
+            pinned_peers: vec![channel(5, -9)],
+            include_peers: vec![
+                tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: 6 }),
+                tl::enums::InputPeer::PeerSelf,
+                tl::enums::InputPeer::UserFromMessage(Box::new(
+                    tl::types::InputPeerUserFromMessage {
+                        peer: channel(5, -9),
+                        msg_id: 10,
+                        user_id: 7,
+                    },
+                )),
+                tl::enums::InputPeer::Empty,
+            ],
+            exclude_peers: vec![channel(8, 1)],
+        }
+    }
+
+    #[test]
+    fn a_folder_is_read_with_its_title_text_and_the_chats_it_names() {
+        let folder = raw_chat_folder(tl::enums::DialogFilter::Filter(work()), ACCOUNT).unwrap();
+        assert_eq!(
+            folder,
+            RawChatFolder {
+                folder: ChatFolder {
+                    id: 4,
+                    title: "Work".into(),
+                    emoji: Some("💼".into()),
+                    rules: false,
+                },
+                pinned: vec![ChatRef::new(ChatId::Channel(5), Some(-9))],
+                included: vec![
+                    ChatRef::new(ChatId::Chat(6), None),
+                    ChatRef::new(ChatId::User(ACCOUNT), None),
+                    ChatRef::new(ChatId::User(7), None),
+                ],
+                excluded: vec![ChatId::Channel(8)],
+            }
+        );
+    }
+
+    #[test]
+    fn every_flag_that_picks_chats_by_kind_or_state_is_a_rule_and_nothing_else_is() {
+        type Flag = fn(&mut tl::types::DialogFilter);
+        let rules: [(&str, Flag); 8] = [
+            ("contacts", |f| f.contacts = true),
+            ("non_contacts", |f| f.non_contacts = true),
+            ("groups", |f| f.groups = true),
+            ("broadcasts", |f| f.broadcasts = true),
+            ("bots", |f| f.bots = true),
+            ("exclude_muted", |f| f.exclude_muted = true),
+            ("exclude_read", |f| f.exclude_read = true),
+            ("exclude_archived", |f| f.exclude_archived = true),
+        ];
+        let rules_of = |filter| {
+            raw_chat_folder(filter, ACCOUNT)
+                .map(|f| f.folder.rules)
+                .unwrap()
+        };
+        for (name, set) in rules {
+            let mut filter = work();
+            set(&mut filter);
+            assert!(rules_of(tl::enums::DialogFilter::Filter(filter)), "{name}");
+        }
+        assert!(!rules_of(tl::enums::DialogFilter::Filter(work())));
+
+        // A shared folder (chatlist) is a list by construction.
+        let chatlist = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+            has_my_invites: true,
+            title_noanimate: false,
+            id: 9,
+            title: title("Shared"),
+            emoticon: None,
+            color: None,
+            pinned_peers: Vec::new(),
+            include_peers: vec![channel(5, -9)],
+        });
+        let chatlist = raw_chat_folder(chatlist, ACCOUNT).unwrap();
+        assert!(!chatlist.folder.rules);
+        assert_eq!(chatlist.folder.title, "Shared");
+        assert_eq!(chatlist.included.len(), 1);
+
+        // "All chats" is no Chat folder.
+        assert_eq!(
+            raw_chat_folder(tl::enums::DialogFilter::Default, ACCOUNT),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_chats_are_asked_for_with_get_peer_dialogs_and_their_hashes() {
+        let (live, _dir) = cold_client().await;
+        let folder = raw_chat_folder(tl::enums::DialogFilter::Filter(work()), ACCOUNT).unwrap();
+        let peers = [folder.pinned, folder.included].concat();
+
+        assert!(live.peer_dialogs(peers).await.is_err());
+        // User 7 has no hash and the peer cache doesn't know it: not asked for.
+        let dialog_peer =
+            |peer| tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer });
+        assert_eq!(
+            sent(&live),
+            [tl::functions::messages::GetPeerDialogs {
+                peers: vec![
+                    dialog_peer(channel(5, -9)),
+                    dialog_peer(tl::enums::InputPeer::Chat(tl::types::InputPeerChat {
+                        chat_id: 6
+                    })),
+                    dialog_peer(tl::enums::InputPeer::PeerSelf),
+                ],
+            }
+            .to_bytes()]
+        );
+
+        // Nothing addressable left: no call at all.
+        live.sent.lock().unwrap().clear();
+        let none = live
+            .peer_dialogs(vec![ChatRef::new(ChatId::User(7), None)])
+            .await
+            .unwrap();
+        assert_eq!(none, DialogsAnswer::default());
+        assert!(sent(&live).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_folder_listing_starts_with_get_dialog_filters_through_the_limiter() {
+        let (live, _dir) = cold_client().await;
+        let query = ChatsQuery {
+            limit: 10,
+            chat_folder: Some(4),
+            ..ChatsQuery::default()
+        };
+        assert!(live.list_chats(query.clone()).await.is_err());
+        assert!(live.chat_folders().await.is_err());
+        let filters = tl::functions::messages::GetDialogFilters {}.to_bytes();
+        assert_eq!(sent(&live), [filters.clone(), filters]);
+
+        // Telegram's FLOOD_WAIT holds back the next listing, never retried.
+        live.sent.lock().unwrap().clear();
+        live.answers
+            .lock()
+            .unwrap()
+            .push_back(rpc::<tl::functions::messages::GetDialogFilters>(
+                420,
+                "FLOOD_WAIT_300",
+            ));
+        assert!(matches!(
+            live.chat_folders().await,
+            Err(TgError::FloodWait { seconds: 300, .. })
+        ));
+        assert!(matches!(
+            live.list_chats(query).await,
+            Err(TgError::FloodWait { .. })
+        ));
+        assert_eq!(sent(&live).len(), 1, "only the flooded request went out");
     }
 }
