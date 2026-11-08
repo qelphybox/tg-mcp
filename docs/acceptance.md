@@ -503,3 +503,45 @@ Needs, in `list_chats` or found with `find_chats`: a large supergroup `<L>` the 
 7. Step 7: three `invalid_params` errors: the user id `… is a user, not a group or channel …`, `limit must be between 1 and 200`, `query must be at most 64 characters …`.
 
 `kamal app logs | grep -iF '<q>'` and `kamal app logs | grep -iF '<the name of one of G's members>'` find nothing: member names are never logged (only ids and counts, if anything).
+
+## 50. A reused refresh Token revokes its Grant after a 60-second grace window, and logs its Telegram session out
+
+Needs two QR scans and about three minutes. The script logs in twice with its own OAuth clients, as `revoke-check.py` does, and never prints a Token:
+
+1. It refreshes twice with the same refresh Token within 60 s (both pairs must work), presents a forged secret for that Token after the window (nothing may happen), then presents the real one after the window: every Token of that Grant must die.
+2. After Enter, a second login: its refresh Token presented with another `client_id` must kill that Grant the same way.
+
+```sh
+python3 scripts/refresh-reuse-check.py   # expect every line [PASS] and exit status 0; it waits 65 s in step 1
+```
+
+Then, within 15 minutes, the server's side of it:
+
+```sh
+logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+logs | grep -E 'refresh token misused|revoked grant'
+# expect 4 lines: WARN "refresh token misused, grant revoked" with grant_id=… reason="refresh_reuse",
+#   then INFO "revoked grant's live client logged its telegram session out" with the same grant_id;
+#   the same pair again with reason="foreign_client" and the second grant_id
+logs | grep -c 'tgm_'   # expect 0: no Token is ever logged
+```
+
+In Telegram → Settings → Devices, neither "Unofficial MCP Server" session of this run is listed: each was logged out with its Live client, which the script's `whoami` calls kept open. If one is still listed, look for `logging a revoked grant's telegram session out failed` or `had no live client` in `logs` and record it.
+
+The Wrapped keys of used refresh Tokens leave the database within minutes. Use your regular connector for over an hour first (access Tokens last an hour, so it refreshes at least once), then dump the database as in §3:
+
+```sh
+mkdir -p /tmp/tgmcp-dump
+ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
+python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 3
+print(db.execute("""SELECT count(*), coalesce(sum(wrapped_key IS NOT NULL
+                      AND consumed_at < CAST(strftime('%s', 'now') AS INTEGER) - 300), 0)
+                    FROM tokens WHERE consumed_at IS NOT NULL""").fetchone())
+# expect (N, 0): N >= 1 used refresh Tokens kept for reuse detection, none with a Wrapped key 5 minutes after its window
+PY
+```
+
+Finally, no false alarm in normal use: open two Claude Code sessions on the connector and use both across an hourly refresh (`whoami` in each after more than an hour). Both keep answering without a browser opening, and `logs` (with `--since` widened to cover the time) has no `refresh token misused` line for your own Grant. If one appears, a client kept a used refresh Token for more than 60 s: record which client and version.
