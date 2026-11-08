@@ -12,6 +12,7 @@ pub mod chats;
 pub mod download;
 pub mod fake;
 pub mod find;
+pub mod folders;
 pub mod grammers;
 pub mod media;
 pub mod members;
@@ -88,12 +89,19 @@ pub enum TgError {
 pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
 
+    /// The Account's Chat folders, in the user's order
+    /// (`messages.getDialogFilters`): neither the Archive nor the "All chats"
+    /// entry is one.
+    async fn chat_folders(&self) -> Result<Vec<folders::ChatFolder>, TgError>;
+
     /// One page of the Account's Chats in the main list or the Archive: pinned
     /// first on the first page, then most recent first, each Chat once. At most
     /// `query.limit` Chats, and `next_cursor` continues right after the last
     /// one, so callers must not cut the page. `query.cursor` is a
     /// `next_cursor` from a previous page (it also decides `archived`). With
     /// `unread_only`, only unread Chats, scanned for by [`chats::list_chats`].
+    /// With `chat_folder`, the Chats of that Chat folder instead
+    /// ([`folders::list_folder_chats`]).
     async fn list_chats(&self, query: chats::ChatsQuery) -> Result<chats::ChatPage, TgError>;
 
     /// Messages of one Chat, newest first, within `query`'s bounds.

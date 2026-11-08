@@ -313,7 +313,13 @@ async fn whoami_strips_the_accounts_names() {
     let me = call(&client, "whoami", json!({})).await;
     assert_eq!(
         me,
-        json!({ "id": 42, "first_name": "Me", "last_name": "Self", "username": "me" })
+        json!({
+            "id": 42,
+            "first_name": "Me",
+            "last_name": "Self",
+            "username": "me",
+            "chat_folders": []
+        })
     );
 }
 

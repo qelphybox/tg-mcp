@@ -83,7 +83,7 @@ Telegram's single built-in place for Chats the user moved out of the main chat l
 _Avoid_: archived folder, folder (unqualified)
 
 **Chat folder**:
-A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Telegram apps. A Chat can be in several Chat folders, and in none. Unrelated to the Archive.
+A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Telegram apps. A Chat can be in several Chat folders, and in none. Unrelated to the Archive. Defined either as an explicit list (pinned and included Chats, minus excluded ones) or also by rules (kinds of Chats such as contacts or groups, or leaving out muted, read or archived ones). A shared Chat folder (chatlist) is always a list.
 _Avoid_: folder (unqualified), filter, tab
 
 **Topic**:
