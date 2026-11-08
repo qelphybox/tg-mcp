@@ -49,6 +49,9 @@ env:
     TG_MCP_DB_PATH: /data/tg-mcp.db
     # kamal-proxy is the only way in; client IPs (for rate limits) come from its XFF.
     TG_MCP_TRUST_FORWARDED_FOR: "1"
+    # EXPERIMENTAL (#58 prototype): get_media mode `document`, tried from claude.ai
+    # (docs/acceptance.md §22). Off by default for self-hosters.
+    TG_MCP_EXPERIMENTAL_DOCUMENTS: "1"
     RUST_LOG: info
   secret:
     - TG_MCP_API_ID

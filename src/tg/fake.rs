@@ -124,6 +124,11 @@ pub struct FakeData {
     /// `messages.getForumTopicsByID`.
     #[serde(default)]
     pub topics_in_answers: bool,
+    /// The bytes of messages' files, by Chat and message id; a file
+    /// without them is [`fake_file_bytes`]. The message's `size_bytes`
+    /// should be their length.
+    #[serde(default)]
+    pub file_contents: std::collections::HashMap<ChatId, Vec<(i32, Vec<u8>)>>,
     /// The Account's Chat folders, in the user's order (#29).
     #[serde(default)]
     pub chat_folders: Vec<FakeChatFolder>,
@@ -555,6 +560,7 @@ impl FakeData {
             pictures: Default::default(),
             topics: Default::default(),
             topics_in_answers: false,
+            file_contents: Default::default(),
             transcriptions: Default::default(),
             transcribe: FakeTranscribeAccess::default(),
             chat_folders: Vec::new(),
@@ -584,6 +590,15 @@ impl FakeData {
 
     pub fn with_transcribe_access(mut self, access: FakeTranscribeAccess) -> Self {
         self.transcribe = access;
+        self
+    }
+
+    /// Message `id` of `chat`'s file is `bytes`.
+    pub fn with_file_contents(mut self, chat: ChatId, id: i32, bytes: Vec<u8>) -> Self {
+        self.file_contents
+            .entry(chat)
+            .or_default()
+            .push((id, bytes));
         self
     }
 
@@ -1323,10 +1338,20 @@ fn fake_picture(
 /// What a fake file's bytes are.
 #[derive(Debug, Clone, Copy)]
 enum FakeContent<'a> {
-    /// The message's file: [`fake_file_bytes`].
+    /// The message's file: [`fake_file_bytes`], or the fixture's bytes.
     File,
     /// A size of its picture: [`fake_picture_bytes`].
     Picture(&'a str, FakeFormat),
+}
+
+/// What a fake file request is served from, once found.
+enum Served<'a> {
+    /// [`fake_file_bytes`].
+    Pattern,
+    /// The fixture's ([`FakeData::with_file_contents`]).
+    Given(&'a [u8]),
+    /// [`fake_picture_bytes`].
+    Picture(String, FakeFormat),
 }
 
 /// The file of a fake message's media: kinds with a file whose size the
@@ -1817,6 +1842,12 @@ impl Telegram for FakeTelegram {
                             (p.at(&s.size), s.size.bytes, content)
                         })
                 });
+                let given = self
+                    .data
+                    .file_contents
+                    .get(&chat)
+                    .and_then(|files| files.iter().find(|(id, _)| *id == m.id))
+                    .map(|(_, bytes)| bytes.as_slice());
                 let whole = fake_file(&current, chat, m)
                     .map(|(stored, size)| (stored, size.unwrap_or(0), FakeContent::File));
                 pictures
@@ -1825,14 +1856,18 @@ impl Telegram for FakeTelegram {
                         stored.same_file(&location) && stored.access_hash == location.access_hash
                     })
                     .map(|(stored, size, content)| match content {
-                        FakeContent::File => (stored.id, size, None),
+                        FakeContent::File => (
+                            stored.id,
+                            size,
+                            given.map_or(Served::Pattern, Served::Given),
+                        ),
                         FakeContent::Picture(r#type, format) => {
-                            (stored.id, size, Some((r#type.to_string(), format)))
+                            (stored.id, size, Served::Picture(r#type.to_string(), format))
                         }
                     })
             })
         });
-        let Some((file_id, size, picture)) = file else {
+        let Some((file_id, size, content)) = file else {
             return Err(FileError::Failed(TgError::Upstream(
                 "rpc error 400: FILE_ID_INVALID".into(),
             )));
@@ -1853,11 +1888,16 @@ impl Telegram for FakeTelegram {
         state.served += 1;
         let size = state.cut_at.map_or(size, |cut| cut.min(size)) as i64;
         let (start, end) = (offset.min(size), (offset + i64::from(limit)).min(size));
-        Ok(FilePart::Bytes(match picture {
-            None => fake_file_range(file_id, start as u64..end as u64),
-            Some((r#type, format)) => fake_picture_bytes(file_id, &r#type, size as u64, format)
-                [start as usize..end as usize]
-                .to_vec(),
+        Ok(FilePart::Bytes(match content {
+            Served::Pattern => fake_file_range(file_id, start as u64..end as u64),
+            Served::Given(bytes) => {
+                bytes[(start as usize).min(bytes.len())..(end as usize).min(bytes.len())].to_vec()
+            }
+            Served::Picture(r#type, format) => {
+                fake_picture_bytes(file_id, &r#type, size as u64, format)
+                    [start as usize..end as usize]
+                    .to_vec()
+            }
         }))
     }
 }

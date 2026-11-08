@@ -9,6 +9,7 @@
 //! real Telegram (QR login + Client pool).
 
 pub mod chats;
+pub mod document;
 pub mod download;
 pub mod fake;
 pub mod find;

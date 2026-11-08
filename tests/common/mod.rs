@@ -73,6 +73,14 @@ impl SequenceLogin {
         }
     }
 
+    /// Logs in as each [`FakeData`] in turn.
+    pub fn with_data(accounts: Vec<FakeData>) -> Self {
+        Self {
+            accounts,
+            next: AtomicUsize::new(0),
+        }
+    }
+
     /// How many Telegram logins were started.
     pub fn started(&self) -> usize {
         self.next.load(Ordering::SeqCst)
