@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Manual check of Scopes (#41) against a running server, with its own OAuth client.
+"""Manual check of Scopes (#41, #43) against a running server, with its own OAuth client.
 
 Logs in through the real Login flow in your browser, asking for the Scopes you
 name (`-` asks for none). On the Consent screen, tick or untick "Write Drafts"
 so that the Grant gets EXPECTED. Then it checks the token response's `scope`,
 that a refresh asking for every Scope keeps it, what the server's instructions
-say, which tools are listed and that whoami works, and finally revokes the
+say, which tools are listed (save_draft only with `draft`, get_drafts always),
+that a Grant without `draft` can't call save_draft (nothing is written: the call
+is refused before Telegram) and that whoami works, and finally revokes the
 Grant (so "Unofficial MCP Server" leaves Telegram -> Settings -> Devices).
 
 No dependencies beyond Python 3. Tokens are never printed.
@@ -71,7 +73,7 @@ def login():
 
 
 def mcp_session(access):
-    """(instructions, tools) as an MCP client sees them on initialize and tools/list."""
+    """(instructions, tools, session) as an MCP client sees them on initialize and tools/list."""
     status, session, answer = rc.mcp_post(access, {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -83,7 +85,7 @@ def mcp_session(access):
     rc.mcp_post(access, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
     _, _, answer = rc.mcp_post(access, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session)
     tools = (answer or {}).get("result", {}).get("tools", [])
-    return instructions, tools
+    return instructions, tools, session
 
 
 def main():
@@ -101,7 +103,7 @@ def main():
     access = refreshed.get("access_token", tokens["access_token"])
     refresh = refreshed.get("refresh_token", tokens["refresh_token"])
 
-    instructions, tools = mcp_session(access)
+    instructions, tools, session = mcp_session(access)
     print(f"\n2. The server's instructions:\n\n   {instructions}\n")
     if EXPECTED == "read":
         results.append(rc.check("instructions say read-only",
@@ -113,6 +115,19 @@ def main():
     names = sorted(t["name"] for t in tools)
     print(f"   tools/list ({len(names)}): {', '.join(names)}\n")
     results.append(rc.check("whoami is listed", "whoami" in names))
+    results.append(rc.check("get_drafts is listed", "get_drafts" in names))
+    drafts = "draft" in EXPECTED.split()
+    results.append(rc.check(f"save_draft is {'' if drafts else 'not '}listed",
+                            ("save_draft" in names) == drafts))
+    if not drafts:
+        # Refused by the Scope check before anything reaches Telegram.
+        _, _, answer = rc.mcp_post(access, {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "save_draft", "arguments": {"chat_id": "chat:1", "text": "scope check"}},
+        }, session)
+        error = (answer or {}).get("error", {}).get("message", "")
+        results.append(rc.check(f"calling save_draft is refused for the missing Scope ({error[:60]!r}...)",
+                                "needs the `draft` Scope" in error))
     status, me = rc.whoami(access)
     results.append(rc.check(f"whoami -> 200 with the account id (got {status})",
                             status == 200 and bool(me and me.get("id"))))

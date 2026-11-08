@@ -625,7 +625,7 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
    python3 scripts/scope-check.py - read   # expect every line [PASS] and exit status 0
    ```
 
-   On the Consent screen: "Read chats and messages…" is ticked and greyed out, "Write Drafts" is unticked, the heading reads "Allow … **read-only** access to all chats of …", and the line under the boxes reads "It can only read: it can't send, edit or delete anything." Leave it so and Allow. The script prints instructions starting "… Read-only access to the connected Telegram account: nothing is ever sent, edited or deleted." and the tool list; note how many tools it lists.
+   On the Consent screen: "Read chats and messages…" is ticked and greyed out, "Write Drafts" is unticked, the heading reads "Allow … **read-only** access to all chats of …", and the line under the boxes reads "It can only read: it can't send, edit or delete anything." Leave it so and Allow. The script prints instructions starting "… Read-only access to the connected Telegram account: nothing is ever sent, edited or deleted." and the tool list, with `get_drafts` but without `save_draft`, and checks that calling `save_draft` is refused for the missing `draft` Scope; note how many tools it lists.
 
 5. **A Grant that asked for `draft`, unticked by the user.**
 
@@ -641,7 +641,7 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
    python3 scripts/scope-check.py "read draft" "read draft"   # expect every line [PASS] and exit status 0
    ```
 
-   Keep "Write Drafts" ticked and Allow. The token response and the refresh (which asks for every Scope) both say `read draft`; the instructions read "… Access to the connected Telegram account: you can read chats, messages and media, and write Drafts (text left in a chat's message field, which only the user sends); you cannot send, edit or delete messages. …"; the tool list is the same as in step 4 (no tool needs `draft` until the Drafts tools land).
+   Keep "Write Drafts" ticked and Allow. The token response and the refresh (which asks for every Scope) both say `read draft`; the instructions read "… Access to the connected Telegram account: you can read chats, messages and media, and write Drafts (text left in a chat's message field, replacing the Draft there; only the user sends it); you cannot send, edit or delete messages. …"; the tool list is step 4's plus `save_draft` (§53 checks what it does).
 
 7. **What Claude Code asks for.** `claude mcp add --transport http telegram-scopes https://tgmcp.qelphybox.space/mcp`, then `/mcp` → `telegram-scopes` → Authenticate, and scan the QR. Record whether "Write Drafts" opens ticked (Claude Code asked for every advertised Scope) or not (it asked for none or `read`). Untick it, Allow, check `whoami` answers, then `claude mcp remove telegram-scopes` and end that session in Telegram → Settings → Devices.
 
@@ -658,7 +658,7 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 
 ## 52. Writes have their own budget and a per-Chat Send cap, never wait, and reading is unaffected
 
-Until the Drafts tools (#43) land no tool writes, so on production this release only shows that the limits are configured and that reading behaves as before. The limits themselves are covered by paused-clock tests (`cargo test --lib limits::`: the 21st write in 10 minutes and the 6th send to one Chat in a minute fail at once while reads and other Chats go on; a write `FLOOD_WAIT` is neither slept through nor retried; `PEER_FLOOD` is returned once, as is). `PEER_FLOOD` can't be provoked on purpose without getting the account limited for spam: if it ever shows up, record the tool error and the log line.
+`save_draft` (#43, §53) is the only write of this release, so on production this section shows that the limits are configured, that reading behaves as before, and that the 21st Draft in 10 minutes is refused (step 4); the Send cap waits for `send_message`. The limits themselves are covered by paused-clock tests (`cargo test --lib limits::`: the 21st write in 10 minutes and the 6th send to one Chat in a minute fail at once while reads and other Chats go on; a write `FLOOD_WAIT` is neither slept through nor retried; `PEER_FLOOD` is returned once, as is). `PEER_FLOOD` can't be provoked on purpose without getting the account limited for spam: if it ever shows up, record the tool error and the log line.
 
 1. **Configuration.** Production runs on the defaults, 20 writes per account in any 10 minutes and 5 messages per chat in any minute:
 
@@ -667,22 +667,82 @@ Until the Drafts tools (#43) land no tool writes, so on production this release 
    # expect no output (exit status 1): neither is set, so the defaults apply; if one is set, record its value
    ```
 
-2. **Reading is unaffected.** With the regular connector, ask Claude Code "list my latest Telegram chats, then show the last 20 messages of the first one and search my chats for 'hello'". `list_chats`, `get_messages` and `search_messages` answer as before, with no "retry in" error, and `tools/list` has the same tools as before this release (no write tool yet).
+2. **Reading is unaffected.** With the regular connector (a `read` Grant), ask Claude Code "list my latest Telegram chats, then show the last 20 messages of the first one and search my chats for 'hello'". `list_chats`, `get_messages` and `search_messages` answer as before, with no "retry in" error, and `tools/list` has no write tool (`save_draft` needs `draft`).
 
 3. **The server's side**, within 15 minutes of step 2:
 
    ```sh
    logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
-   logs | grep -cE 'class=.?writes|over a write limit|PEER_FLOOD'   # expect 0: nothing writes yet
+   logs | grep -cE 'class=.?writes|over a write limit|PEER_FLOOD'   # expect 0: reading spends no writes (run it before step 4)
    ```
 
-4. **After #43 (`save_draft`) is deployed: the Writes budget.** With a connector granted `draft`, ask: "Call save_draft 21 times in a row in my Saved Messages, with text 'budget check N' for N = 1 to 21. Stop at the first error and print its text verbatim. Then call list_chats with limit 3." Expect drafts 1 to 20 to succeed (the Saved Messages input field in the app shows "budget check 20"), the 21st to fail at once with "This account's writes budget (…) is used up; retry in N s. Nothing was written, and it is not queued; reading tools still work." with N close to 600, and `list_chats` to answer right after. Then:
+4. **The Writes budget, with `save_draft`.** With the `telegram-drafts` connector of §53 (a Grant with `draft`) and no write by this account in the last 10 minutes (no `draft saved` line in `logs` within them), ask: "Find my Saved Messages chat (list_chats, the one with is_self). Call save_draft 21 times in a row there, with text 'budget check N' for N = 1 to 21, format plain. Stop at the first error and print its text verbatim. Then call list_chats with limit 3." Expect calls 1 to 20 to answer `status: "saved"` (the Saved Messages input field in the app shows "budget check 20": each replaced the one before), the 21st to fail at once with "This account's writes budget (messages, reactions, marking read, Drafts per 10 minutes) is used up; retry in N s. Nothing was written, and it is not queued; reading tools still work." with N a little under 600 (600 less the seconds since the 1st call), and `list_chats` to answer right after. Then:
 
    ```sh
+   logs | grep -c 'draft saved'                 # expect 20: the 21st never reached Telegram
    logs | grep -E 'over a write limit'          # expect 1 WARN with limit="writes_budget" and seconds=N
    logs | grep -cF 'budget check'               # expect 0: Draft text is never logged
    ```
 
-   After N seconds, clear the Draft (`save_draft` with empty text): it works again.
+   After N seconds, clear the Draft (`save_draft` with text `""`): it answers `status: "cleared"` and the field is empty again.
 
 5. **After #46 and #47 (`send_message`, `react`) are deployed: the Send cap.** With a Grant whose Send allow-list has two chats A and B (both your own test chats) and auto-send on, and a Writes budget not used in the last 10 minutes, ask: "Send 'cap check N' to A for N = 1 to 6, as fast as you can, stopping at the first error and printing it verbatim; then send 'cap check B' to B and react 👍 to the last message in A." Expect 5 messages in A, the 6th to fail at once with "Too many messages to this chat right now; retry in N s. Nothing was sent, and the message is not queued…" (N under 60), and the message to B and the reaction in A to go through. Within a minute nothing more appears in A: refused sends are never sent later. `logs | grep -E 'over a write limit'` shows one WARN with `limit="chat_send_cap"`, and `logs | grep -cF 'cap check'` is 0.
+
+## 53. Drafts: save_draft writes a formatted Draft that shows on every device, only with `draft`, and get_drafts reads them back
+
+Needs Telegram open on a phone and on Telegram Desktop with the account, a private test chat (Saved Messages works; "Alice" below is any chat of yours where a Draft does no harm), and a forum: a supergroup of yours with Topics on and a Topic "Releases" with a message in it (create one if needed). Note the forum's Topic ids with `get_chat_info` (Releases' id is `R` below; General is 1). Clear any Draft the steps below would replace first. The boundaries are also covered by fake-backed tests: `cargo test --test drafts` (4096 characters pass and 4097 don't, Markdown becomes the exact entities, the forum rule, the Scope).
+
+1. **Only a `draft` Grant has `save_draft`.**
+
+   ```sh
+   python3 scripts/scope-check.py - read                    # expect every line [PASS] and exit status 0
+   python3 scripts/scope-check.py "read draft" "read draft" # expect every line [PASS] and exit status 0
+   ```
+
+   The first lists `get_drafts` but not `save_draft`, and "calling save_draft is refused for the missing Scope" passes: the error reads "save_draft needs the `draft` Scope, which this connection was not granted (it has: read). …". The second lists both. Then add the connector the steps below use: `claude mcp add --transport http telegram-drafts https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-drafts` → Authenticate, scan the QR, tick **Write Drafts**, Allow. In a new Claude Code session `/mcp` shows both servers; with only the regular `telegram` connector (a `read` Grant), "save a Telegram draft 'hi' in my Saved Messages" can't be done: no `save_draft` is offered.
+
+2. **Markdown becomes formatting, on phone and desktop.** With `telegram-drafts`, ask:
+
+   ~~~text
+   Use save_draft in my Saved Messages with exactly the text between the lines, keeping every character:
+   ---
+   😀 **Release** _notes_: run `cargo test`, see [the PR](https://github.com/qelphybox/tg-mcp)
+   ```rust
+   fn main() {}
+   ```
+   ---
+   ~~~
+
+   Expect `status: "saved"`, `entities: 5`. On the phone and on the desktop, Saved Messages' message field shows the Draft: **Release** bold (exactly that word: the emoji before it takes two UTF-16 units and must not shift it), *notes* italic, `cargo test` monospace, "the PR" a link, and `fn main() {}` as a code block. Send it from the phone: the sent message keeps all of it, and "the PR" opens the GitHub page. Then the same text with `format: "plain"`: the field shows the asterisks, underscores and backticks as typed, with no formatting.
+
+3. **A Draft replaces the one there, and `""` clears it.** Ask: "save_draft 'first' in Alice, then 'second' in Alice, then call get_drafts". Both devices show only "second" in Alice's field; `get_drafts` has one Draft for Alice's `chat.id`, text "second". Then "save_draft with text "" in Alice": `status: "cleared"`, the field is empty on both devices, and `get_drafts` no longer lists Alice.
+
+4. **`reply_to`.** Ask: "show the last 3 messages in Alice, then save_draft 'about this' in Alice replying to the oldest of them". The field shows a reply bar quoting that message on both devices; sending it sends a reply to it. `get_drafts` shows that Draft with `reply_to` = that id.
+
+5. **A forum needs a Topic.** In the forum, ask in turn and record each answer:
+   - save_draft "x" with neither `topic` nor `reply_to`: an error "… is a forum: say which Topic to write in with topic (…; General is 1), or give reply_to, a message in that Topic". Nothing appears in any field.
+   - `topic: R`, text "in releases": `status: "saved"`, `topic: R`; the Draft is in the Releases Topic's field only, on both devices.
+   - `topic: 1`, text "in general": the Draft is in General's field only (Releases still holds "in releases").
+   - `reply_to` = the id of a message in Releases, no `topic`, text "a reply": the answer has `topic: R`; Releases' field now holds "a reply" with a reply bar.
+   - `topic: R` with `reply_to` = a message in General: an error "reply_to N is in Topic 1, not in topic R …".
+   - `topic: 1` on Alice (no forum): an error "… is not a forum …".
+
+   `get_drafts` lists the forum's Drafts with their `topic` (R and 1). Clear both (`""` with `topic: R`, then `topic: 1`).
+
+6. **Too long is an error, never split.** Ask: "save_draft in Saved Messages with the word 'lorem ' repeated 900 times (about 5400 characters), format plain". Expect an invalid-params error "text is N characters once formatted; Telegram takes at most 4096. It is not split: …" with N over 4096; the field keeps what was there before, and no message or partial Draft appears anywhere.
+
+7. **`get_drafts` lists them newest first.** Save "draft A" in Alice, then "draft B" in Saved Messages, with a minute between; then on the phone type "draft C" by hand into a third chat's field and leave it. Ask "call get_drafts". Expect C, B, A in that order (dates UTC, newest first), C's text as typed, Saved Messages marked `is_self: true`, and each `chat.id` usable with `get_messages`. Clear the three.
+
+8. **The server's side**, within 15 minutes of the steps:
+
+   ```sh
+   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep 'draft saved' | tail -5
+   # expect lines with grant_id, chat (e.g. chat=user:N, chat=channel:N), topic, reply_to, chars, entities and cleared: ids and sizes only
+   logs | grep -cE 'Release|lorem|in releases|draft A|about this'   # expect 0: Draft text is never logged
+   logs | grep -c 'tgm_'                                            # expect 0: no Token is ever logged
+   ```
+
+9. **The Writes budget** is §52 step 4, run with `telegram-drafts`.
+
+10. **Clean up.** `claude mcp remove telegram-drafts`, and end its session in Telegram → Settings → Devices.
