@@ -423,11 +423,16 @@ impl QrAttempt {
 // ── Client pool ─────────────────────────────────────────────────────────────
 
 /// A Live client: a connected grammers client for one Grant, holding the opened
-/// Grant (with its Session key) so an updated Telegram session can be re-sealed.
+/// Grant (with its Session key) so an updated Telegram session can be re-sealed;
+/// or, on the Consent screen, for a session just logged in that has no Grant
+/// yet. Dropping it closes its connection.
 pub struct LiveClient {
     client: Client,
     store: Arc<SessionStore>,
-    grant: OpenedGrant,
+    /// The Account this client acts as.
+    account_id: i64,
+    /// `None` on the Consent screen: nothing to re-seal into.
+    grant: Option<OpenedGrant>,
     /// Access hashes of users and channels seen so far, for ids handed out
     /// without one (before ids carried it). In memory only, and only as long as
     /// this Live client lives.
@@ -461,6 +466,13 @@ impl Live for LiveClient {
     }
 
     fn shutdown(&self) {
+        self.client.disconnect();
+    }
+}
+
+impl Drop for LiveClient {
+    fn drop(&mut self) {
+        // Already done for one the pool evicted; a Consent screen's ends here.
         self.client.disconnect();
     }
 }
@@ -661,7 +673,7 @@ impl Telegram for LiveClient {
                         &tl::functions::users::GetFullUser {
                             // The Account itself: inputUserSelf always works and
                             // returns its own bio.
-                            id: if u.user_id == self.grant.account_id {
+                            id: if u.user_id == self.account_id {
                                 tl::enums::InputUser::UserSelf
                             } else {
                                 tl::enums::InputUser::User(tl::types::InputUser {
@@ -809,6 +821,10 @@ impl Telegram for LiveClient {
             self.contacts_search(request)
         })
         .await
+    }
+
+    async fn existing_dialogs(&self, chats: Vec<ChatRef>) -> Result<Vec<ChatId>, TgError> {
+        find::existing_dialogs(chats, |peers| self.peer_dialogs(peers)).await
     }
 
     async fn media_file(&self, id: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {
@@ -2240,7 +2256,7 @@ impl LiveClient {
         let tl::enums::messages::DialogFilters::Filters(answer) = self
             .call(&tl::functions::messages::GetDialogFilters {}, None)
             .await?;
-        let me = self.grant.account_id;
+        let me = self.account_id;
         Ok(answer
             .filters
             .into_iter()
@@ -2253,7 +2269,7 @@ impl LiveClient {
     /// hash is asked for with the peer cache's, the Account's own Saved
     /// Messages as `inputPeerSelf`, or not at all (no call when none is left).
     async fn peer_dialogs(&self, peers: Vec<ChatRef>) -> Result<DialogsAnswer, TgError> {
-        let me = ChatId::User(self.grant.account_id);
+        let me = ChatId::User(self.account_id);
         let peers: Vec<tl::enums::InputDialogPeer> = peers
             .into_iter()
             .filter_map(|id| {
@@ -2541,8 +2557,19 @@ impl GrammersConnector {
     }
 
     async fn open(&self, grant: OpenedGrant) -> Result<LiveClient, TgError> {
-        let grant_account = grant.account_id;
+        let account_id = grant.account_id;
         let store = SessionStore::from_snapshot(&grant.telegram_session)?;
+        self.open_session(account_id, store, Some(grant)).await
+    }
+
+    /// Connect a Live client acting as `account_id` with `store`'s session,
+    /// and prove the session works (one `users.getUsers`) before handing it out.
+    async fn open_session(
+        &self,
+        account_id: i64,
+        store: SessionStore,
+        grant: Option<OpenedGrant>,
+    ) -> Result<LiveClient, TgError> {
         let Connected {
             client,
             store,
@@ -2554,25 +2581,21 @@ impl GrammersConnector {
         let live = LiveClient {
             client,
             store,
+            account_id,
             grant,
             peers: Default::default(),
             forums: Default::default(),
             folder_cache: Default::default(),
             dead: Default::default(),
-            limiter: self.limits.for_account(grant_account),
+            limiter: self.limits.for_account(account_id),
             transcriptions,
             #[cfg(test)]
             sent: Default::default(),
             #[cfg(test)]
             answers: Default::default(),
         };
-        match live.whoami().await {
-            Ok(_) => Ok(live),
-            Err(err) => {
-                live.shutdown();
-                Err(err)
-            }
-        }
+        // Dropping it on failure closes the connection.
+        live.whoami().await.map(|_| live)
     }
 
     /// Seal each changed Telegram session back into its Grant. Returns how many
@@ -2580,11 +2603,13 @@ impl GrammersConnector {
     async fn reseal(&self, changed: Vec<Evicted<LiveClient>>) -> (usize, usize) {
         let (mut saved, mut failed) = (0, 0);
         for (_, live, snapshot) in changed {
-            match self.vault.save_session(&live.grant, &snapshot).await {
+            // The pool only holds Live clients of Grants.
+            let Some(grant) = &live.grant else { continue };
+            match self.vault.save_session(grant, &snapshot).await {
                 Ok(()) => saved += 1,
                 Err(err) => {
                     failed += 1;
-                    tracing::warn!(grant_id = %live.grant.grant_id, error = %err, "re-sealing telegram session failed");
+                    tracing::warn!(grant_id = %grant.grant_id, error = %err, "re-sealing telegram session failed");
                 }
             }
         }
@@ -2607,6 +2632,17 @@ impl Connector for GrammersConnector {
             return Err(TgError::BadSession("telegram session was revoked".into()));
         }
         Ok(live)
+    }
+
+    /// Not pooled: it lives as long as the Login flow holds it. Its calls go
+    /// through the Account's limiter, like every Live client's.
+    async fn connect_for_consent(
+        &self,
+        logged_in: &LoggedIn,
+    ) -> Result<Arc<dyn Telegram>, TgError> {
+        let store = SessionStore::from_snapshot(&logged_in.telegram_session)?;
+        let live = self.open_session(logged_in.account.id, store, None).await?;
+        Ok(Arc::new(live))
     }
 
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
@@ -3796,7 +3832,8 @@ fn offline_live(grant: OpenedGrant, store: Arc<SessionStore>) -> LiveClient {
     LiveClient {
         client: Client::new(handle),
         store,
-        grant,
+        account_id: grant.account_id,
+        grant: Some(grant),
         peers: Default::default(),
         forums: Default::default(),
         folder_cache: Default::default(),
@@ -4699,6 +4736,31 @@ mod resolve_tests {
                 bots: false,
                 q: "acc".into(),
                 limit: find::TELEGRAM_LIMIT,
+            }
+            .to_bytes()]
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_dialogs_asks_get_peer_dialogs_once_for_every_chat() {
+        let (live, _dir) = cold_client().await;
+        let channel = ChatRef::new(ChatId::Channel(5), Some(7));
+        let group = ChatRef::from(ChatId::Chat(6));
+        assert!(
+            live.existing_dialogs(vec![channel, group]).await.is_err(),
+            "offline"
+        );
+        assert_eq!(
+            sent(&live),
+            [tl::functions::messages::GetPeerDialogs {
+                peers: [channel, group]
+                    .into_iter()
+                    .map(|id| {
+                        tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer {
+                            peer: direct_input_peer(id).unwrap(),
+                        })
+                    })
+                    .collect(),
             }
             .to_bytes()]
         );

@@ -162,6 +162,16 @@ pub trait Telegram: Send + Sync + 'static {
     /// returned.
     async fn find_chats(&self, query: &str, limit: usize) -> Result<find::FoundChats, TgError>;
 
+    /// Which of `chats` the Account has a dialog with, in its main list or
+    /// the Archive (one `messages.getPeerDialogs`), in the order given: a
+    /// contact it never wrote to, a Chat it left or a wrong access hash is
+    /// left out. At most [`folders::PEER_DIALOGS_CHUNK`] Chats, else
+    /// [`TgError::InvalidInput`]; none makes no call.
+    async fn existing_dialogs(
+        &self,
+        chats: Vec<chats::ChatRef>,
+    ) -> Result<Vec<chats::ChatId>, TgError>;
+
     /// The file of message `message_id`'s media in a Chat, fetched by id
     /// ([`download::locate`]): what it is (as get_messages describes it),
     /// its size and where it is. Not found, no media, or media without a
@@ -222,6 +232,14 @@ pub trait Telegram: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait Connector: Send + Sync + 'static {
     async fn connect(&self, grant: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError>;
+
+    /// A Live client for a Telegram session just logged in by the Login flow,
+    /// before any Grant exists: for the Consent screen's chat pickers. Its
+    /// calls go through the Account's limiter like any Live client's; it is
+    /// not pooled, dropping it closes its connection, and changes to its
+    /// session are not kept (the Grant gets the login's own).
+    async fn connect_for_consent(&self, logged_in: &LoggedIn)
+    -> Result<Arc<dyn Telegram>, TgError>;
 
     /// End the Grant's Telegram session (`auth.logOut`, so it leaves the Account's
     /// Active sessions) and drop its Live client. A session Telegram already
@@ -318,6 +336,9 @@ mod tests {
     #[async_trait::async_trait]
     impl Connector for Hung {
         async fn connect(&self, _: OpenedGrant) -> Result<Arc<dyn Telegram>, TgError> {
+            unreachable!()
+        }
+        async fn connect_for_consent(&self, _: &LoggedIn) -> Result<Arc<dyn Telegram>, TgError> {
             unreachable!()
         }
         async fn log_out(&self, _: OpenedGrant) -> Result<(), TgError> {

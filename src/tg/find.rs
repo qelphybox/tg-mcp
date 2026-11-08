@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     TgError,
-    chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind},
+    chats::{ChatId, ChatKind, ChatRef, DialogsAnswer, RawPeer, fallback_kind},
+    folders::PEER_DIALOGS_CHUNK,
     messages::{Issuer, KnownHashes},
 };
 
@@ -118,6 +119,37 @@ fn assemble(answer: FoundAnswer, known: KnownHashes<'_>, limit: usize) -> FoundC
         })
         .collect();
     FoundChats { chats }
+}
+
+/// Which of `chats` the Account has a dialog with, in the order given, each
+/// once: one `messages.getPeerDialogs` through `peer_dialogs` (none for no
+/// Chats). Telegram answers no dialog for a contact the Account never wrote
+/// to, a Chat it left or a wrong access hash. The Consent screen's search
+/// keeps only these: a Send allow-list holds existing dialogs only (ADR-0005).
+pub async fn existing_dialogs<F, Fut>(
+    chats: Vec<ChatRef>,
+    peer_dialogs: F,
+) -> Result<Vec<ChatId>, TgError>
+where
+    F: FnOnce(Vec<ChatRef>) -> Fut,
+    Fut: Future<Output = Result<DialogsAnswer, TgError>>,
+{
+    if chats.len() > PEER_DIALOGS_CHUNK {
+        return Err(TgError::InvalidInput(format!(
+            "at most {PEER_DIALOGS_CHUNK} chats at once"
+        )));
+    }
+    if chats.is_empty() {
+        return Ok(Vec::new());
+    }
+    let asked: Vec<ChatId> = chats.iter().map(ChatRef::chat).collect();
+    let answer = peer_dialogs(chats).await?;
+    let found: HashSet<ChatId> = answer.dialogs.iter().map(|d| d.chat).collect();
+    let mut seen = HashSet::new();
+    Ok(asked
+        .into_iter()
+        .filter(|chat| found.contains(chat) && seen.insert(*chat))
+        .collect())
 }
 
 /// How many common chats `messages.getCommonChats` is asked for: get_chat_info
@@ -293,5 +325,57 @@ mod tests {
             }));
             assert!(matches!(result, Err(TgError::InvalidInput(_))));
         }
+    }
+
+    fn dialog(chat: ChatId) -> crate::tg::chats::RawDialog {
+        crate::tg::chats::RawDialog {
+            chat,
+            top_message: 1,
+            unread_count: 0,
+            pinned: false,
+            folder_id: 0,
+            unread_mark: false,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn only_chats_with_a_dialog_are_kept_in_the_order_asked() {
+        let group = ChatId::Chat(1);
+        let contact = ChatId::User(2);
+        let channel = ChatId::Channel(3);
+        let asked = vec![
+            ChatRef::from(channel),
+            ChatRef::from(contact),
+            ChatRef::from(group),
+            ChatRef::from(channel),
+        ];
+        let kept = now(existing_dialogs(asked.clone(), |peers| {
+            assert_eq!(peers, asked, "one call, for every Chat asked");
+            // Telegram's order, and no dialog for the contact.
+            std::future::ready(Ok(DialogsAnswer {
+                dialogs: vec![dialog(group), dialog(channel)],
+                ..DialogsAnswer::default()
+            }))
+        }))
+        .unwrap();
+        assert_eq!(kept, [channel, group]);
+
+        let none = now(existing_dialogs(Vec::new(), |_| {
+            unreachable!("no Chats, no call");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(DialogsAnswer::default()))
+        }));
+        assert_eq!(none.unwrap(), Vec::<ChatId>::new());
+
+        let too_many = (1..=PEER_DIALOGS_CHUNK as i64 + 1)
+            .map(|id| ChatRef::from(ChatId::User(id)))
+            .collect();
+        let refused = now(existing_dialogs(too_many, |_| {
+            unreachable!("refused before any call");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(DialogsAnswer::default()))
+        }));
+        assert!(matches!(refused, Err(TgError::InvalidInput(_))));
     }
 }

@@ -24,7 +24,7 @@ use std::{cmp::Ordering, sync::Arc};
 
 use super::{
     Account, Telegram, TgError,
-    chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
+    chats::{ChatId, ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
     document::{self, Document, DocumentContent},
     download::{FileError, FilePart, FileRequest, MediaFile},
     drafts::{Draft, DraftChat, Drafts, NewDraft, SavedDraft},
@@ -687,6 +687,11 @@ impl Telegram for Sanitised {
 
     async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
         self.0.find_chats(query, limit).await.map(sanitised)
+    }
+
+    /// Ids only.
+    async fn existing_dialogs(&self, chats: Vec<ChatRef>) -> Result<Vec<ChatId>, TgError> {
+        self.0.existing_dialogs(chats).await
     }
 
     async fn media_file(&self, chat: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {

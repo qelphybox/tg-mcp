@@ -1809,6 +1809,12 @@ impl Telegram for FakeTelegram {
         Ok(page)
     }
 
+    /// The same `messages.getPeerDialogs` call as the Live client, answered
+    /// by [`Self::peer_dialogs`].
+    async fn existing_dialogs(&self, chats: Vec<ChatRef>) -> Result<Vec<ChatId>, TgError> {
+        find::existing_dialogs(chats, |peers| std::future::ready(self.peer_dialogs(&peers))).await
+    }
+
     /// The same `contacts.search` call as the Live client, answered by
     /// [`contacts_search`].
     async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
@@ -2860,6 +2866,8 @@ struct FakeTelegramSide {
     folder_caches: Mutex<std::collections::HashMap<String, Arc<FolderCache>>>,
     /// The folder requests answered, for every Grant, in order.
     folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
+    /// How many Consent screens connected (see [`Connector::connect_for_consent`]).
+    consent_clients: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeConnector {
@@ -2898,6 +2906,13 @@ impl FakeConnector {
     /// Telegram's Drafts, where every Grant's Drafts go.
     pub fn drafts(&self) -> Arc<FakeDrafts> {
         self.telegram.drafts.clone()
+    }
+
+    /// How many Live clients the Consent screen opened, for sessions without a Grant.
+    pub fn consent_clients(&self) -> usize {
+        self.telegram
+            .consent_clients
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The folder requests Telegram answered since the last call, in order.
@@ -2992,6 +3007,38 @@ impl Connector for FakeConnector {
             data,
             known,
             folder_cache,
+            folder_rpcs: self.telegram.folder_rpcs.clone(),
+            files: self.telegram.files.clone(),
+            transcriber: self.telegram.transcriber.clone(),
+            drafts: self.telegram.drafts.clone(),
+        }))
+    }
+
+    /// A fresh peer cache and folder cache: nothing is shared with the
+    /// Grant's Live client to come.
+    async fn connect_for_consent(
+        &self,
+        logged_in: &LoggedIn,
+    ) -> Result<Arc<dyn Telegram>, TgError> {
+        let data: FakeData = serde_json::from_slice(&logged_in.telegram_session)
+            .map_err(|e| TgError::BadSession(e.to_string()))?;
+        self.reachable()?;
+        if self
+            .telegram
+            .dead
+            .lock()
+            .unwrap()
+            .contains(&data.account.id)
+        {
+            return Err(TgError::BadSession("fake session was ended".into()));
+        }
+        self.telegram
+            .consent_clients
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(FakeTelegram {
+            data,
+            known: Arc::default(),
+            folder_cache: Arc::default(),
             folder_rpcs: self.telegram.folder_rpcs.clone(),
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
