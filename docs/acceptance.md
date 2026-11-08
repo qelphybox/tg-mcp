@@ -655,3 +655,34 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
    ```
 
    In Telegram → Settings → Devices, no "Unofficial MCP Server" session from steps 4-7 is left.
+
+## 52. Writes have their own budget and a per-Chat Send cap, never wait, and reading is unaffected
+
+Until the Drafts tools (#43) land no tool writes, so on production this release only shows that the limits are configured and that reading behaves as before. The limits themselves are covered by paused-clock tests (`cargo test --lib limits::`: the 21st write in 10 minutes and the 6th send to one Chat in a minute fail at once while reads and other Chats go on; a write `FLOOD_WAIT` is neither slept through nor retried; `PEER_FLOOD` is returned once, as is). `PEER_FLOOD` can't be provoked on purpose without getting the account limited for spam: if it ever shows up, record the tool error and the log line.
+
+1. **Configuration.** Production runs on the defaults, 20 writes per account in any 10 minutes and 5 messages per chat in any minute:
+
+   ```sh
+   ssh deploy@$KAMAL_HOST 'docker exec $(docker ps -qf label=service=tg-mcp) printenv TG_MCP_ACCOUNT_WRITES_PER_10_MIN TG_MCP_CHAT_SENDS_PER_MINUTE'
+   # expect no output (exit status 1): neither is set, so the defaults apply; if one is set, record its value
+   ```
+
+2. **Reading is unaffected.** With the regular connector, ask Claude Code "list my latest Telegram chats, then show the last 20 messages of the first one and search my chats for 'hello'". `list_chats`, `get_messages` and `search_messages` answer as before, with no "retry in" error, and `tools/list` has the same tools as before this release (no write tool yet).
+
+3. **The server's side**, within 15 minutes of step 2:
+
+   ```sh
+   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -cE 'class=.?writes|over a write limit|PEER_FLOOD'   # expect 0: nothing writes yet
+   ```
+
+4. **After #43 (`save_draft`) is deployed: the Writes budget.** With a connector granted `draft`, ask: "Call save_draft 21 times in a row in my Saved Messages, with text 'budget check N' for N = 1 to 21. Stop at the first error and print its text verbatim. Then call list_chats with limit 3." Expect drafts 1 to 20 to succeed (the Saved Messages input field in the app shows "budget check 20"), the 21st to fail at once with "This account's writes budget (…) is used up; retry in N s. Nothing was written, and it is not queued; reading tools still work." with N close to 600, and `list_chats` to answer right after. Then:
+
+   ```sh
+   logs | grep -E 'over a write limit'          # expect 1 WARN with limit="writes_budget" and seconds=N
+   logs | grep -cF 'budget check'               # expect 0: Draft text is never logged
+   ```
+
+   After N seconds, clear the Draft (`save_draft` with empty text): it works again.
+
+5. **After #46 and #47 (`send_message`, `react`) are deployed: the Send cap.** With a Grant whose Send allow-list has two chats A and B (both your own test chats) and auto-send on, and a Writes budget not used in the last 10 minutes, ask: "Send 'cap check N' to A for N = 1 to 6, as fast as you can, stopping at the first error and printing it verbatim; then send 'cap check B' to B and react 👍 to the last message in A." Expect 5 messages in A, the 6th to fail at once with "Too many messages to this chat right now; retry in N s. Nothing was sent, and the message is not queued…" (N under 60), and the message to B and the reaction in A to go through. Within a minute nothing more appears in A: refused sends are never sent later. `logs | grep -E 'over a write limit'` shows one WARN with `limit="chat_send_cap"`, and `logs | grep -cF 'cap check'` is 0.
