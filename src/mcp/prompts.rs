@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 
 use rmcp::{
     ErrorData,
-    handler::server::wrapper::Parameters,
-    model::{GetPromptResult, PromptMessage, Role},
+    handler::server::{prompt::cached_arguments_from_schema, wrapper::Parameters},
+    model::{GetPromptResult, PromptArgument, PromptMessage, Role},
     prompt, prompt_router, schemars,
 };
 use serde::Deserialize;
@@ -76,6 +76,7 @@ impl TgMcp {
     #[prompt(
         name = "catch_up",
         title = "Catch up on Telegram",
+        arguments = in_order::<CatchUpArgs>(&["since", "chat", "max_chats"]),
         description = "What did I miss: reads the unread chats (or one chat) message by message \
 and reports per chat what happened and who is waiting for your reply, with links, ending with a \
 \"needs your reply\" list."
@@ -90,6 +91,7 @@ and reports per chat what happened and who is waiting for your reply, with links
     #[prompt(
         name = "research",
         title = "Research a topic in Telegram",
+        arguments = in_order::<ResearchArgs>(&["topic", "since", "chat"]),
         description = "Find what your chats say about a topic: several short searches (word \
 forms, synonyms, transliteration), hits read in context, every claim cited with chat and date, \
 facts kept apart from inferences."
@@ -100,6 +102,22 @@ facts kept apart from inferences."
     ) -> Result<GetPromptResult, ErrorData> {
         Ok(user_message(research(args)?))
     }
+}
+
+/// A prompt's arguments in this order, not the schema's alphabetical one:
+/// Claude Code fills them by position, so the one most often given (the
+/// required one, if any) goes first.
+fn in_order<T: schemars::JsonSchema + std::any::Any>(
+    order: &[&str],
+) -> Option<Vec<PromptArgument>> {
+    let mut arguments = cached_arguments_from_schema::<T>()?;
+    arguments.sort_by_key(|a| {
+        order
+            .iter()
+            .position(|name| *name == a.name)
+            .unwrap_or(usize::MAX)
+    });
+    Some(arguments)
 }
 
 /// The request, then the user's scope (if any), each followed by a blank line.

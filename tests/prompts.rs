@@ -72,13 +72,14 @@ async fn both_prompts_are_listed_with_their_arguments() {
     let names: BTreeSet<_> = prompts.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, BTreeSet::from(["catch_up", "research"]));
     for (name, expected) in [
+        // In this order: Claude Code fills a prompt's arguments by position.
         (
             "catch_up",
-            vec![("chat", false), ("max_chats", false), ("since", false)],
+            vec![("since", false), ("chat", false), ("max_chats", false)],
         ),
         (
             "research",
-            vec![("chat", false), ("since", false), ("topic", true)],
+            vec![("topic", true), ("since", false), ("chat", false)],
         ),
     ] {
         let prompt = prompts.iter().find(|p| p.name == name).unwrap();
@@ -87,7 +88,7 @@ async fn both_prompts_are_listed_with_their_arguments() {
             "{name}: {prompt:?}"
         );
         assert!(prompt.title.is_some(), "{name}: {prompt:?}");
-        let mut arguments: Vec<_> = prompt
+        let arguments: Vec<_> = prompt
             .arguments
             .as_ref()
             .unwrap()
@@ -101,7 +102,6 @@ async fn both_prompts_are_listed_with_their_arguments() {
                 (a.name.as_str(), a.required == Some(true))
             })
             .collect();
-        arguments.sort();
         assert_eq!(arguments, expected, "{name}");
     }
 }
