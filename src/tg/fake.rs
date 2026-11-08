@@ -20,9 +20,12 @@ use super::{
         DialogsAnswer, DialogsRequest, MessagePreview, RawDialog, RawMessage, RawPeer, RawProfile,
         chat_info, fallback_kind, user_info,
     },
+    compose,
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
+    drafts::{self, Drafts, DraftsAnswer, NewDraft, RawDraft, SavedDraft},
     find::{self, FindRequest, FoundAnswer, FoundChats},
     folders::{self, ChatFolder, RawChatFolder},
+    markdown::FormattedText,
     media::{FileLocation, StoredFile},
     members::{
         self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
@@ -130,6 +133,116 @@ pub struct FakeData {
     /// When set, `messages.getDialogFilters` fails, and not with a flood.
     #[serde(default)]
     pub chat_folders_fail: bool,
+    /// The Account's Drafts when its first Live client connects (#43), as
+    /// if the user typed them in an app. From then on Telegram keeps them:
+    /// [`FakeDrafts`].
+    #[serde(default)]
+    pub drafts: Vec<FakeDraft>,
+    /// When set, every write (method class Writes, e.g. `messages.saveDraft`)
+    /// answers like FLOOD_WAIT_<seconds>, and nothing else does.
+    #[serde(default)]
+    pub writes_flood_wait: Option<u32>,
+}
+
+/// One Draft of a fake Account: a Chat's input field, or a forum Topic's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FakeDraft {
+    pub chat: ChatId,
+    /// The Topic's top message (`top_msg_id`); `None` in General and outside
+    /// forums.
+    #[serde(default)]
+    pub topic: Option<i32>,
+    #[serde(default)]
+    pub reply_to: Option<i32>,
+    /// The text and its entities, as `messages.saveDraft` got them.
+    pub text: FormattedText,
+    /// Unix seconds.
+    pub date: i32,
+}
+
+impl FakeDraft {
+    pub fn new(chat: ChatId, text: &str, date: i32) -> Self {
+        Self {
+            chat,
+            topic: None,
+            reply_to: None,
+            text: FormattedText::plain(text),
+            date,
+        }
+    }
+}
+
+/// Telegram's Drafts as the fake models them, shared by every Grant like
+/// Telegram is: per Account, one Draft per Chat or forum Topic, the newest
+/// replacing the one there, synced to every device (every Grant of the
+/// Account sees it).
+#[derive(Debug, Default)]
+pub struct FakeDrafts {
+    state: Mutex<DraftsState>,
+}
+
+#[derive(Debug, Default)]
+struct DraftsState {
+    /// Each Account's Drafts, once its first Live client connected.
+    drafts: std::collections::HashMap<i64, Vec<FakeDraft>>,
+    /// The last date given to a Draft: each save gets a later one, so the
+    /// newest is always first even within one second.
+    last_date: i32,
+}
+
+impl FakeDrafts {
+    fn state(&self) -> std::sync::MutexGuard<'_, DraftsState> {
+        self.state.lock().unwrap()
+    }
+
+    /// An Account's Drafts, the most recently saved first.
+    pub fn of(&self, account: i64) -> Vec<FakeDraft> {
+        let mut drafts = self
+            .state()
+            .drafts
+            .get(&account)
+            .cloned()
+            .unwrap_or_default();
+        drafts.sort_by_key(|d| std::cmp::Reverse(d.date));
+        drafts
+    }
+
+    /// The Drafts an Account has when it first connects.
+    fn seed(&self, account: i64, drafts: &[FakeDraft]) {
+        let mut state = self.state();
+        if !state.drafts.contains_key(&account) {
+            let latest = drafts.iter().map(|d| d.date).max().unwrap_or_default();
+            state.last_date = state.last_date.max(latest);
+            state.drafts.insert(account, drafts.to_vec());
+        }
+    }
+
+    /// `messages.saveDraft`: replace the Draft of `chat` / `topic`, or clear
+    /// it with empty text.
+    fn save(
+        &self,
+        account: i64,
+        chat: ChatId,
+        topic: Option<i32>,
+        reply_to: Option<i32>,
+        text: FormattedText,
+    ) {
+        let mut state = self.state();
+        let now = i32::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+        let date = now.max(state.last_date + 1);
+        let drafts = state.drafts.entry(account).or_default();
+        drafts.retain(|d| (d.chat, d.topic) != (chat, topic));
+        if !text.text.is_empty() {
+            drafts.push(FakeDraft {
+                chat,
+                topic,
+                reply_to,
+                text,
+                date,
+            });
+            state.last_date = date;
+        }
+    }
 }
 
 /// One Chat folder of a fake Account. Its Chats are named by id; the fake
@@ -550,7 +663,14 @@ impl FakeData {
             transcribe: FakeTranscribeAccess::default(),
             chat_folders: Vec::new(),
             chat_folders_fail: false,
+            drafts: Vec::new(),
+            writes_flood_wait: None,
         }
+    }
+
+    pub fn with_drafts(mut self, drafts: Vec<FakeDraft>) -> Self {
+        self.drafts = drafts;
+        self
     }
 
     pub fn with_chat_folders(mut self, folders: Vec<FakeChatFolder>) -> Self {
@@ -868,6 +988,7 @@ pub struct FakeTelegram {
     known: KnownPeers,
     files: Arc<FakeFiles>,
     transcriber: Arc<FakeTranscriber>,
+    drafts: Arc<FakeDrafts>,
 }
 
 /// Telegram's transcription service as the fake models it
@@ -1360,12 +1481,20 @@ type KnownPeers = Arc<Mutex<std::collections::HashMap<ChatId, i64>>>;
 
 impl FakeTelegram {
     pub fn new(data: FakeData) -> Self {
+        let drafts = Arc::new(FakeDrafts::default());
+        drafts.seed(data.account.id, &data.drafts);
         Self {
             data,
             known: Arc::default(),
             files: Arc::default(),
             transcriber: Arc::default(),
+            drafts,
         }
+    }
+
+    /// Where this Account's Drafts are kept.
+    pub fn drafts(&self) -> &Arc<FakeDrafts> {
+        &self.drafts
     }
 
     /// The transcription service this Account's transcriptions go to.
@@ -1845,6 +1974,89 @@ impl Telegram for FakeTelegram {
                 [start as usize..end as usize]
                 .to_vec(),
         }))
+    }
+
+    /// Like `messages.getAllDrafts`: one `updateDraftMessage` per Draft,
+    /// with the Chats and users they are in.
+    async fn get_drafts(&self) -> Result<Drafts, TgError> {
+        self.flood()?;
+        let peers = self.peers();
+        self.remember(&peers);
+        let drafts = self
+            .drafts
+            .of(self.data.account.id)
+            .into_iter()
+            .map(|d| RawDraft {
+                chat: d.chat,
+                topic: d.topic,
+                reply_to: d.reply_to,
+                text: d.text.text,
+                date: d.date,
+            })
+            .collect();
+        Ok(drafts::assemble(DraftsAnswer {
+            drafts,
+            peers,
+            forums: self.data.topics.keys().copied().collect(),
+        }))
+    }
+
+    /// Like the Live client: [`compose::place`] with what Telegram knows of
+    /// the Chat, then one `messages.saveDraft`, which Telegram refuses for a
+    /// reply to a message the Chat doesn't have or a Topic the forum doesn't.
+    async fn save_draft(&self, draft: NewDraft) -> Result<SavedDraft, TgError> {
+        self.check_hash(draft.chat)?;
+        let chat = draft.chat.chat();
+        if !self.knows(chat) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        let message_topic = |id| {
+            get_message(&self.data.messages, chat, &MessageRequest { id })
+                .into_iter()
+                .find(|found| found.chat == chat)
+                .map(|found| found.message.topic)
+        };
+        let placement = compose::place(
+            chat,
+            draft.reply_to,
+            draft.topic,
+            || std::future::ready(Ok(self.data.topics.contains_key(&chat))),
+            |id| std::future::ready(Ok(message_topic(id))),
+        )
+        .await?;
+        if let Some(seconds) = self.data.writes_flood_wait {
+            return Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Writes,
+            });
+        }
+        if let Some(id) = placement.reply_to
+            && message_topic(id).is_none()
+        {
+            return Err(TgError::InvalidInput(format!(
+                "reply_to {id} is not a message of {chat}"
+            )));
+        }
+        if let (None, Some(topic)) = (placement.reply_to, placement.topic) {
+            self.check_topic(chat, topic)?;
+        }
+        let top = placement.reply_header().and_then(|(_, top)| top);
+        let cleared = draft.text.text.is_empty();
+        self.drafts.save(
+            self.data.account.id,
+            chat,
+            top,
+            placement.reply_to,
+            draft.text,
+        );
+        Ok(SavedDraft {
+            chat,
+            topic: placement.topic,
+            reply_to: placement.reply_to,
+            cleared,
+        })
     }
 }
 
@@ -2579,6 +2791,8 @@ struct FakeTelegramSide {
     files: Arc<FakeFiles>,
     /// Telegram's transcription service, the same for every Grant.
     transcriber: Arc<FakeTranscriber>,
+    /// Every Account's Drafts, kept by Telegram for all of its Grants.
+    drafts: Arc<FakeDrafts>,
 }
 
 impl FakeConnector {
@@ -2612,6 +2826,11 @@ impl FakeConnector {
     /// Telegram's transcription service, where every Grant's transcriptions go.
     pub fn transcriber(&self) -> Arc<FakeTranscriber> {
         self.telegram.transcriber.clone()
+    }
+
+    /// Telegram's Drafts, where every Grant's Drafts go.
+    pub fn drafts(&self) -> Arc<FakeDrafts> {
+        self.telegram.drafts.clone()
     }
 
     /// Make every call to Telegram fail as if it were down.
@@ -2683,11 +2902,13 @@ impl Connector for FakeConnector {
             .lock()
             .unwrap()
             .insert(grant.grant_id.as_str().to_string(), data.account.id);
+        self.telegram.drafts.seed(data.account.id, &data.drafts);
         Ok(Arc::new(FakeTelegram {
             data,
             known,
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
+            drafts: self.telegram.drafts.clone(),
         }))
     }
 

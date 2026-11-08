@@ -20,9 +20,12 @@ use super::{
         self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatsQuery, Cursor, DialogsAnswer,
         DialogsRequest, RawDialog, RawMessage, RawPeer, RawProfile, RawUserStatus,
     },
+    compose::{self, Placement},
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
+    drafts::{self, Drafts, DraftsAnswer, NewDraft, RawDraft, SavedDraft},
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     folders::{self, ChatFolder, RawChatFolder},
+    markdown::{Entity, EntityKind},
     media,
     media::{FileLocation, StoredFile},
     members::{
@@ -877,6 +880,200 @@ impl Telegram for LiveClient {
             }
         }
     }
+
+    async fn get_drafts(&self) -> Result<Drafts, TgError> {
+        let (updates, users, chats) = match self
+            .call(&tl::functions::messages::GetAllDrafts {}, None)
+            .await?
+        {
+            tl::enums::Updates::Updates(u) => (u.updates, u.users, u.chats),
+            tl::enums::Updates::Combined(u) => (u.updates, u.users, u.chats),
+            tl::enums::Updates::UpdateShort(u) => (vec![u.update], vec![], vec![]),
+            _ => (vec![], vec![], vec![]),
+        };
+        let forums = raw_forums(&chats, Vec::new()).forums;
+        let peers = self.described(users, chats);
+        Ok(drafts::assemble(DraftsAnswer {
+            drafts: updates.into_iter().filter_map(raw_draft).collect(),
+            peers,
+            forums,
+        }))
+    }
+
+    async fn save_draft(&self, draft: NewDraft) -> Result<SavedDraft, TgError> {
+        let NewDraft {
+            chat: id,
+            text,
+            reply_to,
+            topic,
+        } = draft;
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
+        let placement = compose::place(
+            chat,
+            reply_to,
+            topic,
+            || self.is_forum(id),
+            |message| self.message_topic(&peer, chat, message),
+        )
+        .await?;
+        let cleared = text.text.is_empty();
+        let saved = self
+            .call_refusing(
+                &tl::functions::messages::SaveDraft {
+                    no_webpage: false,
+                    invert_media: false,
+                    reply_to: input_reply_to(placement),
+                    peer,
+                    message: text.text,
+                    entities: (!text.entities.is_empty())
+                        .then(|| text.entities.into_iter().map(message_entity).collect()),
+                    media: None,
+                    effect: None,
+                    suggested_post: None,
+                    rich_message: None,
+                },
+                Some(chat),
+                |err| draft_refusal(err, chat, placement),
+            )
+            .await?;
+        if !saved {
+            return Err(TgError::Upstream(
+                "telegram answered saveDraft with false".into(),
+            ));
+        }
+        Ok(SavedDraft {
+            chat,
+            topic: placement.topic,
+            reply_to: placement.reply_to,
+            cleared,
+        })
+    }
+}
+
+/// A Draft from one update of `messages.getAllDrafts`: `None` for another
+/// update or an empty Draft. A Topic's Draft replies to the Topic's top
+/// message without being a reply: only a real reply in the same Chat is
+/// its `reply_to`.
+fn raw_draft(update: tl::enums::Update) -> Option<RawDraft> {
+    let tl::enums::Update::DraftMessage(update) = update else {
+        return None;
+    };
+    let tl::enums::DraftMessage::Message(draft) = update.draft else {
+        return None;
+    };
+    let reply_to = match draft.reply_to {
+        Some(tl::enums::InputReplyTo::Message(r))
+            if r.reply_to_peer_id.is_none() && Some(r.reply_to_msg_id) != update.top_msg_id =>
+        {
+            Some(r.reply_to_msg_id)
+        }
+        _ => None,
+    };
+    Some(RawDraft {
+        chat: chat_id(&update.peer),
+        topic: update.top_msg_id,
+        reply_to,
+        text: message_text(draft.message, draft.rich_message.as_ref()),
+        date: draft.date,
+    })
+}
+
+/// Telegram's `reply_to` for a text placed by [`compose::place`].
+fn input_reply_to(placement: Placement) -> Option<tl::enums::InputReplyTo> {
+    let (reply_to_msg_id, top_msg_id) = placement.reply_header()?;
+    Some(tl::enums::InputReplyTo::Message(
+        tl::types::InputReplyToMessage {
+            reply_to_msg_id,
+            top_msg_id,
+            reply_to_peer_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            monoforum_peer_id: None,
+            todo_item_id: None,
+            poll_option: None,
+        },
+    ))
+}
+
+fn message_entity(entity: Entity) -> tl::enums::MessageEntity {
+    let Entity {
+        kind,
+        offset,
+        length,
+    } = entity;
+    match kind {
+        EntityKind::Bold => {
+            tl::enums::MessageEntity::Bold(tl::types::MessageEntityBold { offset, length })
+        }
+        EntityKind::Italic => {
+            tl::enums::MessageEntity::Italic(tl::types::MessageEntityItalic { offset, length })
+        }
+        EntityKind::Code => {
+            tl::enums::MessageEntity::Code(tl::types::MessageEntityCode { offset, length })
+        }
+        EntityKind::Pre { language } => {
+            tl::enums::MessageEntity::Pre(tl::types::MessageEntityPre {
+                offset,
+                length,
+                language,
+            })
+        }
+        EntityKind::TextUrl { url } => {
+            tl::enums::MessageEntity::TextUrl(tl::types::MessageEntityTextUrl {
+                offset,
+                length,
+                url,
+            })
+        }
+    }
+}
+
+/// Telegram's refusals of a `messages.saveDraft` that are the caller's to
+/// fix, as what to fix. Only error codes are quoted, never the text.
+fn draft_refusal(err: &InvocationError, chat: ChatId, placement: Placement) -> Option<TgError> {
+    let InvocationError::Rpc(rpc) = err else {
+        return None;
+    };
+    let code = rpc.name.as_str();
+    let invalid = |msg: String| Some(TgError::InvalidInput(msg));
+    match code {
+        "MESSAGE_TOO_LONG" => invalid(format!(
+            "Telegram refused the Draft as too long (MESSAGE_TOO_LONG): it counts some \
+             characters double; shorten it below {} characters",
+            compose::MAX_TEXT_CHARS
+        )),
+        "REPLY_MESSAGE_ID_INVALID" | "MSG_ID_INVALID" | "REPLY_TO_INVALID" => {
+            match (placement.reply_to, placement.topic) {
+                (Some(message), _) => invalid(format!(
+                    "reply_to {message} is not a message of {chat} ({code})"
+                )),
+                (None, Some(topic)) => Some(topics::unknown_topic(topic)),
+                (None, None) => None,
+            }
+        }
+        "TOPIC_ID_INVALID" | "TOPIC_DELETED" => placement.topic.map(topics::unknown_topic),
+        "ENTITY_BOUNDS_INVALID" | "ENTITY_TEXTURL_INVALID" | "ENTITIES_TOO_LONG" => {
+            invalid(format!(
+                "Telegram refused the formatting ({code}): fix the Markdown, or pass format \
+                 \"plain\""
+            ))
+        }
+        "CHAT_WRITE_FORBIDDEN"
+        | "CHAT_ADMIN_REQUIRED"
+        | "CHAT_RESTRICTED"
+        | "CHAT_SEND_PLAIN_FORBIDDEN"
+        | "USER_BANNED_IN_CHANNEL"
+        | "TOPIC_CLOSED" => invalid(format!(
+            "this account can't write in {chat}{}: Telegram refused the Draft ({code})",
+            placement
+                .topic
+                .map(|t| format!(" (Topic {t})"))
+                .unwrap_or_default()
+        )),
+        _ => None,
+    }
 }
 
 /// What a refused `upload.getFile` to DC `dc_id` asks of the downloader.
@@ -1283,12 +1480,22 @@ impl LiveClient {
             .copied()
     }
 
-    /// `topic` needs a forum: a user or basic group never is one; a channel
-    /// is one if an answer said so, else one `channels.getChannels` asks.
+    /// `topic` needs a forum ([`Self::is_forum`]).
     async fn require_forum(&self, id: ChatRef) -> Result<(), TgError> {
+        if self.is_forum(id).await? {
+            Ok(())
+        } else {
+            Err(topics::not_a_forum(id.chat()))
+        }
+    }
+
+    /// Whether a Chat is a forum: a user or basic group never is one; a
+    /// channel is one if an answer said so, else one `channels.getChannels`
+    /// asks.
+    async fn is_forum(&self, id: ChatRef) -> Result<bool, TgError> {
         let chat = id.chat();
         if !matches!(chat, ChatId::Channel(_)) {
-            return Err(topics::not_a_forum(chat));
+            return Ok(false);
         }
         if self.known_forum(chat).is_none() {
             let channel = self.input_channel(id).await?;
@@ -1304,10 +1511,24 @@ impl LiveClient {
             };
             self.described(Vec::new(), chats);
         }
-        match self.known_forum(chat) {
-            Some(true) => Ok(()),
-            _ => Err(topics::not_a_forum(chat)),
-        }
+        Ok(self.known_forum(chat) == Some(true))
+    }
+
+    /// The Topic of message `id` of a Chat, as [`compose::place`] asks for
+    /// it: one `channels.getMessages` / `messages.getMessages` call. `None`:
+    /// the Chat has no such message.
+    async fn message_topic(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        id: i32,
+    ) -> Result<Option<Option<i32>>, TgError> {
+        let answer = self.get_message(peer, chat, MessageRequest { id }).await?;
+        Ok(answer
+            .messages
+            .into_iter()
+            .find(|found| found.chat == chat && found.message.id == id)
+            .map(|found| found.message.topic))
     }
 
     /// One `messages.getForumTopicsByID` call: the Topics `ids` of a forum
@@ -5546,5 +5767,314 @@ mod folder_tests {
             Err(TgError::FloodWait { .. })
         ));
         assert_eq!(sent(&live).len(), 1, "only the flooded request went out");
+    }
+}
+
+/// Drafts (#43): what `save_draft` sends, that it spends the Writes budget,
+/// how Telegram's refusals read, and what `messages.getAllDrafts` answers.
+#[cfg(test)]
+mod draft_tests {
+    use grammers_client::tl::Serializable;
+
+    use super::*;
+    use crate::{
+        limits::WriteLimit,
+        sessions::{TokenTtl, Vault},
+        tg::markdown::{FormattedText, TextFormat},
+    };
+
+    async fn cold_client() -> (LiveClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let issued = vault.create_grant("client", 42, b"").await.unwrap();
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        (offline_live(grant, Arc::new(SessionStore::new())), dir)
+    }
+
+    fn sent(live: &LiveClient) -> Vec<Vec<u8>> {
+        live.sent.lock().unwrap().clone()
+    }
+
+    const USER: ChatId = ChatId::User(7);
+    const FORUM: ChatId = ChatId::Channel(5);
+
+    fn draft(chat: ChatId, text: &str, reply_to: Option<i32>, topic: Option<i32>) -> NewDraft {
+        NewDraft {
+            chat: ChatRef::new(chat, Some(99)),
+            text: FormattedText::new(text, TextFormat::Markdown),
+            reply_to,
+            topic,
+        }
+    }
+
+    fn save_draft(
+        peer: tl::enums::InputPeer,
+        message: &str,
+        entities: Option<Vec<tl::enums::MessageEntity>>,
+        reply_to: Option<(i32, Option<i32>)>,
+    ) -> Vec<u8> {
+        tl::functions::messages::SaveDraft {
+            no_webpage: false,
+            invert_media: false,
+            reply_to: reply_to.map(|(reply_to_msg_id, top_msg_id)| {
+                tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                    reply_to_msg_id,
+                    top_msg_id,
+                    reply_to_peer_id: None,
+                    quote_text: None,
+                    quote_entities: None,
+                    quote_offset: None,
+                    monoforum_peer_id: None,
+                    todo_item_id: None,
+                    poll_option: None,
+                })
+            }),
+            peer,
+            message: message.into(),
+            entities,
+            media: None,
+            effect: None,
+            suggested_post: None,
+            rich_message: None,
+        }
+        .to_bytes()
+    }
+
+    fn user_peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 99,
+        })
+    }
+
+    fn forum_peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: 99,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_draft_goes_out_as_one_save_draft_with_its_entities() {
+        let (live, _dir) = cold_client().await;
+        // Offline, Telegram's answer is an error; the request is what counts.
+        assert!(
+            live.save_draft(draft(USER, "**hi** [😀](https://e.com)", Some(3), None))
+                .await
+                .is_err()
+        );
+        assert!(live.save_draft(draft(USER, "", None, None)).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [
+                save_draft(
+                    user_peer(),
+                    "hi 😀",
+                    Some(vec![
+                        tl::enums::MessageEntity::Bold(tl::types::MessageEntityBold {
+                            offset: 0,
+                            length: 2
+                        }),
+                        tl::enums::MessageEntity::TextUrl(tl::types::MessageEntityTextUrl {
+                            offset: 3,
+                            length: 2,
+                            url: "https://e.com".into()
+                        }),
+                    ]),
+                    Some((3, None)),
+                ),
+                // Clearing: empty text, no entities.
+                save_draft(user_peer(), "", None, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forum_draft_names_its_topic_and_a_bad_one_is_refused_before_telegram() {
+        let (live, _dir) = cold_client().await;
+        live.forums.lock().unwrap().insert(FORUM, true);
+        assert!(
+            live.save_draft(draft(FORUM, "x", None, Some(10)))
+                .await
+                .is_err()
+        );
+        assert!(
+            live.save_draft(draft(FORUM, "y", None, Some(1)))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sent(&live),
+            [
+                save_draft(forum_peer(), "x", None, Some((10, Some(10)))),
+                // General: no Topic to name.
+                save_draft(forum_peer(), "y", None, None),
+            ]
+        );
+        // Neither topic nor reply_to: refused without asking Telegram.
+        assert!(matches!(
+            live.save_draft(draft(FORUM, "z", None, None)).await,
+            Err(TgError::InvalidInput(msg)) if msg.contains("is a forum")
+        ));
+        // A reply in a forum asks for the message first, to find its Topic.
+        assert!(
+            live.save_draft(draft(FORUM, "z", Some(12), None))
+                .await
+                .is_err()
+        );
+        let after = sent(&live);
+        assert_eq!(after.len(), 3);
+        assert_eq!(
+            after[2],
+            tl::functions::channels::GetMessages {
+                channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: 5,
+                    access_hash: 99,
+                }),
+                id: vec![tl::enums::InputMessage::Id(tl::types::InputMessageId {
+                    id: 12
+                })],
+            }
+            .to_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_twenty_first_draft_in_ten_minutes_never_reaches_telegram() {
+        let (live, _dir) = cold_client().await;
+        for n in 1..=20 {
+            assert!(matches!(
+                live.save_draft(draft(USER, &format!("budget check {n}"), None, None))
+                    .await,
+                Err(TgError::Upstream(_))
+            ));
+        }
+        match live
+            .save_draft(draft(USER, "budget check 21", None, None))
+            .await
+        {
+            Err(TgError::WritesLimited {
+                seconds,
+                limit: WriteLimit::Account,
+            }) => assert!((590..=600).contains(&seconds), "{seconds}"),
+            other => panic!("expected the writes budget, got {other:?}"),
+        }
+        assert_eq!(sent(&live).len(), 20, "the 21st was refused at home");
+    }
+
+    #[tokio::test]
+    async fn telegrams_refusals_say_what_to_fix() {
+        let (live, _dir) = cold_client().await;
+        type Save = tl::functions::messages::SaveDraft;
+        live.answers.lock().unwrap().extend([
+            rpc::<Save>(400, "REPLY_MESSAGE_ID_INVALID"),
+            rpc::<Save>(400, "MESSAGE_TOO_LONG"),
+            rpc::<Save>(400, "ENTITY_BOUNDS_INVALID"),
+            rpc::<Save>(403, "CHAT_WRITE_FORBIDDEN"),
+            rpc::<Save>(400, "PEER_ID_INVALID"),
+            rpc::<Save>(420, "FLOOD_WAIT_30"),
+        ]);
+        let refused = |result: Result<SavedDraft, TgError>| match result {
+            Err(TgError::InvalidInput(msg)) => msg,
+            other => panic!("expected invalid input, got {other:?}"),
+        };
+        let msg = refused(live.save_draft(draft(USER, "a", Some(9), None)).await);
+        assert!(
+            msg.contains("reply_to 9 is not a message of user:7"),
+            "{msg}"
+        );
+        let msg = refused(live.save_draft(draft(USER, "b", None, None)).await);
+        assert!(msg.contains("MESSAGE_TOO_LONG"), "{msg}");
+        let msg = refused(live.save_draft(draft(USER, "c", None, None)).await);
+        assert!(msg.contains("format \"plain\""), "{msg}");
+        let msg = refused(live.save_draft(draft(USER, "d", None, None)).await);
+        assert!(msg.contains("can't write in user:7"), "{msg}");
+        let msg = refused(live.save_draft(draft(USER, "e", None, None)).await);
+        assert!(msg.contains("can't be read by this account"), "{msg}");
+        assert!(matches!(
+            live.save_draft(draft(USER, "f", None, None)).await,
+            Err(TgError::FloodWait {
+                seconds: 30,
+                class: MethodClass::Writes
+            })
+        ));
+    }
+
+    fn update(
+        peer: tl::enums::Peer,
+        top_msg_id: Option<i32>,
+        reply_to: Option<i32>,
+        text: &str,
+    ) -> tl::enums::Update {
+        tl::enums::Update::DraftMessage(tl::types::UpdateDraftMessage {
+            peer,
+            top_msg_id,
+            saved_peer_id: None,
+            draft: tl::enums::DraftMessage::Message(tl::types::DraftMessage {
+                no_webpage: false,
+                invert_media: false,
+                reply_to: reply_to.map(|reply_to_msg_id| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id,
+                        top_msg_id,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                    })
+                }),
+                message: text.into(),
+                entities: None,
+                media: None,
+                date: 1000,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            }),
+        })
+    }
+
+    #[test]
+    fn get_all_drafts_updates_become_drafts_and_only_real_replies_are_replies() {
+        let user = tl::enums::Peer::User(tl::types::PeerUser { user_id: 7 });
+        let forum = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 });
+        let raw = |u| raw_draft(u).expect("a draft");
+
+        let plain = raw(update(user.clone(), None, None, "hello"));
+        assert_eq!(
+            plain,
+            RawDraft {
+                chat: USER,
+                topic: None,
+                reply_to: None,
+                text: "hello".into(),
+                date: 1000
+            }
+        );
+        assert_eq!(
+            raw(update(user.clone(), None, Some(4), "re")).reply_to,
+            Some(4)
+        );
+        // In a Topic, "replying" to its top message is just being in it.
+        let in_topic = raw(update(forum.clone(), Some(10), Some(10), "t"));
+        assert_eq!((in_topic.topic, in_topic.reply_to), (Some(10), None));
+        let reply_in_topic = raw(update(forum, Some(10), Some(12), "t"));
+        assert_eq!(
+            (reply_in_topic.topic, reply_in_topic.reply_to),
+            (Some(10), Some(12))
+        );
+
+        let empty = tl::enums::Update::DraftMessage(tl::types::UpdateDraftMessage {
+            peer: user,
+            top_msg_id: None,
+            saved_peer_id: None,
+            draft: tl::enums::DraftMessage::Empty(tl::types::DraftMessageEmpty { date: Some(5) }),
+        });
+        assert_eq!(raw_draft(empty), None);
     }
 }

@@ -3,13 +3,15 @@
 //! - [`Login`] / [`LoginAttempt`]: the Telegram part of the Login flow (QR login, then
 //!   the Cloud password if the Account has one).
 //! - [`Connector`]: turns an opened Grant into a Live client.
-//! - [`Telegram`]: read-only calls on one Account.
+//! - [`Telegram`]: calls on one Account: reading, and writing Drafts.
 //!
 //! Tests drive the whole server through the fakes in [`fake`]; [`grammers`] is the
 //! real Telegram (QR login + Client pool).
 
 pub mod chats;
+pub mod compose;
 pub mod download;
+pub mod drafts;
 pub mod fake;
 pub mod find;
 pub mod folders;
@@ -93,7 +95,8 @@ pub enum TgError {
     InvalidInput(String),
 }
 
-/// Read-only access to one Account.
+/// Access to one Account: reading, and the writes its Grant's Scopes allow
+/// (the MCP layer checks those before calling a write).
 #[async_trait::async_trait]
 pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
@@ -199,6 +202,17 @@ pub trait Telegram: Send + Sync + 'static {
         &self,
         request: download::FileRequest,
     ) -> Result<download::FilePart, download::FileError>;
+
+    /// The Account's Drafts, newest first ([`drafts::assemble`]): one
+    /// `messages.getAllDrafts` call.
+    async fn get_drafts(&self) -> Result<drafts::Drafts, TgError>;
+
+    /// Put `draft` in its Chat's input field on all the Account's devices
+    /// (`messages.saveDraft`, method class Writes, so it spends the Writes
+    /// budget), replacing the Draft there; empty text clears it. Where it
+    /// goes is [`compose::place`]'s rule. Any Chat of the Account's; a Chat
+    /// it doesn't have, or can't write in, is [`TgError::InvalidInput`].
+    async fn save_draft(&self, draft: drafts::NewDraft) -> Result<drafts::SavedDraft, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

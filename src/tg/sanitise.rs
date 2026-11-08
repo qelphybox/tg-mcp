@@ -26,6 +26,7 @@ use super::{
     Account, Telegram, TgError,
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
     download::{FileError, FilePart, FileRequest, MediaFile},
+    drafts::{Draft, DraftChat, Drafts, NewDraft, SavedDraft},
     find::{FoundChat, FoundChats},
     folders::ChatFolder,
     members::{Member, MemberPage, MembersQuery},
@@ -563,6 +564,46 @@ impl Untrusted for Transcription {
     }
 }
 
+/// A Draft's text is the Account's own, but may be pasted from anywhere:
+/// cleaned like message text. Its Chat's title is someone else's.
+impl Untrusted for Drafts {
+    fn sanitise(&mut self) {
+        let Drafts {
+            drafts,
+            truncated: _,
+        } = self;
+        for draft in drafts {
+            let Draft {
+                chat,
+                topic: _,
+                reply_to: _,
+                date: _,
+                text,
+            } = draft;
+            let DraftChat {
+                id: _,
+                title,
+                kind: _,
+                is_self: _,
+            } = chat;
+            clean(title);
+            clean_text(text, sanitise, false);
+        }
+    }
+}
+
+/// Where a Draft went: ids only, nothing written on Telegram.
+impl Untrusted for SavedDraft {
+    fn sanitise(&mut self) {
+        let SavedDraft {
+            chat: _,
+            topic: _,
+            reply_to: _,
+            cleared: _,
+        } = self;
+    }
+}
+
 fn sanitised<T: Untrusted>(mut value: T) -> T {
     value.sanitise();
     value
@@ -642,6 +683,16 @@ impl Telegram for Sanitised {
     /// File bytes are the file, not text for the model: passed on as they are.
     async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
         self.0.get_file(request).await
+    }
+
+    async fn get_drafts(&self) -> Result<Drafts, TgError> {
+        self.0.get_drafts().await.map(sanitised)
+    }
+
+    /// What the model writes goes to Telegram as it is: the sanitiser cleans
+    /// what comes back from Telegram, never the Account's own words.
+    async fn save_draft(&self, draft: NewDraft) -> Result<SavedDraft, TgError> {
+        self.0.save_draft(draft).await.map(sanitised)
     }
 }
 
