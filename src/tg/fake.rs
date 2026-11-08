@@ -22,7 +22,7 @@ use super::{
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
-    folders::{self, ChatFolder, RawChatFolder},
+    folders::{self, ChatFolder, FolderCache, RawChatFolder},
     media::{FileLocation, StoredFile},
     members::{
         self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
@@ -171,6 +171,15 @@ impl FakeChatFolder {
             excluded: self.excluded.clone(),
         }
     }
+}
+
+/// A folder request the fake Telegram answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderRpc {
+    /// `messages.getDialogFilters`.
+    DialogFilters,
+    /// `messages.getPeerDialogs` for this many Chats.
+    PeerDialogs(usize),
 }
 
 /// One Topic of a fake forum.
@@ -866,6 +875,10 @@ fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
 pub struct FakeTelegram {
     data: FakeData,
     known: KnownPeers,
+    /// Like a Live client's, kept across requests per Grant.
+    folder_cache: Arc<FolderCache>,
+    /// The folder requests answered, for every Grant.
+    folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
     files: Arc<FakeFiles>,
     transcriber: Arc<FakeTranscriber>,
 }
@@ -1363,6 +1376,8 @@ impl FakeTelegram {
         Self {
             data,
             known: Arc::default(),
+            folder_cache: Arc::default(),
+            folder_rpcs: Arc::default(),
             files: Arc::default(),
             transcriber: Arc::default(),
         }
@@ -1404,11 +1419,9 @@ impl Telegram for FakeTelegram {
     }
 
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
-        Ok(self
-            .dialog_filters()?
-            .into_iter()
-            .map(|f| f.folder)
-            .collect())
+        let folders = self.dialog_filters()?;
+        self.folder_cache.remember(&folders);
+        Ok(folders.into_iter().map(|f| f.folder).collect())
     }
 
     /// The same `messages.getDialogs` calls as the Live client, answered by
@@ -1418,6 +1431,7 @@ impl Telegram for FakeTelegram {
             return folders::list_folder_chats(
                 &query,
                 folder,
+                &self.folder_cache,
                 || std::future::ready(self.dialog_filters()),
                 |peers| std::future::ready(self.peer_dialogs(&peers)),
             )
@@ -2019,6 +2033,10 @@ impl FakeTelegram {
     /// answers none for a Chat it doesn't have or a wrong access hash.
     fn peer_dialogs(&self, peers: &[ChatRef]) -> Result<DialogsAnswer, TgError> {
         self.flood()?;
+        self.folder_rpcs
+            .lock()
+            .unwrap()
+            .push(FolderRpc::PeerDialogs(peers.len()));
         assert!(
             peers.len() <= folders::PEER_DIALOGS_CHUNK,
             "Telegram's limit"
@@ -2084,6 +2102,10 @@ impl FakeTelegram {
     /// One `messages.getDialogFilters`: the Account's Chat folders.
     fn dialog_filters(&self) -> Result<Vec<RawChatFolder>, TgError> {
         self.flood()?;
+        self.folder_rpcs
+            .lock()
+            .unwrap()
+            .push(FolderRpc::DialogFilters);
         if self.data.chat_folders_fail {
             return Err(TgError::Upstream("rpc error 500: INTERNAL".into()));
         }
@@ -2579,6 +2601,10 @@ struct FakeTelegramSide {
     files: Arc<FakeFiles>,
     /// Telegram's transcription service, the same for every Grant.
     transcriber: Arc<FakeTranscriber>,
+    /// Each Grant's [`FolderCache`], kept like `known`.
+    folder_caches: Mutex<std::collections::HashMap<String, Arc<FolderCache>>>,
+    /// The folder requests answered, for every Grant, in order.
+    folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
 }
 
 impl FakeConnector {
@@ -2614,6 +2640,11 @@ impl FakeConnector {
         self.telegram.transcriber.clone()
     }
 
+    /// The folder requests Telegram answered since the last call, in order.
+    pub fn take_folder_rpcs(&self) -> Vec<FolderRpc> {
+        std::mem::take(&mut *self.telegram.folder_rpcs.lock().unwrap())
+    }
+
     /// Make every call to Telegram fail as if it were down.
     pub fn set_unreachable(&self, unreachable: bool) {
         self.telegram
@@ -2630,6 +2661,11 @@ impl FakeConnector {
     fn evict(&self, grant_id: &GrantId) -> Option<i64> {
         self.telegram
             .known
+            .lock()
+            .unwrap()
+            .remove(grant_id.as_str());
+        self.telegram
+            .folder_caches
             .lock()
             .unwrap()
             .remove(grant_id.as_str());
@@ -2683,9 +2719,19 @@ impl Connector for FakeConnector {
             .lock()
             .unwrap()
             .insert(grant.grant_id.as_str().to_string(), data.account.id);
+        let folder_cache = self
+            .telegram
+            .folder_caches
+            .lock()
+            .unwrap()
+            .entry(grant.grant_id.as_str().to_string())
+            .or_default()
+            .clone();
         Ok(Arc::new(FakeTelegram {
             data,
             known,
+            folder_cache,
+            folder_rpcs: self.telegram.folder_rpcs.clone(),
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
         }))

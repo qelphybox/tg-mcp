@@ -142,7 +142,22 @@ impl AccountLimiter {
     /// Run one Telegram request of `class` under the budget. A `FLOOD_WAIT` from it
     /// blocks that class for the Account; a short one is waited out and the request
     /// retried once.
-    pub async fn run<T, F, Fut>(&self, class: MethodClass, mut request: F) -> Result<T, TgError>
+    pub async fn run<T, F, Fut>(&self, class: MethodClass, request: F) -> Result<T, TgError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, TgError>>,
+    {
+        self.run_named(class, "unnamed", request).await
+    }
+
+    /// [`Self::run`] for TL method `method` (e.g. `messages.getPeerDialogs`),
+    /// which its `FLOOD_WAIT` warning names: a method name is no content.
+    pub async fn run_named<T, F, Fut>(
+        &self,
+        class: MethodClass,
+        method: &'static str,
+        mut request: F,
+    ) -> Result<T, TgError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, TgError>>,
@@ -156,6 +171,7 @@ impl AccountLimiter {
                     tracing::warn!(
                         seconds,
                         class = class.name(),
+                        method,
                         "telegram FLOOD_WAIT; class blocked for the account"
                     );
                     if retried || Duration::from_secs(seconds.into()) > self.config.max_wait {
@@ -401,6 +417,47 @@ mod tests {
     fn flood(calls: &AtomicU32, seconds: u32, class: MethodClass) -> Result<(), TgError> {
         calls.fetch_add(1, Ordering::SeqCst);
         Err(TgError::FloodWait { seconds, class })
+    }
+
+    #[tokio::test]
+    async fn a_flood_wait_warning_names_the_method_telegram_throttled() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let limiter = AccountLimiter::new(config(600, 20));
+        let calls = AtomicU32::new(0);
+        let flooded = limiter
+            .run_named(MethodClass::Default, "messages.getPeerDialogs", || async {
+                flood(&calls, 300, MethodClass::Default)
+            })
+            .await;
+        assert!(matches!(
+            flooded,
+            Err(TgError::FloodWait { seconds: 300, .. })
+        ));
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("seconds=300")
+                && logs.contains("class=\"default\"")
+                && logs.contains("method=\"messages.getPeerDialogs\""),
+            "{logs}"
+        );
     }
 
     /// A long flood in `flooded` fails that class fast, untouched by Telegram, and
