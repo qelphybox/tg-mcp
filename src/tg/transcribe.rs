@@ -146,8 +146,9 @@ impl Refusal {
         TgError::InvalidInput(match self {
             Self::PremiumRequired => format!(
                 "Telegram refused to transcribe message {id}: transcription needs Telegram \
-                 Premium on this account (or one of the few free ones a week, which this \
-                 account doesn't get). Use mode download and transcribe the file locally."
+                 Premium on this account; without it Telegram allows a few free ones a week \
+                 to some accounts, and has none for this one now. Use mode download and \
+                 transcribe the file locally."
             ),
             Self::VoiceMissing => format!(
                 "Telegram has no voice to transcribe in message {id}. Use mode download \
