@@ -364,6 +364,45 @@ Then run:
 
 Then on the server: `kamal app logs | grep 'media view served'` shows one line per successful view with `message_id`, `images` and `bytes` only; nothing else of the images (no base64, no file names) is in the logs.
 
+## 21. get_media `transcribe` reads out a voice message or video message, Telegram-native, in claude.ai too
+
+This is how a client without a shell learns what was said, so the primary check is **claude.ai on the web** (connector as in §20); run part (a) in Claude Code afterwards too. Telegram transcribes (`messages.transcribeAudio`); the audio never leaves Telegram. It needs Telegram Premium or the weekly free trial, so there are two parts.
+
+### (a) The main account (Telegram Premium)
+
+Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with the voice message 525381 (9 s, says roughly «Это голосовое сообщение, в котором несколько другой текст. Всем пока»), the round video message 525380 (9 s, «Это видео кружок… Всем привет…») and the photo 525379, as in §19. Run:
+
+```text
+Через Telegram MCP, в чате user:408551275~0xo8DFRPKC4. 1) get_media с mode="transcribe" для 525381: выведи поле transcribe целиком (JSON как есть) и kind, и засеки, сколько примерно шёл вызов. 2) То же для 525380 (кружок). 3) Ещё раз transcribe для 525381: выведи transcribe целиком. 4) get_media transcribe для 525379 (фото): выведи текст ошибки. Ничего не додумывай: если текста нет или статус pending, так и скажи; если pending, вызови ещё раз через retry_after_s секунд и выведи второй ответ.
+```
+
+1. 525381: `kind: "voice"`, `transcribe` = `{ "status": "done", "text": "…", "text_truncated": false }` with the text of the voice message (roughly the words above); no `trial_remaining` or `trial_resets_at` (Premium), no `retry_after_s`. Note whether the last words («Всем пока») are there: prior art reports Telegram dropping them. The call takes seconds, at most about 20 s.
+2. 525380: `kind: "video_note"`, `status: "done"`, the video message's words.
+3. The repeat answers at once with the same text (Telegram keeps it; the server keeps nothing).
+4. 525379: a tool error saying a photo can't be transcribed, only voice messages and video messages, and pointing to mode `view` / `download`; no raw RPC error name.
+
+If a first call comes back `{ "status": "pending", "retry_after_s": 10 }` after about 20 s and the next call is `done` at once, Telegram's final-text update didn't reach the server's session (see the logs below): record it, the tool still works, one call slower.
+
+### (b) A second account without Premium (the weekly trial)
+
+Connect a second account as a separate connector: in claude.ai another custom connector with the same URL under another name (e.g. `telegram-free`), or in Claude Code `claude mcp add --transport http telegram-free https://tgmcp.qelphybox.space/mcp`, then authenticate and scan the QR with the account **without** Premium. **Prepare before the run** in that account's Saved Messages (send them yourself and note their ids; its Saved Messages id is the `user:` id `whoami`/`list_chats` give for it, `<SM>` below):
+
+- `<W1>`, `<W3>`, `<W4>`, `<W5>`: four short voice messages (under 30 s, each saying something different);
+- `<W2>`: a short round video message.
+
+Don't transcribe anything in the Telegram apps of that account during the run: the apps share the same trial.
+
+```text
+Через Telegram MCP telegram-free, в чате <SM>. 1) get_media с mode="transcribe" для <W1>: выведи transcribe целиком. 2) Сразу ещё раз для <W1>: transcribe целиком. 3) Для <W2>: transcribe целиком. 4) По очереди для <W3>, <W4>, <W5>: для каждого transcribe целиком или текст ошибки; остановись на первой ошибке. Ничего не додумывай.
+```
+
+1. `<W1>`: `status: "done"` with its words, `trial_remaining: N` (the trial left after this one) and `trial_resets_at` (an RFC 3339 date within the next week).
+2. The repeat: the same text, and `trial_remaining` still `N`: asking again for the same message spends no trial. If it dropped, record it (the server never asks twice within one call, but a `pending` retry would cost one).
+3. `<W2>`: `kind: "video_note"`, its words, `trial_remaining: N-1`.
+4. Each new message lowers `trial_remaining` by one until it is used up; the next one is a tool error saying Telegram won't transcribe for this account for a while (`FLOOD_WAIT`, with roughly how long, usually days), that without Premium the week's free transcriptions are used up, and to use mode `download` and transcribe locally. An account Telegram offers no trial at all gets, on the first call, a tool error saying transcription needs Telegram Premium. Either way, the other tools of `telegram-free` (e.g. `list_chats`) still work right after.
+
+Then on the server: `kamal app logs | grep -e 'media transcription served' -e 'transcription pending'` shows one `media transcription served` line per answer with `message_id`, `kind`, `pending`, `chars`, `waited_ms` and `trial_remaining` only, and a `transcription pending` line (with `transcription_id`) whenever Telegram first answered pending (a `served` line with `pending=false` right after it, `waited_ms` under 20000, means the final-text update arrived); the used-up trial shows as a `FLOOD_WAIT` warning of class `transcribe`. `kamal app logs | grep -F 'Всем'` and a word of each `<W…>` find nothing: transcriptions are content and never logged.
+
 ## 30. Messages show their reactions, a link that opens them and their pin; `pinned_only` reads the pinned ones
 
 Needs, among the account's chats (replace the `<…>`): a public channel `<K>` (it has an @username) with recent posts that carry reactions, ideally one with a custom-emoji reaction and one with paid Stars (⭐) reactions; a private supergroup or private channel `<G>` (no @username) the account is a member of, with at least 3 pinned messages (pin some yourself if you can; the app's pinned bar lists them, "All pinned messages"); a private chat `<P>` with one pinned message; a basic group `<B>` if the account has one (old small groups that were never upgraded; `type: "group"` in `list_chats`). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:

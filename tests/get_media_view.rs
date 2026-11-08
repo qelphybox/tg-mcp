@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary},
     fake::{
-        FakeData, FakeFormat, FakePicture, FakeSize, fake_file_id, fake_issued_id,
-        fake_picture_bytes,
+        FakeData, FakeFormat, FakePicture, FakeSize, FakeTranscription, fake_file_id,
+        fake_issued_id, fake_picture_bytes,
     },
     messages::{Media, MediaKind, RawHistoryMessage},
     view::{MAX_VIEW_BYTES, SizeForm},
@@ -187,6 +187,7 @@ fn alice_data() -> FakeData {
         .with_messages(BOB, vec![message(12, photo(1280, 960, 99_000))])
         .with_pictures(ALICE, pictures)
         .with_pictures(BOB, vec![picture(12, Some(77), None)])
+        .with_transcriptions(ALICE, vec![FakeTranscription::new(47, "hello", Some(0))])
 }
 
 fn chat(id: ChatId, title: &str) -> ChatSummary {
@@ -519,7 +520,13 @@ async fn every_modes_structured_content_matches_the_declared_output_schema() {
     )
     .await
     .unwrap();
-    let mut answers = vec![download];
+    let transcribe = call(
+        &client,
+        json!({ "chat_id": fake_issued_id(ALICE), "message_id": 47, "mode": "transcribe" }),
+    )
+    .await
+    .unwrap();
+    let mut answers = vec![download, transcribe];
     for id in [1, 13, 31, 43, 71] {
         answers.push(view(&client, id).await.unwrap());
     }
@@ -531,13 +538,14 @@ async fn every_modes_structured_content_matches_the_declared_output_schema() {
             .collect();
         assert!(errors.is_empty(), "{structured}: {errors:?}");
     }
-    // The schema describes both modes, and the input takes `size`.
+    // The schema describes every mode, and the input takes `size`.
     let output = schema.to_string();
     for word in [
         "\"view\"",
         "\"album_truncated\"",
         "\"album_message_ids\"",
         "\"download\"",
+        "\"transcribe\"",
     ] {
         assert!(output.contains(word), "{word} in {output}");
     }

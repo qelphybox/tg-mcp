@@ -35,15 +35,20 @@ pub enum MethodClass {
     Search,
     /// `upload.*`: file downloads (`upload.getFile`, `upload.getCdnFile`, ...).
     Files,
+    /// `messages.transcribeAudio`. Without Premium, Telegram answers a used-up
+    /// weekly trial with a `FLOOD_WAIT` lasting until the trial resets (days,
+    /// as TDLib reads it), which must not hold back anything else.
+    Transcribe,
 }
 
 impl MethodClass {
-    pub const ALL: [Self; 3] = [Self::Default, Self::Search, Self::Files];
+    pub const ALL: [Self; 4] = [Self::Default, Self::Search, Self::Files, Self::Transcribe];
 
     /// The class of a Telegram method, by its TL name (e.g. `messages.searchGlobal`).
     pub fn of(method: &str) -> Self {
         match method {
             "messages.searchGlobal" | "messages.search" | "contacts.search" => Self::Search,
+            "messages.transcribeAudio" => Self::Transcribe,
             _ if method.starts_with("upload.") => Self::Files,
             _ => Self::Default,
         }
@@ -54,6 +59,7 @@ impl MethodClass {
             Self::Default => "default",
             Self::Search => "search",
             Self::Files => "files",
+            Self::Transcribe => "transcribe",
         }
     }
 
@@ -435,7 +441,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{other:?} blocked by a {flooded:?} flood: {err:?}"));
         }
         assert_eq!(start.elapsed(), Duration::ZERO, "other classes don't wait");
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), MethodClass::ALL.len() as u32);
     }
 
     #[tokio::test(start_paused = true)]
@@ -446,6 +452,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_files_flood_blocks_only_files() {
         only_the_flooded_class_is_blocked(MethodClass::Files).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transcribe_flood_blocks_only_transcribe() {
+        only_the_flooded_class_is_blocked(MethodClass::Transcribe).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -529,6 +540,12 @@ mod tests {
         ] {
             assert_eq!(MethodClass::of(files), MethodClass::Files, "{files}");
         }
+        // Without Premium, a used-up weekly trial is FLOOD_WAIT_X for days:
+        // it must not hold back reading.
+        assert_eq!(
+            MethodClass::of("messages.transcribeAudio"),
+            MethodClass::Transcribe
+        );
         for default in [
             "messages.getHistory",
             "messages.getDialogs",
