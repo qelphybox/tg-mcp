@@ -552,7 +552,7 @@ ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /
 python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
-print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 3
+print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 3, or 4 once #41 (Scopes) is deployed
 print(db.execute("""SELECT count(*), coalesce(sum(wrapped_key IS NOT NULL
                       AND consumed_at < CAST(strftime('%s', 'now') AS INTEGER) - 300), 0)
                     FROM tokens WHERE consumed_at IS NOT NULL""").fetchone())
@@ -561,3 +561,78 @@ PY
 ```
 
 Finally, no false alarm in normal use: open two Claude Code sessions on the connector and use both across an hourly refresh (`whoami` in each after more than an hour). Both keep answering without a browser opening, and `logs` (with `--since` widened to cover the time) has no `refresh token misused` line for your own Grant. If one appears, a client kept a used refresh Token for more than 60 s: record which client and version.
+
+## 51. Scopes: a Grant from before keeps reading, a new one gets what Consent ticked, and the MCP surface says so
+
+Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client, asking for the Scopes in its first argument (`-`: none), and expects the second as granted; it never prints a Token and revokes its Grant at the end.
+
+1. **A Grant from before the deploy.** Use the connector you added before this release (no new login): in Claude Code ask "who am I on Telegram": `whoami` answers without a browser opening. Then the database:
+
+   ```sh
+   mkdir -p /tmp/tgmcp-dump
+   ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
+   python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+   import sqlite3, sys
+   db = sqlite3.connect(sys.argv[1])
+   print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 4
+   print(db.execute("SELECT scopes, count(*) FROM grants GROUP BY scopes").fetchall())
+   # expect [('read', N)]: every Grant from before is read-only (run this before steps 4-6, which add their own)
+   PY
+   ```
+
+   More than an hour later (its access Token has been refreshed), `whoami` still answers without a browser: the Scopes are on the Grant and survive a refresh.
+
+2. **Metadata advertises every Scope.**
+
+   ```sh
+   curl -s https://tgmcp.qelphybox.space/.well-known/oauth-authorization-server | jq -c .scopes_supported
+   # expect ["read","draft","send","organize"]
+   curl -s https://tgmcp.qelphybox.space/.well-known/oauth-protected-resource/mcp | jq -c '[.scopes_supported, .resource_name]'
+   # expect [["read","draft","send","organize"],"Telegram (unofficial)"]
+   ```
+
+3. **An unknown Scope is `invalid_scope`**, sent back to the client before any login starts:
+
+   ```sh
+   id=$(curl -s https://tgmcp.qelphybox.space/register -H 'content-type: application/json' \
+     -d '{"client_name": "scope-check (manual test)", "redirect_uris": ["https://example.com/cb"]}' | jq -r .client_id)
+   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://tgmcp.qelphybox.space/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=read%20write"
+   # expect 303 https://example.com/cb?error=invalid_scope&error_description=…&state=s&iss=https%3A%2F%2Ftgmcp.qelphybox.space
+   ```
+
+4. **A new Grant with only `read`.**
+
+   ```sh
+   python3 scripts/scope-check.py - read   # expect every line [PASS] and exit status 0
+   ```
+
+   On the Consent screen: "Read chats and messages…" is ticked and greyed out, "Write Drafts" is unticked, the heading reads "Allow … **read-only** access to all chats of …", and the line under the boxes reads "It can only read: it can't send, edit or delete anything." Leave it so and Allow. The script prints instructions starting "… Read-only access to the connected Telegram account: nothing is ever sent, edited or deleted." and the tool list; note how many tools it lists.
+
+5. **A Grant that asked for `draft`, unticked by the user.**
+
+   ```sh
+   python3 scripts/scope-check.py "read draft" read   # expect every line [PASS] and exit status 0
+   ```
+
+   "Write Drafts" opens ticked and the heading has no "read-only". Untick it: "read-only" comes back into the heading and the line under the boxes switches to "It can only read: …" (tick and untick once more to see both ways). Allow with it unticked.
+
+6. **A new Grant with `draft`.**
+
+   ```sh
+   python3 scripts/scope-check.py "read draft" "read draft"   # expect every line [PASS] and exit status 0
+   ```
+
+   Keep "Write Drafts" ticked and Allow. The token response and the refresh (which asks for every Scope) both say `read draft`; the instructions read "… Access to the connected Telegram account: you can read chats, messages and media, and write Drafts (text left in a chat's message field, which only the user sends); you cannot send, edit or delete messages. …"; the tool list is the same as in step 4 (no tool needs `draft` until the Drafts tools land).
+
+7. **What Claude Code asks for.** `claude mcp add --transport http telegram-scopes https://tgmcp.qelphybox.space/mcp`, then `/mcp` → `telegram-scopes` → Authenticate, and scan the QR. Record whether "Write Drafts" opens ticked (Claude Code asked for every advertised Scope) or not (it asked for none or `read`). Untick it, Allow, check `whoami` answers, then `claude mcp remove telegram-scopes` and end that session in Telegram → Settings → Devices.
+
+8. **The server's side**, within 15 minutes of the runs:
+
+   ```sh
+   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -E 'authorization code issued|grant created'
+   # expect a pair per login of steps 4-7 with client_id / grant_id and scopes=read, scopes=read, scopes=read draft, scopes=read
+   logs | grep -c 'tgm_'   # expect 0: no Token is ever logged
+   ```
+
+   In Telegram → Settings → Devices, no "Unofficial MCP Server" session from steps 4-7 is left.
