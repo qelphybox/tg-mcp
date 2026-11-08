@@ -21,12 +21,15 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::{
-    AuthState, clients,
+    AuthState, CONSENT_OFFERS, clients,
     flows::{AuthRequest, PendingLogin, Progress},
     pages, pkce,
     rate_limit::ClientIp,
 };
-use crate::tg::{LoginState, TgError};
+use crate::{
+    scope::{Scope, Scopes},
+    tg::{LoginState, TgError},
+};
 
 const COOKIE: &str = "tgm_login";
 /// Wrong Cloud passwords per Login flow before it is dropped (Telegram has its own,
@@ -44,6 +47,7 @@ pub struct AuthorizeQuery {
     code_challenge_method: Option<String>,
     state: Option<String>,
     resource: Option<String>,
+    scope: Option<String>,
 }
 
 pub async fn authorize(
@@ -124,6 +128,12 @@ pub async fn authorize(
             "this server only issues tokens for its /mcp resource",
         );
     }
+    let Ok(scopes) = Scopes::parse_request(q.scope.as_deref()) else {
+        return fail(
+            "invalid_scope",
+            "the scopes of this server are read, draft, send and organize",
+        );
+    };
 
     // Each Login flow holds a Telegram connection: take a slot before opening one.
     let slot = match auth.flows.reserve(client_ip) {
@@ -149,6 +159,7 @@ pub async fn authorize(
         redirect_uri: redirect_uri.clone(),
         code_challenge,
         state: q.state.clone(),
+        scopes,
     };
     let login_id = auth.flows.start_login(slot, request, attempt);
 
@@ -418,20 +429,55 @@ pub async fn consent_page(
         redirect_is_loopback: redirect_is_loopback(&login.request.redirect_uri),
         account_name: &account_name,
         account_username: logged_in.account.username.as_deref(),
+        checked: offered(login.request.scopes.iter()),
     })
 }
 
-#[derive(Debug, Deserialize)]
+/// `read`, plus those of `scopes` the Consent screen offers. Anything else (a
+/// Scope not offered yet, a name we don't know) grants nothing: a hand-made form
+/// can't get more than the screen shows.
+fn offered(scopes: impl IntoIterator<Item = Scope>) -> Scopes {
+    scopes
+        .into_iter()
+        .filter(|scope| CONSENT_OFFERS.contains(scope))
+        .collect()
+}
+
+/// The Consent form: `decision` (`allow` or `deny`) and one `scope` per checked
+/// box, as the browser posts them (`scope=draft&decision=allow`).
+#[derive(Debug, Default)]
 pub struct ConsentForm {
     decision: String,
+    scopes: Vec<String>,
+}
+
+impl ConsentForm {
+    fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        pairs
+            .into_iter()
+            .fold(ConsentForm::default(), |mut form, (key, value)| {
+                match key.as_str() {
+                    "decision" if form.decision.is_empty() => form.decision = value,
+                    "scope" => form.scopes.push(value),
+                    _ => {}
+                }
+                form
+            })
+    }
+
+    /// The Scopes the user checked, as a Grant gets them.
+    fn scopes(&self) -> Scopes {
+        offered(self.scopes.iter().filter_map(|name| Scope::parse(name)))
+    }
 }
 
 pub async fn consent_submit(
     headers: HeaderMap,
     Path(id): Path<String>,
     State(auth): State<Arc<AuthState>>,
-    Form(form): Form<ConsentForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let form = ConsentForm::from_pairs(pairs);
     if let Err(response) = owned_login(&auth, &headers, &id) {
         return response;
     }
@@ -452,8 +498,9 @@ pub async fn consent_submit(
         ("allow", Progress::LoggedIn(logged_in)) => {
             let redirect_uri = request.redirect_uri.clone();
             let client_id = request.client_id.clone();
-            let code = auth.flows.issue_code(request, logged_in);
-            tracing::info!(client_id = %client_id, "authorization code issued");
+            let scopes = form.scopes();
+            let code = auth.flows.issue_code(request, logged_in, scopes);
+            tracing::info!(client_id = %client_id, scopes = %scopes, "authorization code issued");
             redirect_with(
                 &redirect_uri,
                 &[("code", &code)],
@@ -608,5 +655,38 @@ mod tests {
             redirect_target("cursor://anysphere.cursor-retrieval/oauth/callback"),
             "cursor://anysphere.cursor-retrieval"
         );
+    }
+
+    fn posted(pairs: &[(&str, &str)]) -> ConsentForm {
+        ConsentForm::from_pairs(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn consent_grants_read_plus_the_checked_offered_boxes() {
+        let form = posted(&[("decision", "allow")]);
+        assert_eq!(form.decision, "allow");
+        assert_eq!(form.scopes(), Scopes::READ_ONLY);
+
+        let form = posted(&[("scope", "draft"), ("decision", "allow")]);
+        assert_eq!(form.scopes().to_string(), "read draft");
+    }
+
+    #[test]
+    fn a_hand_made_consent_form_gets_no_more_than_the_screen_offers() {
+        let form = posted(&[
+            ("scope", "send"),
+            ("scope", "organize"),
+            ("scope", "teleport"),
+            ("scope", "read"),
+            ("decision", "allow"),
+            ("decision", "deny"),
+        ]);
+        assert_eq!(form.scopes(), Scopes::READ_ONLY);
+        assert_eq!(form.decision, "allow", "the first decision counts");
     }
 }

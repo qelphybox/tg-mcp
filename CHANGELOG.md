@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### New
+
+- **Scopes.** Each connection (Grant) has Scopes, chosen on the consent screen: `read`, always, and `draft` (writing Drafts; no tool uses it yet). `send` and `organize` are listed in `scopes_supported` of both OAuth metadata documents but not offered yet: asking for them grants nothing more. `/authorize` takes `scope` (space-separated; an unknown one is `invalid_scope`), and the boxes it asks for start ticked; the token response's `scope` says what was granted, and a refresh keeps it whatever it asks for. Other Scopes mean connecting again.
+- `tools/list` lists only the tools a connection's Scopes allow; calling another one is an error that names the missing Scope. The server's `instructions` and the consent screen say "read-only" only while no write Scope is granted.
+- Connections made before Scopes become `read` and keep working: no re-login.
+- MCP clients that ask for every advertised Scope (the MCP spec's default when the 401 names none) open the consent screen with "Write Drafts" ticked; untick it to stay read-only.
+
 ### Security
 
 - **A reused refresh Token revokes its Grant.** A refresh Token keeps working for 60 seconds after its first use (two client processes refreshing at once, or a retry after a lost response, both get a working pair). Presented after that, or by a client it wasn't issued to, it revokes the whole Grant: every Token stops working (`/mcp` → 401) and, if the server holds a Live client for it, its Telegram session is logged out. The client sees the usual `invalid_grant`; the server logs `refresh_reuse` or `foreign_client` with the Grant id, never a Token. A wrong secret for a used Token revokes nothing.
@@ -10,6 +17,7 @@
 ### Operations
 
 - Migration `0003_consumed_refresh_tokens` rebuilds the `tokens` table. An image built before it does not start on a database that ran it, so `kamal rollback` past this release fails: fix forward instead.
+- Migration `0004_grant_scopes` adds `grants.scopes` (plaintext, `read` for every existing Grant). Same rollback rule.
 
 ## 0.1.3
 

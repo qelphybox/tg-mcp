@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tg_mcp::sessions::{GrantId, PausedClock, RevokeReason, TokenTtl, Vault, VaultError};
+use tg_mcp::{
+    scope::{Scope, Scopes},
+    sessions::{GrantId, PausedClock, RevokeReason, TokenTtl, Vault, VaultError},
+};
 
 const SESSION: &[u8] = b"grammers-session-bytes: auth key, dc, peers";
 
@@ -311,6 +314,54 @@ async fn grants_survive_reopening_the_database() {
     let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
     let grant = vault.open(issued.access.expose()).await.unwrap();
     assert_eq!(grant.telegram_session.as_slice(), SESSION);
+}
+
+/// A Grant keeps the Scopes it was created with through every Token, every
+/// refresh and a restart; another Grant of the same Account has its own.
+#[tokio::test]
+async fn a_grant_keeps_its_scopes_through_refresh_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let drafts: Scopes = [Scope::Draft].into_iter().collect();
+    let (issued, reader) = {
+        let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
+        let issued = vault
+            .create_grant_with_scopes("client", 42, SESSION, drafts)
+            .await
+            .unwrap();
+        let reader = vault.create_grant("client", 42, SESSION).await.unwrap();
+        vault.close().await;
+        (issued, reader)
+    };
+    assert_eq!(issued.scopes.to_string(), "read draft");
+    assert_eq!(reader.scopes, Scopes::READ_ONLY);
+
+    let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
+    assert_eq!(
+        vault.open(issued.access.expose()).await.unwrap().scopes,
+        drafts
+    );
+    let rotated = vault
+        .refresh(issued.refresh.expose(), "client")
+        .await
+        .unwrap();
+    assert_eq!(rotated.scopes, drafts);
+    assert_eq!(
+        vault.open(rotated.access.expose()).await.unwrap().scopes,
+        drafts
+    );
+    assert_eq!(
+        vault
+            .open_for_client(rotated.refresh.expose(), "client")
+            .await
+            .unwrap()
+            .scopes,
+        drafts
+    );
+    assert_eq!(
+        vault.open(reader.access.expose()).await.unwrap().scopes,
+        Scopes::READ_ONLY
+    );
 }
 
 #[tokio::test]

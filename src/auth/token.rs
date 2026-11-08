@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
-use super::{AuthState, SCOPE, pkce};
+use super::{AuthState, pkce};
 use crate::sessions::{GrantId, IssuedTokens, VaultError};
 
 #[derive(Debug, Deserialize)]
@@ -79,10 +79,11 @@ async fn authorization_code(auth: &AuthState, form: TokenForm) -> Response {
     let account_id = issued.logged_in.account.id;
     match auth
         .vault
-        .create_grant(
+        .create_grant_with_scopes(
             &request.client_id,
             account_id,
             &issued.logged_in.telegram_session,
+            issued.scopes,
         )
         .await
     {
@@ -91,6 +92,8 @@ async fn authorization_code(auth: &AuthState, form: TokenForm) -> Response {
     }
 }
 
+/// A `scope` parameter is ignored: a refresh never changes a Grant's Scopes
+/// (ADR-0005), and the response's `scope` says what the Grant has.
 async fn refresh_token(auth: &AuthState, form: TokenForm) -> Response {
     let (Some(token), Some(client_id)) = (form.refresh_token.as_deref(), form.client_id.as_deref())
     else {
@@ -148,7 +151,7 @@ fn token_response(issued: &IssuedTokens) -> Response {
             "token_type": "Bearer",
             "expires_in": issued.access_expires_in.as_secs(),
             "refresh_token": issued.refresh.expose(),
-            "scope": SCOPE,
+            "scope": issued.scopes.to_string(),
         }),
     )
 }

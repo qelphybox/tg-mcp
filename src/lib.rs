@@ -6,6 +6,7 @@ pub mod db;
 pub mod limits;
 pub mod links;
 pub mod mcp;
+pub mod scope;
 pub mod sessions;
 pub mod tg;
 
