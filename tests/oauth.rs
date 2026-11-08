@@ -184,7 +184,7 @@ async fn consent_page_shows_who_gets_what_and_cannot_be_framed() {
     let html = res.text().await.unwrap();
     for needle in [
         // The test client redirects to 127.0.0.1: a loopback host leads.
-        r#"<h1 class="ask">Allow <b>an app on this computer (localhost)</b> read-only access to all chats of <b>Alice</b> (@alice)?</h1>"#,
+        r#"<h1 class="ask">Allow <b>an app on this computer (localhost)</b> <span class="read-only">read-only </span>access to all chats of <b>Alice</b> (@alice)?</h1>"#,
         r#"<p class="muted">The app calls itself “Test Client” (not verified).</p>"#,
         "Settings → Devices",
         "in the app alone does not end that session",

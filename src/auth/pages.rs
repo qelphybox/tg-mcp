@@ -6,7 +6,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::tg::sanitise::sanitise;
+use super::CONSENT_OFFERS;
+use crate::{
+    scope::{Scope, Scopes},
+    tg::sanitise::sanitise,
+};
 
 /// Applied to every page. No framing (the Consent button must not be clickjackable),
 /// scripts only from us. No `form-action`: Chrome applies it to the redirect after
@@ -57,6 +61,14 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
   label {{ display:block; font-weight:600; margin:0 0 6px; }}
   input {{ width:100%; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--fg); }}
   .error {{ color:#d93a3a; font-weight:600; }}
+  fieldset.scopes {{ border:0; padding:0; margin:0 0 14px; }}
+  label.scope {{ display:flex; gap:10px; align-items:flex-start; font-weight:400; margin:0 0 8px; }}
+  label.scope input {{ width:auto; margin:5px 0 0; flex:none; }}
+  main:has(input.write:checked) span.read-only, main:has(input.write:checked) p.read-only {{ display:none; }}
+  main:has(input.write:checked) p.writes {{ display:block; }}
+  main:not(:has(input.write:checked)) p.writes {{ display:none; }}
+  main:not(:has(input.write:checked)) span.read-only {{ display:inline; }}
+  main:not(:has(input.write:checked)) p.read-only {{ display:block; }}
   footer {{ margin-top:22px; font-size:12px; color:var(--muted); }}
 </style>
 </head>
@@ -154,6 +166,42 @@ pub struct ConsentView<'a> {
     pub redirect_is_loopback: bool,
     pub account_name: &'a str,
     pub account_username: Option<&'a str>,
+    /// The boxes checked when the page opens: what the client asked for, of
+    /// what the screen offers ([`CONSENT_OFFERS`]).
+    pub checked: Scopes,
+}
+
+/// What a Scope's box on the Consent screen says it allows.
+fn scope_label(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Read => "<b>Read</b> chats and messages, and download their media. Always included.",
+        Scope::Draft => {
+            "<b>Write Drafts</b>: put text in a chat's message field, on all your devices. \
+             Only you can send it."
+        }
+        Scope::Send => "<b>Send messages</b> to the chats you choose.",
+        Scope::Organize => "<b>Organize</b> your chats.",
+    }
+}
+
+/// One box per Scope: `read` checked and fixed, the offered ones as `checked`
+/// says. Checking a write Scope hides the read-only wording (CSS only); the
+/// page as served already matches the boxes as checked.
+fn scope_boxes(checked: Scopes) -> String {
+    let mut boxes = format!(
+        r#"<label class="scope"><input type="checkbox" checked disabled> <span>{}</span></label>"#,
+        scope_label(Scope::Read)
+    );
+    for &scope in CONSENT_OFFERS {
+        boxes.push_str(&format!(
+            r#"
+    <label class="scope"><input type="checkbox" class="write" name="scope" value="{value}"{checked}> <span>{label}</span></label>"#,
+            value = scope.as_str(),
+            checked = if checked.contains(scope) { " checked" } else { "" },
+            label = scope_label(scope),
+        ));
+    }
+    boxes
 }
 
 /// The redirect host leads, in the heading; the client name follows, muted and
@@ -174,13 +222,24 @@ fn consent_body(view: &ConsentView<'_>) -> String {
         "" => "The app gave no name.".to_string(),
         name => format!("The app calls itself “{}” (not verified).", esc(name)),
     };
+    // Shown as the boxes are checked when the page opens; CSS keeps them in step.
+    let (read_only, writes) = if view.checked.writes() {
+        (" hidden", "")
+    } else {
+        ("", " hidden")
+    };
     format!(
-        r#"<h1 class="ask">Allow <b>{recipient}</b> read-only access to all chats of <b>{account}</b>{username}?</h1>
+        r#"<h1 class="ask">Allow <b>{recipient}</b> <span class="read-only"{read_only}>read-only </span>access to all chats of <b>{account}</b>{username}?</h1>
 <p class="muted">{client}</p>
-<p class="muted">It can read chats and messages. It can't send, edit or delete anything.</p>
-<p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in the app alone does not end that session.</p>
-<p class="muted">If you didn't just connect an app to this Telegram account, deny.</p>
 <form method="post" action="/login/{id}/consent">
+  <fieldset class="scopes">
+    <legend class="muted">It may:</legend>
+    {boxes}
+  </fieldset>
+  <p class="muted read-only"{read_only}>It can only read: it can't send, edit or delete anything.</p>
+  <p class="muted writes"{writes}>It can't send, edit or delete messages.</p>
+  <p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in the app alone does not end that session.</p>
+  <p class="muted">If you didn't just connect an app to this Telegram account, deny.</p>
   <div class="row">
     <button type="submit" name="decision" value="deny">Deny</button>
     <button type="submit" name="decision" value="allow" class="primary">Allow</button>
@@ -188,6 +247,7 @@ fn consent_body(view: &ConsentView<'_>) -> String {
 </form>"#,
         account = esc(&sanitise(view.account_name)),
         id = esc(view.login_id),
+        boxes = scope_boxes(view.checked),
     )
 }
 
@@ -260,7 +320,43 @@ mod tests {
             redirect_is_loopback: loopback,
             account_name: "Alice",
             account_username: Some("alice"),
+            checked: Scopes::READ_ONLY,
         }
+    }
+
+    /// `html` without the elements served `hidden`: what the user reads first.
+    fn shown(html: &str) -> String {
+        let mut out = html.to_string();
+        while let Some(at) = out.find(" hidden>") {
+            let open = out[..at].rfind('<').expect("an opening tag");
+            let tag: String = out[open + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let close = format!("</{tag}>");
+            let end = out[at..].find(&close).expect("a closing tag") + at + close.len();
+            out.replace_range(open..end, "");
+        }
+        out
+    }
+
+    /// Tags gone, whitespace collapsed: the sentences as read.
+    fn text(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn drafts() -> Scopes {
+        [Scope::Draft].into_iter().collect()
     }
 
     fn heading(html: &str) -> &str {
@@ -282,7 +378,7 @@ mod tests {
         let html = consent_body(&view("Claude", "claude.ai", false));
         let h1 = heading(&html);
         assert!(h1.contains("<b>claude.ai</b>"), "{h1}");
-        assert!(h1.contains("read-only access to all chats"), "{h1}");
+        assert!(text(h1).contains("read-only access to all chats"), "{h1}");
         assert!(h1.contains("<b>Alice</b> (@alice)"), "{h1}");
         assert!(!h1.contains("Claude"), "{h1}");
         assert!(html.find("claude.ai").unwrap() < html.find("Claude").unwrap());
@@ -328,6 +424,7 @@ mod tests {
             redirect_is_loopback: false,
             account_name: "<i>Mallory</i>",
             account_username: Some("m&m"),
+            checked: Scopes::READ_ONLY,
         });
         assert!(!html.contains("<script>"), "{html}");
         assert!(
@@ -350,6 +447,7 @@ mod tests {
             redirect_is_loopback: false,
             account_name: "Al\u{202E}ice\u{2066}",
             account_username: Some("ali\u{200F}ce"),
+            checked: Scopes::READ_ONLY,
         });
         assert!(html.contains("Claude"), "{html}");
         assert!(html.contains("edoC"), "{html}");
@@ -365,5 +463,87 @@ mod tests {
         let html = consent_body(&view("\u{202E}\u{200B}", "claude.ai", false));
         assert!(!html.contains("“”"), "{html}");
         assert!(muted_containing(&html, "gave no name").is_some(), "{html}");
+    }
+
+    #[test]
+    fn a_read_only_request_reads_as_read_only() {
+        let html = consent_body(&view("Claude", "claude.ai", false));
+        let page = text(&shown(&html));
+        assert!(
+            page.starts_with("Allow claude.ai read-only access to all chats of Alice (@alice)?"),
+            "{page}"
+        );
+        assert!(
+            page.contains("Read chats and messages, and download their media. Always included."),
+            "{page}"
+        );
+        assert!(
+            page.contains("Write Drafts: put text in a chat's message field, on all your devices. Only you can send it."),
+            "{page}"
+        );
+        assert!(
+            page.contains("It can only read: it can't send, edit or delete anything."),
+            "{page}"
+        );
+        assert!(
+            !page.contains("can't send, edit or delete messages"),
+            "{page}"
+        );
+        assert!(
+            html.contains(r#"<input type="checkbox" class="write" name="scope" value="draft">"#),
+            "the Drafts box starts unchecked: {html}"
+        );
+    }
+
+    #[test]
+    fn a_draft_request_drops_the_read_only_wording_and_checks_its_box() {
+        let html = consent_body(&ConsentView {
+            checked: drafts(),
+            ..view("Claude", "claude.ai", false)
+        });
+        let page = text(&shown(&html));
+        assert!(
+            page.starts_with("Allow claude.ai access to all chats of Alice (@alice)?"),
+            "{page}"
+        );
+        assert!(!page.contains("read-only"), "{page}");
+        assert!(!page.contains("can only read"), "{page}");
+        assert!(
+            page.contains("It can't send, edit or delete messages."),
+            "{page}"
+        );
+        assert!(
+            html.contains(
+                r#"<input type="checkbox" class="write" name="scope" value="draft" checked>"#
+            ),
+            "{html}"
+        );
+        // Both wordings are in the page, for the CSS to swap when a box changes.
+        assert!(text(&html).contains("read-only access"), "{html}");
+    }
+
+    #[test]
+    fn read_is_fixed_and_only_offered_scopes_get_a_box() {
+        let all: Scopes = Scope::ALL.into_iter().collect();
+        let html = consent_body(&ConsentView {
+            checked: all,
+            ..view("Claude", "claude.ai", false)
+        });
+        assert!(
+            html.contains(r#"<input type="checkbox" checked disabled>"#),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches(r#"name="scope""#).count(),
+            CONSENT_OFFERS.len()
+        );
+        for scope in Scope::ALL {
+            assert_eq!(
+                html.contains(&format!(r#"value="{scope}""#)),
+                CONSENT_OFFERS.contains(&scope),
+                "{scope}: {html}"
+            );
+        }
+        assert!(!html.contains(r#"value="read""#), "{html}");
     }
 }
