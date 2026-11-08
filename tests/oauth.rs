@@ -332,14 +332,13 @@ async fn refresh_rotates_and_is_bound_to_the_client() {
         }
     };
 
-    let (_, body) = refresh_with(other_client, refresh.to_string()).await;
-    assert_eq!(body["error"], "invalid_grant");
-
     let (status, rotated) = refresh_with(client_id.clone(), refresh.to_string()).await;
     assert_eq!(status, StatusCode::OK, "{rotated}");
     assert_ne!(rotated["refresh_token"], tokens["refresh_token"]);
-    let (_, replay) = refresh_with(client_id, refresh.to_string()).await;
-    assert_eq!(replay["error"], "invalid_grant");
+    // A retry right away (a lost response) still works: the grace window.
+    let (status, retried) = refresh_with(client_id.clone(), refresh.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_ne!(retried["refresh_token"], rotated["refresh_token"]);
 
     let client = server.mcp(rotated["access_token"].as_str().unwrap()).await;
     let whoami = client
@@ -347,6 +346,14 @@ async fn refresh_rotates_and_is_bound_to_the_client() {
         .await
         .unwrap();
     assert_eq!(whoami.structured_content.unwrap()["id"], 42);
+
+    // Another client presenting it is theft: the Grant ends (tests/refresh_reuse.rs).
+    let (_, body) = refresh_with(
+        other_client,
+        rotated["refresh_token"].as_str().unwrap().to_string(),
+    )
+    .await;
+    assert_eq!(body["error"], "invalid_grant");
 }
 
 #[tokio::test]

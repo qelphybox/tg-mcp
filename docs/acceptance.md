@@ -470,7 +470,7 @@ Needs, prepared in the Telegram app beforehand (Settings → Folders; replace th
 4. Step 4: only `<E>`'s chats with a badge (unread or marked as unread), in step 2's order; no `unread_scan_truncated`.
 5. Step 5: seven `invalid_params`: `this Chat folder is defined by rules, not supported yet (only folders that are a list of chats are): use list_chats without chat_folder to read the whole chat list instead`; `254 is not one of the account's Chat folders: ids come from whoami's chat_folders`; `chat_folder can't be combined with archived: …`; `this cursor continues the listing of Chat folder <id E>: pass chat_folder: <id E> with it` twice; `this cursor continues a listing without chat_folder: leave chat_folder out with it, or start over without a cursor`; `this cursor continues a listing without unread_only: …`.
 
-One `chat_folder` call makes one `messages.getDialogFilters` and one `messages.getPeerDialogs` per 100 chats of the folder (at most 4 calls), each through the Account's limiter; `whoami` makes one `getDialogFilters` more than before. No `FLOOD_WAIT` is expected; if one comes, record its seconds. `kamal app logs | grep -iF '<title of E>'`, the same for `<D>` and for a chat title of step 2 find nothing: folder and chat titles are never logged.
+Telegram calls, each through the Account's limiter: a first page makes one `messages.getDialogFilters` (none if `whoami` or another `chat_folder` call read the folders in the last 60 s; always one for an unknown id) and one `messages.getPeerDialogs` per 100 chats of the folder; a later page within 2 minutes of its listing's first page makes exactly one `messages.getPeerDialogs` of only its own chats (older: as a first page). Step 3 is thus 2 calls, then 1 per page; `whoami` makes one `getDialogFilters` more than before. No `FLOOD_WAIT` is expected (the first run, before this, flooded on the 6th page of step 3); if one comes, `kamal app logs | grep FLOOD_WAIT` names its `method`, `class` and `seconds`: record them. `kamal app logs | grep -iF '<title of E>'`, the same for `<D>` and for a chat title of step 2 find nothing: folder and chat titles are never logged.
 
 ## 40. get_chat_info on a user shows the profile Telegram shows the account, and common chats on request
 
@@ -519,3 +519,64 @@ Needs, in `list_chats` or found with `find_chats`: a large supergroup `<L>` the 
 7. Step 7: three `invalid_params` errors: the user id `… is a user, not a group or channel …`, `limit must be between 1 and 200`, `query must be at most 64 characters …`.
 
 `kamal app logs | grep -iF '<q>'` and `kamal app logs | grep -iF '<the name of one of G's members>'` find nothing: member names are never logged (only ids and counts, if anything).
+
+## 42. The catch_up and research prompts show up in Claude Code, and a run follows their recipe
+
+Needs, prepared in the Telegram app beforehand (replace the `<…>`): at least 4 chats with unread messages in the main list, among them a private chat `<P>` where someone asked you a question you haven't answered, a supergroup or channel `<S>` with an unread message that needs your answer (it has a `t.me` link), and, if the account is in one, a forum `<F>` with unread messages in two Topics. Write down the titles of the unread chats top to bottom, as the app's "All chats" list shows them. Pick a chat `<W>` by its title, a date `<D>` (`YYYY-MM-DD`) a few days back, and a subject `<t>` your chats discussed in different word forms or spellings (e.g. both "впн" and "VPN"). In Claude Code, with the server added as in §1 under a name `<srv>` (a fresh session, so it loads the current prompt list):
+
+1. Run `/mcp` and open `<srv>`. Record whether it shows prompts and how (e.g. a capability line or a count, "prompts"). Then type `/` followed by part of a prompt name: both prompts are offered as slash commands. Record their exact form: per Claude Code's docs `/mcp__<srv>__catch_up` and `/mcp__<srv>__research`, but other versions may show something like `/<srv>:catch_up (MCP)`; record whether the argument names (`since chat max_chats`, `topic since chat`) are shown as hints.
+2. Run the catch_up slash command without arguments and let it finish. Then ask:
+
+   ```text
+   Перечисли по порядку все вызовы инструментов Telegram MCP, которые ты сделал в предыдущем ответе: имя инструмента и параметры (текст сообщений не выводи). Для каждого чата из отчёта скажи, вызывал ли ты для него get_messages.
+   ```
+
+   Expect: the first call is `list_chats` with `unread_only: true`; every chat in the report had a `get_messages` call (none was summarised from the preview alone); at most 10 chats are reported, and with more than 10 unread chats the report says how many were left out; in `<F>`, `get_messages` with `topic` for the Topics with new messages (or `get_chat_info` and then `topic`); per chat 1-3 sentences, who waits for an answer with the sender and a quote, the `t.me` link for `<S>`'s message (none for `<P>`: chat and date instead); at the end a "Needs your reply" list with `<P>` and `<S>` (or a plain statement that nothing needs a reply, if that is true). The answer comes in the language you use in the session.
+3. Run catch_up with arguments: `/mcp__<srv>__catch_up <D> "<W>" 2` (the date, the chat title in quotes, max_chats). Expect a `find_chats` call with `<W>`'s title (or its words) and then `get_messages` for that chat with `since` = `<D>`, and only `<W>` in the report. Then run it with only `<D>` and 2: at most 2 chats, the rest counted as left out. Record how Claude Code passed the quoted title (one argument, or split at the space).
+4. Run the research slash command with `"<t>"` as the only argument, then ask the same question as in step 2 (for search_messages and get_messages). Expect: several `search_messages` calls with short queries, in different word forms, spellings or languages; `get_messages` with `around_id` (or `thread_of`) for the hits it uses; every fact in the answer has its chat and date (and a `t.me` link where the chat has them); inferences are marked apart from facts; the answer says which queries found nothing. Run it once more with `<t>`, `<D>` and `"<W>"`: every `search_messages` call has `since` and `chat_id` of `<W>`.
+5. Errors: run the research slash command with no arguments, and catch_up with `max_chats` 0. Record what Claude Code shows: the server answers `invalid_params` for both: one that names the missing field `topic`, and `max_chats must be between 1 and 50`; Claude Code may also refuse the first itself, since `topic` is marked required.
+6. In claude.ai (web), with the connector added as in §1: look for the prompts in the chat input's "+" (or attachment) menu under the connector, and record whether and how they show up and whether one can be run with arguments. Nothing is expected: record what you see.
+
+`kamal app logs | grep -iF '<t>'` and the same for `<W>`'s title find nothing: prompt arguments, like message content, are never logged.
+
+## 50. A reused refresh Token revokes its Grant after a 60-second grace window, and logs its Telegram session out
+
+Needs two QR scans and about three minutes. The script logs in twice with its own OAuth clients, as `revoke-check.py` does, and never prints a Token:
+
+1. It refreshes twice with the same refresh Token within 60 s (both pairs must work), presents a forged secret for that Token after the window (nothing may happen), then presents the real one after the window: every Token of that Grant must die.
+2. After Enter, a second login: its refresh Token presented with another `client_id` must kill that Grant the same way.
+
+```sh
+python3 scripts/refresh-reuse-check.py   # expect every line [PASS] and exit status 0; it waits 65 s in step 1
+```
+
+Then, within 15 minutes, the server's side of it:
+
+```sh
+logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+logs | grep -E 'refresh token misused|revoked grant'
+# expect 4 lines: WARN "refresh token misused, grant revoked" with grant_id=… reason="refresh_reuse",
+#   then INFO "revoked grant's live client logged its telegram session out" with the same grant_id;
+#   the same pair again with reason="foreign_client" and the second grant_id
+logs | grep -c 'tgm_'   # expect 0: no Token is ever logged
+```
+
+In Telegram → Settings → Devices, neither "Unofficial MCP Server" session of this run is listed: each was logged out with its Live client, which the script's `whoami` calls kept open. If one is still listed, look for `logging a revoked grant's telegram session out failed` or `had no live client` in `logs` and record it.
+
+The Wrapped keys of used refresh Tokens leave the database within minutes. Use your regular connector for over an hour first (access Tokens last an hour, so it refreshes at least once), then dump the database as in §3:
+
+```sh
+mkdir -p /tmp/tgmcp-dump
+ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
+python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 3
+print(db.execute("""SELECT count(*), coalesce(sum(wrapped_key IS NOT NULL
+                      AND consumed_at < CAST(strftime('%s', 'now') AS INTEGER) - 300), 0)
+                    FROM tokens WHERE consumed_at IS NOT NULL""").fetchone())
+# expect (N, 0): N >= 1 used refresh Tokens kept for reuse detection, none with a Wrapped key 5 minutes after its window
+PY
+```
+
+Finally, no false alarm in normal use: open two Claude Code sessions on the connector and use both across an hourly refresh (`whoami` in each after more than an hour). Both keep answering without a browser opening, and `logs` (with `--since` widened to cover the time) has no `refresh token misused` line for your own Grant. If one appears, a client kept a used refresh Token for more than 60 s: record which client and version.

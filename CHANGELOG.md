@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A reused refresh Token revokes its Grant.** A refresh Token keeps working for 60 seconds after its first use (two client processes refreshing at once, or a retry after a lost response, both get a working pair). Presented after that, or by a client it wasn't issued to, it revokes the whole Grant: every Token stops working (`/mcp` → 401) and, if the server holds a Live client for it, its Telegram session is logged out. The client sees the usual `invalid_grant`; the server logs `refresh_reuse` or `foreign_client` with the Grant id, never a Token. A wrong secret for a used Token revokes nothing.
+- A used refresh Token's Wrapped key is deleted from the database within a few minutes; SQLite's `secure_delete` is on, so deleted keys leave the file.
+
+### Operations
+
+- Migration `0003_consumed_refresh_tokens` rebuilds the `tokens` table. An image built before it does not start on a database that ran it, so `kamal rollback` past this release fails: fix forward instead.
+
 ## 0.1.3
 
 ### Breaking: message media is a field of its own

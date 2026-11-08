@@ -22,7 +22,7 @@ use super::{
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
-    folders::{self, ChatFolder, RawChatFolder},
+    folders::{self, ChatFolder, FolderCache, RawChatFolder},
     media::{FileLocation, StoredFile},
     members::{
         self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
@@ -43,7 +43,10 @@ use super::{
     },
     view::{self, Album, Picture, PictureSize, RawViewMessage, SizeForm},
 };
-use crate::{limits::MethodClass, sessions::OpenedGrant};
+use crate::{
+    limits::MethodClass,
+    sessions::{GrantId, OpenedGrant},
+};
 
 /// Everything a fake Account has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +171,15 @@ impl FakeChatFolder {
             excluded: self.excluded.clone(),
         }
     }
+}
+
+/// A folder request the fake Telegram answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderRpc {
+    /// `messages.getDialogFilters`.
+    DialogFilters,
+    /// `messages.getPeerDialogs` for this many Chats.
+    PeerDialogs(usize),
 }
 
 /// One Topic of a fake forum.
@@ -863,6 +875,10 @@ fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
 pub struct FakeTelegram {
     data: FakeData,
     known: KnownPeers,
+    /// Like a Live client's, kept across requests per Grant.
+    folder_cache: Arc<FolderCache>,
+    /// The folder requests answered, for every Grant.
+    folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
     files: Arc<FakeFiles>,
     transcriber: Arc<FakeTranscriber>,
 }
@@ -1360,6 +1376,8 @@ impl FakeTelegram {
         Self {
             data,
             known: Arc::default(),
+            folder_cache: Arc::default(),
+            folder_rpcs: Arc::default(),
             files: Arc::default(),
             transcriber: Arc::default(),
         }
@@ -1401,11 +1419,9 @@ impl Telegram for FakeTelegram {
     }
 
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
-        Ok(self
-            .dialog_filters()?
-            .into_iter()
-            .map(|f| f.folder)
-            .collect())
+        let folders = self.dialog_filters()?;
+        self.folder_cache.remember(&folders);
+        Ok(folders.into_iter().map(|f| f.folder).collect())
     }
 
     /// The same `messages.getDialogs` calls as the Live client, answered by
@@ -1415,6 +1431,7 @@ impl Telegram for FakeTelegram {
             return folders::list_folder_chats(
                 &query,
                 folder,
+                &self.folder_cache,
                 || std::future::ready(self.dialog_filters()),
                 |peers| std::future::ready(self.peer_dialogs(&peers)),
             )
@@ -2016,6 +2033,10 @@ impl FakeTelegram {
     /// answers none for a Chat it doesn't have or a wrong access hash.
     fn peer_dialogs(&self, peers: &[ChatRef]) -> Result<DialogsAnswer, TgError> {
         self.flood()?;
+        self.folder_rpcs
+            .lock()
+            .unwrap()
+            .push(FolderRpc::PeerDialogs(peers.len()));
         assert!(
             peers.len() <= folders::PEER_DIALOGS_CHUNK,
             "Telegram's limit"
@@ -2081,6 +2102,10 @@ impl FakeTelegram {
     /// One `messages.getDialogFilters`: the Account's Chat folders.
     fn dialog_filters(&self) -> Result<Vec<RawChatFolder>, TgError> {
         self.flood()?;
+        self.folder_rpcs
+            .lock()
+            .unwrap()
+            .push(FolderRpc::DialogFilters);
         if self.data.chat_folders_fail {
             return Err(TgError::Upstream("rpc error 500: INTERNAL".into()));
         }
@@ -2563,6 +2588,9 @@ struct FakeTelegramSide {
     dead: Mutex<HashSet<i64>>,
     /// Accounts `auth.logOut` was called for, in order.
     logged_out: Mutex<Vec<i64>>,
+    /// The Account of each Grant with a Live client, as the Client pool holds
+    /// them: from its first connect until it is logged out or shut down.
+    live: Mutex<std::collections::HashMap<String, i64>>,
     unreachable: std::sync::atomic::AtomicBool,
     /// How many times [`Connector::shutdown`] was called.
     shutdowns: std::sync::atomic::AtomicUsize,
@@ -2573,6 +2601,10 @@ struct FakeTelegramSide {
     files: Arc<FakeFiles>,
     /// Telegram's transcription service, the same for every Grant.
     transcriber: Arc<FakeTranscriber>,
+    /// Each Grant's [`FolderCache`], kept like `known`.
+    folder_caches: Mutex<std::collections::HashMap<String, Arc<FolderCache>>>,
+    /// The folder requests answered, for every Grant, in order.
+    folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
 }
 
 impl FakeConnector {
@@ -2584,6 +2616,11 @@ impl FakeConnector {
     /// Accounts whose session was logged out through [`Connector::log_out`].
     pub fn logged_out(&self) -> Vec<i64> {
         self.telegram.logged_out.lock().unwrap().clone()
+    }
+
+    /// How many Grants have a Live client.
+    pub fn live_clients(&self) -> usize {
+        self.telegram.live.lock().unwrap().len()
     }
 
     /// How many times the server shut this connector down.
@@ -2603,6 +2640,11 @@ impl FakeConnector {
         self.telegram.transcriber.clone()
     }
 
+    /// The folder requests Telegram answered since the last call, in order.
+    pub fn take_folder_rpcs(&self) -> Vec<FolderRpc> {
+        std::mem::take(&mut *self.telegram.folder_rpcs.lock().unwrap())
+    }
+
     /// Make every call to Telegram fail as if it were down.
     pub fn set_unreachable(&self, unreachable: bool) {
         self.telegram
@@ -2613,6 +2655,29 @@ impl FakeConnector {
     fn data(grant: &OpenedGrant) -> Result<FakeData, TgError> {
         serde_json::from_slice(&grant.telegram_session)
             .map_err(|e| TgError::BadSession(e.to_string()))
+    }
+
+    /// Drop a Grant's Live client; its Account, if it had one.
+    fn evict(&self, grant_id: &GrantId) -> Option<i64> {
+        self.telegram
+            .known
+            .lock()
+            .unwrap()
+            .remove(grant_id.as_str());
+        self.telegram
+            .folder_caches
+            .lock()
+            .unwrap()
+            .remove(grant_id.as_str());
+        self.telegram.live.lock().unwrap().remove(grant_id.as_str())
+    }
+
+    /// `auth.logOut` for an Account's session.
+    fn end_session(&self, account_id: i64) -> Result<(), TgError> {
+        self.reachable()?;
+        self.telegram.dead.lock().unwrap().insert(account_id);
+        self.telegram.logged_out.lock().unwrap().push(account_id);
+        Ok(())
     }
 
     fn reachable(&self) -> Result<(), TgError> {
@@ -2649,9 +2714,24 @@ impl Connector for FakeConnector {
             .entry(grant.grant_id.as_str().to_string())
             .or_default()
             .clone();
+        self.telegram
+            .live
+            .lock()
+            .unwrap()
+            .insert(grant.grant_id.as_str().to_string(), data.account.id);
+        let folder_cache = self
+            .telegram
+            .folder_caches
+            .lock()
+            .unwrap()
+            .entry(grant.grant_id.as_str().to_string())
+            .or_default()
+            .clone();
         Ok(Arc::new(FakeTelegram {
             data,
             known,
+            folder_cache,
+            folder_rpcs: self.telegram.folder_rpcs.clone(),
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
         }))
@@ -2659,14 +2739,20 @@ impl Connector for FakeConnector {
 
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
         let account_id = Self::data(&grant)?.account.id;
-        self.reachable()?;
-        self.telegram.dead.lock().unwrap().insert(account_id);
-        self.telegram.logged_out.lock().unwrap().push(account_id);
-        Ok(())
+        self.evict(&grant.grant_id);
+        self.end_session(account_id)
+    }
+
+    async fn evict_and_log_out(&self, grant_id: &GrantId) -> Result<bool, TgError> {
+        let Some(account_id) = self.evict(grant_id) else {
+            return Ok(false);
+        };
+        self.end_session(account_id).map(|()| true)
     }
 
     /// Nothing is held open; the peer caches go, as with the Live clients.
     async fn shutdown(&self) {
+        self.telegram.live.lock().unwrap().clear();
         self.telegram.known.lock().unwrap().clear();
         self.telegram
             .shutdowns
