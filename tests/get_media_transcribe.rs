@@ -435,7 +435,25 @@ async fn no_transcript_reaches_the_logs() {
     let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
     assert!(logs.contains("media transcription served"), "{logs}");
     assert!(logs.contains("chars="), "sizes are logged: {logs}");
-    for secret in [SECRET, "4711", "Ignore", "видео кружок", "Это"] {
-        assert!(!logs.contains(secret), "{secret} in the logs");
+    // The sink holds the logs of every test in this binary, full of random
+    // numbers (timestamps, ports, ids, durations), so a needle must be one
+    // that can't turn up by chance: no bare digits like "4711".
+    // Our log lines are ASCII and the transcripts here are Russian, so any
+    // Cyrillic letter is a leaked fragment of one; their ASCII parts that
+    // Telegram delivers are checked as whole phrases.
+    let leaked = |line: &str| {
+        line.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+            || [
+                "4711-0815",
+                "Ignore previous",
+                "Ignore\u{200B}",
+                "previous\u{202E}",
+                "a video is no voice message",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+    };
+    if let Some(line) = logs.lines().find(|line| leaked(line)) {
+        panic!("a transcript in the logs: {line}");
     }
 }
