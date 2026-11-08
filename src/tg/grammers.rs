@@ -165,10 +165,13 @@ fn login_error(err: InvocationError) -> TgError {
     flood_error(err, MethodClass::Default)
 }
 
-/// A flood as [`TgError::FloodWait`] of `class`; anything else is upstream.
+/// A flood as [`TgError::FloodWait`] of `class`, `PEER_FLOOD` (the Account is
+/// limited for spam: a refusal, not a wait) as [`TgError::PeerFlood`]; anything
+/// else is upstream.
 fn flood_error(err: InvocationError, class: MethodClass) -> TgError {
     match flood_seconds(&err) {
         Some(seconds) => TgError::FloodWait { seconds, class },
+        None if err.is("PEER_FLOOD") => TgError::PeerFlood,
         None => upstream(err),
     }
 }
@@ -176,6 +179,11 @@ fn flood_error(err: InvocationError, class: MethodClass) -> TgError {
 /// The FLOOD_WAIT window a request falls in, by its TL method name.
 fn method_class<R: tl::Identifiable>() -> MethodClass {
     MethodClass::of(tl::name_for_id(R::CONSTRUCTOR_ID))
+}
+
+/// Whether a request sends a message, which counts against its Chat's Send cap.
+fn is_send<R: tl::Identifiable>() -> bool {
+    crate::limits::is_send(tl::name_for_id(R::CONSTRUCTOR_ID))
 }
 
 /// Errors meaning "this Telegram session is gone": logged out, revoked, banned.
@@ -471,7 +479,8 @@ impl LiveClient {
     /// One request to Telegram, under the Account's limiter, in the FLOOD_WAIT
     /// window of its [`MethodClass`] (derived from the TL method, so a new request
     /// needs no tagging). `chat` gives "can't read this chat" errors a
-    /// caller-facing meaning.
+    /// caller-facing meaning; a sent message (`messages.sendMessage`) must name
+    /// its `chat`, whose Send cap it counts against.
     async fn call<R: tl::RemoteCall + tl::Identifiable>(
         &self,
         request: &R,
@@ -490,28 +499,36 @@ impl LiveClient {
         refusal: impl Fn(&InvocationError) -> Option<TgError> + Send + Sync,
     ) -> Result<R::Return, TgError> {
         let class = method_class::<R>();
-        self.limiter
-            .run(class, || async {
-                #[cfg(test)]
-                self.sent
-                    .lock()
-                    .unwrap()
-                    .push(tl::Serializable::to_bytes(request));
-                #[cfg(test)]
-                let scripted = self.answers.lock().unwrap().pop_front();
-                #[cfg(not(test))]
-                let scripted = None;
-                let answer = match scripted {
-                    Some(err) => Err(err),
-                    None => self.client.invoke(request).await,
-                };
-                answer.map_err(|err| match (refusal(&err), chat) {
-                    (Some(refused), _) => refused,
-                    (None, Some(chat)) => self.classify_chat_error(err, chat, class),
-                    (None, None) => self.classify(err, class),
-                })
+        let attempt = || async {
+            #[cfg(test)]
+            self.sent
+                .lock()
+                .unwrap()
+                .push(tl::Serializable::to_bytes(request));
+            #[cfg(test)]
+            let scripted = self.answers.lock().unwrap().pop_front();
+            #[cfg(not(test))]
+            let scripted = None;
+            let answer = match scripted {
+                Some(err) => Err(err),
+                None => self.client.invoke(request).await,
+            };
+            answer.map_err(|err| match (refusal(&err), chat) {
+                (Some(refused), _) => refused,
+                (None, Some(chat)) => self.classify_chat_error(err, chat, class),
+                (None, None) => self.classify(err, class),
             })
-            .await
+        };
+        if !is_send::<R>() {
+            return self.limiter.run(class, attempt).await;
+        }
+        // A sent message also counts against its Chat's Send cap.
+        match chat {
+            Some(chat) => self.limiter.run_send(chat, attempt).await,
+            None => Err(TgError::Upstream(
+                "a message can only be sent to a known chat".into(),
+            )),
+        }
     }
 
     /// Like [`Self::call`], to DC `dc_id` (a file's DC): under the Account's
@@ -3451,6 +3468,36 @@ mod tests {
             method_class::<messages::TranscribeAudio>(),
             MethodClass::Transcribe
         );
+        // What the write tools will send (ADR-0005): the writes budget.
+        let writes = [
+            method_class::<messages::SaveDraft>(),
+            method_class::<messages::SendMessage>(),
+            method_class::<messages::SendReaction>(),
+            method_class::<messages::ReadHistory>(),
+            method_class::<channels::ReadHistory>(),
+            method_class::<messages::ReadDiscussion>(),
+        ];
+        assert_eq!(writes, [MethodClass::Writes; 6]);
+    }
+
+    #[test]
+    fn peer_flood_is_its_own_error_never_a_wait() {
+        type SendMessage = tl::functions::messages::SendMessage;
+        assert!(matches!(
+            flood_error(rpc::<SendMessage>(400, "PEER_FLOOD"), MethodClass::Writes),
+            TgError::PeerFlood
+        ));
+        // A FLOOD_WAIT on a write is a wait of the writes class.
+        assert!(matches!(
+            flood_error(
+                rpc::<SendMessage>(420, "FLOOD_WAIT_12"),
+                MethodClass::Writes
+            ),
+            TgError::FloodWait {
+                seconds: 12,
+                class: MethodClass::Writes
+            }
+        ));
     }
 
     #[test]
@@ -4834,6 +4881,68 @@ mod resolve_tests {
             Err(TgError::Upstream(_))
         ));
         assert_eq!(sent(&live).len(), 1, "the transcription reached Telegram");
+    }
+
+    /// A message the way `send_message` will send one, to user `user_id`.
+    fn send_to(user_id: i64, random_id: i64) -> tl::functions::messages::SendMessage {
+        tl::functions::messages::SendMessage {
+            no_webpage: false,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                user_id,
+                access_hash: 99,
+            }),
+            reply_to: None,
+            message: "hi".into(),
+            random_id,
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+            rich_message: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sent_message_counts_against_its_chats_send_cap_at_the_call() {
+        use crate::limits::WriteLimit;
+        let (live, _dir) = cold_client().await;
+        let (a, b) = (ChatId::User(7), ChatId::User(8));
+        for random_id in 0..5 {
+            // Offline, each fails; each was handed to Telegram, so each counts.
+            assert!(matches!(
+                live.call(&send_to(7, random_id), Some(a)).await,
+                Err(TgError::Upstream(_))
+            ));
+        }
+        assert!(matches!(
+            live.call(&send_to(7, 5), Some(a)).await,
+            Err(TgError::WritesLimited {
+                limit: WriteLimit::Chat,
+                ..
+            })
+        ));
+        assert_eq!(sent(&live).len(), 5, "the 6th never reached Telegram");
+        assert!(matches!(
+            live.call(&send_to(8, 6), Some(b)).await,
+            Err(TgError::Upstream(_))
+        ));
+        assert_eq!(sent(&live).len(), 6);
+
+        // A send must name its Chat, or there is no cap to count it against.
+        assert!(live.call(&send_to(8, 7), None).await.is_err());
+        assert_eq!(sent(&live).len(), 6, "never sent without its Chat");
     }
 }
 
