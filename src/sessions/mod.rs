@@ -3,7 +3,8 @@
 //! A Grant's Telegram session is sealed with its Session key. The Session key is
 //! never stored; each Token carries a secret from which we derive a verifier (to
 //! recognise the Token) and a key-encryption key (to unwrap that Token's copy of
-//! the Session key). A database dump without Tokens opens nothing.
+//! the Session key). A Grant's Send allow-list is sealed with the same key. A
+//! database dump without Tokens opens nothing.
 //!
 //! All SQL lives in this file. ADR-0001 planned a `Store` trait; with one backend
 //! it would be a seam with nothing on the other side, so it arrives with Postgres.
@@ -28,9 +29,16 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use self::crypto::KEY_LEN;
-use crate::scope::Scopes;
+use crate::{
+    allow_list::{SendAllowList, WriteRefused, may_write},
+    scope::{Scope, Scopes},
+    tg::chats::ChatId,
+};
 
 const SESSION_AAD: &[u8] = b"tg-mcp/telegram-session/v1:";
+/// The Send allow-list's own label: its blob never opens as a Telegram
+/// session, nor as another Grant's list (the Grant id follows it).
+const SEND_ALLOW_LIST_AAD: &[u8] = b"tg-mcp/send-allow-list/v1:";
 const WRAP_AAD: &[u8] = b"tg-mcp/wrapped-key/v1:";
 const VERIFIER_INFO: &[u8] = b"tg-mcp/token-verifier/v1";
 const WRAP_INFO: &[u8] = b"tg-mcp/token-wrap/v1";
@@ -113,8 +121,18 @@ pub struct OpenedGrant {
     pub account_id: i64,
     /// What this Grant may do, as chosen on Consent.
     pub scopes: Scopes,
+    /// With `send`: the Chats it may write to, as chosen on Consent.
+    pub send_allow_list: Option<SendAllowList>,
     pub telegram_session: Zeroizing<Vec<u8>>,
     key: Zeroizing<[u8; KEY_LEN]>,
+}
+
+impl OpenedGrant {
+    /// May this Grant write to `chat` (send, react, mark as read)? Only with
+    /// the `send` Scope and only into its Send allow-list.
+    pub fn may_write_to(&self, chat: ChatId) -> Result<(), WriteRefused> {
+        may_write(self.scopes, self.send_allow_list.as_ref(), chat)
+    }
 }
 
 impl fmt::Debug for OpenedGrant {
@@ -123,6 +141,7 @@ impl fmt::Debug for OpenedGrant {
             .field("grant_id", &self.grant_id)
             .field("account_id", &self.account_id)
             .field("scopes", &self.scopes)
+            .field("send_allow_list", &self.send_allow_list)
             .field(
                 "telegram_session",
                 &format_args!("<{} bytes>", self.telegram_session.len()),
@@ -276,10 +295,7 @@ impl Vault {
             .await
     }
 
-    /// Store a freshly logged-in Telegram session as a new Grant of `client_id`
-    /// with `scopes`, and issue its first Token pair. The Session key exists only
-    /// inside the returned Tokens from now on. The Scopes never change after this
-    /// (ADR-0005): other Scopes mean a new Grant.
+    /// [`Vault::create_grant_with_send`] without a Send allow-list.
     pub async fn create_grant_with_scopes(
         &self,
         client_id: &str,
@@ -287,21 +303,45 @@ impl Vault {
         telegram_session: &[u8],
         scopes: Scopes,
     ) -> Result<IssuedTokens, VaultError> {
+        self.create_grant_with_send(client_id, account_id, telegram_session, scopes, None)
+            .await
+    }
+
+    /// Store a freshly logged-in Telegram session as a new Grant of `client_id`
+    /// with `scopes`, and issue its first Token pair. The Session key exists only
+    /// inside the returned Tokens from now on. The Scopes never change after this
+    /// (ADR-0005): other Scopes mean a new Grant.
+    ///
+    /// With `send` in `scopes`, `send_allow_list` is sealed with the Session key
+    /// and stored with the Grant (without one, the Grant may write nowhere);
+    /// without `send` it is not stored. It never changes either.
+    pub async fn create_grant_with_send(
+        &self,
+        client_id: &str,
+        account_id: i64,
+        telegram_session: &[u8],
+        scopes: Scopes,
+        send_allow_list: Option<&SendAllowList>,
+    ) -> Result<IssuedTokens, VaultError> {
         let grant_id = GrantId(uuid::Uuid::new_v4().to_string());
         let key = Zeroizing::new(crypto::random::<KEY_LEN>());
         let sealed = crypto::seal(&key, telegram_session, &session_aad(&grant_id));
+        let send_allow_list = send_allow_list.filter(|_| scopes.contains(Scope::Send));
+        let sealed_list = send_allow_list
+            .map(|list| crypto::seal(&key, &list.encode(), &send_allow_list_aad(&grant_id)));
         let now = self.now();
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO grants (id, client_id, account_id, telegram_session, scopes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO grants (id, client_id, account_id, telegram_session, scopes, send_allow_list, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(grant_id.as_str())
         .bind(client_id)
         .bind(account_id)
         .bind(sealed)
         .bind(scopes.to_string())
+        .bind(sealed_list)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -311,7 +351,14 @@ impl Vault {
             .await?;
         tx.commit().await?;
 
-        tracing::info!(grant_id = %grant_id, scopes = %scopes, "grant created");
+        // Counts only: the Chats themselves are as private as their names.
+        tracing::info!(
+            grant_id = %grant_id,
+            scopes = %scopes,
+            send_chats = send_allow_list.map_or(0, SendAllowList::len),
+            auto_send = send_allow_list.is_some_and(SendAllowList::auto_send),
+            "grant created"
+        );
         Ok(issued)
     }
 
@@ -337,22 +384,35 @@ impl Vault {
     }
 
     async fn decrypt(&self, verified: Verified) -> Result<OpenedGrant, VaultError> {
-        let row: Option<(i64, Vec<u8>, String)> =
-            sqlx::query_as("SELECT account_id, telegram_session, scopes FROM grants WHERE id = ?")
-                .bind(verified.grant_id.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        let (account_id, sealed, scopes) = row.ok_or(VaultError::InvalidToken)?;
+        let row: Option<(i64, Vec<u8>, String, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT account_id, telegram_session, scopes, send_allow_list FROM grants WHERE id = ?",
+        )
+        .bind(verified.grant_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let (account_id, sealed, scopes, sealed_list) = row.ok_or(VaultError::InvalidToken)?;
+        let corrupt = || VaultError::Corrupt {
+            token_id: verified.token_id.clone(),
+        };
         let telegram_session =
-            crypto::open(&verified.key, &sealed, &session_aad(&verified.grant_id)).ok_or_else(
-                || VaultError::Corrupt {
-                    token_id: verified.token_id.clone(),
-                },
-            )?;
+            crypto::open(&verified.key, &sealed, &session_aad(&verified.grant_id))
+                .ok_or_else(corrupt)?;
+        let send_allow_list = sealed_list
+            .map(|sealed| {
+                crypto::open(
+                    &verified.key,
+                    &sealed,
+                    &send_allow_list_aad(&verified.grant_id),
+                )
+                .and_then(|plain| SendAllowList::decode(&plain))
+                .ok_or_else(corrupt)
+            })
+            .transpose()?;
         Ok(OpenedGrant {
             grant_id: verified.grant_id,
             account_id,
             scopes: Scopes::from_stored(&scopes),
+            send_allow_list,
             telegram_session,
             key: verified.key,
         })
@@ -688,6 +748,10 @@ fn session_aad(grant_id: &GrantId) -> Vec<u8> {
     [SESSION_AAD, grant_id.as_str().as_bytes()].concat()
 }
 
+fn send_allow_list_aad(grant_id: &GrantId) -> Vec<u8> {
+    [SEND_ALLOW_LIST_AAD, grant_id.as_str().as_bytes()].concat()
+}
+
 fn wrap_aad(token_id: &str, grant_id: &GrantId) -> Vec<u8> {
     [
         WRAP_AAD,
@@ -736,37 +800,61 @@ mod tests {
         dump
     }
 
+    /// Chats of a Send allow-list, with ids unlikely to turn up by chance.
+    fn chosen_chats() -> SendAllowList {
+        SendAllowList::new(
+            [
+                ChatId::User(4_711_000_042),
+                ChatId::Chat(4_711_000_043),
+                ChatId::Channel(1_987_654_321_987),
+            ],
+            true,
+        )
+        .unwrap()
+    }
+
+    fn sending() -> Scopes {
+        [Scope::Send].into_iter().collect()
+    }
+
     /// ADR-0003's core promise: whoever steals the database file, but no Token,
-    /// opens no Telegram session. The first refresh Token is consumed and still in
-    /// its grace window here, so its Wrapped key is in the file too.
+    /// opens no Telegram session and no Send allow-list, and doesn't see which
+    /// Chats are on it. The first refresh Token is consumed and still in its
+    /// grace window here, so its Wrapped key is in the file too.
     #[tokio::test]
     async fn database_dump_without_tokens_opens_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.db");
         let session = crypto::random::<256>();
+        let list = chosen_chats();
 
         let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
-        let issued = vault.create_grant("client", 42, &session).await.unwrap();
+        let issued = vault
+            .create_grant_with_send("client", 42, &session, sending(), Some(&list))
+            .await
+            .unwrap();
         let rotated = vault
             .refresh(issued.refresh.expose(), "client")
             .await
             .unwrap();
         let opened = vault.open(rotated.access.expose()).await.unwrap();
+        assert_eq!(opened.send_allow_list.as_ref(), Some(&list));
         let real_key = *opened.key;
         vault.close().await;
 
         let dump = dump(&path);
-        let sealed: Vec<u8> = {
+        let (sealed, sealed_list): (Vec<u8>, Vec<u8>) = {
             let pool =
                 SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
                     .await
                     .unwrap();
-            sqlx::query_scalar("SELECT telegram_session FROM grants")
+            sqlx::query_as("SELECT telegram_session, send_allow_list FROM grants")
                 .fetch_one(&pool)
                 .await
                 .unwrap()
         };
         let aad = session_aad(&opened.grant_id);
+        let list_aad = send_allow_list_aad(&opened.grant_id);
 
         assert!(
             !contains(&dump, &session),
@@ -797,11 +885,105 @@ mod tests {
             !any_window_opens(&dump, &sealed, &aad),
             "a dump byte window decrypts the session"
         );
+        assert!(
+            !any_window_opens(&dump, &sealed_list, &list_aad),
+            "a dump byte window decrypts the Send allow-list"
+        );
+        assert!(
+            !contains(&dump, &list.encode()[..6 + 3 * 9]),
+            "plaintext Send allow-list in the dump"
+        );
+        for chat in list.chats() {
+            let (kind, id) = match chat {
+                ChatId::User(id) => (1u8, id),
+                ChatId::Chat(id) => (2, id),
+                ChatId::Channel(id) => (3, id),
+            };
+            for needle in [
+                [&[kind][..], &id.to_le_bytes()].concat(),
+                id.to_le_bytes().to_vec(),
+                id.to_be_bytes().to_vec(),
+                id.to_string().into_bytes(),
+                chat.to_string().into_bytes(),
+            ] {
+                assert!(!contains(&dump, &needle), "{chat} in the dump");
+            }
+        }
 
-        // The search above is not vacuous: plant the key and it is found.
+        // The searches above are not vacuous: plant the key and both open.
         let mut leaky = dump.clone();
         leaky.extend_from_slice(&real_key);
         assert!(any_window_opens(&leaky, &sealed, &aad));
+        assert!(any_window_opens(&leaky, &sealed_list, &list_aad));
+    }
+
+    /// A Send allow-list opens only as its own Grant's list: not swapped into
+    /// the Telegram session's place, nor into another Grant (of the same
+    /// Account, or with the same key), and the auto-send flag can't be flipped.
+    #[tokio::test]
+    async fn a_send_allow_list_opens_only_where_it_was_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let list = chosen_chats();
+        let mine = vault
+            .create_grant_with_send("client", 42, b"session", sending(), Some(&list))
+            .await
+            .unwrap();
+        let other = vault
+            .create_grant_with_send("client", 42, b"session", sending(), Some(&list))
+            .await
+            .unwrap();
+        let blobs = |grant: &GrantId| {
+            let pool = vault.pool.clone();
+            let id = grant.as_str().to_string();
+            async move {
+                sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+                    "SELECT telegram_session, send_allow_list FROM grants WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let (session, my_list) = blobs(&mine.grant_id).await;
+        let (_, other_list) = blobs(&other.grant_id).await;
+        let key = *vault.open(mine.access.expose()).await.unwrap().key;
+
+        // The same key can't open one blob as the other.
+        assert!(crypto::open(&key, &my_list, &session_aad(&mine.grant_id)).is_none());
+        assert!(crypto::open(&key, &session, &send_allow_list_aad(&mine.grant_id)).is_none());
+
+        let corrupt = |result: Result<OpenedGrant, VaultError>| {
+            matches!(result, Err(VaultError::Corrupt { .. }))
+        };
+        let set_list = |grant: &GrantId, blob: Vec<u8>| {
+            let pool = vault.pool.clone();
+            let id = grant.as_str().to_string();
+            async move {
+                sqlx::query("UPDATE grants SET send_allow_list = ? WHERE id = ?")
+                    .bind(blob)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        // Another Grant's list, the session blob, or a flipped bit: refused.
+        set_list(&mine.grant_id, other_list).await;
+        assert!(corrupt(vault.open(mine.access.expose()).await));
+        set_list(&mine.grant_id, session.clone()).await;
+        assert!(corrupt(vault.open(mine.access.expose()).await));
+        let mut flipped = my_list.clone();
+        flipped[24 + 1] ^= 1; // inside the ciphertext's first bytes: version, flags
+        set_list(&mine.grant_id, flipped).await;
+        assert!(corrupt(vault.open(mine.access.expose()).await));
+        // Its own: back as it was.
+        set_list(&mine.grant_id, my_list).await;
+        let opened = vault.open(mine.access.expose()).await.unwrap();
+        assert_eq!(opened.send_allow_list, Some(list));
     }
 
     /// A Grant made before Grants had Scopes (the schema of migrations 0001-0003)

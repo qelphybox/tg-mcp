@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tg_mcp::{
+    allow_list::{SendAllowList, WriteRefused},
     scope::{Scope, Scopes},
     sessions::{GrantId, PausedClock, RevokeReason, TokenTtl, Vault, VaultError},
+    tg::chats::ChatId,
 };
 
 const SESSION: &[u8] = b"grammers-session-bytes: auth key, dc, peers";
@@ -364,16 +366,87 @@ async fn a_grant_keeps_its_scopes_through_refresh_and_restart() {
     );
 }
 
+/// A `send` Grant opens with exactly the Chats chosen on Consent, through every
+/// Token, a refresh and a restart, and may write to those only; a Grant
+/// without `send` has no list and may write nowhere, whatever it is given.
+#[tokio::test]
+async fn a_send_grant_keeps_its_allow_list_through_refresh_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let sending: Scopes = [Scope::Send].into_iter().collect();
+    let alice = ChatId::User(7);
+    let team = ChatId::Channel(9);
+    let list = SendAllowList::new([alice, team], false).unwrap();
+    let (sender, drafter) = {
+        let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
+        let sender = vault
+            .create_grant_with_send("client", 42, SESSION, sending, Some(&list))
+            .await
+            .unwrap();
+        // A list without `send` is not kept.
+        let drafts: Scopes = [Scope::Draft].into_iter().collect();
+        let drafter = vault
+            .create_grant_with_send("client", 42, SESSION, drafts, Some(&list))
+            .await
+            .unwrap();
+        vault.close().await;
+        (sender, drafter)
+    };
+    assert_eq!(sender.scopes.to_string(), "read send");
+
+    let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
+    let rotated = vault
+        .refresh(sender.refresh.expose(), "client")
+        .await
+        .unwrap();
+    for grant in [
+        vault.open(sender.access.expose()).await.unwrap(),
+        vault.open(rotated.access.expose()).await.unwrap(),
+        vault
+            .open_for_client(rotated.refresh.expose(), "client")
+            .await
+            .unwrap(),
+    ] {
+        let opened = grant
+            .send_allow_list
+            .as_ref()
+            .expect("a send Grant has its list");
+        let mut chats: Vec<String> = opened.chats().map(|c| c.to_string()).collect();
+        chats.sort();
+        assert_eq!(chats, ["channel:9", "user:7"]);
+        assert!(!opened.auto_send(), "off unless ticked");
+        assert_eq!(grant.may_write_to(alice), Ok(()));
+        assert_eq!(grant.may_write_to(team), Ok(()));
+        assert_eq!(
+            grant.may_write_to(ChatId::Chat(8)),
+            Err(WriteRefused::NotInAllowList(ChatId::Chat(8)))
+        );
+    }
+
+    let drafter = vault.open(drafter.access.expose()).await.unwrap();
+    assert_eq!(drafter.send_allow_list, None);
+    assert_eq!(drafter.may_write_to(alice), Err(WriteRefused::NoSendScope));
+}
+
 #[tokio::test]
 async fn debug_output_never_contains_secrets() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
     let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
     let grant = vault.open(issued.access.expose()).await.unwrap();
 
-    let printed = format!("{issued:?} {grant:?}");
+    let list = SendAllowList::new([ChatId::User(4_711_000_042)], true).unwrap();
+    let sending: Scopes = [Scope::Send].into_iter().collect();
+    let sender = vault
+        .create_grant_with_send("client", 42, SESSION, sending, Some(&list))
+        .await
+        .unwrap();
+    let sender = vault.open(sender.access.expose()).await.unwrap();
+
+    let printed = format!("{issued:?} {grant:?} {sender:?}");
     assert!(!printed.contains(issued.access.expose()));
     assert!(!printed.contains(issued.refresh.expose()));
     assert!(!printed.contains("grammers-session-bytes"));
+    assert!(!printed.contains("4711000042"), "a listed Chat: {printed}");
     assert!(
         printed.contains(issued.grant_id.as_str()),
         "ids stay visible: {printed}"
