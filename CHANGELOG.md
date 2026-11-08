@@ -18,6 +18,7 @@
 
 - Migration `0003_consumed_refresh_tokens` rebuilds the `tokens` table. An image built before it does not start on a database that ran it, so `kamal rollback` past this release fails: fix forward instead.
 - Migration `0004_grant_scopes` adds `grants.scopes` (plaintext, `read` for every existing Grant). Same rollback rule.
+- New settings for the write tools to come (no tool writes yet): `TG_MCP_ACCOUNT_WRITES_PER_10_MIN` (default 20), the Writes budget, writes per account in any 10 minutes on top of the request budget; `TG_MCP_CHAT_SENDS_PER_MINUTE` (default 5), the Send cap, messages sent to one chat in any minute. A write over either, or in a `FLOOD_WAIT` of writes, fails at once with "retry in N s": writes never wait inside a call, are never retried and never queued. Telegram's `PEER_FLOOD` (the account is limited for spam) is reported as such, never retried. Reading is unaffected.
 
 ## 0.1.3
 

@@ -57,6 +57,14 @@ _Avoid_: permission, role, right
 The Chats a Grant with the `send` Scope may send to, react in or mark as read, chosen on the Consent screen. Nothing outside it can be written to.
 _Avoid_: whitelist, allowed chats
 
+**Writes budget**:
+How many writes (Drafts, sent messages, reactions, marking as read) an Account may make in any 10 minutes, 20 by default, on top of the request budget every call to Telegram shares. A write over it fails at once with the wait; it never waits or queues.
+_Avoid_: write quota, rate limit (unqualified)
+
+**Send cap**:
+How many messages the Account may send to one Chat in any minute, 5 by default. Only sent messages count, not reactions, marking as read or Drafts. Counted when the message goes to Telegram, so a send awaiting confirmation doesn't count yet; over the cap it fails at once with the wait and is never queued.
+_Avoid_: per-chat limit, throttle
+
 **Draft**:
 Unsent text in a Chat's input field of the Account, synced to all its devices. Only the user sends it.
 _Avoid_: pending message, unsent message
