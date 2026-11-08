@@ -42,7 +42,10 @@ use super::{
     },
     view::{self, Album, Picture, PictureSize, RawViewMessage, SizeForm},
 };
-use crate::{limits::MethodClass, sessions::OpenedGrant};
+use crate::{
+    limits::MethodClass,
+    sessions::{GrantId, OpenedGrant},
+};
 
 /// Everything a fake Account has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2446,6 +2449,9 @@ struct FakeTelegramSide {
     dead: Mutex<HashSet<i64>>,
     /// Accounts `auth.logOut` was called for, in order.
     logged_out: Mutex<Vec<i64>>,
+    /// The Account of each Grant with a Live client, as the Client pool holds
+    /// them: from its first connect until it is logged out or shut down.
+    live: Mutex<std::collections::HashMap<String, i64>>,
     unreachable: std::sync::atomic::AtomicBool,
     /// How many times [`Connector::shutdown`] was called.
     shutdowns: std::sync::atomic::AtomicUsize,
@@ -2467,6 +2473,11 @@ impl FakeConnector {
     /// Accounts whose session was logged out through [`Connector::log_out`].
     pub fn logged_out(&self) -> Vec<i64> {
         self.telegram.logged_out.lock().unwrap().clone()
+    }
+
+    /// How many Grants have a Live client.
+    pub fn live_clients(&self) -> usize {
+        self.telegram.live.lock().unwrap().len()
     }
 
     /// How many times the server shut this connector down.
@@ -2496,6 +2507,24 @@ impl FakeConnector {
     fn data(grant: &OpenedGrant) -> Result<FakeData, TgError> {
         serde_json::from_slice(&grant.telegram_session)
             .map_err(|e| TgError::BadSession(e.to_string()))
+    }
+
+    /// Drop a Grant's Live client; its Account, if it had one.
+    fn evict(&self, grant_id: &GrantId) -> Option<i64> {
+        self.telegram
+            .known
+            .lock()
+            .unwrap()
+            .remove(grant_id.as_str());
+        self.telegram.live.lock().unwrap().remove(grant_id.as_str())
+    }
+
+    /// `auth.logOut` for an Account's session.
+    fn end_session(&self, account_id: i64) -> Result<(), TgError> {
+        self.reachable()?;
+        self.telegram.dead.lock().unwrap().insert(account_id);
+        self.telegram.logged_out.lock().unwrap().push(account_id);
+        Ok(())
     }
 
     fn reachable(&self) -> Result<(), TgError> {
@@ -2532,6 +2561,11 @@ impl Connector for FakeConnector {
             .entry(grant.grant_id.as_str().to_string())
             .or_default()
             .clone();
+        self.telegram
+            .live
+            .lock()
+            .unwrap()
+            .insert(grant.grant_id.as_str().to_string(), data.account.id);
         Ok(Arc::new(FakeTelegram {
             data,
             known,
@@ -2542,14 +2576,20 @@ impl Connector for FakeConnector {
 
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError> {
         let account_id = Self::data(&grant)?.account.id;
-        self.reachable()?;
-        self.telegram.dead.lock().unwrap().insert(account_id);
-        self.telegram.logged_out.lock().unwrap().push(account_id);
-        Ok(())
+        self.evict(&grant.grant_id);
+        self.end_session(account_id)
+    }
+
+    async fn evict_and_log_out(&self, grant_id: &GrantId) -> Result<bool, TgError> {
+        let Some(account_id) = self.evict(grant_id) else {
+            return Ok(false);
+        };
+        self.end_session(account_id).map(|()| true)
     }
 
     /// Nothing is held open; the peer caches go, as with the Live clients.
     async fn shutdown(&self) {
+        self.telegram.live.lock().unwrap().clear();
         self.telegram.known.lock().unwrap().clear();
         self.telegram
             .shutdowns

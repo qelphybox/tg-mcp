@@ -33,7 +33,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::{limits::MethodClass, sessions::OpenedGrant};
+use crate::{
+    limits::MethodClass,
+    sessions::{GrantId, OpenedGrant},
+};
 
 /// The Telegram Account a Grant reads on behalf of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -193,6 +196,14 @@ pub trait Connector: Send + Sync + 'static {
     /// considers dead counts as logged out.
     async fn log_out(&self, grant: OpenedGrant) -> Result<(), TgError>;
 
+    /// Best effort for a Grant revoked without a Token (a stolen refresh Token,
+    /// ADR-0003): if the Client pool holds its Live client, drop it and end its
+    /// Telegram session (`auth.logOut`) with the session in its memory. `Ok(false)`
+    /// when there is none: nothing is called, and the Telegram session stays in
+    /// the Account's Active sessions, since only a Token could open it. Once
+    /// evicted, the Live client is gone even if logging out fails.
+    async fn evict_and_log_out(&self, grant_id: &GrantId) -> Result<bool, TgError>;
+
     /// Graceful shutdown, once the HTTP server has stopped: close every Live client
     /// and re-seal each Telegram session that changed while it was live. Failures
     /// are logged (Grant ids only), not returned: the process is exiting anyway.
@@ -278,6 +289,9 @@ mod tests {
             unreachable!()
         }
         async fn log_out(&self, _: OpenedGrant) -> Result<(), TgError> {
+            unreachable!()
+        }
+        async fn evict_and_log_out(&self, _: &GrantId) -> Result<bool, TgError> {
             unreachable!()
         }
         async fn shutdown(&self) {

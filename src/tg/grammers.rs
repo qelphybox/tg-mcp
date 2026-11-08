@@ -46,7 +46,7 @@ use super::{
     },
     view::{self, Album, RawViewMessage},
 };
-use crate::sessions::{OpenedGrant, Vault};
+use crate::sessions::{GrantId, OpenedGrant, Vault};
 
 /// How long revocation waits for `auth.logOut` before giving up on Telegram.
 const LOG_OUT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2232,9 +2232,33 @@ impl Connector for GrammersConnector {
             None => grant.telegram_session.clone(),
         };
         drop(grant);
+        self.log_out_session(&snapshot).await
+    }
+
+    async fn evict_and_log_out(&self, grant_id: &GrantId) -> Result<bool, TgError> {
+        let Some(live) = self.pool.remove(grant_id.as_str()) else {
+            return Ok(false);
+        };
+        let snapshot = live.snapshot()?;
+        drop(live);
+        self.log_out_session(&snapshot).await.map(|()| true)
+    }
+
+    async fn shutdown(&self) {
+        let _resealing = self.resealing.lock().await;
+        let live_clients = self.pool.len();
+        let (resealed, failed) = self.reseal(self.pool.drain()).await;
+        tracing::info!(live_clients, resealed, failed, "client pool flushed");
+    }
+}
+
+impl GrammersConnector {
+    /// `auth.logOut` on a fresh connection with this Telegram session. A session
+    /// Telegram already considers dead counts as logged out.
+    async fn log_out_session(&self, snapshot: &[u8]) -> Result<(), TgError> {
         let Connected { client, .. } = connect(
             &self.credentials,
-            SessionStore::from_snapshot(&snapshot)?,
+            SessionStore::from_snapshot(snapshot)?,
             Purpose::Live,
         );
         let result = tokio::time::timeout(
@@ -2249,13 +2273,6 @@ impl Connector for GrammersConnector {
             Ok(Err(err)) => Err(upstream(err)),
             Err(_) => Err(TgError::Upstream("auth.logOut timed out".into())),
         }
-    }
-
-    async fn shutdown(&self) {
-        let _resealing = self.resealing.lock().await;
-        let live_clients = self.pool.len();
-        let (resealed, failed) = self.reseal(self.pool.drain()).await;
-        tracing::info!(live_clients, resealed, failed, "client pool flushed");
     }
 }
 
@@ -3426,6 +3443,36 @@ mod shutdown_tests {
         assert_eq!(connector.pool.len(), 0, "no Live client survives shutdown");
         let reopened = vault.open(issued.access.expose()).await.unwrap();
         assert_eq!(reopened.telegram_session.as_slice(), moved.as_slice());
+    }
+
+    /// A Grant revoked without a Token whose Live client isn't pooled: nothing
+    /// holds its Telegram session, so nothing is sent anywhere.
+    #[tokio::test]
+    async fn evicting_a_grant_without_a_live_client_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(
+            Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+                .await
+                .unwrap(),
+        );
+        let issued = vault.create_grant("client", 42, b"").await.unwrap();
+        let connector = GrammersConnector::new(
+            AppCredentials {
+                api_id: 0,
+                api_hash: "unused".into(),
+            },
+            vault,
+            Arc::new(Limits::new(LimitsConfig::default())),
+            Duration::from_secs(3600),
+        );
+
+        let logged_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            connector.evict_and_log_out(&issued.grant_id),
+        )
+        .await
+        .expect("no network call is made");
+        assert!(!logged_out.unwrap());
     }
 }
 
