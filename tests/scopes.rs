@@ -208,6 +208,19 @@ async fn mcp_tells_each_grant_its_own_scopes() {
     assert!(read_tools.contains(&"whoami".to_string()));
     assert_eq!(names(drafter.list_all_tools().await.unwrap()), read_tools);
 
+    // Prompts read nothing and name only `read` tools: every Grant gets them.
+    let prompts = |list: Vec<rmcp::model::Prompt>| {
+        list.into_iter()
+            .map(|p| p.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    let read_prompts = prompts(reader.list_all_prompts().await.unwrap());
+    assert!(!read_prompts.is_empty());
+    assert_eq!(
+        prompts(drafter.list_all_prompts().await.unwrap()),
+        read_prompts
+    );
+
     let whoami = drafter
         .call_tool(rmcp::model::CallToolRequestParams::new("whoami"))
         .await

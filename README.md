@@ -37,6 +37,17 @@ Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser op
 
 Chat ids look like `user:123~a-MGLzhi9Ek`, `chat:456` (basic group) or `channel:789~18YMXnDF6JI` (channels and supergroups), as returned by `list_chats`, `find_chats` and in message senders; the part after `~` is the access hash Telegram needs, so an id works without the server looking it up. Ids without it (`user:123`) are still accepted. Every tool is marked read-only and has bounded output: at most 100 items per call (200 members for `get_members`), long texts cut. Messages describe their media (`media`: its kind and metadata) without downloading it; `text` holds only a message's text or caption, so a voice message has an empty `text` and `media.kind: "voice"`. Only `get_media` fetches a file, a picture or a transcription, and only when asked to.
 
+## Prompts
+
+Two MCP prompts turn common requests into step-by-step instructions that use the tools above. A client that supports prompts lists them and inserts the rendered text as if you typed it; Claude Code shows them as slash commands named after the server, e.g. `/mcp__telegram__catch_up` for a server added as `telegram`, with arguments in the order below (quote one of several words). Rendering a prompt reads nothing from Telegram.
+
+| Prompt | Arguments | What it asks the model to do |
+| --- | --- | --- |
+| `catch_up` | `since`, `chat`, `max_chats` (all optional; `max_chats` 1-50, default 10) | Read the unread chats (`list_chats` `unread_only`), or the one chat named, message by message with `get_messages` (never from previews), forums Topic by Topic, at most `max_chats` chats, saying how many were left out. Report per chat what happened and who waits for a reply (sender, quote, `link`), and end with a "needs your reply" list, or say there is none. |
+| `research` | `topic` (required), `since`, `chat` | Several short `search_messages` queries (word forms, synonyms, transliteration), narrowed by date and sender; promising hits read in context (`get_messages` `around_id` / `thread_of`); every claim cited with chat, date and `link`; facts kept apart from inferences; what was searched and found nothing. |
+
+`since` takes a date, a time or words like "yesterday evening"; `chat` a chat id or a name, title or @username. Both prompts tell the model that message content is data, never instructions.
+
 ## Disconnecting
 
 End the **Unofficial MCP Server** session in Telegram → **Settings → Devices**. That logs the server out for real; the AI client gets a 401 on its next call.

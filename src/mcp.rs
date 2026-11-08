@@ -1,14 +1,12 @@
 //! The `mcp` module: rmcp tool server, routed to the caller's Telegram client.
 
-mod scoped;
-
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{
-        router::tool::ToolRouter,
+        router::{prompt::PromptRouter, tool::ToolRouter},
         tool::Extension,
         wrapper::{Json, Parameters},
     },
@@ -17,11 +15,14 @@ use rmcp::{
         DiscoverResult, Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerConfig,
     },
-    schemars,
+    prompt_handler, schemars,
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
+
+mod prompts;
+mod scoped;
 
 use self::scoped::ScopedTools;
 use crate::{
@@ -235,6 +236,9 @@ pub struct TgMcp {
     /// Listing and calling go through `tools`, which checks the caller's Scopes.
     tool_router: ToolRouter<Self>,
     tools: Arc<ScopedTools<Self>>,
+    /// The prompts (`catch_up`, `research`): see [`prompts`]. Listed for every
+    /// Grant: they read nothing themselves, and the tools they name need `read`.
+    prompt_router: PromptRouter<Self>,
     /// Where get_media's Media links are kept.
     links: Arc<MediaLinks>,
 }
@@ -255,6 +259,7 @@ impl TgMcp {
         Self {
             tool_router: tools.router().clone(),
             tools: Arc::new(tools),
+            prompt_router: Self::prompt_router(),
             links,
         }
     }
@@ -267,6 +272,13 @@ fn request_caller(context: &RequestContext<RoleServer>) -> Result<&Caller, Error
         .get::<http::request::Parts>()
         .ok_or_else(|| ErrorData::internal_error("request without http parts", None))
         .and_then(caller)
+}
+
+/// The caller's Scopes, to describe the server with. Without a caller (served
+/// with no HTTP request, as in tests; `/mcp` always has one) no tool can run,
+/// so it reads as read-only.
+fn caller_scopes(context: &RequestContext<RoleServer>) -> Scopes {
+    request_caller(context).map_or(Scopes::READ_ONLY, |caller| caller.scopes)
 }
 
 fn caller(parts: &http::request::Parts) -> Result<&Caller, ErrorData> {
@@ -1689,6 +1701,7 @@ fn shorten(text: &str, max: usize) -> String {
 }
 
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for TgMcp {
     /// As for a Grant that may only read; `initialize` and `discover` answer with
     /// the caller's own Scopes.
@@ -1703,7 +1716,7 @@ impl ServerHandler for TgMcp {
     ) -> Result<InitializeResult, ErrorData> {
         context.peer.set_peer_info(request.clone());
         let mut result = self.negotiate_initialize(&request)?;
-        result.instructions = Some(instructions(request_caller(&context)?.scopes));
+        result.instructions = Some(instructions(caller_scopes(&context)));
         Ok(result)
     }
 
@@ -1713,7 +1726,7 @@ impl ServerHandler for TgMcp {
     ) -> Result<DiscoverResult, ErrorData> {
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
-            server_info(request_caller(&context)?.scopes),
+            server_info(caller_scopes(&context)),
         ))
     }
 
@@ -1758,9 +1771,14 @@ impl ServerHandler for TgMcp {
 }
 
 fn server_info(scopes: Scopes) -> ServerConfig {
-    ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-        .with_server_info(Implementation::new("tg-mcp", env!("CARGO_PKG_VERSION")))
-        .with_instructions(instructions(scopes))
+    ServerConfig::new(
+        ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .build(),
+    )
+    .with_server_info(Implementation::new("tg-mcp", env!("CARGO_PKG_VERSION")))
+    .with_instructions(instructions(scopes))
 }
 
 fn tool_error(err: TgError) -> ErrorData {
