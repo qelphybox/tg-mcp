@@ -6,7 +6,7 @@
 
 - `get_messages` messages carry `media` as an object: `{ kind, duration_s?, size_bytes?, mime_type?, file_name?, width?, height? }`. `list_chats` previews and `search_messages` hits carry `{ kind }`.
 - `text` is only a message's text or caption, possibly empty. The old placeholders (`[photo]`, `[voice]`, `[file]`, …) are gone.
-- **Reconnect the connector after upgrading.** MCP clients (claude.ai, Claude Code, others) keep the tool list they fetched when the connector was added. Until it is reconnected (claude.ai: Settings → Connectors; Claude Code: a new session), a client checks answers against the old schemas: `search_messages` fails output validation on hits with media, and new tools and modes (`get_media` `view` / `transcribe`, `get_members`, `pinned_only`) are unknown to the model.
+- **Reconnect the connector after upgrading.** MCP clients (claude.ai, Claude Code, others) keep the tool list they fetched when the connector was added. Until it is reconnected (claude.ai: Settings → Connectors; Claude Code: a new session), a client checks answers against the old schemas: `search_messages` fails output validation on hits with media, and new tools, modes and parameters (`get_media` `view` / `transcribe`, `get_members`, `pinned_only`, `topic`) are unknown to the model.
 
 ### New
 
@@ -16,6 +16,7 @@
   - `transcribe`: what a voice message or video message says, transcribed by Telegram itself (`messages.transcribeAudio`); the audio never leaves Telegram. Needs Telegram Premium or Telegram's free weekly transcriptions.
 - **`get_members`**: a group's members and admins, with roles; says when Telegram hides them.
 - **`get_chat_info` on a user**: bio, phone and birthday as Telegram shows them to the account, last-seen status, and common chats on request.
+- **Forum Topics**: `get_chat_info` lists a forum's Topics, each message says its Topic, and `get_messages` / `search_messages` read one Topic.
 - **Reactions, links and pins** on messages: `reactions` counts, a `t.me` `link` for channel and supergroup messages, `pinned`; `get_messages` `pinned_only` reads only the pinned messages.
 
 ### Fixed
