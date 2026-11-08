@@ -164,3 +164,55 @@ async fn both_metadata_documents_advertise_every_scope() {
         assert_eq!(body["scopes_supported"], every, "{path}");
     }
 }
+
+/// Until a tool needs more than `read`, a `draft` Grant sees the same tools; what
+/// changes is what the server tells the model it may do.
+#[tokio::test]
+async fn mcp_tells_each_grant_its_own_scopes() {
+    let server = start(vec![account(42, "Alice")]).await;
+    let (_, reader) = server.login_scoped(None, &[ALLOW]).await;
+    let (_, drafter) = server
+        .login_scoped(Some("read draft"), &[DRAFT, ALLOW])
+        .await;
+    assert_eq!(drafter["scope"], "read draft");
+
+    let reader = server.mcp(reader["access_token"].as_str().unwrap()).await;
+    let drafter = server.mcp(drafter["access_token"].as_str().unwrap()).await;
+    let instructions =
+        |client: &rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>| {
+            client
+                .peer_info()
+                .and_then(|info| info.instructions.clone())
+                .unwrap()
+        };
+    let read_only = instructions(&reader);
+    assert!(
+        read_only.contains("Read-only access to the connected Telegram account"),
+        "{read_only}"
+    );
+    let drafts = instructions(&drafter);
+    assert!(!drafts.contains("Read-only"), "{drafts}");
+    assert!(drafts.contains("write Drafts"), "{drafts}");
+    assert!(
+        drafts.contains("you cannot send, edit or delete messages"),
+        "{drafts}"
+    );
+
+    let names = |tools: Vec<rmcp::model::Tool>| {
+        tools
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    let read_tools = names(reader.list_all_tools().await.unwrap());
+    assert!(read_tools.contains(&"whoami".to_string()));
+    assert_eq!(names(drafter.list_all_tools().await.unwrap()), read_tools);
+
+    let whoami = drafter
+        .call_tool(rmcp::model::CallToolRequestParams::new("whoami"))
+        .await
+        .unwrap();
+    assert_eq!(whoami.structured_content.unwrap()["id"], 42);
+    reader.cancel().await.unwrap();
+    drafter.cancel().await.unwrap();
+}
