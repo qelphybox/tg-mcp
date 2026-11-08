@@ -22,6 +22,7 @@ use super::{
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
+    folders::{self, ChatFolder, RawChatFolder},
     media::{FileLocation, StoredFile},
     members::{
         self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
@@ -125,6 +126,53 @@ pub struct FakeData {
     /// should be their length.
     #[serde(default)]
     pub file_contents: std::collections::HashMap<ChatId, Vec<(i32, Vec<u8>)>>,
+    /// The Account's Chat folders, in the user's order (#29).
+    #[serde(default)]
+    pub chat_folders: Vec<FakeChatFolder>,
+    /// When set, `messages.getDialogFilters` fails, and not with a flood.
+    #[serde(default)]
+    pub chat_folders_fail: bool,
+}
+
+/// One Chat folder of a fake Account. Its Chats are named by id; the fake
+/// gives them their [`fake_access_hash`], as Telegram's folders carry one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeChatFolder {
+    pub id: i32,
+    pub title: String,
+    #[serde(default)]
+    pub emoji: Option<String>,
+    /// Defined by a rule (kinds of chats, leaving out muted, read or
+    /// archived ones) besides its lists.
+    #[serde(default)]
+    pub rules: bool,
+    #[serde(default)]
+    pub pinned: Vec<ChatId>,
+    #[serde(default)]
+    pub included: Vec<ChatId>,
+    #[serde(default)]
+    pub excluded: Vec<ChatId>,
+}
+
+impl FakeChatFolder {
+    fn raw(&self) -> RawChatFolder {
+        let refs = |ids: &[ChatId]| {
+            ids.iter()
+                .map(|&id| ChatRef::new(id, fake_access_hash(id)))
+                .collect()
+        };
+        RawChatFolder {
+            folder: ChatFolder {
+                id: self.id,
+                title: self.title.clone(),
+                emoji: self.emoji.clone(),
+                rules: self.rules,
+            },
+            pinned: refs(&self.pinned),
+            included: refs(&self.included),
+            excluded: self.excluded.clone(),
+        }
+    }
 }
 
 /// One Topic of a fake forum.
@@ -503,7 +551,14 @@ impl FakeData {
             file_contents: Default::default(),
             transcriptions: Default::default(),
             transcribe: FakeTranscribeAccess::default(),
+            chat_folders: Vec::new(),
+            chat_folders_fail: false,
         }
+    }
+
+    pub fn with_chat_folders(mut self, folders: Vec<FakeChatFolder>) -> Self {
+        self.chat_folders = folders;
+        self
     }
 
     pub fn with_topics(mut self, forum: ChatId, topics: Vec<FakeTopic>) -> Self {
@@ -1370,9 +1425,26 @@ impl Telegram for FakeTelegram {
         Ok(self.data.account.clone())
     }
 
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
+        Ok(self
+            .dialog_filters()?
+            .into_iter()
+            .map(|f| f.folder)
+            .collect())
+    }
+
     /// The same `messages.getDialogs` calls as the Live client, answered by
     /// [`Self::get_dialogs`].
     async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {
+        if let Some(folder) = query.chat_folder {
+            return folders::list_folder_chats(
+                &query,
+                folder,
+                || std::future::ready(self.dialog_filters()),
+                |peers| std::future::ready(self.peer_dialogs(&peers)),
+            )
+            .await;
+        }
         chats::list_chats(&query, |request| {
             std::future::ready(self.get_dialogs(&request))
         })
@@ -1976,10 +2048,41 @@ impl FakeTelegram {
             .filter(|(_, c)| c.pinned && !listing.exclude_pinned())
             .chain(unpinned.into_iter().skip(start).take(request.limit))
             .collect();
+        Ok(self.dialogs_answer(&listed))
+    }
+
+    /// One `messages.getPeerDialogs`: the dialogs of the Chats asked for that
+    /// the Account has, in its main list or the Archive. Like Telegram, it
+    /// answers none for a Chat it doesn't have or a wrong access hash.
+    fn peer_dialogs(&self, peers: &[ChatRef]) -> Result<DialogsAnswer, TgError> {
+        self.flood()?;
+        assert!(
+            peers.len() <= folders::PEER_DIALOGS_CHUNK,
+            "Telegram's limit"
+        );
+        let listed: Vec<(ChatId, &ChatSummary)> = peers
+            .iter()
+            .filter(|peer| self.check_hash(**peer).is_ok())
+            .filter_map(|peer| {
+                let chat = self.data.chats.iter().find(|c| {
+                    c.id.parse::<ChatRef>()
+                        .is_ok_and(|id| id.chat() == peer.chat())
+                })?;
+                Some((peer.chat(), chat))
+            })
+            .collect();
+        let listed: Vec<&(ChatId, &ChatSummary)> = listed.iter().collect();
+        Ok(self.dialogs_answer(&listed))
+    }
+
+    /// The dialogs of `listed` Chats as Telegram describes them: each in its
+    /// folder (main list or Archive), its top message its `last_message`,
+    /// with id 1.
+    fn dialogs_answer(&self, listed: &[&(ChatId, &ChatSummary)]) -> DialogsAnswer {
         let summaries: Vec<ChatSummary> = listed.iter().map(|(_, c)| (*c).clone()).collect();
         let peers = Self::raw_peers(&summaries);
         self.remember(&peers);
-        Ok(DialogsAnswer {
+        DialogsAnswer {
             sent: listed.len(),
             dialogs: listed
                 .iter()
@@ -1988,7 +2091,7 @@ impl FakeTelegram {
                     top_message: 1,
                     unread_count: c.unread_count,
                     pinned: c.pinned,
-                    folder_id: listing.folder_id(),
+                    folder_id: i32::from(self.data.archived.contains(id)),
                     unread_mark: c.marked_unread,
                     muted: c.muted,
                 })
@@ -2012,7 +2115,21 @@ impl FakeTelegram {
                     })
                 })
                 .collect(),
-        })
+        }
+    }
+
+    /// One `messages.getDialogFilters`: the Account's Chat folders.
+    fn dialog_filters(&self) -> Result<Vec<RawChatFolder>, TgError> {
+        self.flood()?;
+        if self.data.chat_folders_fail {
+            return Err(TgError::Upstream("rpc error 500: INTERNAL".into()));
+        }
+        Ok(self
+            .data
+            .chat_folders
+            .iter()
+            .map(FakeChatFolder::raw)
+            .collect())
     }
 
     /// Like the Live client: every hash an answer gives is kept.

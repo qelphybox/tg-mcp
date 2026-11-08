@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     TgError,
     find::FoundChat,
+    folders::{FolderCursor, other_folder},
     messages::{MediaKind, MediaSummary},
     topics::{MAX_LISTED_TOPICS, Topic},
 };
@@ -634,28 +635,7 @@ fn assemble(
 
     let chats = shown
         .iter()
-        .map(|dialog| {
-            let peer = peers.get(&dialog.chat);
-            let top = messages.get(&(dialog.chat, dialog.top_message));
-            ChatSummary {
-                id: ChatRef::new(dialog.chat, peer.and_then(|p| p.access_hash)).to_string(),
-                title: peer
-                    .map(|p| p.title.clone())
-                    .unwrap_or_else(|| "Unknown chat".into()),
-                kind: peer.map_or_else(|| fallback_kind(dialog.chat), |p| p.kind),
-                username: peer.and_then(|p| p.username.clone()),
-                is_self: peer.is_some_and(|p| p.is_self),
-                unread_count: dialog.unread_count,
-                pinned: dialog.pinned,
-                muted: dialog.muted,
-                marked_unread: dialog.unread_mark,
-                last_message: top.map(|m| MessagePreview {
-                    date: rfc3339(m.date),
-                    text: m.text.clone(),
-                    media: m.media.map(|kind| MediaSummary { kind }),
-                }),
-            }
-        })
+        .map(|dialog| summary(dialog, &peers, &messages))
         .collect();
 
     // A cut page continues right after its last shown chat. Otherwise offsets
@@ -694,6 +674,35 @@ fn assemble(
     (chats, next.filter(|_| cut || full_page))
 }
 
+/// How list_chats shows one dialog: named by its peer in `peers`, with its
+/// top message from `messages` as the preview.
+pub(super) fn summary(
+    dialog: &RawDialog,
+    peers: &HashMap<ChatId, &RawPeer>,
+    messages: &HashMap<(ChatId, i32), &RawMessage>,
+) -> ChatSummary {
+    let peer = peers.get(&dialog.chat);
+    let top = messages.get(&(dialog.chat, dialog.top_message));
+    ChatSummary {
+        id: ChatRef::new(dialog.chat, peer.and_then(|p| p.access_hash)).to_string(),
+        title: peer
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| "Unknown chat".into()),
+        kind: peer.map_or_else(|| fallback_kind(dialog.chat), |p| p.kind),
+        username: peer.and_then(|p| p.username.clone()),
+        is_self: peer.is_some_and(|p| p.is_self),
+        unread_count: dialog.unread_count,
+        pinned: dialog.pinned,
+        muted: dialog.muted,
+        marked_unread: dialog.unread_mark,
+        last_message: top.map(|m| MessagePreview {
+            date: rfc3339(m.date),
+            text: m.text.clone(),
+            media: m.media.map(|kind| MediaSummary { kind }),
+        }),
+    }
+}
+
 /// The dialogs `unread_only` reads from Telegram per `messages.getDialogs`
 /// call, and how many calls one list_chats may make before it stops:
 /// Telegram has no unread filter for the dialog list.
@@ -712,6 +721,9 @@ pub struct ChatsQuery {
     pub archived: bool,
     /// Only Chats with unread messages or marked as unread.
     pub unread_only: bool,
+    /// Only the Chats of this Chat folder ([`super::folders`]); not with
+    /// `archived`. A cursor must come from a listing of the same folder.
+    pub chat_folder: Option<i32>,
 }
 
 /// One `messages.getDialogs` call: `listing` gives the folder and whether
@@ -743,17 +755,14 @@ where
     F: FnMut(DialogsRequest) -> Fut,
     Fut: Future<Output = Result<DialogsAnswer, TgError>>,
 {
+    if let Some(folder) = query.cursor.as_deref().and_then(FolderCursor::decode) {
+        return Err(other_folder(&folder));
+    }
     let cursor = query.cursor.as_deref().map(Cursor::decode).transpose()?;
     if let Some(cursor) = &cursor
         && cursor.unread_only != query.unread_only
     {
-        return Err(TgError::InvalidInput(if cursor.unread_only {
-            "this cursor continues an unread_only listing: pass unread_only: true with it".into()
-        } else {
-            "this cursor continues a listing without unread_only: \
-             leave unread_only out with it, or start over without a cursor"
-                .into()
-        }));
+        return Err(other_unread_listing(cursor.unread_only));
     }
     let mut listing = Listing {
         archived: cursor.as_ref().map_or(query.archived, |c| c.archived),
@@ -801,6 +810,17 @@ where
         chats,
         next_cursor: after.map(|c| c.encode()),
         unread_scan_truncated: true,
+    })
+}
+
+/// What a cursor passed with the other `unread_only` than its listing's is.
+pub(super) fn other_unread_listing(cursor_unread_only: bool) -> TgError {
+    TgError::InvalidInput(if cursor_unread_only {
+        "this cursor continues an unread_only listing: pass unread_only: true with it".into()
+    } else {
+        "this cursor continues a listing without unread_only: \
+         leave unread_only out with it, or start over without a cursor"
+            .into()
     })
 }
 
@@ -1565,6 +1585,7 @@ mod tests {
                 cursor: cursor.map(String::from),
                 archived: self.archived,
                 unread_only,
+                chat_folder: None,
             };
             list_chats(&query, |request| {
                 std::future::ready(Ok(self.get_dialogs(request)))
