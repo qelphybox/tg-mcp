@@ -14,6 +14,7 @@ pub mod fake;
 pub mod find;
 pub mod folders;
 pub mod grammers;
+pub mod markdown;
 pub mod media;
 pub mod members;
 pub mod messages;
