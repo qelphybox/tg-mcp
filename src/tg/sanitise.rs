@@ -7,7 +7,10 @@
 //! characters that hide text from a human reading the transcript while the
 //! model still reads it: Unicode format characters (general category `Cf`:
 //! zero-width spaces, bidi overrides and isolates, BOM, invisible operators,
-//! tag characters, …) and control characters other than line breaks and tabs.
+//! tag characters, …), control characters other than line breaks and tabs,
+//! the invisible characters that are not `Cf` (Hangul fillers, the combining
+//! grapheme joiner, the braille blank) and variation selectors that modify
+//! nothing. Message text with nothing visible left reads `[no visible text]`.
 //! Detecting injection attempts by their content is not attempted.
 //!
 //! The seam is the [`Telegram`] trait itself: tools read through [`Sanitised`],
@@ -21,9 +24,16 @@ use std::{cmp::Ordering, sync::Arc};
 
 use super::{
     Account, Telegram, TgError,
-    chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
-    messages::{ChatMessage, HistoryQuery, MessagePage, Sender},
+    chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
+    download::{FileError, FilePart, FileRequest, MediaFile},
+    find::{FoundChat, FoundChats},
+    folders::ChatFolder,
+    members::{Member, MemberPage, MembersQuery},
+    messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
+    topics::Topic,
+    transcribe::{Transcript, Transcription},
+    view::{Album, AlbumItem},
 };
 
 /// Unicode general category `Cf` (format characters), sorted. Identical in
@@ -53,8 +63,21 @@ const FORMAT: &[(char, char)] = &[
     ('\u{E0020}', '\u{E007F}'), // tag characters ("ASCII smuggling")
 ];
 
+/// Invisible characters that are not `Cf`: the combining grapheme joiner, the
+/// Hangul fillers and the braille blank (U+2800, `So`, a common spacer line),
+/// which render as nothing (blank "names" use them).
+const INVISIBLE: [char; 6] = [
+    '\u{034F}', '\u{115F}', '\u{1160}', '\u{2800}', '\u{3164}', '\u{FFA0}',
+];
+
 const ZWJ: char = '\u{200D}';
+const TEXT_PRESENTATION: char = '\u{FE0E}';
 const EMOJI_PRESENTATION: char = '\u{FE0F}';
+const LINE_SEPARATOR: char = '\u{2028}';
+const PARAGRAPH_SEPARATOR: char = '\u{2029}';
+
+/// What message text, a preview or a snippet with nothing visible left reads.
+pub const NO_VISIBLE_TEXT: &str = "[no visible text]";
 
 /// Unicode general category `Cf`.
 pub fn is_format(c: char) -> bool {
@@ -78,16 +101,82 @@ fn is_emoji(c: char) -> bool {
     matches!(c, '\u{2300}'..='\u{2BFF}' | '\u{1F000}'..='\u{1FAFF}')
 }
 
-/// Strip what hides text from a human: every `Cf` character, and control
-/// characters other than `\n` and `\t` (CRLF and a lone CR become `\n`, the
-/// rest a space). Everything visible stays, emoji included: flags, skin tones
-/// and keycaps contain no `Cf`. ZWJ (U+200D) is `Cf` too, but it is kept where
-/// it joins two emoji (👨‍👩‍👧, 🏳️‍🌈, 👩🏽‍💻), so those still render as one
-/// glyph; anywhere else it goes. Tag characters always go, so the subdivision
-/// flags (England, Scotland, Wales) show as a plain black flag 🏴.
+/// Variation selectors VS1–VS16 and the ideographic VS17–VS256 (category
+/// `Mn`). One picks a glyph for the character before it; a run of them, or one
+/// after nothing it can modify, only carries hidden bytes.
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// Whether variation selector `vs` can modify `base`, the character before it.
+fn modifies(vs: char, base: char) -> bool {
+    match vs {
+        // Text or emoji presentation: emoji, and the characters outside the
+        // emoji blocks that have an emoji form (keycap bases, © ® ‼ ⁉ ™ ℹ,
+        // arrows, 〰 〽 ㊗ ㊙), as `emoji-variation-sequences.txt` lists them.
+        TEXT_PRESENTATION | EMOJI_PRESENTATION => {
+            is_emoji(base)
+                || matches!(
+                    base,
+                    '#' | '*'
+                        | '0'..='9'
+                        | '\u{00A9}'
+                        | '\u{00AE}'
+                        | '\u{203C}'
+                        | '\u{2049}'
+                        | '\u{2122}'
+                        | '\u{2139}'
+                        | '\u{2194}'..='\u{2199}'
+                        | '\u{21A9}'..='\u{21AA}'
+                        | '\u{3030}'
+                        | '\u{303D}'
+                        | '\u{3297}'
+                        | '\u{3299}'
+                )
+        }
+        // Ideographic variation sequences: CJK ideographs only.
+        '\u{E0100}'..='\u{E01EF}' => matches!(
+            base,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{20000}'..='\u{3FFFF}'
+        ),
+        // Standardized variants (math symbols, CJK punctuation and
+        // ideographs, Myanmar, Egyptian hieroglyphs, a slashed zero, …) are
+        // too scattered to list: any visible character.
+        _ => !base.is_whitespace() && !is_variation_selector(base),
+    }
+}
+
+/// Strip what hides text from a human: every `Cf` character, the invisible
+/// non-`Cf` ones, and control characters other than `\n` and `\t` (CRLF, a
+/// lone CR and the line and paragraph separators U+2028/U+2029 become `\n`,
+/// the rest a space). Everything visible stays, emoji included: flags, skin
+/// tones and keycaps contain no `Cf`. ZWJ (U+200D) is `Cf` too, but it is kept
+/// where it joins two emoji (👨‍👩‍👧, 🏳️‍🌈, 👩🏽‍💻), so those still render as
+/// one glyph; anywhere else it goes. Tag characters always go, so the
+/// subdivision flags (England, Scotland, Wales) show as a plain black flag 🏴.
+/// A variation selector stays only right after a character it can modify, so
+/// of a run (👀 and six U+FE0F) one is left.
 ///
 /// Characters, not length, are its business: callers cap the result.
 pub fn sanitise(text: &str) -> String {
+    sanitise_with(text, '\n')
+}
+
+/// [`sanitise`] for one-line fields (titles, names, previews, snippets):
+/// every line break becomes a space.
+pub fn sanitise_line(text: &str) -> String {
+    sanitise_with(text, ' ')
+}
+
+/// Nothing a human would see: empty, blank, or only hidden characters.
+pub fn is_blank(text: &str) -> bool {
+    sanitise(text).trim().is_empty()
+}
+
+fn sanitise_with(text: &str, line_break: char) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -102,11 +191,20 @@ pub fn sanitise(text: &str) -> String {
                     out.push(c);
                 }
             }
-            '\n' | '\t' => out.push(c),
+            '\t' => out.push(c),
             '\r' if chars.peek() == Some(&'\n') => {}
-            '\r' => out.push('\n'),
+            '\n' | '\r' | LINE_SEPARATOR | PARAGRAPH_SEPARATOR => out.push(line_break),
+            c if is_variation_selector(c) => {
+                if out
+                    .chars()
+                    .next_back()
+                    .is_some_and(|base| modifies(c, base))
+                {
+                    out.push(c);
+                }
+            }
             c if c.is_control() => out.push(' '),
-            c if is_format(c) => {}
+            c if is_format(c) || INVISIBLE.contains(&c) => {}
             c => out.push(c),
         }
     }
@@ -120,14 +218,56 @@ pub trait Untrusted {
     fn sanitise(&mut self);
 }
 
+/// One-line content: titles, names, usernames.
 fn clean(field: &mut String) {
-    *field = sanitise(field);
+    *field = sanitise_line(field);
 }
 
 fn clean_opt(field: &mut Option<String>) {
     if let Some(value) = field {
         clean(value);
     }
+}
+
+/// One-line content that is no content when nothing visible is left (a
+/// file name of only hidden characters is none).
+fn clean_opt_visible(field: &mut Option<String>) {
+    clean_opt(field);
+    if field.as_deref().is_some_and(|f| f.trim().is_empty()) {
+        *field = None;
+    }
+}
+
+/// Message text, or its preview or snippet: what had text and has nothing
+/// visible left reads [`NO_VISIBLE_TEXT`] rather than an empty string. A
+/// caption with nothing visible is no text: it reads empty, and the message's
+/// `media` says what there is.
+fn clean_text(field: &mut String, sanitiser: fn(&str) -> String, has_media: bool) {
+    let had_text = !field.is_empty();
+    *field = sanitiser(field);
+    if field.trim().is_empty() {
+        if has_media {
+            field.clear();
+        } else if had_text {
+            *field = NO_VISIBLE_TEXT.into();
+        }
+    }
+}
+
+/// What the sender named and declared: content. Kind, sizes and durations are
+/// numbers Telegram set.
+fn clean_media(media: &mut Media) {
+    let Media {
+        kind: _,
+        duration_s: _,
+        size_bytes: _,
+        mime_type,
+        file_name,
+        width: _,
+        height: _,
+    } = media;
+    clean_opt_visible(mime_type);
+    clean_opt_visible(file_name);
 }
 
 impl Untrusted for Account {
@@ -144,11 +284,28 @@ impl Untrusted for Account {
     }
 }
 
+/// Chat folders' titles and emoji are written by the user.
+impl Untrusted for Vec<ChatFolder> {
+    fn sanitise(&mut self) {
+        for ChatFolder {
+            id: _,
+            title,
+            emoji,
+            rules: _,
+        } in self
+        {
+            clean(title);
+            clean_opt_visible(emoji);
+        }
+    }
+}
+
 impl Untrusted for ChatPage {
     fn sanitise(&mut self) {
         let ChatPage {
             chats,
             next_cursor: _,
+            unread_scan_truncated: _,
         } = self;
         for chat in chats {
             let ChatSummary {
@@ -159,12 +316,19 @@ impl Untrusted for ChatPage {
                 is_self: _,
                 unread_count: _,
                 pinned: _,
+                muted: _,
+                marked_unread: _,
                 last_message,
             } = chat;
             clean(title);
             clean_opt(username);
-            if let Some(MessagePreview { date: _, text }) = last_message {
-                clean(text);
+            if let Some(MessagePreview {
+                date: _,
+                text,
+                media,
+            }) = last_message
+            {
+                clean_text(text, sanitise_line, media.is_some());
             }
         }
     }
@@ -177,7 +341,13 @@ impl Untrusted for MessagePage {
             messages,
             next_before_id: _,
             next_after_id: _,
+            continues_in: _,
+            broken_at: _,
+            topics,
         } = self;
+        for title in topics.iter_mut().flat_map(|t| t.0.values_mut()) {
+            clean(title);
+        }
         for message in messages {
             let ChatMessage {
                 id: _,
@@ -185,12 +355,24 @@ impl Untrusted for MessagePage {
                 sender,
                 outgoing: _,
                 text,
+                media,
                 reply_to: _,
                 forwarded: _,
                 edited: _,
+                // Emoji from Telegram's own list, counts, and a link built
+                // from a channel id or an @username Telegram restricts to
+                // letters, digits and `_` (checked in `message_link`).
+                reactions: _,
+                link: _,
+                pinned: _,
+                topic: _,
                 target: _,
+                thread_root: _,
             } = message;
-            clean(text);
+            clean_text(text, sanitise, media.is_some());
+            if let Some(media) = media {
+                clean_media(media);
+            }
             if let Some(Sender { id: _, name }) = sender {
                 clean(name);
             }
@@ -208,13 +390,45 @@ impl Untrusted for ChatInfo {
             is_self: _,
             description,
             member_count: _,
+            bio,
+            status: _,
+            last_seen_at: _,
+            bot: _,
+            bot_description,
+            verified: _,
+            premium: _,
+            scam: _,
+            fake: _,
+            phone,
+            birthday: _,
+            common_chats_count: _,
+            common_chats,
+            topics,
+            topics_truncated: _,
         } = self;
         clean(title);
         clean_opt(username);
-        clean_opt(description);
-        // Nothing but hidden characters is no description.
-        if description.as_deref().is_some_and(|d| d.trim().is_empty()) {
-            *description = None;
+        for text in [description, bio, bot_description] {
+            if let Some(value) = text {
+                *value = sanitise(value);
+            }
+            // Nothing but hidden characters is no text.
+            if text.as_deref().is_some_and(|d| d.trim().is_empty()) {
+                *text = None;
+            }
+        }
+        clean_opt_visible(phone);
+        for chat in common_chats.iter_mut().flatten() {
+            clean_found_chat(chat);
+        }
+        for Topic {
+            id: _,
+            title,
+            closed: _,
+            pinned: _,
+        } in topics.iter_mut().flatten()
+        {
+            clean(title);
         }
     }
 }
@@ -224,7 +438,15 @@ impl Untrusted for SearchPage {
         let SearchPage {
             hits,
             next_cursor: _,
+            topics,
         } = self;
+        for title in topics
+            .iter_mut()
+            .flat_map(|t| t.0.values_mut())
+            .flat_map(|t| t.0.values_mut())
+        {
+            clean(title);
+        }
         for hit in hits {
             let SearchHit {
                 chat:
@@ -238,16 +460,105 @@ impl Untrusted for SearchPage {
                 sender,
                 outgoing: _,
                 snippet,
-                media: _,
+                media,
                 reply_to: _,
                 forwarded: _,
                 edited: _,
+                // As in a get_messages message.
+                reactions: _,
+                link: _,
+                pinned: _,
+                topic: _,
             } = hit;
             clean(title);
-            clean(snippet);
+            clean_text(snippet, sanitise_line, media.is_some());
             if let Some(Sender { id: _, name }) = sender {
                 clean(name);
             }
+        }
+    }
+}
+
+impl Untrusted for FoundChats {
+    fn sanitise(&mut self) {
+        let FoundChats { chats } = self;
+        for chat in chats {
+            clean_found_chat(chat);
+        }
+    }
+}
+
+fn clean_found_chat(chat: &mut FoundChat) {
+    let FoundChat {
+        id: _,
+        title,
+        kind: _,
+        username,
+    } = chat;
+    clean(title);
+    clean_opt(username);
+}
+
+impl Untrusted for MemberPage {
+    fn sanitise(&mut self) {
+        let MemberPage {
+            members,
+            total: _,
+            members_hidden: _,
+            next_cursor: _,
+        } = self;
+        for member in members {
+            let Member {
+                id: _,
+                name,
+                username,
+                role: _,
+                bot: _,
+                is_self: _,
+            } = member;
+            clean(name);
+            clean_opt_visible(username);
+        }
+    }
+}
+
+impl Untrusted for MediaFile {
+    fn sanitise(&mut self) {
+        let MediaFile {
+            media,
+            location: _,
+            size: _,
+        } = self;
+        clean_media(media);
+    }
+}
+
+impl Untrusted for Album {
+    fn sanitise(&mut self) {
+        let Album { asked: _, items } = self;
+        for item in items {
+            let AlbumItem {
+                message_id: _,
+                media,
+                picture: _,
+            } = item;
+            clean_media(media);
+        }
+    }
+}
+
+impl Untrusted for Transcription {
+    fn sanitise(&mut self) {
+        let Transcription {
+            kind: _,
+            transcript,
+            // Numbers Telegram set.
+            trial: _,
+        } = self;
+        match transcript {
+            // What someone said: multi-line message text.
+            Transcript::Done(text) => clean_text(text, sanitise, false),
+            Transcript::Pending => {}
         }
     }
 }
@@ -272,16 +583,12 @@ impl Telegram for Sanitised {
         self.0.whoami().await.map(sanitised)
     }
 
-    async fn list_chats(
-        &self,
-        limit: usize,
-        cursor: Option<&str>,
-        archived: bool,
-    ) -> Result<ChatPage, TgError> {
-        self.0
-            .list_chats(limit, cursor, archived)
-            .await
-            .map(sanitised)
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
+        self.0.chat_folders().await.map(sanitised)
+    }
+
+    async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {
+        self.0.list_chats(query).await.map(sanitised)
     }
 
     async fn get_messages(
@@ -296,15 +603,55 @@ impl Telegram for Sanitised {
         self.0.get_chat_info(chat).await.map(sanitised)
     }
 
+    async fn common_chats(&self, user: ChatRef, limit: usize) -> Result<FoundChats, TgError> {
+        self.0.common_chats(user, limit).await.map(sanitised)
+    }
+
+    async fn get_members(&self, query: MembersQuery) -> Result<MemberPage, TgError> {
+        self.0.get_members(query).await.map(sanitised)
+    }
+
     async fn search_messages(&self, query: SearchQuery) -> Result<SearchPage, TgError> {
         self.0.search_messages(query).await.map(sanitised)
+    }
+
+    async fn find_chats(&self, query: &str, limit: usize) -> Result<FoundChats, TgError> {
+        self.0.find_chats(query, limit).await.map(sanitised)
+    }
+
+    async fn media_file(&self, chat: ChatRef, message_id: i32) -> Result<MediaFile, TgError> {
+        self.0.media_file(chat, message_id).await.map(sanitised)
+    }
+
+    async fn media_album(&self, chat: ChatRef, message_id: i32) -> Result<Album, TgError> {
+        self.0.media_album(chat, message_id).await.map(sanitised)
+    }
+
+    async fn transcribe(
+        &self,
+        chat: ChatRef,
+        message_id: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<Transcription, TgError> {
+        self.0
+            .transcribe(chat, message_id, deadline)
+            .await
+            .map(sanitised)
+    }
+
+    /// File bytes are the file, not text for the model: passed on as they are.
+    async fn get_file(&self, request: FileRequest) -> Result<FilePart, FileError> {
+        self.0.get_file(request).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tg::chats::ChatKind;
+    use crate::tg::{
+        chats::{ChatId, ChatKind, RawPeer, chat_info},
+        messages::{MediaKind, MediaSummary},
+    };
 
     #[test]
     fn the_format_table_is_sorted_and_disjoint() {
@@ -410,6 +757,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_run_of_variation_selectors_keeps_one_after_a_character_it_modifies() {
+        let run = "\u{FE0F}".repeat(6);
+        assert_eq!(
+            sanitise(&format!("👀{run} H E S O Y A M")),
+            "👀\u{FE0F} H E S O Y A M"
+        );
+        // Ideographic variation selectors after a CJK ideograph.
+        assert_eq!(sanitise("葛\u{E0100}\u{E0101}\u{E0102}城"), "葛\u{E0100}城");
+        // A standardized variant (≩ with a vertical stroke, a slashed zero).
+        assert_eq!(
+            sanitise("\u{2269}\u{FE00}\u{FE00} 0\u{FE00}"),
+            "\u{2269}\u{FE00} 0\u{FE00}"
+        );
+    }
+
+    #[test]
+    fn variation_selectors_with_nothing_to_modify_are_removed() {
+        assert_eq!(sanitise("\u{FE0F}hi"), "hi", "start of the text");
+        assert_eq!(sanitise("a \u{FE0F}b \u{FE00}c\n\u{E0100}"), "a b c\n");
+        // Emoji presentation needs a character with an emoji form.
+        assert_eq!(sanitise("a\u{FE0F}b\u{FE0E}"), "ab");
+        // Ideographic ones need an ideograph: "hi" hidden after an emoji, a
+        // byte per selector, is dropped.
+        assert_eq!(sanitise("😀\u{E0158}\u{E0159} x\u{E0100}"), "😀 x");
+        // The keycap's enclosing mark is no base.
+        assert_eq!(sanitise("1\u{FE0F}\u{20E3}\u{FE0F}"), "1\u{FE0F}\u{20E3}");
+    }
+
+    #[test]
+    fn variation_selectors_that_belong_stay() {
+        for text in [
+            "\u{2716}\u{FE0E} \u{2716}\u{FE0F}",
+            "1\u{FE0F}\u{20E3} #\u{FE0F}\u{20E3} *\u{FE0F}\u{20E3}",
+            "\u{00A9}\u{FE0F} \u{2122}\u{FE0F} \u{203C}\u{FE0F} \u{2194}\u{FE0F} \u{3030}\u{FE0F}",
+            "\u{2764}\u{FE0F} \u{263A}\u{FE0F} \u{1F3F3}\u{FE0F}",
+            "\u{8FBB}\u{E0100} \u{2000B}\u{E0101}",
+        ] {
+            assert_eq!(sanitise(text), text);
+        }
+    }
+
+    #[test]
+    fn hangul_fillers_and_the_grapheme_joiner_are_removed() {
+        assert_eq!(
+            sanitise("a\u{034F}b\u{115F}\u{1160}c\u{3164}d\u{FFA0}e"),
+            "abcde"
+        );
+        assert_eq!(sanitise("\u{3164}"), "", "a 'blank' name");
+    }
+
+    #[test]
+    fn the_braille_blank_is_removed() {
+        // U+2800 is `So`, not `Cf`, but renders as nothing: a common spacer.
+        assert_eq!(sanitise("a\n\u{2800}\nb\u{2800}c"), "a\n\nbc");
+        assert!(is_blank("\u{2800}\u{2800} \n\u{2800}"));
+        assert_eq!(sanitise("\u{2801}"), "\u{2801}", "other braille stays");
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_follow_the_field() {
+        assert_eq!(sanitise("a\u{2028}b\u{2029}c"), "a\nb\nc");
+        assert_eq!(sanitise_line("a\u{2028}b\u{2029}c"), "a b c");
+        assert_eq!(
+            sanitise_line("one\r\ntwo\nthree\rfour\tcol"),
+            "one two three four\tcol"
+        );
+    }
+
+    #[test]
+    fn blank_is_nothing_a_human_would_see() {
+        for text in ["", " \n", "\u{2063}", "\u{200B}\u{3164} \u{FE0F}"] {
+            assert!(is_blank(text), "{text:?}");
+        }
+        for text in ["x", "👀", ".\u{2063}"] {
+            assert!(!is_blank(text), "{text:?}");
+        }
+    }
+
+    /// A Chat's details with nothing in them.
+    fn blank_info() -> ChatInfo {
+        let peer = RawPeer {
+            id: ChatId::Channel(2),
+            title: String::new(),
+            kind: ChatKind::Channel,
+            username: None,
+            access_hash: None,
+            is_self: false,
+        };
+        chat_info(&peer, None, None)
+    }
+
+    #[test]
+    fn members_names_and_usernames_are_sanitised() {
+        use crate::tg::members::Role;
+        let mut page = MemberPage {
+            members: vec![Member {
+                id: "user:1~AAAAAAAAAAE".into(),
+                name: "An\u{202E}na\u{2028}Lee".into(),
+                username: Some("\u{200B}".into()),
+                role: Role::Admin,
+                bot: false,
+                is_self: false,
+            }],
+            total: Some(1),
+            members_hidden: false,
+            next_cursor: None,
+        };
+        page.sanitise();
+        let member = &page.members[0];
+        assert_eq!(member.name, "Anna Lee");
+        assert_eq!(member.username, None, "nothing visible is no username");
+        assert_eq!(member.id, "user:1~AAAAAAAAAAE");
+    }
+
+    #[test]
+    fn a_users_profile_and_common_chats_are_sanitised() {
+        let mut info = ChatInfo {
+            bio: Some("co\u{200B}ffee\n& code".into()),
+            bot_description: Some("\u{202E}I help\u{2028}a lot".into()),
+            phone: Some("+7999\u{2060}123".into()),
+            common_chats: Some(vec![FoundChat {
+                id: "chat:1".into(),
+                title: "Fa\u{200F}mily".into(),
+                kind: ChatKind::Group,
+                username: Some("fa\u{FEFF}m".into()),
+            }]),
+            ..blank_info()
+        };
+        info.sanitise();
+        assert_eq!(info.bio.as_deref(), Some("coffee\n& code"));
+        assert_eq!(info.bot_description.as_deref(), Some("I help\na lot"));
+        assert_eq!(info.phone.as_deref(), Some("+7999123"));
+        let chat = &info.common_chats.as_ref().unwrap()[0];
+        assert_eq!(
+            (
+                chat.id.as_str(),
+                chat.title.as_str(),
+                chat.username.as_deref()
+            ),
+            ("chat:1", "Family", Some("fam"))
+        );
+
+        let mut ghost = ChatInfo {
+            bio: Some("\u{200B}".into()),
+            bot_description: Some("\u{2060}\u{3164}".into()),
+            phone: Some("\u{200B}".into()),
+            ..blank_info()
+        };
+        ghost.sanitise();
+        assert_eq!(
+            (ghost.bio, ghost.bot_description, ghost.phone),
+            (None, None, None)
+        );
+    }
+
     fn summary(title: &str, preview: &str) -> ChatSummary {
         ChatSummary {
             id: "user:1~AAAAAAAAAAE".into(),
@@ -419,9 +922,12 @@ mod tests {
             is_self: false,
             unread_count: 0,
             pinned: false,
+            muted: false,
+            marked_unread: false,
             last_message: Some(MessagePreview {
                 date: "2026-11-06T00:00:00Z".into(),
                 text: preview.into(),
+                media: None,
             }),
         }
     }
@@ -431,6 +937,7 @@ mod tests {
         let mut page = ChatPage {
             chats: vec![summary("Al\u{202E}ice", "hi\u{2066}!")],
             next_cursor: Some("cursor".into()),
+            unread_scan_truncated: false,
         };
         page.sanitise();
         let chat = &page.chats[0];
@@ -447,6 +954,7 @@ mod tests {
             is_self: false,
             description: Some("line\u{200F}\nnext".into()),
             member_count: Some(3),
+            ..blank_info()
         };
         info.sanitise();
         assert_eq!(
@@ -478,9 +986,9 @@ mod tests {
             ("Me", Some("Last"), Some("me"))
         );
 
-        let mut history = MessagePage {
-            chat_id: "user:1".into(),
-            messages: vec![ChatMessage {
+        let mut history = MessagePage::new(
+            "user:1".into(),
+            vec![ChatMessage {
                 id: 1,
                 date: "2026-11-06T00:00:00Z".into(),
                 sender: Some(Sender {
@@ -489,14 +997,18 @@ mod tests {
                 }),
                 outgoing: false,
                 text: "a\u{200B}\nb".into(),
+                media: None,
                 reply_to: None,
                 forwarded: false,
                 edited: false,
                 target: false,
+                thread_root: false,
+                reactions: None,
+                link: None,
+                pinned: false,
+                topic: None,
             }],
-            next_before_id: None,
-            next_after_id: None,
-        };
+        );
         history.sanitise();
         assert_eq!(history.messages[0].text, "a\nb");
         assert_eq!(history.messages[0].sender.as_ref().unwrap().name, "Bob");
@@ -520,8 +1032,13 @@ mod tests {
                 reply_to: None,
                 forwarded: false,
                 edited: false,
+                reactions: None,
+                link: None,
+                pinned: false,
+                topic: None,
             }],
             next_cursor: None,
+            topics: None,
         };
         found.sanitise();
         let hit = &found.hits[0];
@@ -531,5 +1048,277 @@ mod tests {
         );
         assert_eq!(hit.sender.as_ref().unwrap().name, "Bob");
         assert_eq!(hit.chat.id, "channel:2~AAAAAAAAAAE");
+
+        let mut chats = FoundChats {
+            chats: vec![FoundChat {
+                id: "user:1~AAAAAAAAAAE".into(),
+                title: "Ca\u{200B}rol \u{202E}lorac".into(),
+                kind: ChatKind::Private,
+                username: Some("ca\u{2060}rol".into()),
+            }],
+        };
+        chats.sanitise();
+        let chat = &chats.chats[0];
+        assert_eq!(
+            (chat.title.as_str(), chat.username.as_deref()),
+            ("Carol lorac", Some("carol"))
+        );
+        assert_eq!(chat.id, "user:1~AAAAAAAAAAE");
+    }
+
+    fn message(text: &str) -> ChatMessage {
+        ChatMessage {
+            id: 1,
+            date: "2026-11-06T00:00:00Z".into(),
+            sender: Some(Sender {
+                id: "user:1".into(),
+                name: "Bo\u{2028}b".into(),
+            }),
+            outgoing: false,
+            text: text.into(),
+            media: None,
+            reply_to: None,
+            forwarded: false,
+            edited: false,
+            target: false,
+            thread_root: false,
+            reactions: None,
+            link: None,
+            pinned: false,
+            topic: None,
+        }
+    }
+
+    fn hit(snippet: &str, media: Option<MediaKind>) -> SearchHit {
+        SearchHit {
+            chat: HitChat {
+                id: "channel:2".into(),
+                title: "Te\u{2029}am".into(),
+                kind: ChatKind::Supergroup,
+            },
+            id: 1,
+            date: "2026-11-06T00:00:00Z".into(),
+            sender: None,
+            outgoing: false,
+            snippet: snippet.into(),
+            media: media.map(|kind| MediaSummary { kind }),
+            reply_to: None,
+            forwarded: false,
+            edited: false,
+            reactions: None,
+            link: None,
+            pinned: false,
+            topic: None,
+        }
+    }
+
+    #[test]
+    fn separators_break_lines_in_text_and_are_spaces_in_one_line_fields() {
+        let mut page = ChatPage {
+            chats: vec![summary("Al\u{2028}ice", "hi\u{2029}there")],
+            next_cursor: None,
+            unread_scan_truncated: false,
+        };
+        page.sanitise();
+        let chat = &page.chats[0];
+        assert_eq!(chat.title, "Al ice");
+        assert_eq!(chat.last_message.as_ref().unwrap().text, "hi there");
+
+        let mut history = MessagePage::new("user:1".into(), vec![message("a\u{2028}b")]);
+        history.sanitise();
+        assert_eq!(history.messages[0].text, "a\nb");
+        assert_eq!(history.messages[0].sender.as_ref().unwrap().name, "Bo b");
+
+        let mut info = ChatInfo {
+            id: "channel:2".into(),
+            title: "T\u{2029}eam".into(),
+            kind: ChatKind::Channel,
+            username: None,
+            is_self: false,
+            description: Some("line\u{2029}next".into()),
+            member_count: None,
+            ..blank_info()
+        };
+        info.sanitise();
+        assert_eq!(info.title, "T eam");
+        assert_eq!(info.description.as_deref(), Some("line\nnext"));
+
+        let mut found = SearchPage {
+            hits: vec![hit("de\u{2028}ploy", None)],
+            next_cursor: None,
+            topics: None,
+        };
+        found.sanitise();
+        assert_eq!(found.hits[0].snippet, "de ploy");
+        assert_eq!(found.hits[0].chat.title, "Te am");
+
+        let mut chats = FoundChats {
+            chats: vec![FoundChat {
+                id: "user:1".into(),
+                title: "Ca\u{2028}rol".into(),
+                kind: ChatKind::Private,
+                username: None,
+            }],
+        };
+        chats.sanitise();
+        assert_eq!(chats.chats[0].title, "Ca rol");
+
+        let mut me = Account {
+            id: 1,
+            first_name: "M\u{2028}e".into(),
+            last_name: Some("La\u{2029}st".into()),
+            username: None,
+        };
+        me.sanitise();
+        assert_eq!(
+            (me.first_name.as_str(), me.last_name.as_deref()),
+            ("M e", Some("La st"))
+        );
+    }
+
+    #[test]
+    fn text_with_nothing_visible_left_shows_as_a_placeholder() {
+        let mut history = MessagePage::new(
+            "user:1".into(),
+            [
+                "\u{2063}",
+                "\u{200B} \u{FE0F}\n",
+                " ",
+                "",
+                "[photo]",
+                "hi\u{2063}",
+                "\u{2800}\n\u{2800}",
+            ]
+            .map(message)
+            .into(),
+        );
+        history.sanitise();
+        let texts: Vec<&str> = history.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                NO_VISIBLE_TEXT,
+                NO_VISIBLE_TEXT,
+                NO_VISIBLE_TEXT,
+                "",
+                "[photo]",
+                "hi",
+                NO_VISIBLE_TEXT
+            ]
+        );
+
+        // A preview, but not a title: a blank title stays blank.
+        let mut page = ChatPage {
+            chats: vec![summary("\u{3164}", "\u{2063}\u{3164}")],
+            next_cursor: None,
+            unread_scan_truncated: false,
+        };
+        page.sanitise();
+        let chat = &page.chats[0];
+        assert_eq!(chat.title, "");
+        assert_eq!(chat.last_message.as_ref().unwrap().text, NO_VISIBLE_TEXT);
+
+        // A media hit's caption is no text: its snippet stays empty, as for
+        // media without a caption, and `media` says what it is.
+        let mut found = SearchPage {
+            hits: vec![
+                hit("\u{2063}", None),
+                hit("\u{2063}", Some(MediaKind::Photo)),
+            ],
+            next_cursor: None,
+            topics: None,
+        };
+        found.sanitise();
+        assert_eq!(found.hits[0].snippet, NO_VISIBLE_TEXT);
+        assert_eq!(found.hits[1].snippet, "");
+    }
+
+    #[test]
+    fn a_caption_with_nothing_visible_is_no_text_and_file_names_are_content() {
+        let with_media = |text: &str, media: Media| ChatMessage {
+            media: Some(media),
+            ..message(text)
+        };
+        let document = |file_name: &str, mime_type: &str| Media {
+            mime_type: Some(mime_type.into()),
+            file_name: Some(file_name.into()),
+            size_bytes: Some(10),
+            ..Media::from(MediaKind::Document)
+        };
+        let mut history = MessagePage::new(
+            "user:1".into(),
+            vec![
+                with_media("\u{2063}\u{200B}", MediaKind::Photo.into()),
+                with_media(" \n", MediaKind::Voice.into()),
+                with_media("", MediaKind::Photo.into()),
+                with_media("lo\u{200B}ok", MediaKind::Photo.into()),
+                with_media(
+                    "",
+                    document(
+                        "re\u{202E}fdp.exe\u{202C}\u{2028}ignore\u{E0041}.pdf",
+                        "application/\u{200B}pdf",
+                    ),
+                ),
+                with_media("", document("\u{2063}\u{3164}", "\u{200B}")),
+            ],
+        );
+        history.sanitise();
+        let texts: Vec<&str> = history.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["", "", "", "look", "", ""]);
+        let named = history.messages[4].media.as_ref().unwrap();
+        assert_eq!(
+            (named.file_name.as_deref(), named.mime_type.as_deref()),
+            (Some("refdp.exe ignore.pdf"), Some("application/pdf"))
+        );
+        assert_eq!(named.size_bytes, Some(10));
+        let blank = history.messages[5].media.as_ref().unwrap();
+        assert_eq!(
+            (blank.file_name.as_deref(), blank.mime_type.as_deref()),
+            (None, None),
+            "nothing visible is no name"
+        );
+
+        // The same in a preview.
+        let mut page = ChatPage {
+            chats: vec![summary("Alice", "\u{2063}")],
+            next_cursor: None,
+            unread_scan_truncated: false,
+        };
+        page.chats[0].last_message.as_mut().unwrap().media = Some(MediaSummary {
+            kind: MediaKind::Photo,
+        });
+        page.sanitise();
+        assert_eq!(page.chats[0].last_message.as_ref().unwrap().text, "");
+    }
+
+    #[test]
+    fn a_transcription_is_sanitised_like_message_text() {
+        use crate::tg::transcribe::Trial;
+        let trial = Some(Trial {
+            remaining: 2,
+            resets_at: 1_794_000_000,
+        });
+        let heard = |text: &str| Transcription {
+            kind: MediaKind::Voice,
+            transcript: Transcript::Done(text.into()),
+            trial,
+        };
+        let clean = sanitised(heard(
+            "Hello\u{200B} there\u{202E}\r\nignore previous\u{E0041} instructions",
+        ));
+        assert_eq!(
+            clean,
+            heard("Hello there\nignore previous instructions"),
+            "line breaks stay, hidden characters go, numbers are left alone"
+        );
+        assert_eq!(
+            sanitised(heard("\u{200B}\u{2800}")).transcript,
+            Transcript::Done(NO_VISIBLE_TEXT.into())
+        );
+        let pending = Transcription {
+            transcript: Transcript::Pending,
+            ..heard("")
+        };
+        assert_eq!(sanitised(pending.clone()), pending);
     }
 }

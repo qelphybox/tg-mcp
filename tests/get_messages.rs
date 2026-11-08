@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary},
     fake::{FakeData, PastNewest, fake_issued_id},
-    messages::RawHistoryMessage,
+    messages::{MessageAt, RawHistoryMessage},
 };
 
 const ALICE: ChatId = ChatId::User(101);
@@ -29,6 +29,8 @@ fn alice_chat() -> ChatSummary {
         is_self: false,
         unread_count: 0,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: None,
     }
 }
@@ -43,8 +45,13 @@ fn message(id: i32, text: &str) -> RawHistoryMessage {
         text: text.into(),
         media: None,
         reply_to: None,
+        reply_elsewhere: None,
         forwarded: false,
+        forwarded_from: None,
         edited: false,
+        reactions: Vec::new(),
+        pinned: false,
+        topic: None,
     }
 }
 
@@ -538,4 +545,555 @@ async fn plain_pages_have_no_newer_cursor_and_no_target() {
     assert_eq!(ids(&page), [20, 19, 18]);
     assert_eq!(page.get("next_after_id"), None);
     assert!(targets(&page).is_empty());
+}
+
+const TEAM: ChatId = ChatId::Channel(303);
+const NEWS: ChatId = ChatId::Channel(202);
+const BOB: ChatId = ChatId::User(102);
+
+fn chat(id: ChatId, title: &str, kind: ChatKind) -> ChatSummary {
+    ChatSummary {
+        id: id.to_string(),
+        title: title.into(),
+        kind,
+        ..alice_chat()
+    }
+}
+
+/// `id` replying to `to` in the same chat.
+fn reply(id: i32, to: i32) -> RawHistoryMessage {
+    RawHistoryMessage {
+        reply_to: Some(to),
+        ..message(id, &format!("m{id}"))
+    }
+}
+
+/// A busy supergroup: `10 * k` replies to `10 * (k - 1)` for k in 2..=hops+1,
+/// 10 is the root, the ids in between are unrelated chatter.
+fn busy_team(hops: i32) -> Vec<RawHistoryMessage> {
+    let newest = 10 * (hops + 1);
+    (1..=newest + 5)
+        .map(|id| match id {
+            10 => message(10, "root"),
+            id if id % 10 == 0 && id <= newest => reply(id, id - 10),
+            id => message(id, "chatter"),
+        })
+        .collect()
+}
+
+/// An account with Alice and Bob (private), the Team supergroup and the News
+/// channel, with these histories.
+async fn client_with_chats(
+    histories: Vec<(ChatId, Vec<RawHistoryMessage>)>,
+) -> (common::TestServer, Client) {
+    let mut data = FakeData::new(account(42, "Me")).with_chats(vec![
+        alice_chat(),
+        chat(BOB, "Bob", ChatKind::Private),
+        chat(TEAM, "Team", ChatKind::Supergroup),
+        chat(NEWS, "News", ChatKind::Channel),
+    ]);
+    for (chat, messages) in histories {
+        data = data.with_messages(chat, messages);
+    }
+    let server = start_with(vec![data]).await;
+    let (_, tokens) = server.login().await;
+    let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+    (server, client)
+}
+
+fn roots(page: &Value) -> Vec<i64> {
+    page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m.get("thread_root").is_some())
+        .inspect(|m| assert_eq!(m["thread_root"], true, "{m}"))
+        .map(|m| m["id"].as_i64().unwrap())
+        .collect()
+}
+
+/// What a chain page must always be: the message first and flagged, each
+/// next message the one its predecessor replies to, no id twice, no cursors.
+fn assert_chain(page: &Value, start: i64) {
+    let messages = page["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["id"], start, "{page}");
+    assert_eq!(targets(page), [start], "{page}");
+    for pair in messages.windows(2) {
+        assert_eq!(pair[0]["reply_to"], pair[1]["id"], "{page}");
+    }
+    let mut seen = ids(page);
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), messages.len(), "no id twice: {page}");
+    assert_eq!(page.get("next_before_id"), None);
+    assert_eq!(page.get("next_after_id"), None);
+}
+
+#[tokio::test]
+async fn thread_of_returns_the_chain_newest_first_with_its_root_flagged() {
+    let team = fake_issued_id(TEAM);
+    let (_server, client) = client_with_chats(vec![(TEAM, busy_team(4))]).await;
+    let page = call(&client, json!({ "chat_id": team, "thread_of": 50 }))
+        .await
+        .unwrap();
+    assert_chain(&page, 50);
+    assert_eq!(ids(&page), [50, 40, 30, 20, 10]);
+    assert_eq!(roots(&page), [10]);
+    assert_eq!(page["messages"][4].get("reply_to"), None);
+    assert_eq!(page.get("broken_at"), None);
+    assert_eq!(page.get("continues_in"), None);
+    assert_eq!(page["chat_id"], team);
+
+    // A message that replies to nothing is its own root.
+    let page = call(&client, json!({ "chat_id": team, "thread_of": 7 }))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), [7]);
+    assert_eq!((targets(&page), roots(&page)), (vec![7], vec![7]));
+}
+
+#[tokio::test]
+async fn a_private_chats_chain_is_never_another_chats_messages() {
+    // Outside channels Telegram's message ids are the account's: Bob's 5 is
+    // found by id from any private chat, and must not show up as Alice's.
+    let (_server, client) = client_with_chats(vec![
+        (ALICE, vec![message(3, "q"), reply(9, 3), reply(11, 9)]),
+        (BOB, vec![message(5, "b"), reply(8, 5)]),
+    ])
+    .await;
+    let page = call(&client, json!({ "chat_id": alice_id(), "thread_of": 11 }))
+        .await
+        .unwrap();
+    assert_chain(&page, 11);
+    assert_eq!(ids(&page), [11, 9, 3]);
+    assert_eq!(roots(&page), [3]);
+    for bobs in [5, 8] {
+        match call(&client, json!({ "chat_id": alice_id(), "thread_of": bobs })).await {
+            Err(rmcp::ServiceError::McpError(err)) => assert!(
+                err.message
+                    .contains(&format!("message {bobs} not found in this chat")),
+                "{err:?}"
+            ),
+            other => panic!("Bob's {bobs} read as Alice's: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn depth_caps_the_chain_and_its_oldest_reply_to_goes_on() {
+    let team = fake_issued_id(TEAM);
+    let (_server, client) = client_with_chats(vec![(TEAM, busy_team(60))]).await;
+
+    // Default: the message and 10 ancestors.
+    let page = call(&client, json!({ "chat_id": team, "thread_of": 610 }))
+        .await
+        .unwrap();
+    assert_chain(&page, 610);
+    assert_eq!(ids(&page).len(), 11);
+    assert!(roots(&page).is_empty());
+    assert_eq!(page["messages"][10]["reply_to"], 500);
+
+    // The maximum, then the rest from where it stopped: the whole chain once.
+    let page = call(
+        &client,
+        json!({ "chat_id": team, "thread_of": 610, "depth": 50 }),
+    )
+    .await
+    .unwrap();
+    assert_chain(&page, 610);
+    assert_eq!(ids(&page).len(), 51);
+    let mut chain = ids(&page);
+    let next = page["messages"][50]["reply_to"].as_i64().unwrap();
+    let rest = call(
+        &client,
+        json!({ "chat_id": team, "thread_of": next, "depth": 50 }),
+    )
+    .await
+    .unwrap();
+    assert_chain(&rest, next);
+    assert_eq!(roots(&rest), [10]);
+    chain.extend(ids(&rest));
+    assert_eq!(chain, (1..=61).rev().map(|k| 10 * k).collect::<Vec<i64>>());
+
+    let page = call(
+        &client,
+        json!({ "chat_id": team, "thread_of": 30, "depth": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), [30, 20]);
+    assert!(roots(&page).is_empty(), "20 replies to 10: not a root");
+}
+
+#[tokio::test]
+async fn a_deleted_parent_is_named_and_the_chain_up_to_it_returned() {
+    let team = fake_issued_id(TEAM);
+    let mut history = busy_team(6);
+    history.retain(|m| m.id != 30);
+    let (_server, client) = client_with_chats(vec![(TEAM, history)]).await;
+    let page = call(&client, json!({ "chat_id": team, "thread_of": 60 }))
+        .await
+        .unwrap();
+    assert_chain(&page, 60);
+    assert_eq!(ids(&page), [60, 50, 40]);
+    assert_eq!(page["broken_at"], 30);
+    assert_eq!(page["messages"][2]["reply_to"], 30, "the broken link shows");
+    assert!(roots(&page).is_empty());
+
+    // The message itself deleted: an error, not an empty chain.
+    match call(&client, json!({ "chat_id": team, "thread_of": 30 })).await {
+        Err(rmcp::ServiceError::McpError(err)) => {
+            assert!(err.message.contains("message 30 not found"), "{err:?}")
+        }
+        other => panic!("a deleted message answered {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_parent_in_another_chat_is_where_the_chain_continues() {
+    let team = fake_issued_id(TEAM);
+    let mut history = busy_team(4);
+    // 20 replies to post 7 of the News channel (reply_to_peer_id).
+    let at = history.iter().position(|m| m.id == 20).unwrap();
+    history[at] = RawHistoryMessage {
+        reply_elsewhere: Some(MessageAt { chat: NEWS, id: 7 }),
+        ..message(20, "comment")
+    };
+    let news: Vec<RawHistoryMessage> = (1..=9).map(|id| message(id, "post")).collect();
+    let (_server, client) = client_with_chats(vec![(TEAM, history), (NEWS, news)]).await;
+    let page = call(&client, json!({ "chat_id": team, "thread_of": 40 }))
+        .await
+        .unwrap();
+    assert_chain(&page, 40);
+    assert_eq!(ids(&page), [40, 30, 20]);
+    assert_eq!(page["messages"][2].get("reply_to"), None);
+    assert_eq!(
+        page["continues_in"],
+        json!({ "chat_id": fake_issued_id(NEWS), "message_id": 7 })
+    );
+    assert_eq!(page.get("broken_at"), None);
+    assert!(roots(&page).is_empty());
+
+    // The link opens as it is.
+    let link = &page["continues_in"];
+    let there = call(
+        &client,
+        json!({ "chat_id": link["chat_id"], "thread_of": link["message_id"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&there), [7]);
+    assert_eq!(roots(&there), [7]);
+}
+
+#[tokio::test]
+async fn the_budget_cuts_a_chain_at_its_old_end_never_the_message() {
+    let team = fake_issued_id(TEAM);
+    let long = "y".repeat(5000);
+    let mut history: Vec<RawHistoryMessage> = busy_team(60)
+        .into_iter()
+        .map(|m| RawHistoryMessage {
+            text: long.clone(),
+            ..m
+        })
+        .collect();
+    // 180's parent is deleted: 44 messages up to the break, more than fit.
+    history.retain(|m| m.id != 170);
+    let (_server, client) = client_with_chats(vec![(TEAM, history)]).await;
+    let page = call(
+        &client,
+        json!({ "chat_id": team, "thread_of": 610, "depth": 50 }),
+    )
+    .await
+    .unwrap();
+    assert_chain(&page, 610);
+    let kept = ids(&page);
+    assert!(kept.len() < 44, "44 x 1000 characters must be cut");
+    assert_eq!(page.get("broken_at"), None, "not shown: {kept:?}");
+    let oldest = page["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        oldest["reply_to"],
+        kept.last().unwrap() - 10,
+        "goes on there"
+    );
+}
+
+#[tokio::test]
+async fn thread_of_takes_no_other_position_and_depth_only_with_it() {
+    let team = fake_issued_id(TEAM);
+    let (_server, client) = client_with_chats(vec![(TEAM, busy_team(4))]).await;
+    for (bad, says) in [
+        (
+            json!({ "thread_of": 50, "before_id": 11 }),
+            "can't be combined",
+        ),
+        (
+            json!({ "thread_of": 50, "around_id": 40 }),
+            "can't be combined",
+        ),
+        (
+            json!({ "thread_of": 50, "after_id": 40 }),
+            "can't be combined",
+        ),
+        (
+            json!({ "thread_of": 50, "since": "2026-11-06" }),
+            "can't be combined",
+        ),
+        (
+            json!({ "thread_of": 50, "until": "2026-11-06" }),
+            "can't be combined",
+        ),
+        (
+            json!({ "around_id": 50, "thread_of": 40 }),
+            "can't be combined",
+        ),
+        (json!({ "thread_of": 50, "limit": 5 }), "depth"),
+        (json!({ "depth": 5 }), "only applies to thread_of"),
+        (
+            json!({ "around_id": 50, "depth": 5 }),
+            "only applies to thread_of",
+        ),
+        (json!({ "thread_of": 50, "depth": 51 }), "between 1 and 50"),
+        (json!({ "thread_of": 50, "depth": 0 }), "between 1 and 50"),
+        (json!({ "thread_of": 0 }), "positive"),
+    ] {
+        let mut args = bad.clone();
+        args["chat_id"] = json!(team);
+        match call(&client, args).await {
+            Err(rmcp::ServiceError::McpError(err)) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{bad}: {err:?}");
+                assert!(err.message.contains(says), "{bad}: {err:?}");
+            }
+            other => panic!("{bad} was accepted: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_schema_bounds_thread_of_and_depth() {
+    let (_server, client) = client_with(vec![]).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let tool = tools.iter().find(|t| t.name == "get_messages").unwrap();
+    let properties = &tool.input_schema["properties"];
+    assert_eq!(properties["thread_of"]["minimum"], 1);
+    assert_eq!(properties["depth"]["minimum"], 1);
+    assert_eq!(properties["depth"]["maximum"], 50);
+    let description = tool.description.as_deref().unwrap();
+    for word in ["thread_of", "thread_root", "broken_at", "continues_in"] {
+        assert!(description.contains(word), "{word}: {description}");
+    }
+}
+
+/// Team, where Bob (a member the account also has a private chat with) wrote
+/// the newest message, 10, and Alice the rest. Telegram describes users and
+/// channels as "min" (no hash to hand out) in a getHistory answer whose slice
+/// reaches past the newest message, as it did in production (#51).
+async fn team_client(past_newest: PastNewest) -> (common::TestServer, Client) {
+    let history = (1..=10)
+        .map(|id| RawHistoryMessage {
+            from: Some(if id == 10 { BOB } else { ALICE }),
+            out: false,
+            ..message(id, "x")
+        })
+        .collect();
+    let data = FakeData::new(account(42, "Me"))
+        .with_chats(vec![
+            alice_chat(),
+            chat(BOB, "Bob", ChatKind::Private),
+            chat(TEAM, "Team", ChatKind::Supergroup),
+        ])
+        .with_messages(TEAM, history)
+        .with_past_newest(past_newest)
+        .with_min_past_newest();
+    let server = start_with(vec![data]).await;
+    let (_, tokens) = server.login().await;
+    let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+    (server, client)
+}
+
+/// The window of 3 around Team's newest message.
+fn newest_window() -> Value {
+    json!({ "chat_id": fake_issued_id(TEAM), "around_id": 10, "limit": 3 })
+}
+
+fn sender_of(page: &Value, id: i64) -> &str {
+    let message = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap();
+    message["sender"]["id"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn a_cold_window_at_the_newest_message_has_every_senders_hash() {
+    // Telegram shortens the slice past the newest message (as in
+    // production), so the window is read again from the top: a plain page,
+    // whose answer describes its senders in full. Nothing was seen before.
+    let (_server, client) = team_client(PastNewest::Shorten).await;
+    let page = call(&client, newest_window()).await.unwrap();
+    assert_eq!(ids(&page), [10, 9, 8]);
+    assert_eq!(targets(&page), [10]);
+    assert_eq!(page["next_before_id"], 8);
+    assert_eq!(page.get("next_after_id"), None);
+    assert_eq!(sender_of(&page, 10), fake_issued_id(BOB));
+    assert_eq!(sender_of(&page, 9), fake_issued_id(ALICE));
+    assert_eq!(sender_of(&page, 8), fake_issued_id(ALICE));
+}
+
+#[tokio::test]
+async fn a_window_answered_with_min_peers_takes_the_hashes_seen_before() {
+    // Telegram answers the slice past the newest message in full (shifted
+    // down): one call, and its senders described as min.
+    let (_server, client) = team_client(PastNewest::ShiftOlder).await;
+    // Nothing has described Bob in full yet: no hash, and none is invented.
+    let page = call(&client, newest_window()).await.unwrap();
+    assert_eq!(ids(&page), [10, 9, 8]);
+    assert_eq!(sender_of(&page, 10), BOB.to_string());
+
+    // A plain page describes Bob in full; from then on the window hands out
+    // his id with its hash.
+    call(
+        &client,
+        json!({ "chat_id": fake_issued_id(TEAM), "limit": 5 }),
+    )
+    .await
+    .unwrap();
+    let page = call(&client, newest_window()).await.unwrap();
+    assert_eq!(sender_of(&page, 10), fake_issued_id(BOB));
+    assert_eq!(sender_of(&page, 9), fake_issued_id(ALICE));
+    assert_eq!(sender_of(&page, 8), fake_issued_id(ALICE));
+}
+
+#[tokio::test]
+async fn every_answer_teaches_the_hashes_later_ids_carry() {
+    let team = fake_issued_id(TEAM);
+    for (tool, arguments) in [
+        ("list_chats", json!({})),
+        ("get_chat_info", json!({ "chat_id": fake_issued_id(BOB) })),
+        ("find_chats", json!({ "query": "bob" })),
+        ("search_messages", json!({ "query": "x" })),
+        ("get_messages", json!({ "chat_id": team, "thread_of": 9 })),
+        ("get_messages", json!({ "chat_id": team, "limit": 5 })),
+    ] {
+        let (_server, client) = team_client(PastNewest::ShiftOlder).await;
+        client
+            .call_tool(
+                CallToolRequestParams::new(tool)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        let page = call(&client, newest_window()).await.unwrap();
+        assert_eq!(
+            sender_of(&page, 10),
+            fake_issued_id(BOB),
+            "{tool} {arguments}"
+        );
+    }
+}
+
+const ME: ChatId = ChatId::User(42);
+
+/// Saved Messages as Telegram sends them (#52): every message names the
+/// Account as sender (`from_id`) and none has the `out` flag. 1 is a note,
+/// 2 Alice's message saved there, 3 a note replying to it, 4 a message the
+/// Account wrote elsewhere and saved there.
+async fn saved_messages_client() -> (common::TestServer, Client) {
+    let mine = |id, text: &str| RawHistoryMessage {
+        from: Some(ME),
+        out: false,
+        ..message(id, text)
+    };
+    let forwarded = |id, text: &str, author| RawHistoryMessage {
+        forwarded: true,
+        forwarded_from: Some(author),
+        ..mine(id, text)
+    };
+    let saved = ChatSummary {
+        id: ME.to_string(),
+        title: "Me".into(),
+        is_self: true,
+        ..alice_chat()
+    };
+    let data = FakeData::new(account(42, "Me"))
+        .with_chats(vec![saved, alice_chat()])
+        .with_messages(
+            ME,
+            vec![
+                mine(1, "buy milk"),
+                forwarded(2, "the address is on the card", ALICE),
+                RawHistoryMessage {
+                    reply_to: Some(2),
+                    ..mine(3, "ask Alice which card")
+                },
+                forwarded(4, "see you at 6", ME),
+            ],
+        );
+    let server = start_with(vec![data]).await;
+    let (_, tokens) = server.login().await;
+    let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+    (server, client)
+}
+
+#[tokio::test]
+async fn the_accounts_own_messages_in_saved_messages_are_outgoing() {
+    let (_server, client) = saved_messages_client().await;
+    let me = fake_issued_id(ME);
+    let alice = json!({ "id": alice_id(), "name": "Alice" });
+
+    let page = call(&client, json!({ "chat_id": me })).await.unwrap();
+    assert_eq!(
+        page["messages"],
+        json!([
+            { "id": 4, "date": "2026-11-06T04:00:00Z", "outgoing": true, "text": "see you at 6",
+              "forwarded": true },
+            { "id": 3, "date": "2026-11-06T03:00:00Z", "outgoing": true,
+              "text": "ask Alice which card", "reply_to": 2 },
+            { "id": 2, "date": "2026-11-06T02:00:00Z", "sender": alice,
+              "text": "the address is on the card", "forwarded": true },
+            { "id": 1, "date": "2026-11-06T01:00:00Z", "outgoing": true, "text": "buy milk" },
+        ])
+    );
+
+    // The same in a reply chain and in a window around a message.
+    let chain = call(&client, json!({ "chat_id": me, "thread_of": 3 }))
+        .await
+        .unwrap();
+    let authors = |page: &Value| -> Vec<(i64, Value, Value)> {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_i64().unwrap(),
+                    m["sender"].clone(),
+                    m["outgoing"].clone(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        authors(&chain),
+        [
+            (3, Value::Null, json!(true)),
+            (2, alice.clone(), Value::Null)
+        ]
+    );
+    let window = call(
+        &client,
+        json!({ "chat_id": me, "around_id": 2, "limit": 3 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        authors(&window),
+        [
+            (3, Value::Null, json!(true)),
+            (2, alice, Value::Null),
+            (1, Value::Null, json!(true)),
+        ]
+    );
 }

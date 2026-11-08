@@ -1,7 +1,8 @@
-//! Per-client-IP limits on the anonymous OAuth endpoints (`/register`, `/authorize`,
-//! `/token`, `/revoke`): a token bucket per endpoint and client, answered with
-//! `429 Too Many Requests` + `Retry-After` when empty. Everything else (`/mcp`,
-//! `/healthz`, `.well-known/*`, the Login flow pages) is not limited here.
+//! Per-client-IP limits on the anonymous endpoints (`/register`, `/authorize`,
+//! `/token`, `/revoke`, and `/media/{ticket}` for Media links): a token bucket
+//! per endpoint and client, answered with `429 Too Many Requests` +
+//! `Retry-After` when empty. Everything else (`/mcp`, `/healthz`,
+//! `.well-known/*`, the Login flow pages) is not limited here.
 //!
 //! The client is the TCP peer, or, when [`OAuthLimits::trust_forwarded_for`] is on
 //! (behind kamal-proxy), the right-most `X-Forwarded-For` entry: the one our own
@@ -49,6 +50,8 @@ pub struct OAuthLimits {
     pub register: Rate,
     /// `/token` and `/revoke`, each its own bucket.
     pub token: Rate,
+    /// `/media/{ticket}`: Media link downloads (and guesses).
+    pub media: Rate,
     /// Login flows pending at once, server-wide. Each holds a Telegram connection.
     pub max_pending_logins: usize,
     /// Login flows pending at once from one client.
@@ -68,6 +71,10 @@ impl Default for OAuthLimits {
                 burst: 5,
             },
             token: Rate {
+                per_minute: 30,
+                burst: 10,
+            },
+            media: Rate {
                 per_minute: 30,
                 burst: 10,
             },
@@ -133,6 +140,7 @@ pub enum Endpoint {
     Authorize,
     Token,
     Revoke,
+    Media,
 }
 
 impl Endpoint {
@@ -142,6 +150,8 @@ impl Endpoint {
             Self::Authorize => "/authorize",
             Self::Token => "/token",
             Self::Revoke => "/revoke",
+            // Never the ticket: it is a credential.
+            Self::Media => "/media",
         }
     }
 
@@ -150,6 +160,7 @@ impl Endpoint {
             Self::Register => limits.register,
             Self::Authorize => limits.authorize,
             Self::Token | Self::Revoke => limits.token,
+            Self::Media => limits.media,
         }
     }
 }

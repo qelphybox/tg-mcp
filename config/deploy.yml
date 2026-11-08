@@ -35,6 +35,12 @@ proxy:
   # Only bounds the wait for response headers. MCP streams are text/event-stream,
   # which kamal-proxy switches to unbuffered pass-through on its own.
   response_timeout: 30
+  # Media links (#36) stream files of up to 20 MB from Telegram: pass responses
+  # through as they come. Buffered, kamal-proxy would hold each one whole and
+  # write anything over 1 MB to disk. Requests stay buffered (the default).
+  buffering:
+    requests: true
+    responses: false
 
 env:
   clear:

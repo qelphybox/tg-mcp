@@ -9,13 +9,22 @@
 //! real Telegram (QR login + Client pool).
 
 pub mod chats;
+pub mod download;
 pub mod fake;
+pub mod find;
+pub mod folders;
 pub mod grammers;
+pub mod media;
+pub mod members;
 pub mod messages;
 mod pool;
+pub mod rich;
 pub mod sanitise;
 pub mod search;
 mod session;
+pub mod topics;
+pub mod transcribe;
+pub mod view;
 
 pub use fake::{FakeConnector, FakeLogin, FakePassword, FakeTelegram};
 
@@ -77,17 +86,20 @@ pub enum TgError {
 pub trait Telegram: Send + Sync + 'static {
     async fn whoami(&self) -> Result<Account, TgError>;
 
+    /// The Account's Chat folders, in the user's order
+    /// (`messages.getDialogFilters`): neither the Archive nor the "All chats"
+    /// entry is one.
+    async fn chat_folders(&self) -> Result<Vec<folders::ChatFolder>, TgError>;
+
     /// One page of the Account's Chats in the main list or the Archive: pinned
     /// first on the first page, then most recent first, each Chat once. At most
-    /// `limit` Chats, and `next_cursor` continues right after the last one, so
-    /// callers must not cut the page. `cursor` is a `next_cursor` from a
-    /// previous page (it also decides `archived`).
-    async fn list_chats(
-        &self,
-        limit: usize,
-        cursor: Option<&str>,
-        archived: bool,
-    ) -> Result<chats::ChatPage, TgError>;
+    /// `query.limit` Chats, and `next_cursor` continues right after the last
+    /// one, so callers must not cut the page. `query.cursor` is a
+    /// `next_cursor` from a previous page (it also decides `archived`). With
+    /// `unread_only`, only unread Chats, scanned for by [`chats::list_chats`].
+    /// With `chat_folder`, the Chats of that Chat folder instead
+    /// ([`folders::list_folder_chats`]).
+    async fn list_chats(&self, query: chats::ChatsQuery) -> Result<chats::ChatPage, TgError>;
 
     /// Messages of one Chat, newest first, within `query`'s bounds.
     async fn get_messages(
@@ -96,8 +108,29 @@ pub trait Telegram: Send + Sync + 'static {
         query: messages::HistoryQuery,
     ) -> Result<messages::MessagePage, TgError>;
 
-    /// Details of one Chat: title, type, @username, description/bio, member count.
+    /// Details of one Chat: title, type, @username, description, member count;
+    /// for a user, the profile Telegram shows the Account
+    /// ([`chats::user_info`]), without `common_chats`.
     async fn get_chat_info(&self, chat: chats::ChatRef) -> Result<chats::ChatInfo, TgError>;
+
+    /// The groups and channels the Account shares with a user
+    /// (`messages.getCommonChats`), at most `limit`
+    /// ([`find::MAX_COMMON_CHATS`]). Not a user is [`TgError::InvalidInput`].
+    async fn common_chats(
+        &self,
+        user: chats::ChatRef,
+        limit: usize,
+    ) -> Result<find::FoundChats, TgError>;
+
+    /// One page of a group's, supergroup's or channel's members
+    /// ([`members::get_members`]): Telegram's listing for a supergroup or
+    /// channel, ours over the whole list for a basic group and for admins. A
+    /// user is [`TgError::InvalidInput`], and so is a Chat whose members
+    /// Telegram doesn't show the Account.
+    async fn get_members(
+        &self,
+        query: members::MembersQuery,
+    ) -> Result<members::MemberPage, TgError>;
 
     /// One page of Search hits, Telegram's search across the Account's Chats or
     /// in one of them, newest first. At most `query.limit` hits; `next_cursor`
@@ -106,6 +139,54 @@ pub trait Telegram: Send + Sync + 'static {
         &self,
         query: search::SearchQuery,
     ) -> Result<search::SearchPage, TgError>;
+
+    /// The Account's own Chats and contacts whose name, title or @username
+    /// matches `query` (trimmed, without a leading `@`), in Telegram's order,
+    /// each once, at most `limit`. Public Chats the Account isn't in are never
+    /// returned.
+    async fn find_chats(&self, query: &str, limit: usize) -> Result<find::FoundChats, TgError>;
+
+    /// The file of message `message_id`'s media in a Chat, fetched by id
+    /// ([`download::locate`]): what it is (as get_messages describes it),
+    /// its size and where it is. Not found, no media, or media without a
+    /// file is [`TgError::InvalidInput`].
+    async fn media_file(
+        &self,
+        chat: chats::ChatRef,
+        message_id: i32,
+    ) -> Result<download::MediaFile, TgError>;
+
+    /// Message `message_id` of a Chat and, when it is in an album, the
+    /// album's other messages, each with what a view can show of its media
+    /// ([`view::locate_album`]: one `getMessages` call for the ids around
+    /// it). Not found or no media is [`TgError::InvalidInput`].
+    async fn media_album(
+        &self,
+        chat: chats::ChatRef,
+        message_id: i32,
+    ) -> Result<view::Album, TgError>;
+
+    /// Telegram's transcription of message `message_id`'s voice message or
+    /// video message ([`transcribe::transcribe`]): one `getMessages` for it
+    /// (the Chat's own message only), then one `messages.transcribeAudio`
+    /// (method class Transcribe), then the final text from Telegram's
+    /// updates until `deadline`, else [`transcribe::Transcript::Pending`].
+    /// Another kind of media is [`TgError::InvalidInput`] without asking
+    /// Telegram, and so is Telegram's refusal ([`transcribe::Refusal`]).
+    async fn transcribe(
+        &self,
+        chat: chats::ChatRef,
+        message_id: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<transcribe::Transcription, TgError>;
+
+    /// One `upload.getFile` call, in method class Files: through the
+    /// Account's limiter, its `FLOOD_WAIT` honoured. [`download::Download`]
+    /// makes these calls.
+    async fn get_file(
+        &self,
+        request: download::FileRequest,
+    ) -> Result<download::FilePart, download::FileError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

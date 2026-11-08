@@ -62,4 +62,4 @@ jobs:
           generate_release_notes: true
           body: |
             Image: `ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}` (linux/amd64, linux/arm64).
-            Self-hosting: see the README.
+            Self-hosting: see the README. What changed: see CHANGELOG.md.

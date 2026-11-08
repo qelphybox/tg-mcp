@@ -79,16 +79,32 @@ Telegram's single built-in place for Chats the user moved out of the main chat l
 _Avoid_: archived folder, folder (unqualified)
 
 **Chat folder**:
-A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Telegram apps. A Chat can be in several Chat folders, and in none. Unrelated to the Archive.
+A user-defined, named grouping of Chats ("Work", "Family"), shown as tabs in Telegram apps. A Chat can be in several Chat folders, and in none. Unrelated to the Archive. Defined either as an explicit list (pinned and included Chats, minus excluded ones) or also by rules (kinds of Chats such as contacts or groups, or leaving out muted, read or archived ones). A shared Chat folder (chatlist) is always a list.
 _Avoid_: folder (unqualified), filter, tab
 
 **Topic**:
-A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic.
+A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic; the tools name it by its id, which is the id of the message that created it, and General, every forum's first Topic, is 1.
 _Avoid_: thread (a thread is a chain of replies), subchat
+
+**Rich message**:
+A message whose content is page blocks (paragraphs, lists, tables, collapsible sections, photos: Telegram's Instant View blocks, `message.rich_message`) rather than, or besides, its plain text. The tools read it as plain lines after the plain text.
+_Avoid_: Instant View (that is a web page's preview), formatted message
 
 **Media link**:
 A short-lived URL that lets whoever holds it download the media of one message, without a Token.
 _Avoid_: download token, file URL
+
+**Message link**:
+A `https://t.me/…` URL that opens one message in the Telegram apps: `t.me/<username>/<id>` in a channel or supergroup with a public @username, `t.me/c/<channel id>/<id>` (members only) in one without. Computed by the server, never fetched; private chats and basic groups have none. Carries no credential, unlike a Media link.
+_Avoid_: permalink, share link
+
+**Album**:
+Messages sent together as one post (Telegram's `grouped_id`): up to 10 photos, videos or files with consecutive ids in one Chat. get_media `view` shows an album, not just the one message.
+_Avoid_: media group, gallery
+
+**Transcription**:
+Telegram's own text of what is said in a voice message or video message (`messages.transcribeAudio`), read by get_media `transcribe`. The audio never leaves Telegram. Needs Telegram Premium, or the weekly free trial of an Account without it.
+_Avoid_: speech-to-text, STT, recognition
 
 **Search hit**:
 One message found by a search, together with its Chat and a snippet of its text around the match.

@@ -55,6 +55,13 @@ impl GrantId {
     }
 }
 
+#[cfg(test)]
+impl From<String> for GrantId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
 impl fmt::Display for GrantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -287,6 +294,16 @@ impl Vault {
             .await?;
         tx.commit().await?;
         Ok(issued)
+    }
+
+    /// Whether a Grant still exists (it isn't revoked or purged). Needs no
+    /// Token, and opens nothing: for Media links, which carry no Token.
+    pub async fn grant_exists(&self, grant_id: &GrantId) -> Result<bool, VaultError> {
+        let found = sqlx::query("SELECT 1 FROM grants WHERE id = ?")
+            .bind(grant_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// Delete a Grant with its sealed Telegram session and all its Tokens.

@@ -34,6 +34,7 @@ use self::{
     rate_limit::{Endpoint, OAuthLimits, RateLimiter},
 };
 use crate::{
+    links::MediaLinks,
     sessions::{GrantId, Vault, VaultError},
     tg::{Connector, Login, Telegram, TgError},
 };
@@ -48,6 +49,8 @@ pub struct AuthState {
     pub clients: ClientRegistry,
     pub login: Arc<dyn Login>,
     pub connector: Arc<dyn Connector>,
+    /// Media links: revoking a Grant ends them, and `/media/{ticket}` serves them.
+    pub links: Arc<MediaLinks>,
     flows: Flows,
     rate_limiter: RateLimiter,
 }
@@ -59,6 +62,7 @@ impl AuthState {
         clients: ClientRegistry,
         login: Arc<dyn Login>,
         connector: Arc<dyn Connector>,
+        links: Arc<MediaLinks>,
         limits: OAuthLimits,
     ) -> Self {
         Self {
@@ -67,6 +71,7 @@ impl AuthState {
             clients,
             login,
             connector,
+            links,
             flows: Flows::new(
                 limits.max_pending_logins,
                 limits.max_pending_logins_per_client,
@@ -90,7 +95,8 @@ impl AuthState {
     }
 }
 
-/// Sweep expired Login flows every minute, for as long as the server lives.
+/// Sweep expired Login flows and Media links every minute, for as long as the
+/// server lives.
 pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
     let auth = Arc::downgrade(auth);
     tokio::spawn(async move {
@@ -101,6 +107,10 @@ pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
             let swept = auth.flows.sweep();
             if swept > 0 {
                 tracing::info!(swept, "abandoned logins dropped");
+            }
+            let links = auth.links.sweep();
+            if links > 0 {
+                tracing::info!(links, "expired media links dropped");
             }
         }
     });
@@ -194,6 +204,7 @@ pub async fn require_bearer(
             // Ended in Telegram (Active sessions) or unreadable: that is permanent, so
             // the Grant goes too, and the client has to log in again.
             tracing::warn!(grant_id = %grant_id, error = %err, "grant has a dead telegram session, deleting it");
+            auth.links.revoke_grant(&grant_id);
             if let Err(err) = auth.vault.delete_grant(&grant_id).await {
                 tracing::error!(grant_id = %grant_id, error = %err, "deleting dead grant failed");
             }
