@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tg_mcp::sessions::{TokenTtl, Vault, VaultError};
+use tg_mcp::sessions::{GrantId, PausedClock, RevokeReason, TokenTtl, Vault, VaultError};
 
 const SESSION: &[u8] = b"grammers-session-bytes: auth key, dc, peers";
 
@@ -14,6 +14,16 @@ async fn vault(ttl: TokenTtl) -> (Vault, TempDir) {
         .unwrap();
     (vault, dir)
 }
+
+/// A vault whose time stands still until the test advances `clock`.
+async fn paused_vault(ttl: TokenTtl) -> (Vault, PausedClock, TempDir) {
+    let (vault, dir) = vault(ttl).await;
+    let clock = PausedClock::new();
+    (vault.with_clock(clock.clone()), clock, dir)
+}
+
+/// How long a consumed refresh Token keeps working (ADR-0003).
+const GRACE: Duration = Duration::from_secs(60);
 
 fn assert_invalid<T: std::fmt::Debug>(result: Result<T, VaultError>) {
     match result {
@@ -76,8 +86,8 @@ async fn expired_tokens_are_rejected() {
 }
 
 #[tokio::test]
-async fn refresh_rotates_and_the_old_refresh_token_dies() {
-    let (vault, _dir) = vault(TokenTtl::default()).await;
+async fn refresh_rotates_and_the_new_refresh_token_carries_on() {
+    let (vault, clock, _dir) = paused_vault(TokenTtl::default()).await;
     let first = vault.create_grant("client", 42, SESSION).await.unwrap();
 
     let second = vault
@@ -90,11 +100,12 @@ async fn refresh_rotates_and_the_old_refresh_token_dies() {
 
     let grant = vault.open(second.access.expose()).await.unwrap();
     assert_eq!(grant.telegram_session.as_slice(), SESSION);
+    // A consumed refresh Token is never an access Token, even in its grace window.
+    assert_invalid(vault.open(first.refresh.expose()).await);
 
-    assert_invalid(vault.refresh(first.refresh.expose(), "client").await);
-    // Another client can't use this Grant's refresh Token.
-    assert_invalid(vault.refresh(second.refresh.expose(), "other-client").await);
-    // The new refresh Token keeps the chain going.
+    // The new refresh Token keeps the chain going after the window; reusing the
+    // old one then is theft (reuse_after_the_grace_window_revokes_the_grant).
+    clock.advance(GRACE);
     vault
         .refresh(second.refresh.expose(), "client")
         .await
@@ -102,7 +113,132 @@ async fn refresh_rotates_and_the_old_refresh_token_dies() {
 }
 
 #[tokio::test]
-async fn concurrent_refresh_with_one_token_has_one_winner() {
+async fn a_consumed_refresh_token_keeps_working_for_its_grace_window() {
+    let (vault, clock, _dir) = paused_vault(TokenTtl::default()).await;
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+    // A retry after a lost response, just before the window closes.
+    clock.advance(GRACE - Duration::from_secs(1));
+    let third = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+
+    assert_ne!(third.refresh.expose(), second.refresh.expose());
+    for pair in [&second, &third] {
+        assert_eq!(pair.grant_id, first.grant_id);
+        let grant = vault.open(pair.access.expose()).await.unwrap();
+        assert_eq!(grant.telegram_session.as_slice(), SESSION);
+        vault
+            .refresh(pair.refresh.expose(), "client")
+            .await
+            .unwrap();
+    }
+}
+
+/// The Token with one character of its secret changed, still well-formed.
+fn forged(token: &str) -> String {
+    let (id, secret) = token.split_once('.').unwrap();
+    let mut chars: Vec<char> = secret.chars().collect();
+    chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+    format!("{id}.{}", chars.into_iter().collect::<String>())
+}
+
+fn assert_revoked<T: std::fmt::Debug>(
+    result: Result<T, VaultError>,
+    grant: &GrantId,
+    why: RevokeReason,
+) {
+    match result {
+        Err(VaultError::GrantRevoked { grant_id, reason })
+            if &grant_id == grant && reason == why => {}
+        other => panic!("expected GrantRevoked({grant}, {why:?}), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reuse_after_the_grace_window_revokes_the_grant() {
+    let (vault, clock, _dir) = paused_vault(TokenTtl::default()).await;
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let other = vault.create_grant("client", 7, SESSION).await.unwrap();
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+    clock.advance(GRACE);
+
+    assert_revoked(
+        vault.refresh(first.refresh.expose(), "client").await,
+        &first.grant_id,
+        RevokeReason::RefreshReuse,
+    );
+
+    assert!(!vault.grant_exists(&first.grant_id).await.unwrap());
+    assert_invalid(vault.open(second.access.expose()).await);
+    assert_invalid(vault.refresh(second.refresh.expose(), "client").await);
+    assert_invalid(vault.refresh(first.refresh.expose(), "client").await);
+    // Other Grants are untouched.
+    vault.open(other.access.expose()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_genuine_refresh_token_from_another_client_revokes_the_grant() {
+    let (vault, _dir) = vault(TokenTtl::default()).await;
+
+    // A live refresh Token.
+    let live = vault.create_grant("client", 42, SESSION).await.unwrap();
+    assert_revoked(
+        vault.refresh(live.refresh.expose(), "other-client").await,
+        &live.grant_id,
+        RevokeReason::ForeignClient,
+    );
+    assert!(!vault.grant_exists(&live.grant_id).await.unwrap());
+    assert_invalid(vault.open(live.access.expose()).await);
+
+    // A consumed one, still in its grace window.
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+    assert_revoked(
+        vault.refresh(first.refresh.expose(), "other-client").await,
+        &first.grant_id,
+        RevokeReason::ForeignClient,
+    );
+    assert_invalid(vault.open(second.access.expose()).await);
+    assert_invalid(vault.refresh(second.refresh.expose(), "client").await);
+}
+
+#[tokio::test]
+async fn a_forged_secret_for_a_consumed_token_revokes_nothing() {
+    let (vault, clock, _dir) = paused_vault(TokenTtl::default()).await;
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+    let forged = forged(first.refresh.expose());
+
+    assert_invalid(vault.refresh(&forged, "client").await);
+    clock.advance(GRACE);
+    assert_invalid(vault.refresh(&forged, "client").await);
+    assert_invalid(vault.refresh(&forged, "other-client").await);
+
+    assert!(vault.grant_exists(&first.grant_id).await.unwrap());
+    vault.open(second.access.expose()).await.unwrap();
+    vault
+        .refresh(second.refresh.expose(), "client")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_refreshes_with_one_token_both_succeed() {
     let (vault, _dir) = vault(TokenTtl::default()).await;
     let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
     let token = issued.refresh.expose();
@@ -111,11 +247,11 @@ async fn concurrent_refresh_with_one_token_has_one_winner() {
         vault.refresh(token, "client"),
         vault.refresh(token, "client")
     );
-    assert_eq!(
-        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
-        1,
-        "exactly one refresh may succeed: {a:?} / {b:?}"
-    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.refresh.expose(), b.refresh.expose());
+    for pair in [&a, &b] {
+        vault.open(pair.access.expose()).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -236,4 +372,95 @@ async fn purge_drops_grants_left_without_tokens() {
     // The Grant row is gone too: writing its session finds nothing.
     assert_invalid(vault.save_session(&opened, b"late write").await);
     vault.save_session(&kept_opened, SESSION).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_sweep_drops_wrapped_keys_only_after_the_grace_window() {
+    let (vault, clock, _dir) = paused_vault(TokenTtl::default()).await;
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+    vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+
+    assert_eq!(vault.drop_consumed_keys().await.unwrap(), 0);
+    let retried = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+
+    clock.advance(GRACE);
+    assert_eq!(vault.drop_consumed_keys().await.unwrap(), 1);
+    assert_eq!(vault.drop_consumed_keys().await.unwrap(), 0);
+    // A consumed record without its key still recognises a reuse.
+    assert_revoked(
+        vault.refresh(first.refresh.expose(), "client").await,
+        &first.grant_id,
+        RevokeReason::RefreshReuse,
+    );
+    assert_invalid(vault.open(retried.access.expose()).await);
+}
+
+#[tokio::test]
+async fn purge_drops_consumed_tokens_at_their_original_expiry() {
+    let ttl = TokenTtl {
+        access: Duration::from_secs(60 * 60),
+        refresh: Duration::from_secs(2 * 60 * 60),
+    };
+    let (vault, clock, _dir) = paused_vault(ttl).await;
+    let first = vault.create_grant("client", 42, SESSION).await.unwrap();
+    let second = vault
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(30 * 60));
+    let third = vault
+        .refresh(second.refresh.expose(), "client")
+        .await
+        .unwrap();
+
+    clock.advance(Duration::from_secs(90 * 60) - Duration::from_secs(1));
+    // Two hours less a second in: the three access Tokens (1 h each) expired.
+    assert_eq!(vault.purge_expired().await.unwrap(), 3);
+    clock.advance(Duration::from_secs(1));
+    // Two hours in: both consumed refresh Tokens reach their original expiry.
+    assert_eq!(vault.purge_expired().await.unwrap(), 2);
+
+    assert!(vault.grant_exists(&first.grant_id).await.unwrap());
+    // Gone, not just expired: presenting it is a plain invalid Token.
+    assert_invalid(vault.refresh(first.refresh.expose(), "client").await);
+    vault
+        .refresh(third.refresh.expose(), "client")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn consumed_tokens_never_keep_a_grant_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = tg_mcp::db::open(&dir.path().join("vault.db"))
+        .await
+        .unwrap();
+    let clock = PausedClock::new();
+    // Tokens issued under a long TTL, refreshed after a restart with a shorter one:
+    // the consumed refresh Token outlives every live Token of its Grant.
+    let long = Vault::new(pool.clone(), TokenTtl::default()).with_clock(clock.clone());
+    let short = Vault::new(
+        pool,
+        TokenTtl {
+            access: Duration::from_secs(60),
+            refresh: Duration::from_secs(60),
+        },
+    )
+    .with_clock(clock.clone());
+    let first = long.create_grant("client", 42, SESSION).await.unwrap();
+    short
+        .refresh(first.refresh.expose(), "client")
+        .await
+        .unwrap();
+
+    clock.advance(Duration::from_secs(60 * 60));
+    // Both access Tokens and the new refresh Token; the consumed one has days left.
+    assert_eq!(short.purge_expired().await.unwrap(), 3);
+    assert!(!short.grant_exists(&first.grant_id).await.unwrap());
 }

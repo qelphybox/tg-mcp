@@ -101,7 +101,9 @@ async fn refresh_token(auth: &AuthState, form: TokenForm) -> Response {
     };
     match auth.vault.refresh(token, client_id).await {
         Ok(issued) => token_response(&issued),
-        Err(VaultError::InvalidToken) => {
+        // A revoked Grant (theft, logged by the vault) is answered exactly as any
+        // bad refresh Token.
+        Err(VaultError::InvalidToken | VaultError::GrantRevoked { .. }) => {
             oauth_error("invalid_grant", "invalid, used or expired refresh_token")
         }
         Err(err) => server_error(err),

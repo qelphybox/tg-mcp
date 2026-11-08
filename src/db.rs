@@ -15,6 +15,9 @@ pub async fn open(path: &Path) -> Result<SqlitePool, sqlx::Error> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
+        // Deleted content is overwritten with zeros, not left in free space: a
+        // swept Wrapped key (ADR-0003) or a deleted Grant leaves the file for real.
+        .pragma("secure_delete", "ON")
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
