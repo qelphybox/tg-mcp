@@ -27,7 +27,7 @@ use tg_mcp::{
     auth::clients::ClientRegistry,
     config::Config,
     db,
-    sessions::{TokenTtl, Vault},
+    sessions::{PausedClock, TokenTtl, Vault},
     tg::{Account, FakeConnector, FakeLogin, Login, LoginAttempt, TgError, fake::FakeData},
 };
 use tokio_util::sync::CancellationToken;
@@ -119,6 +119,21 @@ const RELAXED_LIMITS: &[(&str, &str)] = &[
 
 /// A server with extra environment variables on top of the test defaults.
 pub async fn start_with_env(login: Arc<dyn Login>, env: &[(&str, &str)]) -> TestServer {
+    serve(login, env, None).await
+}
+
+/// A server whose vault reads the time from `clock` (Token expiry, the refresh
+/// grace window), logging in as each Account in turn.
+pub async fn start_with_clock(accounts: Vec<Account>, clock: PausedClock) -> TestServer {
+    let login = Arc::new(SequenceLogin::new(accounts));
+    serve(login, &[], Some(clock)).await
+}
+
+async fn serve(
+    login: Arc<dyn Login>,
+    env: &[(&str, &str)],
+    clock: Option<PausedClock>,
+) -> TestServer {
     let connector = FakeConnector::default();
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -134,8 +149,12 @@ pub async fn start_with_env(login: Arc<dyn Login>, env: &[(&str, &str)]) -> Test
     })
     .unwrap();
     let pool = db::open(&dir.path().join("test.db")).await.unwrap();
+    let mut vault = Vault::new(pool.clone(), TokenTtl::default());
+    if let Some(clock) = clock {
+        vault = vault.with_clock(clock);
+    }
     let deps = Deps {
-        vault: Arc::new(Vault::new(pool.clone(), TokenTtl::default())),
+        vault: Arc::new(vault),
         clients: ClientRegistry::new(pool),
         login,
         connector: Arc::new(connector.clone()),

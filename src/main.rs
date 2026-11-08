@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(db = %config.db_path.display(), "database ready");
     let vault = Arc::new(Vault::new(pool.clone(), TokenTtl::default()));
     tokio::spawn(purge_expired_tokens(vault.clone()));
+    tokio::spawn(drop_consumed_keys(vault.clone()));
 
     let (login, connector): (Arc<dyn Login>, Arc<dyn Connector>) = match (
         config.fake_telegram,
@@ -99,6 +100,24 @@ async fn purge_expired_tokens(vault: Arc<Vault>) {
             Ok(0) => {}
             Ok(purged) => tracing::info!(purged, "expired tokens purged"),
             Err(err) => tracing::warn!(error = %err, "purging expired tokens failed"),
+        }
+    }
+}
+
+/// Every minute: delete the Wrapped keys of refresh Tokens past their grace
+/// window (ADR-0003), so they leave the database file within minutes.
+async fn drop_consumed_keys(vault: Arc<Vault>) {
+    let mut every = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        every.tick().await;
+        match vault.drop_consumed_keys().await {
+            Ok(0) => {}
+            Ok(dropped) => {
+                tracing::info!(dropped, "wrapped keys of consumed refresh tokens deleted")
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "deleting consumed refresh tokens' wrapped keys failed")
+            }
         }
     }
 }

@@ -13,7 +13,7 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 
 use super::{AuthState, SCOPE, pkce};
-use crate::sessions::{IssuedTokens, VaultError};
+use crate::sessions::{GrantId, IssuedTokens, VaultError};
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
@@ -101,10 +101,42 @@ async fn refresh_token(auth: &AuthState, form: TokenForm) -> Response {
     };
     match auth.vault.refresh(token, client_id).await {
         Ok(issued) => token_response(&issued),
-        Err(VaultError::InvalidToken) => {
-            oauth_error("invalid_grant", "invalid, used or expired refresh_token")
+        Err(VaultError::InvalidToken) => invalid_refresh_token(),
+        // Theft: the vault deleted the Grant and logged why. Drop what memory holds
+        // of it, then answer exactly as for any bad refresh Token.
+        Err(VaultError::GrantRevoked { grant_id, .. }) => {
+            end_revoked_grant(auth, &grant_id).await;
+            invalid_refresh_token()
         }
         Err(err) => server_error(err),
+    }
+}
+
+fn invalid_refresh_token() -> Response {
+    oauth_error("invalid_grant", "invalid, used or expired refresh_token")
+}
+
+/// A Grant revoked without a Token: its Media links go, and its Live client, if
+/// pooled, logs its Telegram session out (best effort, ADR-0003).
+async fn end_revoked_grant(auth: &AuthState, grant_id: &GrantId) {
+    let links = auth.links.revoke_grant(grant_id);
+    if links > 0 {
+        tracing::info!(grant_id = %grant_id, links, "media links of a revoked grant dropped");
+    }
+    match auth.connector.evict_and_log_out(grant_id).await {
+        Ok(true) => tracing::info!(
+            grant_id = %grant_id,
+            "revoked grant's live client logged its telegram session out"
+        ),
+        Ok(false) => tracing::info!(
+            grant_id = %grant_id,
+            "revoked grant had no live client; its telegram session stays in the account's active sessions"
+        ),
+        Err(err) => tracing::warn!(
+            grant_id = %grant_id,
+            error = %err,
+            "logging a revoked grant's telegram session out failed; it stays in the account's active sessions"
+        ),
     }
 }
 

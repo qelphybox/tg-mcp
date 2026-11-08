@@ -16,6 +16,10 @@ pub(crate) use crypto::random as random_bytes;
 use std::{
     fmt,
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -29,6 +33,10 @@ const SESSION_AAD: &[u8] = b"tg-mcp/telegram-session/v1:";
 const WRAP_AAD: &[u8] = b"tg-mcp/wrapped-key/v1:";
 const VERIFIER_INFO: &[u8] = b"tg-mcp/token-verifier/v1";
 const WRAP_INFO: &[u8] = b"tg-mcp/token-wrap/v1";
+
+/// How long a consumed refresh Token stays fully usable (ADR-0003): two client
+/// processes refreshing at once, or a retry after a lost response, both work.
+pub const REFRESH_GRACE: Duration = Duration::from_secs(60);
 
 /// How long issued Tokens live.
 #[derive(Debug, Clone, Copy)]
@@ -126,11 +134,45 @@ pub enum VaultError {
     /// A valid Token presented by a client it was not issued to.
     #[error("token was issued to another client")]
     WrongClient,
+    /// A genuine refresh Token was presented where it never may be: reused after
+    /// its grace window, or by a client the Grant wasn't issued to. One of the two
+    /// presenters is a thief, so the Grant is already deleted (with its Telegram
+    /// session and every Token). The caller drops what it holds of the Grant in
+    /// memory and answers as for [`VaultError::InvalidToken`].
+    #[error("grant {grant_id} revoked: {reason}")]
+    GrantRevoked {
+        grant_id: GrantId,
+        reason: RevokeReason,
+    },
     /// The Token verified but its data does not decrypt: the database was altered.
     #[error("vault data for token {token_id} failed authentication")]
     Corrupt { token_id: String },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+/// Why a Grant was revoked without its owner asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeReason {
+    /// A consumed refresh Token came back after its grace window.
+    RefreshReuse,
+    /// A refresh Token came from a client the Grant wasn't issued to.
+    ForeignClient,
+}
+
+impl RevokeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevokeReason::RefreshReuse => "refresh_reuse",
+            RevokeReason::ForeignClient => "foreign_client",
+        }
+    }
+}
+
+impl fmt::Display for RevokeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +190,38 @@ impl Kind {
     }
 }
 
+/// The vault's time, standing still until [`PausedClock::advance`] moves it: for
+/// tests of the time-bound rules (expiry, the refresh grace window). Without one
+/// the vault reads the system clock. Clones share one time.
+#[derive(Debug, Clone)]
+pub struct PausedClock(Arc<AtomicI64>);
+
+impl PausedClock {
+    /// Paused at the current system time.
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicI64::new(unix_now())))
+    }
+
+    pub fn advance(&self, by: Duration) {
+        let secs = i64::try_from(by.as_secs()).unwrap_or(i64::MAX);
+        self.0.fetch_add(secs, Ordering::SeqCst);
+    }
+
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for PausedClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Vault {
     pool: SqlitePool,
     ttl: TokenTtl,
+    clock: Option<PausedClock>,
 }
 
 impl Vault {
@@ -161,7 +232,26 @@ impl Vault {
 
     /// A vault over an already migrated pool (see [`crate::db::open`]).
     pub fn new(pool: SqlitePool, ttl: TokenTtl) -> Self {
-        Self { pool, ttl }
+        Self {
+            pool,
+            ttl,
+            clock: None,
+        }
+    }
+
+    /// Read the time from `clock` instead of the system clock (tests).
+    pub fn with_clock(mut self, clock: PausedClock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    fn now(&self) -> i64 {
+        self.clock.as_ref().map_or_else(unix_now, PausedClock::now)
+    }
+
+    /// Whether a refresh Token consumed at `consumed_at` is still in its grace window.
+    fn in_grace(consumed_at: i64, now: i64) -> bool {
+        now < consumed_at.saturating_add(grace_secs())
     }
 
     /// Close the pool, checkpointing the WAL into the main database file.
@@ -181,7 +271,7 @@ impl Vault {
         let grant_id = GrantId(uuid::Uuid::new_v4().to_string());
         let key = Zeroizing::new(crypto::random::<KEY_LEN>());
         let sealed = crypto::seal(&key, telegram_session, &session_aad(&grant_id));
-        let now = unix_now();
+        let now = self.now();
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -256,7 +346,7 @@ impl Vault {
         let updated =
             sqlx::query("UPDATE grants SET telegram_session = ?, updated_at = ? WHERE id = ?")
                 .bind(sealed)
-                .bind(unix_now())
+                .bind(self.now())
                 .bind(grant.grant_id.as_str())
                 .execute(&self.pool)
                 .await?;
@@ -268,25 +358,55 @@ impl Vault {
     }
 
     /// Exchange a refresh Token for a new pair. Only the client the Grant was issued
-    /// to may do this. The old refresh Token is consumed; presenting it again (or
-    /// racing it) fails.
+    /// to may do this. The presented refresh Token is consumed: it stays fully
+    /// usable for [`REFRESH_GRACE`] after its first use (each use issues another
+    /// pair), then it only serves to recognise a reuse.
+    ///
+    /// A refresh Token whose secret matches but that is past its grace window, or
+    /// whose Grant belongs to another client, revokes the Grant
+    /// ([`VaultError::GrantRevoked`]). A secret that doesn't match revokes nothing:
+    /// only the real Token may end a Grant.
     pub async fn refresh(
         &self,
         refresh_token: &str,
         client_id: &str,
     ) -> Result<IssuedTokens, VaultError> {
-        let verified = self.verify(refresh_token, &[Kind::Refresh]).await?;
-        if !self.owned_by(&verified.grant_id, client_id).await? {
-            return Err(VaultError::InvalidToken);
-        }
-        let now = unix_now();
-        let mut tx = self.pool.begin().await?;
-        let consumed = sqlx::query("DELETE FROM tokens WHERE id = ?")
-            .bind(&verified.token_id)
-            .execute(&mut *tx)
+        let now = self.now();
+        let matched = self.find(refresh_token, &[Kind::Refresh], now).await?;
+        let owner: Option<String> = sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
+            .bind(matched.grant_id.as_str())
+            .fetch_optional(&self.pool)
             .await?;
+        let Some(owner) = owner else {
+            // Deleted since the Token was read.
+            return Err(VaultError::InvalidToken);
+        };
+        if !bool::from(owner.as_bytes().ct_eq(client_id.as_bytes())) {
+            return Err(self
+                .revoke_stolen(matched.grant_id, RevokeReason::ForeignClient)
+                .await);
+        }
+        let grant_id = matched.grant_id.clone();
+        let Some(usable) = matched.usable(now) else {
+            return Err(self
+                .revoke_stolen(grant_id, RevokeReason::RefreshReuse)
+                .await);
+        };
+        let verified = usable.open_key()?;
+        let mut tx = self.pool.begin().await?;
+        // The grace window counts from the first use, so a later use within it
+        // leaves `consumed_at` as it is.
+        let consumed = sqlx::query(
+            "UPDATE tokens SET consumed_at = COALESCE(consumed_at, ?1)
+             WHERE id = ?2 AND (consumed_at IS NULL OR consumed_at > ?1 - ?3)",
+        )
+        .bind(now)
+        .bind(&verified.token_id)
+        .bind(grace_secs())
+        .execute(&mut *tx)
+        .await?;
         if consumed.rows_affected() != 1 {
-            // A concurrent refresh with the same Token won.
+            // Revoked, or its grace window ended, since it was verified.
             return Err(VaultError::InvalidToken);
         }
         let issued = self
@@ -316,15 +436,35 @@ impl Vault {
         Ok(())
     }
 
-    /// Drop expired Tokens, then Grants left without any Token: nothing can ever
-    /// decrypt those again (ADR-0003). Returns how many Tokens were removed.
+    /// Delete the Wrapped key of every refresh Token consumed longer than
+    /// [`REFRESH_GRACE`] ago; its id, Grant, verifier and expiry stay, to recognise a
+    /// reuse. Verification already refuses such a Token; this removes the key from
+    /// the database file. Run it every minute. Returns how many keys were deleted.
+    pub async fn drop_consumed_keys(&self) -> Result<u64, VaultError> {
+        let dropped = sqlx::query(
+            "UPDATE tokens SET wrapped_key = NULL
+             WHERE consumed_at IS NOT NULL AND consumed_at <= ? - ? AND wrapped_key IS NOT NULL",
+        )
+        .bind(self.now())
+        .bind(grace_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(dropped.rows_affected())
+    }
+
+    /// Drop expired Tokens (consumed ones too, at their original expiry), then
+    /// Grants left without a live Token: nothing can ever decrypt those again
+    /// (ADR-0003), and a consumed Token keeps no Grant alive. Returns how many
+    /// Tokens were removed.
     pub async fn purge_expired(&self) -> Result<u64, VaultError> {
         let purged = sqlx::query("DELETE FROM tokens WHERE expires_at <= ?")
-            .bind(unix_now())
+            .bind(self.now())
             .execute(&self.pool)
             .await?;
         let orphans = sqlx::query(
-            "DELETE FROM grants WHERE NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.grant_id = grants.id)",
+            "DELETE FROM grants WHERE NOT EXISTS (
+                 SELECT 1 FROM tokens WHERE tokens.grant_id = grants.id AND tokens.consumed_at IS NULL
+             )",
         )
         .execute(&self.pool)
         .await?;
@@ -346,7 +486,20 @@ impl Vault {
         Ok(owner.is_some_and(|owner| owner.as_bytes().ct_eq(client_id.as_bytes()).into()))
     }
 
+    /// Verify a Token that is usable now: live, or consumed and in its grace window.
     async fn verify(&self, token: &str, accepted: &[Kind]) -> Result<Verified, VaultError> {
+        let now = self.now();
+        self.find(token, accepted, now)
+            .await?
+            .usable(now)
+            .ok_or(VaultError::InvalidToken)?
+            .open_key()
+    }
+
+    /// The stored record of a Token of an `accepted` kind whose secret matches its
+    /// verifier and that hasn't expired. It may be consumed and past its grace
+    /// window: see [`Matched::usable`].
+    async fn find(&self, token: &str, accepted: &[Kind], now: i64) -> Result<Matched, VaultError> {
         let parsed = token::parse(token).ok_or(VaultError::InvalidToken)?;
         let TokenRow {
             grant_id,
@@ -354,8 +507,10 @@ impl Vault {
             verifier: stored_verifier,
             wrapped_key,
             expires_at,
+            consumed_at,
         } = sqlx::query_as(
-            "SELECT grant_id, kind, verifier, wrapped_key, expires_at FROM tokens WHERE id = ?",
+            "SELECT grant_id, kind, verifier, wrapped_key, expires_at, consumed_at
+             FROM tokens WHERE id = ?",
         )
         .bind(&parsed.id)
         .fetch_optional(&self.pool)
@@ -365,23 +520,32 @@ impl Vault {
         let verifier = crypto::derive(parsed.secret.as_ref(), parsed.id.as_bytes(), VERIFIER_INFO);
         let secret_ok: bool = verifier.as_slice().ct_eq(&stored_verifier).into();
         let kind_ok = accepted.iter().any(|k| k.as_str() == kind);
-        if !secret_ok || !kind_ok || expires_at <= unix_now() {
+        if !secret_ok || !kind_ok || expires_at <= now {
             return Err(VaultError::InvalidToken);
         }
-
-        let grant_id = GrantId(grant_id);
-        let kek = crypto::derive(parsed.secret.as_ref(), parsed.id.as_bytes(), WRAP_INFO);
-        let corrupt = || VaultError::Corrupt {
-            token_id: parsed.id.clone(),
-        };
-        let unwrapped = crypto::open(&kek, &wrapped_key, &wrap_aad(&parsed.id, &grant_id))
-            .ok_or_else(corrupt)?;
-        let key: [u8; KEY_LEN] = unwrapped.as_slice().try_into().map_err(|_| corrupt())?;
-        Ok(Verified {
-            token_id: parsed.id,
-            grant_id,
-            key: Zeroizing::new(key),
+        Ok(Matched {
+            parsed,
+            grant_id: GrantId(grant_id),
+            wrapped_key,
+            consumed_at,
         })
+    }
+
+    /// Delete a Grant whose genuine refresh Token was misused, and say so.
+    async fn revoke_stolen(&self, grant_id: GrantId, reason: RevokeReason) -> VaultError {
+        if let Err(err) = sqlx::query("DELETE FROM grants WHERE id = ?")
+            .bind(grant_id.as_str())
+            .execute(&self.pool)
+            .await
+        {
+            return err.into();
+        }
+        tracing::warn!(
+            grant_id = %grant_id,
+            reason = reason.as_str(),
+            "refresh token misused, grant revoked"
+        );
+        VaultError::GrantRevoked { grant_id, reason }
     }
 
     async fn insert_pair(
@@ -408,8 +572,51 @@ struct TokenRow {
     grant_id: String,
     kind: String,
     verifier: Vec<u8>,
-    wrapped_key: Vec<u8>,
+    wrapped_key: Option<Vec<u8>>,
     expires_at: i64,
+    consumed_at: Option<i64>,
+}
+
+/// A Token record whose secret matched.
+struct Matched {
+    parsed: token::ParsedToken,
+    grant_id: GrantId,
+    wrapped_key: Option<Vec<u8>>,
+    consumed_at: Option<i64>,
+}
+
+impl Matched {
+    /// `Some` if the Token may be used now: never consumed, or consumed less than
+    /// [`REFRESH_GRACE`] ago (with its Wrapped key still there).
+    fn usable(self, now: i64) -> Option<Self> {
+        let in_grace = self
+            .consumed_at
+            .is_none_or(|consumed_at| Vault::in_grace(consumed_at, now));
+        (in_grace && self.wrapped_key.is_some()).then_some(self)
+    }
+
+    /// Unwrap the Session key with the Token's secret.
+    fn open_key(self) -> Result<Verified, VaultError> {
+        let Matched {
+            parsed,
+            grant_id,
+            wrapped_key,
+            ..
+        } = self;
+        let wrapped_key = wrapped_key.ok_or(VaultError::InvalidToken)?;
+        let kek = crypto::derive(parsed.secret.as_ref(), parsed.id.as_bytes(), WRAP_INFO);
+        let corrupt = || VaultError::Corrupt {
+            token_id: parsed.id.clone(),
+        };
+        let unwrapped = crypto::open(&kek, &wrapped_key, &wrap_aad(&parsed.id, &grant_id))
+            .ok_or_else(corrupt)?;
+        let key: [u8; KEY_LEN] = unwrapped.as_slice().try_into().map_err(|_| corrupt())?;
+        Ok(Verified {
+            token_id: parsed.id,
+            grant_id,
+            key: Zeroizing::new(key),
+        })
+    }
 }
 
 struct Verified {
@@ -463,6 +670,10 @@ fn wrap_aad(token_id: &str, grant_id: &GrantId) -> Vec<u8> {
     .concat()
 }
 
+fn grace_secs() -> i64 {
+    i64::try_from(REFRESH_GRACE.as_secs()).unwrap_or(i64::MAX)
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -486,8 +697,20 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// The attacker's copy: the database file plus any WAL leftovers.
+    fn dump(path: &Path) -> Vec<u8> {
+        let mut dump = std::fs::read(path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            if let Ok(extra) = std::fs::read(format!("{}{suffix}", path.display())) {
+                dump.extend(extra);
+            }
+        }
+        dump
+    }
+
     /// ADR-0003's core promise: whoever steals the database file, but no Token,
-    /// opens no Telegram session.
+    /// opens no Telegram session. The first refresh Token is consumed and still in
+    /// its grace window here, so its Wrapped key is in the file too.
     #[tokio::test]
     async fn database_dump_without_tokens_opens_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -504,13 +727,7 @@ mod tests {
         let real_key = *opened.key;
         vault.close().await;
 
-        // The attacker's copy: the database file plus any WAL leftovers.
-        let mut dump = std::fs::read(&path).unwrap();
-        for suffix in ["-wal", "-shm"] {
-            if let Ok(extra) = std::fs::read(format!("{}{suffix}", path.display())) {
-                dump.extend(extra);
-            }
-        }
+        let dump = dump(&path);
         let sealed: Vec<u8> = {
             let pool =
                 SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
@@ -557,5 +774,41 @@ mod tests {
         let mut leaky = dump.clone();
         leaky.extend_from_slice(&real_key);
         assert!(any_window_opens(&leaky, &sealed, &aad));
+    }
+
+    /// After the grace window the sweep removes a consumed refresh Token's Wrapped
+    /// key from the file itself, not just from the row: with that Token (say, from
+    /// an old copy of a client's credential store) a dump opens nothing either.
+    #[tokio::test]
+    async fn swept_wrapped_keys_leave_the_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let clock = PausedClock::new();
+        let vault = Vault::open_path(&path, TokenTtl::default())
+            .await
+            .unwrap()
+            .with_clock(clock.clone());
+        let issued = vault.create_grant("client", 42, b"session").await.unwrap();
+        vault
+            .refresh(issued.refresh.expose(), "client")
+            .await
+            .unwrap();
+        let consumed = token::parse(issued.refresh.expose()).unwrap();
+        let wrapped: Vec<u8> = sqlx::query_scalar("SELECT wrapped_key FROM tokens WHERE id = ?")
+            .bind(&consumed.id)
+            .fetch_one(&vault.pool)
+            .await
+            .unwrap();
+
+        clock.advance(REFRESH_GRACE);
+        assert_eq!(vault.drop_consumed_keys().await.unwrap(), 1);
+        vault.close().await;
+
+        let dump = dump(&path);
+        assert!(contains(&dump, consumed.id.as_bytes()), "the record stays");
+        assert!(
+            !contains(&dump, &wrapped),
+            "a swept Wrapped key is still in the file"
+        );
     }
 }
