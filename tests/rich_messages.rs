@@ -114,6 +114,8 @@ async fn client() -> (common::TestServer, Client) {
         is_self: false,
         unread_count: 0,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: Some(MessagePreview {
             date: "2026-11-06T00:00:02Z".into(),
             text: message_text(String::new(), Some(&rich_listing())),

@@ -87,15 +87,11 @@ pub trait Telegram: Send + Sync + 'static {
 
     /// One page of the Account's Chats in the main list or the Archive: pinned
     /// first on the first page, then most recent first, each Chat once. At most
-    /// `limit` Chats, and `next_cursor` continues right after the last one, so
-    /// callers must not cut the page. `cursor` is a `next_cursor` from a
-    /// previous page (it also decides `archived`).
-    async fn list_chats(
-        &self,
-        limit: usize,
-        cursor: Option<&str>,
-        archived: bool,
-    ) -> Result<chats::ChatPage, TgError>;
+    /// `query.limit` Chats, and `next_cursor` continues right after the last
+    /// one, so callers must not cut the page. `query.cursor` is a
+    /// `next_cursor` from a previous page (it also decides `archived`). With
+    /// `unread_only`, only unread Chats, scanned for by [`chats::list_chats`].
+    async fn list_chats(&self, query: chats::ChatsQuery) -> Result<chats::ChatPage, TgError>;
 
     /// Messages of one Chat, newest first, within `query`'s bounds.
     async fn get_messages(

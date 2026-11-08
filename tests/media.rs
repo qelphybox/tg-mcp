@@ -46,6 +46,8 @@ fn chat(id: ChatId, title: &str, kind: ChatKind, preview: Option<MessagePreview>
         is_self: false,
         unread_count: 0,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: preview,
     }
 }

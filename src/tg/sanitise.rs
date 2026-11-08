@@ -24,7 +24,7 @@ use std::{cmp::Ordering, sync::Arc};
 
 use super::{
     Account, Telegram, TgError,
-    chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, MessagePreview},
+    chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
     download::{FileError, FilePart, FileRequest, MediaFile},
     find::{FoundChat, FoundChats},
     members::{Member, MemberPage, MembersQuery},
@@ -288,6 +288,7 @@ impl Untrusted for ChatPage {
         let ChatPage {
             chats,
             next_cursor: _,
+            unread_scan_truncated: _,
         } = self;
         for chat in chats {
             let ChatSummary {
@@ -298,6 +299,8 @@ impl Untrusted for ChatPage {
                 is_self: _,
                 unread_count: _,
                 pinned: _,
+                muted: _,
+                marked_unread: _,
                 last_message,
             } = chat;
             clean(title);
@@ -563,16 +566,8 @@ impl Telegram for Sanitised {
         self.0.whoami().await.map(sanitised)
     }
 
-    async fn list_chats(
-        &self,
-        limit: usize,
-        cursor: Option<&str>,
-        archived: bool,
-    ) -> Result<ChatPage, TgError> {
-        self.0
-            .list_chats(limit, cursor, archived)
-            .await
-            .map(sanitised)
+    async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {
+        self.0.list_chats(query).await.map(sanitised)
     }
 
     async fn get_messages(
@@ -906,6 +901,8 @@ mod tests {
             is_self: false,
             unread_count: 0,
             pinned: false,
+            muted: false,
+            marked_unread: false,
             last_message: Some(MessagePreview {
                 date: "2026-11-06T00:00:00Z".into(),
                 text: preview.into(),
@@ -919,6 +916,7 @@ mod tests {
         let mut page = ChatPage {
             chats: vec![summary("Al\u{202E}ice", "hi\u{2066}!")],
             next_cursor: Some("cursor".into()),
+            unread_scan_truncated: false,
         };
         page.sanitise();
         let chat = &page.chats[0];
@@ -1098,6 +1096,7 @@ mod tests {
         let mut page = ChatPage {
             chats: vec![summary("Al\u{2028}ice", "hi\u{2029}there")],
             next_cursor: None,
+            unread_scan_truncated: false,
         };
         page.sanitise();
         let chat = &page.chats[0];
@@ -1191,6 +1190,7 @@ mod tests {
         let mut page = ChatPage {
             chats: vec![summary("\u{3164}", "\u{2063}\u{3164}")],
             next_cursor: None,
+            unread_scan_truncated: false,
         };
         page.sanitise();
         let chat = &page.chats[0];
@@ -1261,6 +1261,7 @@ mod tests {
         let mut page = ChatPage {
             chats: vec![summary("Alice", "\u{2063}")],
             next_cursor: None,
+            unread_scan_truncated: false,
         };
         page.chats[0].last_message.as_mut().unwrap().media = Some(MediaSummary {
             kind: MediaKind::Photo,

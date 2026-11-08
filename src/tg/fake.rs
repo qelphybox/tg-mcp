@@ -16,8 +16,9 @@ use zeroize::Zeroizing;
 use super::{
     Account, Connector, LoggedIn, Login, LoginAttempt, LoginState, Telegram, TgError,
     chats::{
-        ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, MessagePreview, RawPeer,
-        RawProfile, chat_info, fallback_kind, user_info,
+        self, ChatId, ChatInfo, ChatKind, ChatPage, ChatRef, ChatSummary, ChatsQuery,
+        DialogsAnswer, DialogsRequest, MessagePreview, RawDialog, RawMessage, RawPeer, RawProfile,
+        chat_info, fallback_kind, user_info,
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
@@ -1320,8 +1321,6 @@ impl FakeTelegram {
     }
 }
 
-const CURSOR_PREFIX: &str = "fake:";
-
 /// The access hash the fake Telegram gives a user or channel: fixed per id (and
 /// often negative, like real ones), so tests can predict the ids it issues.
 /// Basic groups have none.
@@ -1346,58 +1345,13 @@ impl Telegram for FakeTelegram {
         Ok(self.data.account.clone())
     }
 
-    /// The main list or the Archive, in the order of `chats`. Cursors are
-    /// `fake:<offset>` (main list) and `fake:a<offset>` (Archive).
-    async fn list_chats(
-        &self,
-        limit: usize,
-        cursor: Option<&str>,
-        archived: bool,
-    ) -> Result<ChatPage, TgError> {
-        self.flood()?;
-        let (start, archived) = match cursor {
-            None => (0, archived),
-            Some(c) => {
-                let offset = c.strip_prefix(CURSOR_PREFIX).ok_or_else(foreign_cursor)?;
-                let (offset, archived) = match offset.strip_prefix('a') {
-                    Some(offset) => (offset, true),
-                    None => (offset, false),
-                };
-                (
-                    offset.parse::<usize>().map_err(|_| foreign_cursor())?,
-                    archived,
-                )
-            }
-        };
-        let listing: Vec<&ChatSummary> = self
-            .data
-            .chats
-            .iter()
-            .filter(|c| {
-                c.id.parse::<ChatRef>()
-                    .is_ok_and(|id| self.data.archived.contains(&id.chat()))
-                    == archived
-            })
-            .collect();
-        let chats: Vec<ChatSummary> = listing
-            .iter()
-            .skip(start)
-            .take(limit)
-            .map(|c| ChatSummary {
-                id: c
-                    .id
-                    .parse::<ChatRef>()
-                    .map_or_else(|_| c.id.clone(), |id| fake_issued_id(id.chat())),
-                ..(*c).clone()
-            })
-            .collect();
-        self.remember(&Self::raw_peers(&chats));
-        let end = start + chats.len();
-        let folder = if archived { "a" } else { "" };
-        Ok(ChatPage {
-            next_cursor: (end < listing.len()).then(|| format!("{CURSOR_PREFIX}{folder}{end}")),
-            chats,
+    /// The same `messages.getDialogs` calls as the Live client, answered by
+    /// [`Self::get_dialogs`].
+    async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {
+        chats::list_chats(&query, |request| {
+            std::future::ready(self.get_dialogs(&request))
         })
+        .await
     }
 
     /// The same getHistory calls as the Live client, answered by [`get_history`].
@@ -1895,10 +1849,6 @@ impl MemberSource for FakeTelegram {
     }
 }
 
-fn foreign_cursor() -> TgError {
-    TgError::InvalidInput("cursor is not one this server returned".into())
-}
-
 impl FakeTelegram {
     fn flood(&self) -> Result<(), TgError> {
         match self.data.flood_wait {
@@ -1952,6 +1902,77 @@ impl FakeTelegram {
                 .iter()
                 .chain(&self.data.contacts)
                 .any(|c| c.id.parse::<ChatRef>().is_ok_and(|id| id.chat() == chat))
+    }
+
+    /// One `messages.getDialogs` as Telegram answers it, `chats` being in
+    /// Telegram's order: the listing's folder, its pinned Chats first unless
+    /// left out, then `limit` unpinned ones after the offset Chat. A Chat's top
+    /// message is its `last_message`, with id 1.
+    fn get_dialogs(&self, request: &DialogsRequest) -> Result<DialogsAnswer, TgError> {
+        self.flood()?;
+        let listing = request.listing;
+        let folder: Vec<(ChatId, &ChatSummary)> = self
+            .data
+            .chats
+            .iter()
+            .filter_map(|c| Some((c.id.parse::<ChatRef>().ok()?.chat(), c)))
+            .filter(|(id, _)| self.data.archived.contains(id) == listing.archived)
+            .collect();
+        let unpinned: Vec<&(ChatId, &ChatSummary)> =
+            folder.iter().filter(|(_, c)| !c.pinned).collect();
+        let start = match request
+            .after
+            .as_ref()
+            .and_then(|c| c.offset_peer.as_deref())
+        {
+            None => 0,
+            Some(peer) => unpinned
+                .iter()
+                .position(|(id, _)| id.to_string() == peer)
+                .map_or(unpinned.len(), |i| i + 1),
+        };
+        let listed: Vec<&(ChatId, &ChatSummary)> = folder
+            .iter()
+            .filter(|(_, c)| c.pinned && !listing.exclude_pinned())
+            .chain(unpinned.into_iter().skip(start).take(request.limit))
+            .collect();
+        let summaries: Vec<ChatSummary> = listed.iter().map(|(_, c)| (*c).clone()).collect();
+        let peers = Self::raw_peers(&summaries);
+        self.remember(&peers);
+        Ok(DialogsAnswer {
+            sent: listed.len(),
+            dialogs: listed
+                .iter()
+                .map(|(id, c)| RawDialog {
+                    chat: *id,
+                    top_message: 1,
+                    unread_count: c.unread_count,
+                    pinned: c.pinned,
+                    folder_id: listing.folder_id(),
+                    unread_mark: c.marked_unread,
+                    muted: c.muted,
+                })
+                .collect(),
+            peers,
+            messages: listed
+                .iter()
+                .filter_map(|(id, c)| {
+                    let last = c.last_message.as_ref()?;
+                    let date = time::OffsetDateTime::parse(
+                        &last.date,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .ok()?;
+                    Some(RawMessage {
+                        chat: *id,
+                        id: 1,
+                        date: i32::try_from(date.unix_timestamp()).ok()?,
+                        text: last.text.clone(),
+                        media: last.media.map(|m| m.kind),
+                    })
+                })
+                .collect(),
+        })
     }
 
     /// Like the Live client: every hash an answer gives is kept.
@@ -2126,6 +2147,8 @@ pub fn sample_chats() -> Vec<ChatSummary> {
             is_self: false,
             unread_count: unread,
             pinned: false,
+            muted: false,
+            marked_unread: false,
             last_message: Some(MessagePreview {
                 date: "2026-11-06T12:00:00Z".into(),
                 text: text.into(),

@@ -29,6 +29,8 @@ fn alice_chat() -> ChatSummary {
         is_self: false,
         unread_count: 0,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: None,
     }
 }

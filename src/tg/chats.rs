@@ -207,6 +207,13 @@ pub struct ChatSummary {
     pub unread_count: i32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// The user muted this chat's notifications, for a while or for good (its
+    /// own setting; an account-wide default for its kind of chat isn't seen).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
+    /// The user marked this chat as unread by hand; its `unread_count` may be 0.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub marked_unread: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<MessagePreview>,
 }
@@ -217,6 +224,10 @@ pub struct ChatPage {
     /// Pass back as `cursor` to get the next page; absent on the last page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// `unread_only` only: the scan stopped at its cap before reaching the
+    /// end of the list or `limit`; `next_cursor` scans on. Absent otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread_scan_truncated: bool,
 }
 
 /// Details of one Chat (`get_chat_info`).
@@ -506,6 +517,15 @@ pub struct RawDialog {
     pub pinned: bool,
     /// Telegram's peer folder: 0 (absent in TL) is the main list, 1 the Archive.
     pub folder_id: i32,
+    /// Marked as unread by the user (`dialog.unread_mark`).
+    pub unread_mark: bool,
+    /// Notifications muted at the time of the answer ([`is_muted`]).
+    pub muted: bool,
+}
+
+/// Telegram mutes "forever" by muting until the end of `i32` time.
+pub fn is_muted(mute_until: Option<i32>, now: i64) -> bool {
+    mute_until.is_some_and(|until| i64::from(until) > now)
 }
 
 /// Which listing a page belongs to (main list or Archive), and whether it is
@@ -515,6 +535,8 @@ pub struct RawDialog {
 pub struct Listing {
     pub archived: bool,
     pub first_page: bool,
+    /// Keep only Chats with unread messages or marked as unread.
+    pub unread_only: bool,
 }
 
 impl Listing {
@@ -543,6 +565,9 @@ pub struct Cursor {
     pub offset_access_hash: Option<i64>,
     #[serde(rename = "a", default)]
     pub archived: bool,
+    /// Continues an `unread_only` listing (and only such a one).
+    #[serde(rename = "u", default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread_only: bool,
 }
 
 impl Cursor {
@@ -564,8 +589,8 @@ impl Cursor {
 /// Assemble a page of at most `limit` chats. `full_page` = Telegram returned
 /// as many dialogs as asked for, so there may be more. Whatever Telegram sends,
 /// the page keeps only dialogs of the listing's folder, pinned ones only on the
-/// first page, each chat once. The page is cut here and nowhere else: the
-/// cursor has to know where it ends.
+/// first page, each chat once, and with `unread_only` only unread ones. The
+/// page is cut here and nowhere else: the cursor has to know where it ends.
 pub fn assemble_page(
     dialogs: &[RawDialog],
     peers: &[RawPeer],
@@ -574,6 +599,23 @@ pub fn assemble_page(
     full_page: bool,
     listing: Listing,
 ) -> ChatPage {
+    let (chats, next) = assemble(dialogs, peers, messages, limit, full_page, listing);
+    ChatPage {
+        chats,
+        next_cursor: next.map(|c| c.encode()),
+        unread_scan_truncated: false,
+    }
+}
+
+/// [`assemble_page`], with the next page's cursor still to encode.
+fn assemble(
+    dialogs: &[RawDialog],
+    peers: &[RawPeer],
+    messages: &[RawMessage],
+    limit: usize,
+    full_page: bool,
+    listing: Listing,
+) -> (Vec<ChatSummary>, Option<Cursor>) {
     let peers: HashMap<ChatId, &RawPeer> = peers.iter().map(|p| (p.id, p)).collect();
     let messages: HashMap<(ChatId, i32), &RawMessage> =
         messages.iter().map(|m| ((m.chat, m.id), m)).collect();
@@ -583,6 +625,7 @@ pub fn assemble_page(
         .iter()
         .filter(|d| d.folder_id == listing.folder_id())
         .filter(|d| !(d.pinned && listing.exclude_pinned()))
+        .filter(|d| !listing.unread_only || d.unread_count > 0 || d.unread_mark)
         .filter(|d| seen.insert(d.chat))
         .collect();
     // A first page brings the pinned dialogs on top of `limit` unpinned ones.
@@ -604,6 +647,8 @@ pub fn assemble_page(
                 is_self: peer.is_some_and(|p| p.is_self),
                 unread_count: dialog.unread_count,
                 pinned: dialog.pinned,
+                muted: dialog.muted,
+                marked_unread: dialog.unread_mark,
                 last_message: top.map(|m| MessagePreview {
                     date: rfc3339(m.date),
                     text: m.text.clone(),
@@ -631,6 +676,7 @@ pub fn assemble_page(
             offset_peer: Some(last.chat.to_string()),
             offset_access_hash: peers.get(&last.chat).and_then(|p| p.access_hash),
             archived: listing.archived,
+            unread_only: listing.unread_only,
         }),
         // A first page of pinned chats only: the unpinned ones start at the top.
         None if listing.first_page => Some(Cursor {
@@ -639,14 +685,123 @@ pub fn assemble_page(
             offset_peer: None,
             offset_access_hash: None,
             archived: listing.archived,
+            unread_only: listing.unread_only,
         }),
         // A later page with nothing to go on would only repeat itself.
         None => None,
     };
     // What was cut off is still to come.
-    let next_cursor = next.filter(|_| cut || full_page).map(|c| c.encode());
+    (chats, next.filter(|_| cut || full_page))
+}
 
-    ChatPage { chats, next_cursor }
+/// The dialogs `unread_only` reads from Telegram per `messages.getDialogs`
+/// call, and how many calls one list_chats may make before it stops:
+/// Telegram has no unread filter for the dialog list.
+pub const UNREAD_SCAN_PAGE_SIZE: usize = 100;
+pub const UNREAD_SCAN_MAX_PAGES: usize = 5;
+
+/// What one list_chats call asks for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatsQuery {
+    /// At most this many Chats.
+    pub limit: usize,
+    /// A `next_cursor` from a previous page. It decides `archived`, and must
+    /// come from a listing with the same `unread_only`.
+    pub cursor: Option<String>,
+    /// The Archive instead of the main list.
+    pub archived: bool,
+    /// Only Chats with unread messages or marked as unread.
+    pub unread_only: bool,
+}
+
+/// One `messages.getDialogs` call: `listing` gives the folder and whether
+/// pinned dialogs are left out, `after` the offset (none: from the top).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogsRequest {
+    pub listing: Listing,
+    pub after: Option<Cursor>,
+    pub limit: usize,
+}
+
+/// What the adapter extracts from a `messages.getDialogs` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DialogsAnswer {
+    pub dialogs: Vec<RawDialog>,
+    pub peers: Vec<RawPeer>,
+    pub messages: Vec<RawMessage>,
+    /// How many dialogs Telegram sent, Chats or not (the Archive's own entry
+    /// is no Chat): as many as asked for means there may be more.
+    pub sent: usize,
+}
+
+/// One page of list_chats, each `messages.getDialogs` call made through
+/// `get_dialogs`: one call, or with `unread_only` as many as it takes to
+/// find `limit` unread Chats, at most [`UNREAD_SCAN_MAX_PAGES`]. A cursor of
+/// the other kind (with or without `unread_only`) is [`TgError::InvalidInput`].
+pub async fn list_chats<F, Fut>(query: &ChatsQuery, mut get_dialogs: F) -> Result<ChatPage, TgError>
+where
+    F: FnMut(DialogsRequest) -> Fut,
+    Fut: Future<Output = Result<DialogsAnswer, TgError>>,
+{
+    let cursor = query.cursor.as_deref().map(Cursor::decode).transpose()?;
+    if let Some(cursor) = &cursor
+        && cursor.unread_only != query.unread_only
+    {
+        return Err(TgError::InvalidInput(if cursor.unread_only {
+            "this cursor continues an unread_only listing: pass unread_only: true with it".into()
+        } else {
+            "this cursor continues a listing without unread_only: \
+             leave unread_only out with it, or start over without a cursor"
+                .into()
+        }));
+    }
+    let mut listing = Listing {
+        archived: cursor.as_ref().map_or(query.archived, |c| c.archived),
+        first_page: cursor.is_none(),
+        unread_only: query.unread_only,
+    };
+    // Dialogs per Telegram call, and how many calls at most.
+    let (fetch, pages) = if query.unread_only {
+        (UNREAD_SCAN_PAGE_SIZE, UNREAD_SCAN_MAX_PAGES)
+    } else {
+        (query.limit, 1)
+    };
+    let mut chats: Vec<ChatSummary> = Vec::new();
+    let mut after = cursor;
+    for _ in 0..pages {
+        let answer = get_dialogs(DialogsRequest {
+            listing,
+            after: after.clone(),
+            limit: fetch,
+        })
+        .await?;
+        let (found, next) = assemble(
+            &answer.dialogs,
+            &answer.peers,
+            &answer.messages,
+            query.limit - chats.len(),
+            answer.sent >= fetch,
+            listing,
+        );
+        chats.extend(found);
+        match next {
+            Some(next) if query.unread_only && chats.len() < query.limit => after = Some(next),
+            next => {
+                return Ok(ChatPage {
+                    chats,
+                    next_cursor: next.map(|c| c.encode()),
+                    unread_scan_truncated: false,
+                });
+            }
+        }
+        listing.first_page = false;
+    }
+    // Only an unread scan gets here: it stopped at its cap, with more to scan.
+    Ok(ChatPage {
+        chats,
+        next_cursor: after.map(|c| c.encode()),
+        unread_scan_truncated: true,
+    })
 }
 
 /// The kind of a Chat Telegram didn't describe, as far as its id tells.
@@ -675,14 +830,17 @@ mod tests {
     const MAIN_FIRST: Listing = Listing {
         archived: false,
         first_page: true,
+        unread_only: false,
     };
     const MAIN_NEXT: Listing = Listing {
         archived: false,
         first_page: false,
+        unread_only: false,
     };
     const ARCHIVE_FIRST: Listing = Listing {
         archived: true,
         first_page: true,
+        unread_only: false,
     };
 
     /// A main-list dialog whose top message is `user:<n>`'s message `n`, dated `n`.
@@ -693,6 +851,8 @@ mod tests {
             unread_count: 0,
             pinned,
             folder_id: 0,
+            unread_mark: false,
+            muted: false,
         }
     }
 
@@ -738,6 +898,8 @@ mod tests {
                 unread_count: 0,
                 pinned: false,
                 folder_id: 0,
+                unread_mark: false,
+                muted: false,
             },
             RawDialog {
                 chat: ChatId::User(7),
@@ -745,6 +907,8 @@ mod tests {
                 unread_count: 0,
                 pinned: false,
                 folder_id: 0,
+                unread_mark: false,
+                muted: false,
             },
         ];
         let other = peer(ChatId::User(7), "Bob", ChatKind::Private, Some(2));
@@ -1056,6 +1220,8 @@ mod tests {
                 unread_count: 3,
                 pinned: true,
                 folder_id: 0,
+                unread_mark: false,
+                muted: false,
             },
             RawDialog {
                 chat: alice,
@@ -1063,6 +1229,8 @@ mod tests {
                 unread_count: 0,
                 pinned: false,
                 folder_id: 0,
+                unread_mark: false,
+                muted: false,
             },
         ];
         let peers = [
@@ -1138,6 +1306,8 @@ mod tests {
             unread_count: 0,
             pinned: false,
             folder_id: 1,
+            unread_mark: false,
+            muted: false,
         }];
         let peers = [peer(bob, "Bob", ChatKind::Bot, Some(-5))];
         let messages = [RawMessage {
@@ -1158,6 +1328,7 @@ mod tests {
                 offset_peer: Some("user:9".into()),
                 offset_access_hash: Some(-5),
                 archived: true,
+                unread_only: false,
             }
         );
     }
@@ -1173,6 +1344,8 @@ mod tests {
             unread_count: 0,
             pinned: false,
             folder_id: 0,
+            unread_mark: false,
+            muted: false,
         }];
         let messages = [RawMessage {
             chat: news,
@@ -1194,6 +1367,8 @@ mod tests {
             unread_count: 0,
             pinned: false,
             folder_id: 0,
+            unread_mark: false,
+            muted: false,
         }];
         let page = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
         assert_eq!(page.chats[0].title, "Unknown chat");
@@ -1233,6 +1408,7 @@ mod tests {
                     offset_peer: Some("user:8".into()),
                     offset_access_hash: None,
                     archived: false,
+                    unread_only: false,
                 }
             );
         }
@@ -1251,6 +1427,7 @@ mod tests {
                 offset_peer: None,
                 offset_access_hash: None,
                 archived: true,
+                unread_only: false,
             }
         );
 
@@ -1282,6 +1459,7 @@ mod tests {
                 offset_peer: Some("user:30".into()),
                 offset_access_hash: None,
                 archived: false,
+                unread_only: false,
             }
         );
 
@@ -1312,6 +1490,7 @@ mod tests {
                     offset_peer: None,
                     offset_access_hash: None,
                     archived: false,
+                    unread_only: false,
                 },
                 "limit {limit}"
             );
@@ -1322,23 +1501,26 @@ mod tests {
     /// a first page brings every pinned dialog on top of `limit` unpinned ones,
     /// and each page's unpinned dialogs are the newest strictly older than the
     /// offset. `dialog(n)` is dated `n`, so `unpinned` is in descending order;
-    /// pinned dates are deliberately out of that order.
+    /// pinned dates are deliberately out of that order. Chats in `unread` have
+    /// one unread message, those in `marked` are marked as unread.
+    #[derive(Default)]
     struct Folder {
         archived: bool,
         pinned: Vec<i64>,
         unpinned: Vec<i64>,
+        unread: HashSet<i64>,
+        marked: HashSet<i64>,
+        /// Every `messages.getDialogs` call, in order.
+        requests: std::cell::RefCell<Vec<DialogsRequest>>,
     }
 
     impl Folder {
-        /// What `LiveClient::list_chats` gets from Telegram and hands on.
-        fn list_chats(&self, limit: usize, cursor: Option<&str>) -> ChatPage {
-            let cursor = cursor.map(|c| Cursor::decode(c).unwrap());
-            let listing = Listing {
-                archived: cursor.as_ref().map_or(self.archived, |c| c.archived),
-                first_page: cursor.is_none(),
-            };
+        /// One `messages.getDialogs` call.
+        fn get_dialogs(&self, request: DialogsRequest) -> DialogsAnswer {
+            self.requests.borrow_mut().push(request.clone());
+            let listing = request.listing;
             assert_eq!(listing.archived, self.archived);
-            let older_than = cursor.map_or(i32::MAX, |c| match c.offset_date {
+            let older_than = request.after.map_or(i32::MAX, |c| match c.offset_date {
                 0 => i32::MAX,
                 date => date,
             });
@@ -1346,9 +1528,11 @@ mod tests {
             let unpinned = self.unpinned.iter().filter(|&&n| (n as i32) < older_than);
             let dialogs: Vec<RawDialog> = pinned
                 .map(|&n| dialog(n, true))
-                .chain(unpinned.take(limit).map(|&n| dialog(n, false)))
+                .chain(unpinned.take(request.limit).map(|&n| dialog(n, false)))
                 .map(|d| RawDialog {
                     folder_id: listing.folder_id(),
+                    unread_count: i32::from(self.unread.contains(&(d.top_message as i64))),
+                    unread_mark: self.marked.contains(&(d.top_message as i64)),
                     ..d
                 })
                 .collect();
@@ -1356,16 +1540,49 @@ mod tests {
                 .iter()
                 .map(|d| message(d.top_message.into()))
                 .collect();
-            let full_page = dialogs.len() >= limit;
-            assemble_page(&dialogs, &[], &messages, limit, full_page, listing)
+            DialogsAnswer {
+                sent: dialogs.len(),
+                dialogs,
+                peers: Vec::new(),
+                messages,
+            }
+        }
+
+        /// What `LiveClient::list_chats` makes of it.
+        fn list(&self, limit: usize, cursor: Option<&str>, unread_only: bool) -> ChatPage {
+            self.try_list(limit, cursor, unread_only).unwrap()
+        }
+
+        fn try_list(
+            &self,
+            limit: usize,
+            cursor: Option<&str>,
+            unread_only: bool,
+        ) -> Result<ChatPage, TgError> {
+            use futures_util::FutureExt;
+            let query = ChatsQuery {
+                limit,
+                cursor: cursor.map(String::from),
+                archived: self.archived,
+                unread_only,
+            };
+            list_chats(&query, |request| {
+                std::future::ready(Ok(self.get_dialogs(request)))
+            })
+            .now_or_never()
+            .expect("the fake answers at once")
         }
 
         /// Every page, from the first until there is no `next_cursor`.
         fn page_through(&self, limit: usize) -> Vec<ChatPage> {
-            let mut pages = vec![self.list_chats(limit, None)];
+            self.page_through_listing(limit, false)
+        }
+
+        fn page_through_listing(&self, limit: usize, unread_only: bool) -> Vec<ChatPage> {
+            let mut pages = vec![self.list(limit, None, unread_only)];
             while let Some(next) = pages.last().unwrap().next_cursor.clone() {
-                assert!(pages.len() < 100, "paging never ends");
-                pages.push(self.list_chats(limit, Some(&next)));
+                assert!(pages.len() < 2000, "paging never ends");
+                pages.push(self.list(limit, Some(&next), unread_only));
             }
             pages
         }
@@ -1382,6 +1599,7 @@ mod tests {
                             archived,
                             pinned: pinned.to_vec(),
                             unpinned: (100..100 + unpinned).rev().collect(),
+                            ..Folder::default()
                         };
                         let case = format!(
                             "archived {archived}, pinned {pinned:?}, {unpinned} unpinned, \
@@ -1401,6 +1619,286 @@ mod tests {
                             .map(|n| format!("user:{n}"))
                             .collect();
                         assert_eq!(shown, expected, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    const UNREAD_FIRST: Listing = Listing {
+        archived: false,
+        first_page: true,
+        unread_only: true,
+    };
+
+    #[test]
+    fn an_unread_listing_keeps_unread_and_marked_chats_and_says_which_are_muted() {
+        let unread = |d: RawDialog| RawDialog {
+            unread_count: 4,
+            ..d
+        };
+        let dialogs = [
+            unread(dialog(1, true)),
+            dialog(2, true),
+            dialog(9, false),
+            RawDialog {
+                muted: true,
+                ..unread(dialog(8, false))
+            },
+            RawDialog {
+                unread_mark: true,
+                ..dialog(7, false)
+            },
+            dialog(6, false),
+        ];
+        let page = assemble_page(&dialogs, &[], &[], 100, false, UNREAD_FIRST);
+        assert_eq!(ids(&page), ["user:1", "user:8", "user:7"]);
+        assert!(page.chats[0].pinned, "unread pinned chats still come first");
+        assert_eq!(
+            page.chats
+                .iter()
+                .map(|c| (c.muted, c.marked_unread))
+                .collect::<Vec<_>>(),
+            [(false, false), (true, false), (false, true)]
+        );
+
+        // Every listing says so, unread_only or not.
+        let all = assemble_page(&dialogs, &[], &[], 100, false, MAIN_FIRST);
+        assert_eq!(all.chats.len(), 6);
+        assert!(all.chats[3].muted && all.chats[4].marked_unread);
+        let json = serde_json::to_value(&all.chats[5]).unwrap();
+        for absent in ["muted", "marked_unread"] {
+            assert!(json.get(absent).is_none(), "{absent} when false: {json}");
+        }
+        assert!(
+            serde_json::to_value(&all)
+                .unwrap()
+                .get("unread_scan_truncated")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_chat_is_muted_until_its_mute_runs_out() {
+        const NOW: i64 = 1_700_000_000;
+        assert!(!is_muted(None, NOW), "no setting: the default, not muted");
+        assert!(!is_muted(Some(0), NOW));
+        assert!(!is_muted(Some(NOW as i32 - 1), NOW), "ran out");
+        assert!(!is_muted(Some(NOW as i32), NOW));
+        assert!(is_muted(Some(NOW as i32 + 3600), NOW), "for an hour");
+        assert!(is_muted(Some(i32::MAX), NOW), "forever");
+    }
+
+    /// A main list of `unpinned` chats `n..1`, dated as numbered, newest first.
+    fn main_list(unpinned: i64, unread: &[i64]) -> Folder {
+        Folder {
+            unpinned: (1..=unpinned).rev().collect(),
+            unread: unread.iter().copied().collect(),
+            ..Folder::default()
+        }
+    }
+
+    fn requests(folder: &Folder) -> Vec<DialogsRequest> {
+        folder.requests.borrow_mut().drain(..).collect()
+    }
+
+    #[test]
+    fn an_unread_page_reads_on_until_it_is_full() {
+        // Chats 650..1, unread ones far apart: three Telegram pages to fill 3.
+        let folder = main_list(650, &[640, 550, 450, 10]);
+        let page = folder.list(3, None, true);
+        assert_eq!(ids(&page), ["user:640", "user:550", "user:450"]);
+        assert!(!page.unread_scan_truncated);
+        let sent = requests(&folder);
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|r| r.limit == UNREAD_SCAN_PAGE_SIZE));
+        assert_eq!(
+            sent.iter()
+                .map(|r| (r.listing.first_page, r.listing.exclude_pinned()))
+                .collect::<Vec<_>>(),
+            [(true, false), (false, true), (false, true)],
+            "pinned chats come with the first Telegram page only"
+        );
+        // Full but not cut: it goes on after the last chat read, all of them
+        // read ones (a cut page would go on after its last chat).
+        assert_eq!(
+            cursor(&page),
+            Cursor {
+                offset_date: 351,
+                offset_id: 351,
+                offset_peer: Some("user:351".into()),
+                offset_access_hash: None,
+                archived: false,
+                unread_only: true,
+            }
+        );
+        // 350..1 takes four more Telegram pages, the last one short.
+        let rest = folder.list(3, page.next_cursor.as_deref(), true);
+        assert_eq!(requests(&folder).len(), 4);
+        assert_eq!(ids(&rest), ["user:10"]);
+        assert_eq!(rest.next_cursor, None);
+        assert!(
+            !rest.unread_scan_truncated,
+            "the end of the list was reached"
+        );
+    }
+
+    #[test]
+    fn an_unread_scan_stops_at_its_cap_and_its_cursor_scans_on() {
+        // Chats 750..1: five Telegram pages reach 251, the rest takes three.
+        let folder = main_list(750, &[700, 100]);
+        let page = folder.list(30, None, true);
+        assert_eq!(ids(&page), ["user:700"]);
+        assert!(page.unread_scan_truncated);
+        assert_eq!(requests(&folder).len(), UNREAD_SCAN_MAX_PAGES);
+        // Continues after the last chat read, not after the last one shown.
+        assert_eq!(cursor(&page).offset_peer.as_deref(), Some("user:251"));
+
+        let more = folder.list(30, page.next_cursor.as_deref(), true);
+        assert_eq!(ids(&more), ["user:100"]);
+        assert_eq!(requests(&folder).len(), 3, "Telegram's end ends the scan");
+        assert_eq!(more.next_cursor, None);
+        assert!(!more.unread_scan_truncated);
+        assert!(
+            serde_json::to_value(&page)
+                .unwrap()
+                .get("unread_scan_truncated")
+                == Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn an_error_mid_scan_ends_the_call_with_it() {
+        use futures_util::FutureExt;
+        let folder = main_list(400, &[]);
+        let mut calls = 0;
+        let query = ChatsQuery {
+            limit: 10,
+            unread_only: true,
+            ..ChatsQuery::default()
+        };
+        let answer = list_chats(&query, |request| {
+            calls += 1;
+            std::future::ready(match calls {
+                2 => Err(TgError::FloodWait {
+                    seconds: 30,
+                    class: crate::limits::MethodClass::Default,
+                }),
+                _ => Ok(folder.get_dialogs(request)),
+            })
+        })
+        .now_or_never()
+        .unwrap();
+        assert!(matches!(
+            answer,
+            Err(TgError::FloodWait { seconds: 30, .. })
+        ));
+        assert_eq!(calls, 2, "no call after Telegram said to wait");
+    }
+
+    #[test]
+    fn a_scan_that_fills_its_page_on_the_last_allowed_call_is_not_truncated() {
+        let folder = main_list(1000, &[1000, 550]);
+        let page = folder.list(2, None, true);
+        assert_eq!(ids(&page), ["user:1000", "user:550"]);
+        assert_eq!(requests(&folder).len(), 5);
+        assert!(!page.unread_scan_truncated);
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn a_listing_without_unread_only_is_one_call_of_its_limit() {
+        let folder = main_list(500, &[]);
+        let page = folder.list(30, None, false);
+        assert_eq!(page.chats.len(), 30);
+        let sent = requests(&folder);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].limit, 30);
+        assert!(!sent[0].listing.unread_only);
+        assert!(!page.unread_scan_truncated);
+        // Its cursors look as they always did: no unread mark in them.
+        let raw = URL_SAFE_NO_PAD
+            .decode(page.next_cursor.as_deref().unwrap())
+            .unwrap();
+        assert!(!String::from_utf8(raw).unwrap().contains("\"u\""));
+    }
+
+    #[test]
+    fn a_cursor_continues_only_its_own_kind_of_listing() {
+        let folder = main_list(300, &[250, 120]);
+        let unread = folder.list(1, None, true);
+        let plain = folder.list(1, None, false);
+        requests(&folder);
+        for (cursor, unread_only) in [(&unread, false), (&plain, true)] {
+            let cursor = cursor.next_cursor.as_deref();
+            match folder.try_list(10, cursor, unread_only) {
+                Err(TgError::InvalidInput(msg)) => assert!(msg.contains("unread_only"), "{msg}"),
+                other => panic!("a mismatched cursor was taken: {other:?}"),
+            }
+        }
+        assert!(requests(&folder).is_empty(), "nothing asked of Telegram");
+
+        // A cursor issued before unread_only existed continues a plain listing.
+        let v0_1_1 = URL_SAFE_NO_PAD.encode(br#"{"d":200,"i":200,"p":"user:200"}"#);
+        assert_eq!(ids(&folder.list(1, Some(&v0_1_1), false)), ["user:199"]);
+        assert!(folder.try_list(1, Some(&v0_1_1), true).is_err());
+    }
+
+    #[test]
+    fn unread_paging_shows_every_unread_chat_exactly_once_in_order() {
+        let pinned_sets: [&[i64]; 3] = [&[], &[5, 999], &[5, 999, 3, 998]];
+        for archived in [false, true] {
+            for pinned in pinned_sets {
+                for unpinned in [0, 7, 250, 1300] {
+                    for limit in [1, 2, 3, 100] {
+                        let unpinned: Vec<i64> = (100..100 + unpinned).rev().collect();
+                        // Every third chat unread, every seventh marked.
+                        let every = |k: usize| -> HashSet<i64> {
+                            pinned
+                                .iter()
+                                .chain(&unpinned)
+                                .enumerate()
+                                .filter(|(i, _)| i % k == 0)
+                                .map(|(_, &n)| n)
+                                .collect()
+                        };
+                        let folder = Folder {
+                            archived,
+                            pinned: pinned.to_vec(),
+                            unread: every(3),
+                            marked: every(7),
+                            unpinned,
+                            ..Folder::default()
+                        };
+                        let case = format!(
+                            "archived {archived}, pinned {pinned:?}, {} unpinned, limit {limit}",
+                            folder.unpinned.len()
+                        );
+                        let is_unread =
+                            |n: &&i64| folder.unread.contains(n) || folder.marked.contains(n);
+                        let pages = folder.page_through_listing(limit, true);
+                        for page in &pages {
+                            assert!(page.chats.len() <= limit, "{case}");
+                        }
+                        let shown: Vec<String> = pages.iter().flat_map(ids).collect();
+                        // Pinned chats beyond `limit` are not shown (#37's limitation).
+                        let expected: Vec<String> = folder
+                            .pinned
+                            .iter()
+                            .filter(is_unread)
+                            .take(limit)
+                            .chain(folder.unpinned.iter().filter(is_unread))
+                            .map(|n| format!("user:{n}"))
+                            .collect();
+                        assert_eq!(shown, expected, "{case}");
+                        let calls = folder.requests.borrow().len();
+                        assert!(calls <= pages.len() * UNREAD_SCAN_MAX_PAGES, "{case}");
+                        for page in &pages {
+                            if page.unread_scan_truncated {
+                                assert!(page.chats.len() < limit, "{case}");
+                                assert!(page.next_cursor.is_some(), "{case}");
+                            }
+                        }
                     }
                 }
             }
@@ -1439,6 +1937,7 @@ mod tests {
                 offset_peer: Some("user:9".into()),
                 offset_access_hash: Some(-5),
                 archived: false,
+                unread_only: false,
             }
         );
         let archive = URL_SAFE_NO_PAD.encode(br#"{"d":5,"i":6,"p":"chat:7","a":true}"#);
@@ -1450,6 +1949,7 @@ mod tests {
                 offset_peer: Some("chat:7".into()),
                 offset_access_hash: None,
                 archived: true,
+                unread_only: false,
             }
         );
     }

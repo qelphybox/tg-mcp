@@ -39,6 +39,8 @@ fn chat(id: ChatId, title: &str, kind: ChatKind, username: Option<&str>) -> Chat
         is_self: false,
         unread_count: 3,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: None,
     }
 }

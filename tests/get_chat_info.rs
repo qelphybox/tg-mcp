@@ -25,6 +25,8 @@ fn summary(id: ChatId, title: &str, kind: ChatKind, username: Option<&str>) -> C
         is_self: false,
         unread_count: 0,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: None,
     }
 }

@@ -36,6 +36,8 @@ fn chat(id: ChatId, title: &str, kind: ChatKind) -> ChatSummary {
         is_self: false,
         unread_count: 0,
         pinned: false,
+        muted: false,
+        marked_unread: false,
         last_message: None,
     }
 }
