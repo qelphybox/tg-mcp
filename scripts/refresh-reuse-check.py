@@ -32,7 +32,9 @@ import time
 import urllib.parse
 import webbrowser
 
-# The HTTP, MCP and redirect helpers of the revocation check (same BASE argument).
+# The HTTP, MCP and redirect helpers of the revocation check (same BASE argument),
+# loaded without leaving a __pycache__ in scripts/.
+sys.dont_write_bytecode = True
 _spec = importlib.util.spec_from_file_location(
     "revoke_check", os.path.join(os.path.dirname(os.path.abspath(__file__)), "revoke-check.py"))
 rc = importlib.util.module_from_spec(_spec)
