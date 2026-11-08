@@ -44,6 +44,8 @@ pub struct PendingLogin {
     /// for the logged-in session, closed when the login goes. Locked after
     /// `progress`, never before.
     pub send_pickers: tokio::sync::Mutex<Option<Pickers>>,
+    /// How many times loading the pickers was tried.
+    pub picker_loads: std::sync::atomic::AtomicU32,
     client: ClientIp,
     created: Instant,
 }
@@ -178,6 +180,7 @@ impl Flows {
                 progress: tokio::sync::Mutex::new(Progress::InProgress(attempt)),
                 password_gate: Mutex::default(),
                 send_pickers: tokio::sync::Mutex::default(),
+                picker_loads: Default::default(),
                 client,
                 created: Instant::now(),
             }),

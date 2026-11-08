@@ -530,10 +530,41 @@ async fn telegram_failing_shows_why_and_grants_nothing() {
 
     server.connector.set_unreachable(false);
     flow.post(&server, &flow.chats, &[SEND]).await;
+    assert_eq!(
+        server.connector.consent_clients(),
+        1,
+        "loaded once, then kept"
+    );
+    flow.post(&server, &flow.chats, &[SEND]).await;
+    assert_eq!(server.connector.consent_clients(), 1);
     let tokens = flow
         .allow(&server, &[SEND, ("chat", &id(friend(1))), ALLOW])
         .await;
     assert_eq!(opened(&server, &tokens).await, (set(&[friend(1)]), false));
+}
+
+/// Each failed try to load the chats opens a connection: a few per login.
+#[tokio::test]
+async fn loading_the_chats_is_tried_a_few_times_per_login() {
+    let server = server().await;
+    let flow = on_consent(&server).await;
+    server.connector.set_unreachable(true);
+    for _ in 0..5 {
+        let (_, html) = flow.post(&server, &flow.chats, &[SEND]).await;
+        assert!(html.contains("Telegram didn"), "{html}");
+    }
+    server.connector.set_unreachable(false);
+    let (_, html) = flow.post(&server, &flow.chats, &[SEND]).await;
+    assert!(html.contains("Start again from your app."), "{html}");
+    let (status, _) = flow
+        .post(
+            &server,
+            &flow.consent,
+            &[SEND, ("chat", &id(friend(1))), ALLOW],
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(server.connector.consent_clients(), 0);
 }
 
 #[tokio::test]

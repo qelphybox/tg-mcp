@@ -6,7 +6,7 @@
 //! screen's chat pickers (which also are rate limited per client IP).
 
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,8 @@ use crate::{
 };
 
 const COOKIE: &str = "tgm_login";
+/// Tries per Login flow to load the Consent screen's chats.
+const MAX_PICKER_LOADS: u32 = 5;
 /// Wrong Cloud passwords per Login flow before it is dropped (Telegram has its own,
 /// stricter-over-time limits on top, answered as `FLOOD_WAIT`).
 const MAX_WRONG_PASSWORDS: u32 = 5;
@@ -556,7 +558,7 @@ pub async fn consent_chats(
     };
     let mut notice = None;
     let mut error = None;
-    match load_pickers(&auth, logged_in, &mut pickers).await {
+    match load_pickers(&auth, &login, logged_in, &mut pickers).await {
         Err(refused) => error = Some(refused),
         Ok(loaded) if !send.query.is_empty() => match loaded.search(send.query, &picked).await {
             Ok(0) => notice = Some("None of your chats has that name.".to_string()),
@@ -574,13 +576,21 @@ pub async fn consent_chats(
 }
 
 /// The login's pickers, loaded through a Live client for its session if they
-/// aren't yet. A failure loads nothing, so the next try asks Telegram again.
+/// aren't yet. A failure loads nothing, so the next try asks Telegram again,
+/// up to [`MAX_PICKER_LOADS`] times per Login flow (each opens a connection).
 async fn load_pickers<'p>(
     auth: &AuthState,
+    login: &PendingLogin,
     logged_in: &LoggedIn,
     pickers: &'p mut Option<Pickers>,
 ) -> Result<&'p mut Pickers, Refused> {
     if pickers.is_none() {
+        let tries = login.picker_loads.fetch_add(1, Ordering::SeqCst);
+        if tries >= MAX_PICKER_LOADS {
+            return Err(Refused::Telegram(
+                "Your chats couldn't be loaded. Start again from your app.".into(),
+            ));
+        }
         let telegram = auth
             .connector
             .connect_for_consent(logged_in)
@@ -688,7 +698,7 @@ async fn send_allow_list(
     };
     let mut pickers = login.send_pickers.lock().await;
     let picked = form.picked();
-    let refused = match load_pickers(auth, logged_in, &mut pickers).await {
+    let refused = match load_pickers(auth, login, logged_in, &mut pickers).await {
         Ok(loaded) => match loaded.resolve(&picked).await {
             Ok(list) => return Ok(list),
             Err(refused) => refused,
