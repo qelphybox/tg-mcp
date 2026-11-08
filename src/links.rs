@@ -376,7 +376,9 @@ fn refused(auth: &AuthState, taken: &Taken, err: TgError) -> Response {
             auth.links.revoke_grant(&taken.grant_id);
             bare(StatusCode::NOT_FOUND)
         }
-        TgError::FloodWait { seconds, .. } | TgError::RateLimited { seconds } => {
+        TgError::FloodWait { seconds, .. }
+        | TgError::RateLimited { seconds }
+        | TgError::WritesLimited { seconds, .. } => {
             auth.links.refund(&taken.key);
             let mut response = bare(StatusCode::SERVICE_UNAVAILABLE);
             response
@@ -384,7 +386,7 @@ fn refused(auth: &AuthState, taken: &Taken, err: TgError) -> Response {
                 .insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
             response
         }
-        TgError::Upstream(_) | TgError::WrongPassword => {
+        TgError::Upstream(_) | TgError::WrongPassword | TgError::PeerFlood => {
             auth.links.refund(&taken.key);
             bare(StatusCode::BAD_GATEWAY)
         }

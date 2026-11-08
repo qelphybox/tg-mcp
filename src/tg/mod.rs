@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    limits::MethodClass,
+    limits::{MethodClass, WriteLimit},
     sessions::{GrantId, OpenedGrant},
 };
 
@@ -79,6 +79,14 @@ pub enum TgError {
     /// Our own per-Account request budget is used up; retry after `seconds`.
     #[error("this account's request budget is used up; retry in {seconds} s")]
     RateLimited { seconds: u32 },
+    /// A write refused by our Writes budget or a Chat's Send cap (ADR-0005):
+    /// nothing reached Telegram; retry after `seconds`. Writes are never queued.
+    #[error("too many writes ({}); retry in {seconds} s", limit.name())]
+    WritesLimited { seconds: u32, limit: WriteLimit },
+    /// Telegram's `PEER_FLOOD`: the Account is limited for spam and may not
+    /// write there now. Not a wait: never retried.
+    #[error("telegram limits this account for spam (PEER_FLOOD)")]
+    PeerFlood,
     /// The caller passed something malformed (bad chat id, foreign cursor).
     #[error("{0}")]
     InvalidInput(String),

@@ -97,6 +97,14 @@ impl Config {
             max_wait: Duration::from_secs(
                 number("TG_MCP_MAX_WAIT_SECS", defaults.max_wait.as_secs() as u32)?.into(),
             ),
+            writes_per_10_min: number(
+                "TG_MCP_ACCOUNT_WRITES_PER_10_MIN",
+                defaults.writes_per_10_min,
+            )?,
+            sends_per_chat_per_minute: number(
+                "TG_MCP_CHAT_SENDS_PER_MINUTE",
+                defaults.sends_per_chat_per_minute,
+            )?,
         };
 
         let defaults = OAuthLimits::default();
@@ -206,6 +214,39 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn write_limits_default_to_adr_0005_and_come_from_env() {
+        let limits = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]))
+            .unwrap()
+            .limits;
+        assert_eq!(
+            (limits.writes_per_10_min, limits.sends_per_chat_per_minute),
+            (20, 5)
+        );
+        let limits = Config::from_lookup(env(&[
+            ("TG_MCP_FAKE_TELEGRAM", "1"),
+            ("TG_MCP_ACCOUNT_WRITES_PER_10_MIN", "40"),
+            ("TG_MCP_CHAT_SENDS_PER_MINUTE", "2"),
+        ]))
+        .unwrap()
+        .limits;
+        assert_eq!(
+            (limits.writes_per_10_min, limits.sends_per_chat_per_minute),
+            (40, 2)
+        );
+        for key in [
+            "TG_MCP_ACCOUNT_WRITES_PER_10_MIN",
+            "TG_MCP_CHAT_SENDS_PER_MINUTE",
+        ] {
+            for bad in ["0", "-1", "five"] {
+                assert!(
+                    Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, bad)])).is_err(),
+                    "{key}={bad}"
+                );
+            }
+        }
     }
 
     #[test]

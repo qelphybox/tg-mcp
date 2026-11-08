@@ -27,7 +27,7 @@ mod scoped;
 use self::scoped::ScopedTools;
 use crate::{
     auth::Caller,
-    limits::MethodClass,
+    limits::{MethodClass, WriteLimit},
     links::{MAX_DOWNLOAD_BYTES, MediaDownload, MediaLinks},
     scope::{Scope, Scopes},
     tg::{
@@ -1812,6 +1812,12 @@ fn tool_error(err: TgError) -> ErrorData {
                      and mode still works.",
                     roughly(seconds)
                 ),
+                MethodClass::Writes => format!(
+                    "Telegram asks this account to wait {seconds} s before writing again \
+                     (FLOOD_WAIT). Nothing was written. Don't send, react, mark as read or save \
+                     Drafts before then; reading tools (list_chats, get_messages, \
+                     get_chat_info) still work."
+                ),
             };
             ErrorData::internal_error(message, None)
         }
@@ -1819,6 +1825,37 @@ fn tool_error(err: TgError) -> ErrorData {
             format!("Too many requests for this account right now; retry in {seconds} s."),
             None,
         ),
+        TgError::WritesLimited { seconds, limit } => {
+            tracing::warn!(
+                seconds,
+                limit = limit.name(),
+                "tool call over a write limit"
+            );
+            let message = match limit {
+                WriteLimit::Chat => format!(
+                    "Too many messages to this chat right now; retry in {seconds} s. Nothing \
+                     was sent, and the message is not queued: send it again then if it is \
+                     still wanted."
+                ),
+                WriteLimit::Account => format!(
+                    "This account's writes budget (messages, reactions, marking read, Drafts \
+                     per 10 minutes) is used up; retry in {seconds} s. Nothing was written, \
+                     and it is not queued; reading tools still work."
+                ),
+            };
+            ErrorData::internal_error(message, None)
+        }
+        TgError::PeerFlood => {
+            tracing::warn!("tool call hit PEER_FLOOD: telegram limits the account for spam");
+            ErrorData::internal_error(
+                "Telegram refused this write with PEER_FLOOD: it has limited this account \
+                 for spam, usually after messages to people who don't have it as a contact \
+                 or after reports. Nothing was written. This is not a wait. Don't retry: \
+                 more attempts can make the limit longer. The user can see the limit \
+                 and when it ends by messaging @SpamBot in Telegram. Reading still works.",
+                None,
+            )
+        }
         err => {
             tracing::warn!(error = %err, "tool call failed");
             ErrorData::internal_error(err.to_string(), None)
@@ -1853,7 +1890,7 @@ fn roughly(seconds: u32) -> String {
 mod tests {
     use super::{
         MAX_TITLE_CHARS, MESSAGE_PAGE_BUDGET_CHARS, MessagePage, MethodClass, Reach, TgError,
-        bound_history, shorten, tool_error,
+        WriteLimit, bound_history, shorten, tool_error,
     };
     use crate::tg::{
         messages::{ChatMessage, MAX_REACTION_EMOJI, Media, MediaKind, Reactions},
@@ -2090,6 +2127,64 @@ mod tests {
         let files = flood_message(MethodClass::Files);
         assert!(files.contains("file downloads"));
         assert!(files.contains("search_messages") && files.contains("find_chats"));
+    }
+
+    #[test]
+    fn a_writes_flood_says_nothing_was_written_and_reading_still_works() {
+        let message = flood_message(MethodClass::Writes);
+        for words in [
+            "wait 120 s",
+            "FLOOD_WAIT",
+            "Nothing was written",
+            "reading tools",
+            "still work",
+        ] {
+            assert!(message.contains(words), "{words}: {message}");
+        }
+    }
+
+    #[test]
+    fn our_write_limits_say_which_and_when_and_that_nothing_was_queued() {
+        let limited = |limit| {
+            tool_error(TgError::WritesLimited { seconds: 42, limit })
+                .message
+                .to_string()
+        };
+        let chat = limited(WriteLimit::Chat);
+        for words in [
+            "Too many messages to this chat",
+            "retry in 42 s",
+            "Nothing was sent",
+            "not queued",
+        ] {
+            assert!(chat.contains(words), "{words}: {chat}");
+        }
+        let account = limited(WriteLimit::Account);
+        for words in [
+            "writes budget",
+            "retry in 42 s",
+            "Nothing was written",
+            "not queued",
+            "reading tools",
+        ] {
+            assert!(account.contains(words), "{words}: {account}");
+        }
+    }
+
+    #[test]
+    fn peer_flood_says_what_it_means_for_the_account_and_not_to_retry() {
+        let message = tool_error(TgError::PeerFlood).message.to_string();
+        for words in [
+            "PEER_FLOOD",
+            "spam",
+            "Nothing was written",
+            "not a wait",
+            "Don't retry",
+            "@SpamBot",
+            "Reading still works",
+        ] {
+            assert!(message.contains(words), "{words}: {message}");
+        }
     }
 
     #[test]
