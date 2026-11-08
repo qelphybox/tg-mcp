@@ -63,7 +63,7 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
   .error {{ color:#d93a3a; font-weight:600; }}
   fieldset.scopes {{ border:0; padding:0; margin:0 0 14px; }}
   label.scope {{ display:flex; gap:10px; align-items:flex-start; font-weight:400; margin:0 0 8px; }}
-  label.scope input {{ width:auto; margin:5px 0 0; flex:none; }}
+  label.scope input {{ width:auto; padding:0; margin:5px 0 0; flex:none; }}
   main:has(input.write:checked) span.read-only, main:has(input.write:checked) p.read-only {{ display:none; }}
   main:has(input.write:checked) p.writes {{ display:block; }}
   main:not(:has(input.write:checked)) p.writes {{ display:none; }}
@@ -176,8 +176,8 @@ fn scope_label(scope: Scope) -> &'static str {
     match scope {
         Scope::Read => "<b>Read</b> chats and messages, and download their media. Always included.",
         Scope::Draft => {
-            "<b>Write Drafts</b>: put text in a chat's message field, on all your devices. \
-             Only you can send it."
+            "<b>Write Drafts</b>: put text in a chat's message field on all your devices, \
+             replacing a draft that is there. Only you can send it."
         }
         Scope::Send => "<b>Send messages</b> to the chats you choose.",
         Scope::Organize => "<b>Organize</b> your chats.",
@@ -478,7 +478,10 @@ mod tests {
             "{page}"
         );
         assert!(
-            page.contains("Write Drafts: put text in a chat's message field, on all your devices. Only you can send it."),
+            page.contains(
+                "Write Drafts: put text in a chat's message field on all your devices, \
+                 replacing a draft that is there. Only you can send it."
+            ),
             "{page}"
         );
         assert!(
