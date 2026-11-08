@@ -25,7 +25,11 @@ An OAuth access or refresh token issued for a Grant. Its secret half unwraps the
 _Avoid_: API key, session token
 
 **Wrapped key**:
-A copy of the Session key encrypted under a key derived from one Token's secret. One per live Token.
+A copy of the Session key encrypted under a key derived from one Token's secret. One per live Token, and per consumed refresh Token during its Grace window.
+
+**Grace window**:
+The 60 seconds after a refresh Token's first use in which it still works like a live one. Presenting it after that revokes its Grant (ADR-0003).
+_Avoid_: leeway, reuse interval
 
 ## Onboarding
 

@@ -62,6 +62,8 @@ kamal app logs -f        # follow logs
 kamal rollback <sha>     # switch back to a previous image (kamal app containers lists them)
 ```
 
+A rollback can't cross a database migration: an image older than a migration the database already ran refuses to start (sqlx: "migration N was previously applied but is missing"). Check `migrations/` between the two commits; if one was added, fix forward instead.
+
 The image is distroless (no shell), so `kamal app exec` with a shell does not work, by design.
 
 ## Releases
