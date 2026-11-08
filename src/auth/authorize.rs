@@ -26,7 +26,7 @@ use super::{
     flows::{AuthRequest, PendingLogin, Progress},
     pages, pkce,
     rate_limit::ClientIp,
-    send_list::{Picked, Pickers, Refused},
+    send_list::{self, Picked, Pickers, Refused},
 };
 use crate::{
     allow_list::{MAX_CHATS, SendAllowList},
@@ -595,10 +595,7 @@ async fn load_pickers<'p>(
             .connector
             .connect_for_consent(logged_in)
             .await
-            .map_err(|err| {
-                let (_, title, message) = telegram_failure(&err);
-                Refused::Telegram(format!("{title}. {message}"))
-            })?;
+            .map_err(send_list::refused)?;
         *pickers = Some(Pickers::load(telegram).await?);
     }
     Ok(pickers.as_mut().expect("loaded above"))

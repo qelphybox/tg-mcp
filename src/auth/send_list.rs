@@ -304,7 +304,7 @@ impl Pickers {
 }
 
 /// A Telegram failure as the Consent screen tells it.
-fn refused(err: TgError) -> Refused {
+pub(super) fn refused(err: TgError) -> Refused {
     match err {
         TgError::FloodWait { seconds, .. } | TgError::RateLimited { seconds } => {
             tracing::warn!(seconds, "telegram limits the consent chat pickers");
