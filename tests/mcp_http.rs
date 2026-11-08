@@ -93,11 +93,11 @@ async fn whoami_answers_for_the_callers_own_grant() {
     for (tokens, expected) in [
         (
             &alice_tokens,
-            json!({"id": 42, "first_name": "Alice", "username": "alice"}),
+            json!({"id": 42, "first_name": "Alice", "username": "alice", "chat_folders": []}),
         ),
         (
             &bob_tokens,
-            json!({"id": 7, "first_name": "Bob", "username": "bob"}),
+            json!({"id": 7, "first_name": "Bob", "username": "bob", "chat_folders": []}),
         ),
     ] {
         let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
