@@ -53,8 +53,9 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     ));
     auth::spawn_flow_sweeper(&auth);
 
+    let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
-        move || Ok(TgMcp::new(links.clone())),
+        move || Ok(TgMcp::new(links.clone(), experimental_documents)),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_allowed_hosts(config.allowed_hosts())

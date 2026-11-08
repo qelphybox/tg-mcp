@@ -403,6 +403,32 @@ Don't transcribe anything in the Telegram apps of that account during the run: t
 
 Then on the server: `kamal app logs | grep -e 'media transcription served' -e 'transcription pending'` shows one `media transcription served` line per answer with `message_id`, `kind`, `pending`, `chars`, `waited_ms` and `trial_remaining` only, and a `transcription pending` line (with `transcription_id`) whenever Telegram first answered pending (a `served` line with `pending=false` right after it, `waited_ms` under 20000, means the final-text update arrived); the used-up trial shows as a `FLOOD_WAIT` warning of class `transcribe`. `kamal app logs | grep -F 'Всем'` and a word of each `<W…>` find nothing: transcriptions are content and never logged.
 
+## 22. Prototype: does claude.ai read a document from a tool result
+
+A throwaway prototype for #58, not a release criterion. It answers one question: when a tool result carries an MCP **embedded resource** (`{"type": "resource", "resource": {"uri", "mimeType", "blob" | "text"}}`), does the client hand the document to the model? get_media mode `document` exists only with `TG_MCP_EXPERIMENTAL_DOCUMENTS=1` (production sets it in `config/deploy.yml`; self-hosters don't have it unless they set it). The primary check is **claude.ai on the web**: after the deploy, start a new conversation and ask it to show get_media's description; if it doesn't mention ``EXPERIMENTAL mode `document` ``, the client still has the old tool list: disconnect and connect the connector again (Settings → Connectors; this logs the Telegram session out, as in §5, so it takes a QR login). Then run the same prompt in Claude desktop and in Claude Code (`/mcp` → reconnect there).
+
+Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with `tickets.pdf` (525384, 4 pages, 31512 bytes), the voice message 525381 and the photo 525379, as in §19. **Prepare before the run:** write a small `.txt` file with one made-up sentence that appears nowhere else (e.g. «Ключ от сарая лежит под фиолетовым жирафом номер 7342»), send it to Saved Messages **as a file**, and note its id as `<TXT>`. Open `tickets.pdf` locally and pick a line from page 2 and one from page 3 to compare against.
+
+```text
+Через Telegram MCP, в чате user:408551275~0xo8DFRPKC4. 1) get_media с mode="document" для 525384 (tickets.pdf): выведи поле document из ответа целиком (JSON как есть) и текстовый блок ответа. Потом, опираясь только на содержимое самого файла, скажи, сколько в нём страниц, и процитируй дословно по одной строке со второй и с третьей страницы. 2) То же для <TXT>: выведи document целиком и текстовый блок, затем процитируй файл дословно. 3) get_media с mode="document" для 525381 (голосовое) и 525379 (фото): выведи текст каждой ошибки. Ничего не додумывай: если содержимого файла не видишь (только текстовый блок или JSON), так и скажи прямо и не угадывай по имени файла.
+```
+
+1. 525384: `document` = `{ "mime_type": "application/pdf", "size_bytes": 31512, "delivered_as": "blob" }`, and the text block reads `Message 525384: document "tickets.pdf", application/pdf, 31512 bytes. The file itself is the embedded resource below (its bytes); …`.
+2. The model says 4 pages and quotes a line from page 2 and one from page 3 that match the PDF opened locally: something neither the file name, the size nor the text block gives away. That is **read**. A model that says it only sees the metadata, or that guesses from "tickets", saw **only the text block**.
+3. `<TXT>`: `document` = `{ "mime_type": "text/plain", "size_bytes": <its size>, "delivered_as": "text", "text_truncated": false }`, and the model quotes the made-up sentence word for word.
+4. 525381 and 525379: tool errors saying the media is a `voice` / `photo`, not a document, and pointing to mode `download`.
+5. Record per client, for the PDF and for `<TXT>` separately, one of **read** (the quotes match), **text block only** (the model saw the metadata but not the file), or **call failed** (the client showed an error, e.g. about an unsupported content type; copy its wording):
+
+   | Client | PDF (525384) | Text (`<TXT>`) | Notes |
+   | --- | --- | --- | --- |
+   | claude.ai (web) | | | |
+   | Claude desktop | | | |
+   | Claude Code | | | |
+
+   What it decides for #58: PDF **read** in claude.ai means the embedded resource is the delivery (no server-side text extraction); **text block only** or **call failed** for the PDF but **read** for the text means a PDF needs another route (text extracted on the server, an ADR first); neither read means embedded resources don't reach the model in that client and the design starts from text content blocks.
+
+Then on the server: `kamal app logs | grep 'media document served'` shows one line per successful call with `message_id`, `bytes`, `delivered_as` (and `chars`, `truncated` for text) only; `kamal app logs | grep -F tickets.pdf` and a word of the made-up sentence find nothing.
+
 ## 30. Messages show their reactions, a link that opens them and their pin; `pinned_only` reads the pinned ones
 
 Needs, among the account's chats (replace the `<…>`): a public channel `<K>` (it has an @username) with recent posts that carry reactions, ideally one with a custom-emoji reaction and one with paid Stars (⭐) reactions; a private supergroup or private channel `<G>` (no @username) the account is a member of, with at least 3 pinned messages (pin some yourself if you can; the app's pinned bar lists them, "All pinned messages"); a private chat `<P>` with one pinned message; a basic group `<B>` if the account has one (old small groups that were never upgraded; `type: "group"` in `list_chats`). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
@@ -470,7 +496,7 @@ Needs, prepared in the Telegram app beforehand (Settings → Folders; replace th
 4. Step 4: only `<E>`'s chats with a badge (unread or marked as unread), in step 2's order; no `unread_scan_truncated`.
 5. Step 5: seven `invalid_params`: `this Chat folder is defined by rules, not supported yet (only folders that are a list of chats are): use list_chats without chat_folder to read the whole chat list instead`; `254 is not one of the account's Chat folders: ids come from whoami's chat_folders`; `chat_folder can't be combined with archived: …`; `this cursor continues the listing of Chat folder <id E>: pass chat_folder: <id E> with it` twice; `this cursor continues a listing without chat_folder: leave chat_folder out with it, or start over without a cursor`; `this cursor continues a listing without unread_only: …`.
 
-One `chat_folder` call makes one `messages.getDialogFilters` and one `messages.getPeerDialogs` per 100 chats of the folder (at most 4 calls), each through the Account's limiter; `whoami` makes one `getDialogFilters` more than before. No `FLOOD_WAIT` is expected; if one comes, record its seconds. `kamal app logs | grep -iF '<title of E>'`, the same for `<D>` and for a chat title of step 2 find nothing: folder and chat titles are never logged.
+Telegram calls, each through the Account's limiter: a first page makes one `messages.getDialogFilters` (none if `whoami` or another `chat_folder` call read the folders in the last 60 s; always one for an unknown id) and one `messages.getPeerDialogs` per 100 chats of the folder; a later page within 2 minutes of its listing's first page makes exactly one `messages.getPeerDialogs` of only its own chats (older: as a first page). Step 3 is thus 2 calls, then 1 per page; `whoami` makes one `getDialogFilters` more than before. No `FLOOD_WAIT` is expected (the first run, before this, flooded on the 6th page of step 3); if one comes, `kamal app logs | grep FLOOD_WAIT` names its `method`, `class` and `seconds`: record them. `kamal app logs | grep -iF '<title of E>'`, the same for `<D>` and for a chat title of step 2 find nothing: folder and chat titles are never logged.
 
 ## 40. get_chat_info on a user shows the profile Telegram shows the account, and common chats on request
 
