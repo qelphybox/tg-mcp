@@ -112,7 +112,8 @@ impl SendAllowList {
     /// Reverse of [`Self::encode`]; `None` for anything it can't have written.
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         let (&[version, flags], rest) = bytes.split_first_chunk::<2>()?;
-        if version != VERSION || flags & !FLAG_AUTO_SEND != 0 || bytes.len() % PAD_TO != 0 {
+        if version != VERSION || flags & !FLAG_AUTO_SEND != 0 || !bytes.len().is_multiple_of(PAD_TO)
+        {
             return None;
         }
         let (count, mut rest) = rest.split_first_chunk::<4>()?;

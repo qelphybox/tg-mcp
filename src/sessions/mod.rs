@@ -384,13 +384,18 @@ impl Vault {
     }
 
     async fn decrypt(&self, verified: Verified) -> Result<OpenedGrant, VaultError> {
-        let row: Option<(i64, Vec<u8>, String, Option<Vec<u8>>)> = sqlx::query_as(
+        let GrantRow {
+            account_id,
+            telegram_session: sealed,
+            scopes,
+            send_allow_list: sealed_list,
+        } = sqlx::query_as(
             "SELECT account_id, telegram_session, scopes, send_allow_list FROM grants WHERE id = ?",
         )
         .bind(verified.grant_id.as_str())
         .fetch_optional(&self.pool)
-        .await?;
-        let (account_id, sealed, scopes, sealed_list) = row.ok_or(VaultError::InvalidToken)?;
+        .await?
+        .ok_or(VaultError::InvalidToken)?;
         let corrupt = || VaultError::Corrupt {
             token_id: verified.token_id.clone(),
         };
@@ -653,6 +658,15 @@ impl Vault {
             refresh_expires_in: self.ttl.refresh,
         })
     }
+}
+
+/// What opening a Grant reads: all of it sealed but its Account and Scopes.
+#[derive(sqlx::FromRow)]
+struct GrantRow {
+    account_id: i64,
+    telegram_session: Vec<u8>,
+    scopes: String,
+    send_allow_list: Option<Vec<u8>>,
 }
 
 #[derive(sqlx::FromRow)]
