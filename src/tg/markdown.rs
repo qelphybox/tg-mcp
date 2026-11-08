@@ -279,14 +279,10 @@ fn closes(before: Option<char>) -> bool {
 }
 
 fn starts_with(chars: &[char], at: usize, pattern: &str) -> bool {
-    let mut i = at;
-    for p in pattern.chars() {
-        if chars.get(i) != Some(&p) {
-            return false;
-        }
-        i += 1;
-    }
-    true
+    pattern
+        .chars()
+        .enumerate()
+        .all(|(i, p)| chars.get(at + i) == Some(&p))
 }
 
 fn find(chars: &[char], from: usize, c: char) -> Option<usize> {
