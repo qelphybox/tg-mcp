@@ -29,6 +29,9 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Per-client limits on the anonymous OAuth endpoints and on Login flows.
     pub oauth_limits: OAuthLimits,
+    /// Experimental, off by default (#58 prototype): get_media takes mode
+    /// `document` and lists it in its schema and description.
+    pub experimental_documents: bool,
 }
 
 impl Config {
@@ -133,6 +136,11 @@ impl Config {
             )? as usize,
         };
 
+        let experimental_documents = matches!(
+            get("TG_MCP_EXPERIMENTAL_DOCUMENTS").as_deref(),
+            Some("1" | "true")
+        );
+
         Ok(Self {
             bind,
             public_url,
@@ -142,6 +150,7 @@ impl Config {
             live_client_idle_ttl,
             limits,
             oauth_limits,
+            experimental_documents,
         })
     }
 
@@ -297,6 +306,23 @@ mod tests {
         assert_eq!(config.public_url.to_string(), "http://localhost:8080/");
         assert!(config.fake_telegram);
         assert_eq!(config.db_path, PathBuf::from("tg-mcp.db"));
+        assert!(!config.experimental_documents);
+    }
+
+    #[test]
+    fn experimental_documents_are_off_unless_set() {
+        let on = |value: &str| {
+            Config::from_lookup(env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_EXPERIMENTAL_DOCUMENTS", value),
+            ]))
+            .unwrap()
+            .experimental_documents
+        };
+        assert!(on("1"));
+        assert!(on("true"));
+        assert!(!on("0"));
+        assert!(!on(""));
     }
 
     #[test]

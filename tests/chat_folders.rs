@@ -8,7 +8,7 @@ use rmcp::model::{CallToolRequestParams, ErrorCode};
 use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary, MessagePreview},
-    fake::{FakeChatFolder, FakeData, fake_issued_id},
+    fake::{FakeChatFolder, FakeData, FolderRpc, fake_issued_id},
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
@@ -398,4 +398,69 @@ async fn chat_folder_is_a_bounded_integer_in_the_schema() {
     );
     let folders = &whoami.output_schema.as_ref().unwrap()["properties"]["chat_folders"];
     assert_eq!(folders["maxItems"], 50, "{folders}");
+}
+
+#[tokio::test]
+async fn paging_a_folder_reads_it_once_then_only_each_pages_chats() {
+    // 40 chats: 2 pinned in the folder, 38 more; a limit=3 walk is 14 pages.
+    let data = FakeData::new(account(42, "Alice"))
+        .with_chats((1..=40).map(chat).collect())
+        .with_chat_folders(vec![explicit(
+            4,
+            "Flats",
+            &[1, 2],
+            &(3..=40).collect::<Vec<_>>(),
+            &[],
+        )]);
+    let (server, client) = client_for(data).await;
+    server.connector.take_folder_rpcs();
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = Vec::new();
+    loop {
+        let mut request = json!({ "chat_folder": 4, "limit": 3 });
+        if let Some(c) = &cursor {
+            request["cursor"] = json!(c);
+        }
+        let page = call(&client, "list_chats", request).await.unwrap();
+        let chats = listed(&page);
+        pages.push((chats.len(), server.connector.take_folder_rpcs()));
+        seen.extend(chats);
+        match page.get("next_cursor").and_then(Value::as_str) {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+        assert!(pages.len() < 20, "the walk never ends");
+    }
+    let order: Vec<i64> = [1, 2].into_iter().chain((3..=40).rev()).collect();
+    assert_eq!(seen, issued(&order));
+    assert_eq!(pages.len(), 14);
+    // Cold: the folder, then its 40 chats in one getPeerDialogs.
+    assert_eq!(
+        pages[0].1,
+        [FolderRpc::DialogFilters, FolderRpc::PeerDialogs(40)]
+    );
+    // Then each page: one getPeerDialogs of its own chats only.
+    for (chats, rpcs) in &pages[1..] {
+        assert_eq!(*rpcs, [FolderRpc::PeerDialogs(*chats)]);
+    }
+
+    // whoami's getDialogFilters spares the next first page its own.
+    call(&client, "whoami", json!({})).await.unwrap();
+    assert_eq!(
+        server.connector.take_folder_rpcs(),
+        [FolderRpc::DialogFilters]
+    );
+    call(
+        &client,
+        "list_chats",
+        json!({ "chat_folder": 4, "limit": 3 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        server.connector.take_folder_rpcs(),
+        [FolderRpc::PeerDialogs(40)]
+    );
 }

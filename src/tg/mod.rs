@@ -10,6 +10,7 @@
 
 pub mod chats;
 pub mod compose;
+pub mod document;
 pub mod download;
 pub mod drafts;
 pub mod fake;

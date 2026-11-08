@@ -278,13 +278,28 @@ impl AccountLimiter {
     /// A request of class [`MethodClass::Writes`] (a Draft, a reaction, marking
     /// read) also spends the Writes budget, and never waits or retries: it goes
     /// now or fails with the wait. A sent message goes through [`Self::run_send`].
-    pub async fn run<T, F, Fut>(&self, class: MethodClass, mut request: F) -> Result<T, TgError>
+    pub async fn run<T, F, Fut>(&self, class: MethodClass, request: F) -> Result<T, TgError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, TgError>>,
+    {
+        self.run_named(class, "unnamed", request).await
+    }
+
+    /// [`Self::run`] for TL method `method` (e.g. `messages.getPeerDialogs`),
+    /// which its `FLOOD_WAIT` warning names: a method name is no content.
+    pub async fn run_named<T, F, Fut>(
+        &self,
+        class: MethodClass,
+        method: &'static str,
+        mut request: F,
+    ) -> Result<T, TgError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, TgError>>,
     {
         if class == MethodClass::Writes {
-            return self.write(None, request).await;
+            return self.write(None, method, request).await;
         }
         let mut retried = false;
         loop {
@@ -295,6 +310,7 @@ impl AccountLimiter {
                     tracing::warn!(
                         seconds,
                         class = class.name(),
+                        method,
                         "telegram FLOOD_WAIT; class blocked for the account"
                     );
                     if retried || Duration::from_secs(seconds.into()) > self.config.max_wait {
@@ -317,10 +333,30 @@ impl AccountLimiter {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, TgError>>,
     {
-        self.write(Some(chat), request).await
+        self.run_send_named(chat, "unnamed", request).await
     }
 
-    async fn write<T, F, Fut>(&self, chat: Option<ChatId>, request: F) -> Result<T, TgError>
+    /// [`Self::run_send`] for TL method `method` (`messages.sendMessage`), which
+    /// its `FLOOD_WAIT` warning names, as [`Self::run_named`]'s do.
+    pub async fn run_send_named<T, F, Fut>(
+        &self,
+        chat: ChatId,
+        method: &'static str,
+        request: F,
+    ) -> Result<T, TgError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, TgError>>,
+    {
+        self.write(Some(chat), method, request).await
+    }
+
+    async fn write<T, F, Fut>(
+        &self,
+        chat: Option<ChatId>,
+        method: &'static str,
+        request: F,
+    ) -> Result<T, TgError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, TgError>>,
@@ -333,6 +369,7 @@ impl AccountLimiter {
                 tracing::warn!(
                     seconds,
                     class = class.name(),
+                    method,
                     "telegram FLOOD_WAIT; class blocked for the account"
                 );
                 Err(TgError::FloodWait { seconds, class })
@@ -620,6 +657,47 @@ mod tests {
         Err(TgError::FloodWait { seconds, class })
     }
 
+    #[tokio::test]
+    async fn a_flood_wait_warning_names_the_method_telegram_throttled() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let limiter = AccountLimiter::new(config(600, 20));
+        let calls = AtomicU32::new(0);
+        let flooded = limiter
+            .run_named(MethodClass::Default, "messages.getPeerDialogs", || async {
+                flood(&calls, 300, MethodClass::Default)
+            })
+            .await;
+        assert!(matches!(
+            flooded,
+            Err(TgError::FloodWait { seconds: 300, .. })
+        ));
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("seconds=300")
+                && logs.contains("class=\"default\"")
+                && logs.contains("method=\"messages.getPeerDialogs\""),
+            "{logs}"
+        );
+    }
+
     /// A long flood in `flooded` fails that class fast, untouched by Telegram, and
     /// leaves every other class of the same Account alone.
     async fn only_the_flooded_class_is_blocked(flooded: MethodClass) {
@@ -866,6 +944,57 @@ mod tests {
             .run(MethodClass::Writes, || ok(&calls))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_flood_wait_warning_names_the_method_too() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let limiter = AccountLimiter::new(LimitsConfig::default());
+        let calls = AtomicU32::new(0);
+        let drafted = limiter
+            .run_named(MethodClass::Writes, "messages.saveDraft", || async {
+                flood(&calls, 30, MethodClass::Writes)
+            })
+            .await;
+        assert!(matches!(
+            drafted,
+            Err(TgError::FloodWait { seconds: 30, .. })
+        ));
+        // Another Account's limiter, so the Writes window above doesn't refuse it.
+        let limiter = AccountLimiter::new(LimitsConfig::default());
+        let sent = limiter
+            .run_send_named(ChatId::User(1), "messages.sendMessage", || async {
+                flood(&calls, 40, MethodClass::Writes)
+            })
+            .await;
+        assert!(matches!(sent, Err(TgError::FloodWait { seconds: 40, .. })));
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("seconds=30")
+                && logs.contains("method=\"messages.saveDraft\"")
+                && logs.contains("seconds=40")
+                && logs.contains("method=\"messages.sendMessage\"")
+                && logs.contains("class=\"writes\""),
+            "{logs}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

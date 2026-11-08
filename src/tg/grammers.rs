@@ -24,7 +24,7 @@ use super::{
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     drafts::{self, Drafts, DraftsAnswer, NewDraft, RawDraft, SavedDraft},
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
-    folders::{self, ChatFolder, RawChatFolder},
+    folders::{self, ChatFolder, FolderCache, RawChatFolder},
     markdown::{Entity, EntityKind},
     media,
     media::{FileLocation, StoredFile},
@@ -435,6 +435,9 @@ pub struct LiveClient {
     /// Whether each channel seen so far is a forum (`channel.forum`), so
     /// `topic` on a known Chat needs no lookup. In memory only, like `peers`.
     forums: std::sync::Mutex<std::collections::HashMap<ChatId, bool>>,
+    /// The Account's Chat folders' Chats and the order of folder listings
+    /// being paged, briefly: identifiers and dates only ([`FolderCache`]).
+    folder_cache: FolderCache,
     /// Telegram said this session is gone (logged out / revoked from the app).
     dead: std::sync::atomic::AtomicBool,
     /// The Account's budget and FLOOD_WAIT state, shared with its other Grants.
@@ -502,6 +505,7 @@ impl LiveClient {
         refusal: impl Fn(&InvocationError) -> Option<TgError> + Send + Sync,
     ) -> Result<R::Return, TgError> {
         let class = method_class::<R>();
+        let method = tl::name_for_id(R::CONSTRUCTOR_ID);
         let attempt = || async {
             #[cfg(test)]
             self.sent
@@ -523,11 +527,11 @@ impl LiveClient {
             })
         };
         if !is_send::<R>() {
-            return self.limiter.run(class, attempt).await;
+            return self.limiter.run_named(class, method, attempt).await;
         }
         // A sent message also counts against its Chat's Send cap.
         match chat {
-            Some(chat) => self.limiter.run_send(chat, attempt).await,
+            Some(chat) => self.limiter.run_send_named(chat, method, attempt).await,
             None => Err(TgError::Upstream(
                 "a message can only be sent to a known chat".into(),
             )),
@@ -546,7 +550,7 @@ impl LiveClient {
     ) -> Result<Result<R::Return, InvocationError>, TgError> {
         let class = method_class::<R>();
         self.limiter
-            .run(class, || async {
+            .run_named(class, tl::name_for_id(R::CONSTRUCTOR_ID), || async {
                 #[cfg(test)]
                 self.sent
                     .lock()
@@ -611,18 +615,16 @@ impl Telegram for LiveClient {
     }
 
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
-        Ok(self
-            .dialog_filters()
-            .await?
-            .into_iter()
-            .map(|f| f.folder)
-            .collect())
+        let folders = self.dialog_filters().await?;
+        self.folder_cache.remember(&folders);
+        Ok(folders.into_iter().map(|f| f.folder).collect())
     }
     async fn list_chats(&self, query: ChatsQuery) -> Result<ChatPage, TgError> {
         if let Some(folder) = query.chat_folder {
             return folders::list_folder_chats(
                 &query,
                 folder,
+                &self.folder_cache,
                 || self.dialog_filters(),
                 |peers| self.peer_dialogs(peers),
             )
@@ -2555,6 +2557,7 @@ impl GrammersConnector {
             grant,
             peers: Default::default(),
             forums: Default::default(),
+            folder_cache: Default::default(),
             dead: Default::default(),
             limiter: self.limits.for_account(grant_account),
             transcriptions,
@@ -3796,6 +3799,7 @@ fn offline_live(grant: OpenedGrant, store: Arc<SessionStore>) -> LiveClient {
         grant,
         peers: Default::default(),
         forums: Default::default(),
+        folder_cache: Default::default(),
         dead: Default::default(),
         limiter: Arc::new(AccountLimiter::new(crate::limits::LimitsConfig::default())),
         transcriptions: transcribe::feed(),
