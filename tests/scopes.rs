@@ -165,8 +165,8 @@ async fn both_metadata_documents_advertise_every_scope() {
     }
 }
 
-/// Until a tool needs more than `read`, a `draft` Grant sees the same tools; what
-/// changes is what the server tells the model it may do.
+/// A `draft` Grant sees one tool more, save_draft, and the server tells the
+/// model what it may do; reading is the same for both.
 #[tokio::test]
 async fn mcp_tells_each_grant_its_own_scopes() {
     let server = start(vec![account(42, "Alice")]).await;
@@ -206,7 +206,11 @@ async fn mcp_tells_each_grant_its_own_scopes() {
     };
     let read_tools = names(reader.list_all_tools().await.unwrap());
     assert!(read_tools.contains(&"whoami".to_string()));
-    assert_eq!(names(drafter.list_all_tools().await.unwrap()), read_tools);
+    assert!(read_tools.contains(&"get_drafts".to_string()));
+    assert!(!read_tools.contains(&"save_draft".to_string()));
+    let mut draft_tools = names(drafter.list_all_tools().await.unwrap());
+    draft_tools.retain(|name| name != "save_draft");
+    assert_eq!(draft_tools, read_tools, "save_draft is the only addition");
 
     // Prompts read nothing and name only `read` tools: every Grant gets them.
     let prompts = |list: Vec<rmcp::model::Prompt>| {

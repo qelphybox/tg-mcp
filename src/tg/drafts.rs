@@ -12,16 +12,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    chats::{ChatId, ChatKind, ChatRef, RawPeer, fallback_kind, rfc3339},
+    chats::{CHAT_REF_MAX_LEN, ChatId, ChatKind, ChatRef, RawPeer, fallback_kind, rfc3339},
+    compose::MAX_TEXT_CHARS,
     markdown::FormattedText,
-    topics::GENERAL_TOPIC_ID,
+    topics::{GENERAL_TOPIC_ID, MAX_TOPIC_TITLE_CHARS},
 };
+
+/// get_drafts lists at most this many Drafts, the newest.
+pub const MAX_LISTED_DRAFTS: usize = 100;
 
 /// The Chat a Draft is in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DraftChat {
     /// A chat id, as list_chats gives it: pass it to save_draft or get_messages.
+    #[schemars(length(max = CHAT_REF_MAX_LEN))]
     pub id: String,
+    #[schemars(length(max = MAX_TOPIC_TITLE_CHARS))]
     pub title: String,
     #[serde(rename = "type")]
     pub kind: ChatKind,
@@ -41,15 +47,18 @@ pub struct Draft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i32>,
     /// When the Draft was last changed, UTC, RFC 3339.
+    #[schemars(length(max = 40))]
     pub date: String,
     /// The Draft's text without its formatting, possibly empty (a Draft may
     /// be only a reply); text with nothing visible reads `[no visible text]`.
+    #[schemars(length(max = MAX_TEXT_CHARS))]
     pub text: String,
 }
 
 /// The Account's Drafts, newest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Drafts {
+    #[schemars(length(max = MAX_LISTED_DRAFTS))]
     pub drafts: Vec<Draft>,
     /// More Drafts exist than are listed: the oldest are left out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

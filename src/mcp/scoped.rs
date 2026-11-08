@@ -90,7 +90,6 @@ mod tests {
         RoleClient, ServiceExt,
         model::{CallToolRequestParams, ClientConfig},
         service::RunningService,
-        tool, tool_router,
         transport::{
             StreamableHttpClientTransport,
             streamable_http_server::{
@@ -109,17 +108,8 @@ mod tests {
         tg::{Account, Connector, FakeConnector, fake::FakeData},
     };
 
-    /// A stand-in for a `draft` tool until a real one exists.
-    #[tool_router(router = test_draft_tools)]
-    impl TgMcp {
-        #[tool(description = "A test tool under the draft Scope.")]
-        async fn test_save_draft(&self) -> String {
-            "drafted".into()
-        }
-    }
-
     fn tools() -> ScopedTools<TgMcp> {
-        TgMcp::scoped_tools().with(Scope::Draft, TgMcp::test_draft_tools())
+        TgMcp::scoped_tools()
     }
 
     fn drafts() -> Scopes {
@@ -127,19 +117,20 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_today_needs_read() {
+    fn every_tool_needs_read_but_save_draft() {
         let tools = TgMcp::scoped_tools();
         let all = tools.router().list_all();
         assert!(all.iter().any(|t| t.name == "whoami"));
+        assert!(all.iter().any(|t| t.name == "get_drafts"));
         for tool in &all {
-            assert_eq!(
-                tools.required[tool.name.as_ref()],
-                Scope::Read,
-                "{}",
-                tool.name
-            );
+            let needed = if tool.name == "save_draft" {
+                Scope::Draft
+            } else {
+                Scope::Read
+            };
+            assert_eq!(tools.required[tool.name.as_ref()], needed, "{}", tool.name);
         }
-        assert_eq!(tools.listed(Scopes::READ_ONLY).len(), all.len());
+        assert_eq!(tools.listed(Scopes::READ_ONLY).len(), all.len() - 1);
     }
 
     #[test]
@@ -155,13 +146,15 @@ mod tests {
         let read = names(Scopes::READ_ONLY);
         let draft = names(drafts());
         assert!(read.contains(&"whoami".to_string()));
-        assert!(!read.contains(&"test_save_draft".to_string()));
+        assert!(read.contains(&"get_drafts".to_string()));
+        assert!(!read.contains(&"save_draft".to_string()));
         assert_eq!(draft.len(), read.len() + 1);
-        assert!(draft.contains(&"test_save_draft".to_string()));
+        assert!(draft.contains(&"save_draft".to_string()));
 
-        assert!(tools.check("test_save_draft", Scopes::READ_ONLY).is_err());
-        assert!(tools.check("test_save_draft", drafts()).is_ok());
+        assert!(tools.check("save_draft", Scopes::READ_ONLY).is_err());
+        assert!(tools.check("save_draft", drafts()).is_ok());
         assert!(tools.check("whoami", Scopes::READ_ONLY).is_ok());
+        assert!(tools.check("get_drafts", Scopes::READ_ONLY).is_ok());
         assert!(tools.check("no_such_tool", Scopes::READ_ONLY).is_ok());
     }
 
@@ -171,7 +164,7 @@ mod tests {
         let _ = TgMcp::scoped_tools().with(Scope::Draft, TgMcp::scoped_tools().router().clone());
     }
 
-    /// `/mcp` as rmcp serves it, with a `draft` tool, for a caller with `scopes`.
+    /// `/mcp` as rmcp serves it, for a caller with `scopes`.
     type Client = RunningService<RoleClient, ClientConfig>;
 
     /// Stops the server and removes its database when dropped.
@@ -241,23 +234,32 @@ mod tests {
 
         let read: Vec<_> = reader.list_all_tools().await.unwrap();
         let draft: Vec<_> = drafter.list_all_tools().await.unwrap();
-        assert!(!read.iter().any(|t| t.name == "test_save_draft"));
-        assert!(draft.iter().any(|t| t.name == "test_save_draft"));
+        assert!(!read.iter().any(|t| t.name == "save_draft"));
+        assert!(draft.iter().any(|t| t.name == "save_draft"));
         assert_eq!(draft.len(), read.len() + 1);
 
+        // Into Saved Messages, which every Account has.
+        let save = || {
+            let saved_messages =
+                crate::tg::fake::fake_issued_id(crate::tg::chats::ChatId::User(42));
+            CallToolRequestParams::new("save_draft").with_arguments(
+                serde_json::json!({ "chat_id": saved_messages, "text": "hi" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        };
         let refused = reader
-            .call_tool(CallToolRequestParams::new("test_save_draft"))
+            .call_tool(save())
             .await
             .expect_err("a read Grant may not call a draft tool");
         assert!(
             refused.to_string().contains("needs the `draft` Scope"),
             "{refused}"
         );
-        let done = drafter
-            .call_tool(CallToolRequestParams::new("test_save_draft"))
-            .await
-            .unwrap();
+        let done = drafter.call_tool(save()).await.unwrap();
         assert_eq!(done.is_error, Some(false));
+        assert_eq!(done.structured_content.unwrap()["status"], "saved");
 
         // Read tools work for both.
         for client in [&reader, &drafter] {

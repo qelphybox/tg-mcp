@@ -21,6 +21,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+mod drafts;
 mod prompts;
 mod scoped;
 
@@ -144,7 +145,8 @@ pub fn instructions(scopes: Scopes) -> String {
         let mut can = vec!["read chats, messages and media"];
         if scopes.contains(Scope::Draft) {
             can.push(
-                "write Drafts (text left in a chat's message field, which only the user sends)",
+                "write Drafts (text left in a chat's message field, replacing the Draft there; \
+                 only the user sends it)",
             );
         }
         if scopes.contains(Scope::Send) {
@@ -202,8 +204,8 @@ mod instructions_tests {
             format!(
                 "Unofficial Telegram MCP server (uses the Telegram API). Access to the connected \
                  Telegram account: you can read chats, messages and media, and write Drafts (text \
-                 left in a chat's message field, which only the user sends); you cannot send, \
-                 edit or delete messages. {UNTRUSTED}"
+                 left in a chat's message field, replacing the Draft there; only the user sends \
+                 it); you cannot send, edit or delete messages. {UNTRUSTED}"
             )
         );
     }
@@ -252,7 +254,10 @@ impl TgMcp {
     /// Scope is the `#[tool_router(router = …)]` block it is declared in: one
     /// line per block here, nothing per tool.
     fn scoped_tools() -> ScopedTools<Self> {
-        ScopedTools::new().with(Scope::Read, Self::read_tools())
+        ScopedTools::new()
+            .with(Scope::Read, Self::read_tools())
+            .with(Scope::Read, Self::draft_read_tools())
+            .with(Scope::Draft, Self::draft_tools())
     }
 
     fn with_tools(links: Arc<MediaLinks>, tools: ScopedTools<Self>) -> Self {
@@ -544,7 +549,7 @@ pub struct GetMembersParams {
 
 /// The tools of the `read` Scope: every tool here is listed and callable for
 /// every Grant. A tool of another Scope goes in a block of its own (see
-/// [`TgMcp::scoped_tools`]).
+/// [`TgMcp::scoped_tools`]); the Drafts tools are in [`drafts`].
 #[tool_router(router = read_tools)]
 impl TgMcp {
     #[tool(

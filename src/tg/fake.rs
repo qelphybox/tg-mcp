@@ -2007,7 +2007,8 @@ impl Telegram for FakeTelegram {
     async fn save_draft(&self, draft: NewDraft) -> Result<SavedDraft, TgError> {
         self.check_hash(draft.chat)?;
         let chat = draft.chat.chat();
-        if !self.knows(chat) {
+        // Saved Messages is always there.
+        if !self.knows(chat) && chat != ChatId::User(self.data.account.id) {
             return Err(TgError::InvalidInput(format!(
                 "{chat} is not one of your chats; chat ids come from list_chats"
             )));
