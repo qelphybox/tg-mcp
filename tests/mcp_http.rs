@@ -103,7 +103,7 @@ async fn whoami_answers_for_the_callers_own_grant() {
         let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
         let tools = client.list_all_tools().await.unwrap();
         assert!(tools.iter().any(|t| t.name == "whoami"));
-        // The spec: every tool is read-only.
+        // The spec: every tool a `read` Grant (the default) sees is read-only.
         for tool in &tools {
             assert_eq!(
                 tool.annotations.as_ref().and_then(|a| a.read_only_hint),

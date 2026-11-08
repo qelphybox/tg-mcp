@@ -1,6 +1,6 @@
 # tg-mcp
 
-A public remote MCP server that gives AI clients read-only access to a user's personal Telegram account, onboarded with a URL and a QR login.
+A public remote MCP server that gives AI clients read access to a user's personal Telegram account, and the writes its Grant's Scopes allow, onboarded with a URL and a QR login.
 
 ## Identity and access
 
@@ -66,7 +66,7 @@ How many messages the Account may send to one Chat in any minute, 5 by default. 
 _Avoid_: per-chat limit, throttle
 
 **Draft**:
-Unsent text in a Chat's input field of the Account, synced to all its devices. Only the user sends it.
+Unsent text in a Chat's input field of the Account, synced to all its devices: one per Chat, or per Topic in a forum, and a new one replaces it. Only the user sends it.
 _Avoid_: pending message, unsent message
 
 ## Runtime

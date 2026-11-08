@@ -1,4 +1,5 @@
-//! tg-mcp: a read-only remote MCP server for a personal Telegram account.
+//! tg-mcp: a remote MCP server for a personal Telegram account: reading, and
+//! the writes a Grant's Scopes allow (Drafts so far).
 
 pub mod auth;
 pub mod config;
