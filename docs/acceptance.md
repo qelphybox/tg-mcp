@@ -520,6 +520,25 @@ Needs, in `list_chats` or found with `find_chats`: a large supergroup `<L>` the 
 
 `kamal app logs | grep -iF '<q>'` and `kamal app logs | grep -iF '<the name of one of G's members>'` find nothing: member names are never logged (only ids and counts, if anything).
 
+## 42. The catch_up and research prompts show up in Claude Code, and a run follows their recipe
+
+Needs, prepared in the Telegram app beforehand (replace the `<…>`): at least 4 chats with unread messages in the main list, among them a private chat `<P>` where someone asked you a question you haven't answered, a supergroup or channel `<S>` with an unread message that needs your answer (it has a `t.me` link), and, if the account is in one, a forum `<F>` with unread messages in two Topics. Write down the titles of the unread chats top to bottom, as the app's "All chats" list shows them. Pick a chat `<W>` by its title, a date `<D>` (`YYYY-MM-DD`) a few days back, and a subject `<t>` your chats discussed in different word forms or spellings (e.g. both "впн" and "VPN"). In Claude Code, with the server added as in §1 under a name `<srv>` (a fresh session, so it loads the current prompt list):
+
+1. Run `/mcp` and open `<srv>`. Record whether it shows prompts and how (e.g. a capability line or a count, "prompts"). Then type `/` followed by part of a prompt name: both prompts are offered as slash commands. Record their exact form: per Claude Code's docs `/mcp__<srv>__catch_up` and `/mcp__<srv>__research`, but other versions may show something like `/<srv>:catch_up (MCP)`; record whether the argument names (`since chat max_chats`, `topic since chat`) are shown as hints.
+2. Run the catch_up slash command without arguments and let it finish. Then ask:
+
+   ```text
+   Перечисли по порядку все вызовы инструментов Telegram MCP, которые ты сделал в предыдущем ответе: имя инструмента и параметры (текст сообщений не выводи). Для каждого чата из отчёта скажи, вызывал ли ты для него get_messages.
+   ```
+
+   Expect: the first call is `list_chats` with `unread_only: true`; every chat in the report had a `get_messages` call (none was summarised from the preview alone); at most 10 chats are reported, and with more than 10 unread chats the report says how many were left out; in `<F>`, `get_messages` with `topic` for the Topics with new messages (or `get_chat_info` and then `topic`); per chat 1-3 sentences, who waits for an answer with the sender and a quote, the `t.me` link for `<S>`'s message (none for `<P>`: chat and date instead); at the end a "Needs your reply" list with `<P>` and `<S>` (or a plain statement that nothing needs a reply, if that is true). The answer comes in the language you use in the session.
+3. Run catch_up with arguments: `/mcp__<srv>__catch_up <D> "<W>" 2` (the date, the chat title in quotes, max_chats). Expect a `find_chats` call with `<W>`'s title (or its words) and then `get_messages` for that chat with `since` = `<D>`, and only `<W>` in the report. Then run it with only `<D>` and 2: at most 2 chats, the rest counted as left out. Record how Claude Code passed the quoted title (one argument, or split at the space).
+4. Run the research slash command with `"<t>"` as the only argument, then ask the same question as in step 2 (for search_messages and get_messages). Expect: several `search_messages` calls with short queries, in different word forms, spellings or languages; `get_messages` with `around_id` (or `thread_of`) for the hits it uses; every fact in the answer has its chat and date (and a `t.me` link where the chat has them); inferences are marked apart from facts; the answer says which queries found nothing. Run it once more with `<t>`, `<D>` and `"<W>"`: every `search_messages` call has `since` and `chat_id` of `<W>`.
+5. Errors: run the research slash command with no arguments, and catch_up with `max_chats` 0. Record what Claude Code shows: the server answers `invalid_params` for both: one that names the missing field `topic`, and `max_chats must be between 1 and 50`; Claude Code may also refuse the first itself, since `topic` is marked required.
+6. In claude.ai (web), with the connector added as in §1: look for the prompts in the chat input's "+" (or attachment) menu under the connector, and record whether and how they show up and whether one can be run with arguments. Nothing is expected: record what you see.
+
+`kamal app logs | grep -iF '<t>'` and the same for `<W>`'s title find nothing: prompt arguments, like message content, are never logged.
+
 ## 50. A reused refresh Token revokes its Grant after a 60-second grace window, and logs its Telegram session out
 
 Needs two QR scans and about three minutes. The script logs in twice with its own OAuth clients, as `revoke-check.py` does, and never prints a Token:
