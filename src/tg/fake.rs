@@ -34,6 +34,7 @@ use super::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
+    topics::{self, RawForums, RawTopic, topic_of},
     transcribe::{
         self, Refusal, TranscribedAudio, Transcription, TranscriptionFeed, TranscriptionUpdate,
         Trial,
@@ -108,6 +109,48 @@ pub struct FakeData {
     /// Whether the Account may transcribe: Premium, a weekly trial, or not.
     #[serde(default)]
     pub transcribe: FakeTranscribeAccess,
+    /// The forums among the Chats and their Topics, General (id 1)
+    /// included, in Telegram's order (`messages.getForumTopics`). A message
+    /// of a forum is in the Topic its `topic` names, else in General.
+    #[serde(default)]
+    pub topics: std::collections::HashMap<ChatId, Vec<FakeTopic>>,
+    /// When set, history and search answers describe the Topics of their
+    /// messages (`messages.messages.topics`); otherwise titles take a
+    /// `messages.getForumTopicsByID`.
+    #[serde(default)]
+    pub topics_in_answers: bool,
+}
+
+/// One Topic of a fake forum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeTopic {
+    pub id: i32,
+    pub title: String,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+impl FakeTopic {
+    pub fn new(id: i32, title: &str) -> Self {
+        Self {
+            id,
+            title: title.into(),
+            closed: false,
+            pinned: false,
+        }
+    }
+
+    fn raw(&self, chat: ChatId) -> RawTopic {
+        RawTopic {
+            chat,
+            id: self.id,
+            title: self.title.clone(),
+            closed: self.closed,
+            pinned: self.pinned,
+        }
+    }
 }
 
 /// What Telegram hears in one message, and how long it takes to say.
@@ -258,7 +301,8 @@ const HISTORY_MAX_LIMIT: i64 = 100;
 
 /// `messages.getHistory` as Telegram answers it (core.telegram.org/api/offsets),
 /// or `messages.search` with the pinned filter (`request.pinned`) on the
-/// pinned messages only, on a history given in any order: newest first, slice at
+/// pinned messages only, or `messages.getReplies` on a Topic (`request.topic`)
+/// on that Topic's messages only, on a history given in any order: newest first, slice at
 /// `position(offset_id) + add_offset` (`position` counts the messages down to
 /// `offset_id` inclusive, whether or not that id exists; `offset_id` wins over
 /// `offset_date`), keep `limit`, then drop ids outside `min_id`/`max_id`.
@@ -271,6 +315,7 @@ pub fn get_history(
     // `messages.search` with the pinned filter: the same slicing, among the
     // pinned messages only.
     list.retain(|m| m.pinned || !request.pinned);
+    list.retain(|m| request.topic == 0 || topic_of(m.topic) == request.topic);
     list.sort_by_key(|m| std::cmp::Reverse(m.id));
     let limit = i64::from(request.limit).clamp(0, HISTORY_MAX_LIMIT);
     let mut start = slice_start(&list, request);
@@ -292,6 +337,7 @@ pub fn get_history(
 /// Whether a getHistory slice starts above the newest message of `history`.
 fn reaches_past_newest(history: &[RawHistoryMessage], request: &HistoryRequest) -> bool {
     let mut list = history.to_vec();
+    list.retain(|m| request.topic == 0 || topic_of(m.topic) == request.topic);
     list.sort_by_key(|m| std::cmp::Reverse(m.id));
     slice_start(&list, request) < 0
 }
@@ -446,9 +492,21 @@ impl FakeData {
             past_newest: PastNewest::default(),
             min_past_newest: false,
             pictures: Default::default(),
+            topics: Default::default(),
+            topics_in_answers: false,
             transcriptions: Default::default(),
             transcribe: FakeTranscribeAccess::default(),
         }
+    }
+
+    pub fn with_topics(mut self, forum: ChatId, topics: Vec<FakeTopic>) -> Self {
+        self.topics.insert(forum, topics);
+        self
+    }
+
+    pub fn with_topics_in_answers(mut self) -> Self {
+        self.topics_in_answers = true;
+        self
     }
 
     pub fn with_transcriptions(mut self, chat: ChatId, heard: Vec<FakeTranscription>) -> Self {
@@ -637,6 +695,7 @@ pub fn search_answer(chats: &[FakeSearchChat], me: i64, request: &SearchRequest)
         RequestScope::Chat {
             chat,
             from,
+            topic,
             offset_id,
         } => {
             let mut results: Vec<RawFoundMessage> = chats
@@ -646,6 +705,7 @@ pub fn search_answer(chats: &[FakeSearchChat], me: i64, request: &SearchRequest)
                     c.messages
                         .iter()
                         .filter(|m| offset_id == 0 || m.id < offset_id)
+                        .filter(|m| topic.is_none_or(|t| topic_of(m.topic) == t))
                         .filter(|m| matches(c.id, m, from))
                         .map(|m| found(c.id, m))
                 })
@@ -666,6 +726,7 @@ pub fn search_answer(chats: &[FakeSearchChat], me: i64, request: &SearchRequest)
         complete,
         messages: page,
         peers: Vec::new(),
+        forums: RawForums::default(),
     }
 }
 
@@ -1349,9 +1410,12 @@ impl Telegram for FakeTelegram {
                 "{chat} is not one of your chats; chat ids come from list_chats"
             )));
         }
+        if let Some(topic) = query.topic {
+            self.check_topic(chat, topic)?;
+        }
         let history = self.data.messages.get(&chat).map_or(&[][..], Vec::as_slice);
         let peers = self.peers();
-        read_history(
+        let mut page = read_history(
             id,
             &query,
             &|chat| self.known(chat),
@@ -1382,21 +1446,32 @@ impl Telegram for FakeTelegram {
                     })
                     .collect();
                 self.remember(&described);
+                let forums = self.forums_described(&[chat], messages.iter().map(|m| (chat, m)));
                 std::future::ready(Ok(HistoryAnswer {
                     returned: messages.len(),
                     messages,
                     peers: described,
+                    forums,
                 }))
             },
             |request| {
                 self.remember(&peers);
+                let messages = get_message(&self.data.messages, chat, &request);
+                // getMessages answers describe no Topics.
+                let forums = self.forums_described(&[chat], std::iter::empty());
                 std::future::ready(Ok(MessageAnswer {
-                    messages: get_message(&self.data.messages, chat, &request),
+                    messages,
                     peers: peers.clone(),
+                    forums,
                 }))
             },
         )
-        .await
+        .await?;
+        topics::complete(&mut page, |ids| {
+            std::future::ready(self.topics_by_id(chat, &ids))
+        })
+        .await?;
+        Ok(page)
     }
 
     async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
@@ -1419,7 +1494,18 @@ impl Telegram for FakeTelegram {
             return Ok(user_info(&peer, profile.profile, now));
         }
         let details = self.data.details.get(&chat).cloned().unwrap_or_default();
-        Ok(chat_info(&peer, details.description, details.member_count))
+        let mut info = chat_info(&peer, details.description, details.member_count);
+        // A forum's Topics: one `messages.getForumTopics` of 50.
+        if let Some(forum) = self.data.topics.get(&chat) {
+            let listed = forum
+                .iter()
+                .take(topics::MAX_LISTED_TOPICS)
+                .map(|t| t.raw(chat))
+                .collect();
+            let (listed, truncated) = topics::listed(listed, forum.len());
+            (info.topics, info.topics_truncated) = (Some(listed), truncated);
+        }
+        Ok(info)
     }
 
     /// Like Telegram: the user's common Chats as `messages.getCommonChats`
@@ -1459,7 +1545,7 @@ impl Telegram for FakeTelegram {
                 class: MethodClass::Search,
             });
         }
-        if let SearchScope::Chat { chat, from } = query.scope {
+        if let SearchScope::Chat { chat, from, topic } = query.scope {
             self.check_hash(chat)?;
             if !self.knows(chat.chat()) {
                 return Err(TgError::InvalidInput(format!(
@@ -1469,6 +1555,9 @@ impl Telegram for FakeTelegram {
             }
             if let Some(SearchFrom::Peer(peer)) = from {
                 self.check_hash(peer)?;
+            }
+            if let Some(topic) = topic {
+                self.check_topic(chat.chat(), topic)?;
             }
         }
         let chats: Vec<FakeSearchChat> = self
@@ -1489,7 +1578,7 @@ impl Telegram for FakeTelegram {
             .collect();
         let peers = self.peers();
         let me = self.data.account.id;
-        search::search(&query, &|chat| self.known(chat), |request| {
+        let mut page = search::search(&query, &|chat| self.known(chat), |request| {
             // SEARCH_QUERY_EMPTY, as the Live client reports it.
             let answer = if request.q.is_empty()
                 && request.filter.is_none()
@@ -1498,14 +1587,29 @@ impl Telegram for FakeTelegram {
                 Err(TgError::InvalidInput(QUERY_REQUIRED.into()))
             } else {
                 self.remember(&peers);
+                let answer = search_answer(&chats, me, &request);
+                let in_answer: Vec<ChatId> = answer.messages.iter().map(|f| f.chat).collect();
+                let forums = self.forums_described(
+                    &in_answer,
+                    answer.messages.iter().map(|f| (f.chat, &f.message)),
+                );
                 Ok(SearchAnswer {
                     peers,
-                    ..search_answer(&chats, me, &request)
+                    forums,
+                    ..answer
                 })
             };
             std::future::ready(answer)
         })
-        .await
+        .await?;
+        topics::complete_search(&mut page, |chat, ids| {
+            std::future::ready(
+                self.check_hash(chat)
+                    .and_then(|()| self.topics_by_id(chat.chat(), &ids)),
+            )
+        })
+        .await?;
+        Ok(page)
     }
 
     /// The same `contacts.search` call as the Live client, answered by
@@ -1860,6 +1964,66 @@ impl FakeTelegram {
 
     fn known(&self, chat: ChatId) -> Option<i64> {
         self.known.lock().unwrap().get(&chat).copied()
+    }
+
+    /// Like the Live client: `topic` needs a forum, and Telegram refuses a
+    /// Topic the forum doesn't have.
+    fn check_topic(&self, chat: ChatId, topic: i32) -> Result<(), TgError> {
+        let forum = self
+            .data
+            .topics
+            .get(&chat)
+            .ok_or_else(|| topics::not_a_forum(chat))?;
+        if !forum.iter().any(|t| t.id == topic) {
+            return Err(topics::unknown_topic(topic));
+        }
+        Ok(())
+    }
+
+    /// What an answer about `chats` and `messages` says of forums: which of
+    /// those Chats are forums and, when the fake's answers carry them, the
+    /// Topics of the messages.
+    fn forums_described<'a>(
+        &self,
+        chats: &[ChatId],
+        messages: impl Iterator<Item = (ChatId, &'a RawHistoryMessage)>,
+    ) -> RawForums {
+        let mut forums: Vec<ChatId> = chats
+            .iter()
+            .copied()
+            .filter(|c| self.data.topics.contains_key(c))
+            .collect();
+        forums.sort_by_key(|&c| peer_key(c));
+        forums.dedup();
+        let mut described: Vec<RawTopic> = Vec::new();
+        if self.data.topics_in_answers {
+            for (chat, m) in messages {
+                let topic = topic_of(m.topic);
+                let known = described.iter().any(|t| t.chat == chat && t.id == topic);
+                if let (false, Some(t)) = (known, self.topic(chat, topic)) {
+                    described.push(t.raw(chat));
+                }
+            }
+        }
+        RawForums {
+            forums,
+            topics: described,
+        }
+    }
+
+    fn topic(&self, chat: ChatId, id: i32) -> Option<&FakeTopic> {
+        self.data.topics.get(&chat)?.iter().find(|t| t.id == id)
+    }
+
+    /// `messages.getForumTopicsByID`, a reading call: the Topics of `ids`
+    /// the forum has.
+    fn topics_by_id(&self, chat: ChatId, ids: &[i32]) -> Result<Vec<RawTopic>, TgError> {
+        self.flood()?;
+        Ok(ids
+            .iter()
+            .filter_map(|&id| self.topic(chat, id))
+            .map(|t| t.raw(chat))
+            .collect())
     }
 
     /// One call's worth of a group's members: like any reading call, a
@@ -2393,6 +2557,7 @@ mod tests {
                 edited: false,
                 reactions: Vec::new(),
                 pinned: false,
+                topic: None,
             })
             .collect()
     }

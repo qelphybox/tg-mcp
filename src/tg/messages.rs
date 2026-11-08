@@ -17,12 +17,13 @@ use super::{
     TgError,
     chats::{ChatId, ChatRef, RawPeer, rfc3339},
     search::RawFoundMessage,
+    topics::{self, RawForums, TopicTitles},
 };
 
 /// What to fetch. Messages come newest first. At most one of `before_id`,
 /// `around_id`, `after_id` and `thread_of` is set, and `since`/`until` only go
 /// with `before_id` (or none of them). `pinned_only` goes with `before_id`
-/// alone.
+/// alone. `topic` goes with anything but `thread_of`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HistoryQuery {
     pub limit: usize,
@@ -42,6 +43,10 @@ pub struct HistoryQuery {
     /// Only the Chat's pinned messages (Telegram's search with the pinned
     /// filter), paged with `before_id`.
     pub pinned_only: bool,
+    /// Only this Topic of a forum: `messages.getReplies` on it instead of
+    /// `messages.getHistory` (the same offsets), or the pinned search with
+    /// its `top_msg_id`. The adapter has checked the Chat is a forum.
+    pub topic: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -87,6 +92,10 @@ pub struct ChatMessage {
     pub link: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Only in a forum: the id of the Topic the message is in (General is
+    /// 1); the page's `topics` has its title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<i32>,
     /// The message an `around_id` window or a `thread_of` chain was asked for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub target: bool,
@@ -124,6 +133,10 @@ pub struct MessagePage {
     /// id, which is deleted or can't be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broken_at: Option<i32>,
+    /// Only with messages of a forum: the title of each Topic they are in,
+    /// by Topic id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics: Option<TopicTitles>,
 }
 
 /// What kind of media a message carries.
@@ -362,6 +375,12 @@ pub struct RawHistoryMessage {
     pub reactions: Vec<RawReaction>,
     #[serde(default)]
     pub pinned: bool,
+    /// The Topic the message says it is in, in a forum: its reply header's
+    /// (`forum_topic`), or its own id for the service message that created a
+    /// Topic. `None` in a forum is the General Topic
+    /// ([`super::topics::topic_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<i32>,
 }
 
 /// A message by its Chat and id.
@@ -393,6 +412,10 @@ pub struct HistoryRequest {
     /// Only pinned messages: `messages.search` with the pinned filter and the
     /// same offsets instead (it has no `offset_date`, which stays 0).
     pub pinned: bool,
+    /// Only this Topic (0: the whole Chat): `messages.getReplies` with it as
+    /// `msg_id` and the same offsets, or the pinned search with it as
+    /// `top_msg_id`.
+    pub topic: i32,
 }
 
 /// What Telegram answered to one [`HistoryRequest`].
@@ -404,6 +427,8 @@ pub struct HistoryAnswer {
     /// full when this reaches its `limit`.
     pub returned: usize,
     pub peers: Vec<RawPeer>,
+    /// Which of the answer's Chats are forums, and the Topics it describes.
+    pub forums: RawForums,
 }
 
 /// One `messages.getMessages` call (`channels.getMessages` in a channel) for
@@ -421,6 +446,8 @@ pub struct MessageAnswer {
     /// and basic groups, so a message here may be another Chat's.
     pub messages: Vec<RawFoundMessage>,
     pub peers: Vec<RawPeer>,
+    /// Which of the answer's Chats are forums, and the Topics it describes.
+    pub forums: RawForums,
 }
 
 /// Access hashes of users and channels seen in earlier answers (the Live
@@ -457,6 +484,13 @@ where
                 .into(),
         ));
     }
+    if query.thread_of.is_some() && query.topic.is_some() {
+        return Err(TgError::InvalidInput(
+            "thread_of doesn't combine with topic: a reply chain is followed wherever it goes"
+                .into(),
+        ));
+    }
+    let topic = query.topic.unwrap_or(0);
     if let Some(start) = query.thread_of {
         let positioned =
             query.before_id.is_some() || query.around_id.is_some() || query.after_id.is_some();
@@ -472,6 +506,7 @@ where
         (_, None, None) => {
             let answer = get_history(HistoryRequest {
                 pinned: query.pinned_only,
+                topic,
                 offset_id: query.before_id.unwrap_or(0),
                 // getHistory returns messages strictly before offset_date.
                 offset_date: query
@@ -483,17 +518,10 @@ where
             })
             .await?;
             let full_page = answer.returned >= query.limit;
-            Ok(assemble_history(
-                chat,
-                &answer.messages,
-                &answer.peers,
-                known,
-                query,
-                full_page,
-            ))
+            Ok(assemble_page(chat, &answer, known, query, full_page))
         }
         (None, Some(target), None) if !dated => {
-            around(chat, target, limit, known, get_history).await
+            around(chat, target, topic, limit, known, get_history).await
         }
         (None, None, Some(after)) if !dated => {
             // Everything at and above after+1, i.e. strictly newer; min_id drops
@@ -504,6 +532,7 @@ where
                 add_offset: -limit,
                 limit,
                 min_id: after,
+                topic,
                 ..HistoryRequest::default()
             })
             .await?;
@@ -511,14 +540,15 @@ where
             let next_after_id = (answer.returned >= query.limit)
                 .then(|| window.first().map(|m| m.id))
                 .flatten();
-            let issuer = Issuer::new(&answer.peers, known);
+            let issuer = Issuer::new(&answer.peers, known).in_forums(&answer.forums);
             Ok(MessagePage {
                 next_after_id,
                 ..MessagePage::new(
                     issuer.chat_id(chat),
                     window.iter().map(|m| issuer.message(chat, m)).collect(),
                 )
-            })
+            }
+            .with_topics(chat, &answer.forums))
         }
         _ => Err(TgError::InvalidInput(
             "before_id, around_id and after_id exclude each other, and since/until don't go \
@@ -533,6 +563,7 @@ where
 async fn around<F, Fut>(
     chat: ChatRef,
     target: i32,
+    topic: i32,
     limit: i32,
     known: KnownHashes<'_>,
     mut get_history: F,
@@ -549,15 +580,24 @@ where
         offset_id: target,
         add_offset: -(newer_wanted as i32 + 1),
         limit,
+        topic,
         ..HistoryRequest::default()
     })
     .await?;
     let mut peers = answer.peers;
+    let mut forums = answer.forums;
     let mut window = newest_first(answer.messages, |_| true);
     let Some(at) = window.iter().position(|m| m.id == target) else {
-        return Err(TgError::InvalidInput(format!(
-            "message {target} not found in this chat (deleted, or the id is from another chat)"
-        )));
+        return Err(TgError::InvalidInput(if topic == 0 {
+            format!(
+                "message {target} not found in this chat (deleted, or the id is from another chat)"
+            )
+        } else {
+            format!(
+                "message {target} not found in topic {topic} (deleted, in another topic, or the \
+                 id is from another chat)"
+            )
+        }));
     };
     let newer = at;
     let older = window.len() - at - 1;
@@ -572,6 +612,7 @@ where
     if at_newest && more_older && window.len() < size {
         let top = get_history(HistoryRequest {
             limit,
+            topic,
             ..HistoryRequest::default()
         })
         .await?;
@@ -583,8 +624,9 @@ where
             window = top_window;
         }
         peers.extend(top.peers);
+        forums.extend(top.forums);
     }
-    let issuer = Issuer::new(&peers, known);
+    let issuer = Issuer::new(&peers, known).in_forums(&forums);
     Ok(MessagePage {
         next_before_id: more_older.then(|| window.last().map(|m| m.id)).flatten(),
         next_after_id: (!at_newest).then(|| window.first().map(|m| m.id)).flatten(),
@@ -598,7 +640,8 @@ where
                 })
                 .collect(),
         )
-    })
+    }
+    .with_topics(chat, &forums))
 }
 
 /// The reply chain of `start`, newest first: `start` and its ancestors, at
@@ -619,12 +662,14 @@ where
     GFut: Future<Output = Result<MessageAnswer, TgError>>,
 {
     let mut peers = Vec::new();
+    let mut forums = RawForums::default();
     let mut chain: Vec<RawHistoryMessage> = Vec::new();
     let (mut root, mut broken_at, mut elsewhere) = (false, None, None);
     let mut next = start;
     loop {
         let answer = get_message(MessageRequest { id: next }).await?;
         peers.extend(answer.peers);
+        forums.extend(answer.forums);
         let Some(found) = in_chat(
             answer.messages,
             MessageAt {
@@ -668,7 +713,7 @@ where
             Some(parent) => next = parent,
         }
     }
-    let issuer = Issuer::new(&peers, known);
+    let issuer = Issuer::new(&peers, known).in_forums(&forums);
     let last = chain.len() - 1;
     let messages = chain
         .iter()
@@ -686,7 +731,8 @@ where
         }),
         broken_at,
         ..MessagePage::new(issuer.chat_id(chat), messages)
-    })
+    }
+    .with_topics(chat, &forums))
 }
 
 /// The message at `at` among the messages a `messages.getMessages` /
@@ -712,6 +758,16 @@ impl MessagePage {
             next_after_id: None,
             continues_in: None,
             broken_at: None,
+            topics: None,
+        }
+    }
+
+    /// The page with its `topics`: the titles `forums` has of the Topics its
+    /// messages are in ([`topics::page_titles`]).
+    fn with_topics(self, chat: ChatRef, forums: &RawForums) -> Self {
+        Self {
+            topics: topics::page_titles(chat.chat(), &self.messages, &forums.topics),
+            ..self
         }
     }
 }
@@ -735,6 +791,9 @@ pub(super) struct Issuer<'a> {
     /// The Account, as the answers describe it (its user has the `self`
     /// flag, and is described wherever a message names it).
     me: Option<ChatId>,
+    /// The Chats the answers describe as forums ([`Self::in_forums`]): their
+    /// messages carry their Topic.
+    forums: std::collections::HashSet<ChatId>,
 }
 
 impl<'a> Issuer<'a> {
@@ -752,7 +811,14 @@ impl<'a> Issuer<'a> {
             me: peers.iter().find(|p| p.is_self).map(|p| p.id),
             peers: by_id,
             known,
+            forums: Default::default(),
         }
+    }
+
+    /// The same, knowing which Chats the answers describe as forums.
+    pub(super) fn in_forums(mut self, forums: &RawForums) -> Self {
+        self.forums.extend(forums.forums.iter().copied());
+        self
     }
 
     pub(super) fn peer(&self, id: ChatId) -> Option<&'a RawPeer> {
@@ -820,6 +886,10 @@ impl<'a> Issuer<'a> {
                 m.id,
             ),
             pinned: m.pinned,
+            topic: self
+                .forums
+                .contains(&chat.chat())
+                .then(|| topics::topic_of(m.topic)),
             target: false,
             thread_root: false,
         }
@@ -828,15 +898,15 @@ impl<'a> Issuer<'a> {
 
 /// Build a page from what Telegram returned for `query` (newest first).
 /// `full_page` = Telegram returned as many messages as asked for.
-fn assemble_history(
+fn assemble_page(
     chat: ChatRef,
-    raw: &[RawHistoryMessage],
-    peers: &[RawPeer],
+    answer: &HistoryAnswer,
     known: KnownHashes<'_>,
     query: &HistoryQuery,
     full_page: bool,
 ) -> MessagePage {
-    let issuer = Issuer::new(peers, known);
+    let raw = &answer.messages;
+    let issuer = Issuer::new(&answer.peers, known).in_forums(&answer.forums);
     let mut reached_since = false;
     let mut messages = Vec::new();
     for m in raw {
@@ -857,6 +927,7 @@ fn assemble_history(
         next_before_id,
         ..MessagePage::new(issuer.chat_id(chat), messages)
     }
+    .with_topics(chat, &answer.forums)
 }
 
 /// Parse a `since`/`until` bound: RFC 3339, or a plain `YYYY-MM-DD` (midnight UTC;
@@ -913,6 +984,7 @@ mod tests {
             edited: false,
             reactions: Vec::new(),
             pinned: false,
+            topic: None,
         }
     }
 
@@ -921,6 +993,24 @@ mod tests {
             limit,
             ..HistoryQuery::default()
         }
+    }
+
+    /// [`assemble_page`] of an answer with `raw` and `peers`, and no forum.
+    fn assemble_history(
+        chat: ChatRef,
+        raw: &[RawHistoryMessage],
+        peers: &[RawPeer],
+        known: KnownHashes<'_>,
+        query: &HistoryQuery,
+        full_page: bool,
+    ) -> MessagePage {
+        let answer = HistoryAnswer {
+            messages: raw.to_vec(),
+            returned: raw.len(),
+            peers: peers.to_vec(),
+            forums: RawForums::default(),
+        };
+        assemble_page(chat, &answer, known, query, full_page)
     }
 
     fn peer(id: ChatId, title: &str) -> RawPeer {
@@ -1221,6 +1311,7 @@ mod tests {
                         returned: messages.len(),
                         messages,
                         peers: describing_bob(answers[calls - 1]),
+                        forums: Default::default(),
                     }))
                 },
                 |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
@@ -1261,6 +1352,7 @@ mod tests {
                     std::future::ready(Ok(MessageAnswer {
                         messages: get_message(&histories, GROUP, &request),
                         peers: describing_bob(answers[calls - 1]),
+                        forums: Default::default(),
                     }))
                 },
             ))
@@ -1360,6 +1452,7 @@ mod tests {
                     returned: messages.len(),
                     messages,
                     peers: Vec::new(),
+                    forums: Default::default(),
                 }))
             },
             |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
@@ -1502,6 +1595,7 @@ mod tests {
                     returned: messages.len(),
                     messages,
                     peers: Vec::new(),
+                    forums: Default::default(),
                 }))
             },
             |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
@@ -1641,6 +1735,7 @@ mod tests {
                 std::future::ready(Ok(MessageAnswer {
                     messages: get_message(histories, chat, &request),
                     peers: Vec::new(),
+                    forums: Default::default(),
                 }))
             },
         ));
@@ -1751,6 +1846,7 @@ mod tests {
                 std::future::ready(Ok(MessageAnswer {
                     messages: get_message(&histories, GROUP, &request),
                     peers: peers.to_vec(),
+                    forums: Default::default(),
                 }))
             },
         ))
@@ -1988,6 +2084,116 @@ mod tests {
         assert!(json.get("pinned").is_none(), "{json}");
     }
 
+    /// A forum's ids 1..=20: the even ones in Topic 10, the rest in General.
+    fn forum_history() -> Vec<RawHistoryMessage> {
+        (1..=20)
+            .map(|id| RawHistoryMessage {
+                topic: (id % 2 == 0).then_some(10),
+                ..msg(id, id)
+            })
+            .collect()
+    }
+
+    /// Read `query` from a forum's history, with the requests it sent; the
+    /// answers describe the Chat as a forum and Topic 10.
+    fn read_forum(query: HistoryQuery) -> (Result<MessagePage, TgError>, Vec<HistoryRequest>) {
+        let history = forum_history();
+        let mut sent = Vec::new();
+        let page = futures_executor(read_history(
+            ChatId::Channel(9).into(),
+            &query,
+            &unknown,
+            |request| {
+                sent.push(request);
+                let messages = get_history(&history, &request, PastNewest::Shorten);
+                std::future::ready(Ok(HistoryAnswer {
+                    returned: messages.len(),
+                    messages,
+                    peers: Vec::new(),
+                    forums: RawForums {
+                        forums: vec![ChatId::Channel(9)],
+                        topics: vec![topics::RawTopic {
+                            chat: ChatId::Channel(9),
+                            id: 10,
+                            title: "Releases".into(),
+                            closed: false,
+                            pinned: false,
+                        }],
+                    },
+                }))
+            },
+            |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {
+                unreachable!("no chain here")
+            },
+        ));
+        (page, sent)
+    }
+
+    #[test]
+    fn every_request_of_a_topic_stays_in_the_topic() {
+        let in_topic = |query: HistoryQuery| HistoryQuery {
+            topic: Some(10),
+            ..query
+        };
+        // A window at the newest message of the Topic: Telegram shortens
+        // it, and the top is read again, in the Topic too.
+        let (page, sent) = read_forum(in_topic(around(18, 5)));
+        let page = page.unwrap();
+        assert_eq!(page_ids(&page), [20, 18, 16, 14, 12]);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|r| r.topic == 10), "{sent:?}");
+        for query in [
+            query(3),
+            HistoryQuery {
+                before_id: Some(10),
+                ..query(3)
+            },
+            HistoryQuery {
+                after_id: Some(10),
+                ..query(3)
+            },
+            pinned_only(3, None),
+        ] {
+            let (page, sent) = read_forum(in_topic(query));
+            let page = page.unwrap();
+            assert!(
+                page.messages.iter().all(|m| m.topic == Some(10)),
+                "{query:?}"
+            );
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].topic, 10, "{query:?}");
+        }
+        // Without a Topic, a forum reads interleaved, each message tagged.
+        let (page, sent) = read_forum(query(4));
+        let page = page.unwrap();
+        let tagged: Vec<(i32, Option<i32>)> =
+            page.messages.iter().map(|m| (m.id, m.topic)).collect();
+        assert_eq!(
+            tagged,
+            [(20, Some(10)), (19, Some(1)), (18, Some(10)), (17, Some(1))]
+        );
+        assert_eq!(sent[0].topic, 0);
+        assert_eq!(
+            page.topics,
+            Some(TopicTitles([(10, "Releases".into())].into())),
+            "General is left to the lookup: the answer didn't describe it"
+        );
+    }
+
+    #[test]
+    fn a_topic_doesnt_combine_with_a_reply_chain() {
+        let (page, sent) = read_forum(HistoryQuery {
+            thread_of: Some(12),
+            topic: Some(10),
+            ..query(5)
+        });
+        assert!(
+            matches!(page, Err(TgError::InvalidInput(ref e)) if e.contains("thread_of")),
+            "{page:?}"
+        );
+        assert!(sent.is_empty());
+    }
+
     /// Ids 1..=20, every third one pinned (3, 6, …, 18).
     fn with_pins() -> Vec<RawHistoryMessage> {
         (1..=20)
@@ -2023,6 +2229,7 @@ mod tests {
                     returned: messages.len(),
                     messages,
                     peers: Vec::new(),
+                    forums: Default::default(),
                 }))
             },
             |_| -> std::future::Ready<Result<MessageAnswer, TgError>> {

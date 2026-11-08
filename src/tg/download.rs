@@ -329,6 +329,7 @@ mod tests {
             edited: false,
             reactions: Vec::new(),
             pinned: false,
+            topic: None,
         }
     }
 

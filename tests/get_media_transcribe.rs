@@ -51,6 +51,7 @@ fn message(id: i32, kind: MediaKind, duration_s: u32) -> RawHistoryMessage {
         edited: false,
         reactions: Vec::new(),
         pinned: false,
+        topic: None,
     }
 }
 

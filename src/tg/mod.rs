@@ -21,6 +21,7 @@ pub mod rich;
 pub mod sanitise;
 pub mod search;
 mod session;
+pub mod topics;
 pub mod transcribe;
 pub mod view;
 
