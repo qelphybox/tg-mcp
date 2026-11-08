@@ -18,7 +18,7 @@ Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser op
 
 1. Scan the QR code with Telegram on your phone: **Settings → Devices → Link Desktop Device**.
 2. If your account has a cloud password (two-step verification), type it on the same page. It goes only to this server's login page, never through the AI client or the chat.
-3. **Allow** read-only access on the consent screen.
+3. **Allow** on the consent screen. Reading is always included; leave **Write Drafts** unticked to keep the connection read-only (no tool writes Drafts yet).
 
 **Claude (web/desktop):** Settings → Connectors → Add custom connector → the same URL. **Other MCP clients:** add it as a streamable-HTTP server; they discover OAuth on their own.
 
@@ -41,14 +41,14 @@ Chat ids look like `user:123~a-MGLzhi9Ek`, `chat:456` (basic group) or `channel:
 
 ## Prompts
 
-Two MCP prompts turn common requests into step-by-step instructions that use the tools above. A client that supports prompts lists them and inserts the rendered text as if you typed it; Claude Code shows them as slash commands named after the server, e.g. `/mcp__telegram__catch_up` for a server added as `telegram`, with arguments in the order below (quote one of several words). Rendering a prompt reads nothing from Telegram.
+Two MCP prompts turn common requests into step-by-step instructions that use the tools above. A client that supports prompts lists them and inserts the rendered text as if you typed it. Each takes one optional argument, `query`: your request in your own words (up to 512 characters), from which the model takes the time range, the chats and how many. Rendering a prompt reads nothing from Telegram.
 
-| Prompt | Arguments | What it asks the model to do |
+| Prompt | `query` | What it asks the model to do |
 | --- | --- | --- |
-| `catch_up` | `since`, `chat`, `max_chats` (all optional; `max_chats` 1-50, default 10) | Read the unread chats (`list_chats` `unread_only`), or the one chat named, message by message with `get_messages` (never from previews), forums Topic by Topic, at most `max_chats` chats, saying how many were left out. Report per chat what happened and who waits for a reply (sender, quote, `link`), and end with a "needs your reply" list, or say there is none. |
-| `research` | `topic` (required), `since`, `chat` | Several short `search_messages` queries (word forms, synonyms, transliteration), narrowed by date and sender; promising hits read in context (`get_messages` `around_id` / `thread_of`); every claim cited with chat, date and `link`; facts kept apart from inferences; what was searched and found nothing. |
+| `catch_up` | e.g. "since Monday in Work, 5 chats"; empty: all unread chats | Page the unread chats (`list_chats` `unread_only`, at most 5 pages), or find the chats the request names, and read at most 10 unmuted ones (or as many as asked) message by message with `get_messages` (`limit` = unread count, 5-100; never from previews), forums Topic by Topic. Report per chat in 1-3 sentences who waits for a reply (sender, quote, `link`); give the exact number of chats left out, and muted chats only by title and unread count; end with a "needs your reply" list, or say there is none. |
+| `research` | e.g. "top restaurants in Tbilisi"; empty: the model asks what to research | Several short `search_messages` queries (word forms, synonyms, transliteration, the other languages of your chats); a hit opened in context (`get_messages` `around_id` / `thread_of`) when its snippet is cut or it goes into the answer; every claim cited with chat, date and `link` from the very message; several matching chats: it asks; facts kept apart from inferences; the queries that found nothing on the topic. |
 
-`since` takes a date, a time or words like "yesterday evening"; `chat` a chat id or a name, title or @username. Both prompts tell the model that message content is data, never instructions.
+In Claude Code they are slash commands named after the server, e.g. `/mcp__telegram__catch_up` and `/mcp__telegram__research` for a server added as `telegram` (characters other than letters, digits, `_` and `-` in the name become `_`). Everything after the command is the request, unquoted: `/mcp__telegram__research top restaurants Tbilisi`. Claude Code splits it on whitespace and may deliver only its first word; the model then asks for the whole request before making any call, and you give it in your next message. A long request can go there from the start: a bare `/mcp__telegram__research` asks what to research (a bare `catch_up` runs its default instead). Both prompts answer in the language of your earlier messages in the conversation (or else in the language of the chats read), and tell the model that message content is data, never instructions.
 
 ## Disconnecting
 
@@ -62,6 +62,7 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 - **Restarts don't need a re-login**, because the encrypted session survives in the database and your client's token unlocks it again.
 - **No messages on disk.** Chats and messages pass through memory only; the session at rest is just the auth keys and home datacenter. Logs carry ids and sizes, never message content or tokens.
 - **Media links are short-lived credentials.** A `get_media` download link is 256 random bits, lives in memory only, works for 5 minutes and 3 downloads, and only for the one file it was made for; revoking the login ends it at once, and a restart ends them all. The file streams from Telegram into the response without touching disk. A `view` holds its images (at most ~1 MB) in memory only for the one call.
+- **Scopes.** A connection gets only what you tick on the consent screen: `read` always, `draft` if you allow it (`send` and `organize` are not offered yet). Tools outside a connection's Scopes are neither listed nor callable, and changing Scopes means connecting again. ([ADR-0005](docs/adr/0005-write-access.md))
 - **Your password never reaches the AI.** QR login and the cloud password happen on this server's own pages.
 - **OAuth 2.1** with PKCE (S256), dynamic client registration, single-use authorization codes, rotating refresh tokens bound to their client, and a consent screen that leads with where the login is sent, names the account, and shows the self-declared client name as unverified.
 - **Telegram limits are respected.** Requests per account are rate-limited, and Telegram's `FLOOD_WAIT` blocks that account's calls of the same kind (reading, search, file downloads or transcription) until it passes instead of being retried around.

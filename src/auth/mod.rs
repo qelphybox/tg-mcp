@@ -35,12 +35,20 @@ use self::{
 };
 use crate::{
     links::MediaLinks,
+    scope::{Scope, Scopes},
     sessions::{GrantId, Vault, VaultError},
     tg::{Connector, Login, Telegram, TgError},
 };
 
-/// The only scope: read-only access to all chats.
-pub const SCOPE: &str = "read";
+/// The Scopes the Consent screen offers besides `read`, which is always granted.
+/// `send` comes with the Send allow-list; `organize` has no tools yet, so both
+/// are advertised but not offered, and a request for them grants nothing more.
+pub const CONSENT_OFFERS: &[Scope] = &[Scope::Draft];
+
+/// `scopes_supported` of both metadata documents: every Scope there is.
+fn scopes_supported() -> Vec<&'static str> {
+    Scope::ALL.iter().map(|s| s.as_str()).collect()
+}
 
 pub struct AuthState {
     /// `scheme://host[:port]` of the public URL, no trailing slash. Also the issuer.
@@ -120,6 +128,8 @@ pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
 #[derive(Clone)]
 pub struct Caller {
     pub grant_id: GrantId,
+    /// The Grant's Scopes: which tools this caller sees and may call.
+    pub scopes: Scopes,
     pub telegram: Arc<dyn Telegram>,
 }
 
@@ -198,6 +208,7 @@ pub async fn require_bearer(
         }
     };
     let grant_id = grant.grant_id.clone();
+    let scopes = grant.scopes;
     let telegram = match auth.connector.connect(grant).await {
         Ok(telegram) => telegram,
         Err(err @ TgError::BadSession(_)) => {
@@ -215,9 +226,11 @@ pub async fn require_bearer(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    request
-        .extensions_mut()
-        .insert(Caller { grant_id, telegram });
+    request.extensions_mut().insert(Caller {
+        grant_id,
+        scopes,
+        telegram,
+    });
     next.run(request).await
 }
 
@@ -246,8 +259,8 @@ async fn protected_resource(State(auth): State<Arc<AuthState>>) -> Response {
         "resource": auth.mcp_url(),
         "authorization_servers": [auth.base_url],
         "bearer_methods_supported": ["header"],
-        "scopes_supported": [SCOPE],
-        "resource_name": "Telegram (unofficial, read-only)",
+        "scopes_supported": scopes_supported(),
+        "resource_name": "Telegram (unofficial)",
     }))
     .into_response()
 }
@@ -265,7 +278,7 @@ async fn authorization_server(State(auth): State<Arc<AuthState>>) -> Response {
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": [SCOPE],
+        "scopes_supported": scopes_supported(),
         "authorization_response_iss_parameter_supported": true,
     }))
     .into_response()

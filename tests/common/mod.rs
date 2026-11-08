@@ -396,6 +396,61 @@ impl TestServer {
         (client_id, tokens)
     }
 
+    /// The browser part with `scope` on `/authorize` and the Consent form posted
+    /// as `consent` (e.g. `[("scope", "draft"), ("decision", "allow")]`). Returns
+    /// the Consent page's HTML and the code.
+    pub async fn authorize_scoped(
+        &self,
+        client_id: &str,
+        pkce: &Pkce,
+        scope: Option<&str>,
+        consent: &[(&str, &str)],
+    ) -> (String, String) {
+        let mut path = self.authorize_path(client_id, pkce, "xyz");
+        if let Some(scope) = scope {
+            path.push_str(&format!("&{}", form(&[("scope", scope)])));
+        }
+        let res = self.get(&path, None).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let cookie = res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let login_path = res.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(login_path.starts_with("/login/"), "{login_path}");
+        let consent_path = self.wait_logged_in(&login_path, &cookie).await;
+        let page = self.get(&consent_path, Some(&cookie)).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let html = page.text().await.unwrap();
+        let res = self.post_form(&consent_path, consent, Some(&cookie)).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let redirect = location(&res);
+        (html, query(&redirect, "code").expect("code in redirect"))
+    }
+
+    /// [`TestServer::login`] with `scope` asked for and `consent` posted.
+    /// Returns (client_id, token response).
+    pub async fn login_scoped(
+        &self,
+        scope: Option<&str>,
+        consent: &[(&str, &str)],
+    ) -> (String, Value) {
+        let client_id = self.register().await;
+        let pkce = pkce();
+        let (_, code) = self
+            .authorize_scoped(&client_id, &pkce, scope, consent)
+            .await;
+        let (status, tokens) = json(self.exchange(&client_id, &code, &pkce.verifier).await).await;
+        assert_eq!(status, StatusCode::OK, "{tokens}");
+        (client_id, tokens)
+    }
+
     pub async fn mcp(&self, access_token: &str) -> RunningService<RoleClient, ClientConfig> {
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(self.url("/mcp"))

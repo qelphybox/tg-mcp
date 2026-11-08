@@ -546,24 +546,31 @@ Needs, in `list_chats` or found with `find_chats`: a large supergroup `<L>` the 
 
 `kamal app logs | grep -iF '<q>'` and `kamal app logs | grep -iF '<the name of one of G's members>'` find nothing: member names are never logged (only ids and counts, if anything).
 
-## 42. The catch_up and research prompts show up in Claude Code, and a run follows their recipe
+## 42. The catch_up and research prompts show up in Claude Code, take the request as one `query`, and a run follows their recipe
 
-Needs, prepared in the Telegram app beforehand (replace the `<…>`): at least 4 chats with unread messages in the main list, among them a private chat `<P>` where someone asked you a question you haven't answered, a supergroup or channel `<S>` with an unread message that needs your answer (it has a `t.me` link), and, if the account is in one, a forum `<F>` with unread messages in two Topics. Write down the titles of the unread chats top to bottom, as the app's "All chats" list shows them. Pick a chat `<W>` by its title, a date `<D>` (`YYYY-MM-DD`) a few days back, and a subject `<t>` your chats discussed in different word forms or spellings (e.g. both "впн" and "VPN"). In Claude Code, with the server added as in §1 under a name `<srv>` (a fresh session, so it loads the current prompt list):
+Needs, prepared in the Telegram app beforehand (replace the `<…>`): more than 10 unmuted chats with unread messages in the main list, among them a private chat `<P>` where someone asked you a question you haven't answered and a supergroup or channel `<S>` with an unread message that needs your answer (it has a `t.me` link); at least one muted chat `<M>` with unread messages; and, if the account is in one, a forum `<F>` with unread messages in two Topics. Write down, top to bottom as the app's "All chats" list shows them, the title, the unread count and whether it is muted for each unread chat. Pick a chat `<W>` by its title, a date `<D>` (`YYYY-MM-DD`) a few days back, a subject `<t>` your chats discussed in different word forms, spellings or languages (e.g. both "впн" and "VPN"), at least once in a long message, and a word `<N>` that is in the titles of two or more of your chats. In Claude Code, with the server added as in §1 under a name `<srv>` (a fresh session, so it loads the current prompt list):
 
-1. Run `/mcp` and open `<srv>`. Record whether it shows prompts and how (e.g. a capability line or a count, "prompts"). Then type `/` followed by part of a prompt name: both prompts are offered as slash commands. Record their exact form: per Claude Code's docs `/mcp__<srv>__catch_up` and `/mcp__<srv>__research`, but other versions may show something like `/<srv>:catch_up (MCP)`; record whether the argument names (`since chat max_chats`, `topic since chat`) are shown as hints.
-2. Run the catch_up slash command without arguments and let it finish. Then ask:
+1. Run `/mcp` and open `<srv>`. Record whether it shows prompts and how (e.g. a capability line or a count, "prompts"). Then type `/mcp__` and part of a prompt name: both prompts are offered as `/mcp__<srv>__catch_up` and `/mcp__<srv>__research`, where Claude Code replaces every character of `<srv>` outside `A-Z a-z 0-9 _ -` with `_` (on production, added as `Telegram`, they show as `/mcp__Telegram__catch_up`). Record the exact form, and whether the one argument name `query` is shown as a hint.
+2. What a multi-word request delivers. Run `/mcp__<srv>__research один два три четыре` and let it answer. Then ask:
 
    ```text
-   Перечисли по порядку все вызовы инструментов Telegram MCP, которые ты сделал в предыдущем ответе: имя инструмента и параметры (текст сообщений не выводи). Для каждого чата из отчёта скажи, вызывал ли ты для него get_messages.
+   Процитируй дословно строку «My request» из текста промпта выше (или скажи, что её нет). Сделал ли ты в предыдущем ответе вызовы инструментов Telegram MCP?
    ```
 
-   Expect: the first call is `list_chats` with `unread_only: true`; every chat in the report had a `get_messages` call (none was summarised from the preview alone); at most 10 chats are reported, and with more than 10 unread chats the report says how many were left out; in `<F>`, `get_messages` with `topic` for the Topics with new messages (or `get_chat_info` and then `topic`); per chat 1-3 sentences, who waits for an answer with the sender and a quote, the `t.me` link for `<S>`'s message (none for `<P>`: chat and date instead); at the end a "Needs your reply" list with `<P>` and `<S>` (or a plain statement that nothing needs a reply, if that is true). The answer comes in the language you use in the session.
-3. Run catch_up with arguments: `/mcp__<srv>__catch_up <D> "<W>" 2` (the date, the chat title in quotes, max_chats). Expect a `find_chats` call with `<W>`'s title (or its words) and then `get_messages` for that chat with `since` = `<D>`, and only `<W>` in the report. Then run it with only `<D>` and 2: at most 2 chats, the rest counted as left out. Record how Claude Code passed the quoted title (one argument, or split at the space).
-4. Run the research slash command with `"<t>"` as the only argument, then ask the same question as in step 2 (for search_messages and get_messages). Expect: several `search_messages` calls with short queries, in different word forms, spellings or languages; `get_messages` with `around_id` (or `thread_of`) for the hits it uses; every fact in the answer has its chat and date (and a `t.me` link where the chat has them); inferences are marked apart from facts; the answer says which queries found nothing. Run it once more with `<t>`, `<D>` and `"<W>"`: every `search_messages` call has `since` and `chat_id` of `<W>`.
-5. Errors: run the research slash command with no arguments, and catch_up with `max_chats` 0. Record what Claude Code shows: the server answers `invalid_params` for both: one that names the missing field `topic`, and `max_chats must be between 1 and 50`; Claude Code may also refuse the first itself, since `topic` is marked required.
-6. In claude.ai (web), with the connector added as in §1: look for the prompts in the chat input's "+" (or attachment) menu under the connector, and record whether and how they show up and whether one can be run with arguments. Nothing is expected: record what you see.
+   Record whether the whole phrase arrived or only `один` (Claude Code splits on whitespace, one word per argument: anthropics/claude-code#14210). Expect: with only `один`, the model made no tool call and asked for the full request; with the whole phrase, it either asked (the request is ambiguous) or searched for it.
+3. The catch_up default. In a fresh session (no earlier message of yours), run `/mcp__<srv>__catch_up` without a request and let it finish. Then ask:
 
-`kamal app logs | grep -iF '<t>'` and the same for `<W>`'s title find nothing: prompt arguments, like message content, are never logged.
+   ```text
+   Перечисли по порядку все вызовы инструментов Telegram MCP, которые ты сделал в предыдущем ответе: имя инструмента и параметры (текст сообщений не выводи). Для каждого чата из отчёта скажи, вызывал ли ты для него get_messages и с каким limit. Для каждого замьюченного чата скажи, читал ли ты его сообщения.
+   ```
+
+   Expect: the first call is `list_chats` with `unread_only: true`, followed by at most 4 more pages with `cursor`; every chat in the report had a `get_messages` call with `limit` = its unread count from your notes, raised to 5 and capped at 100, and no other value; only unmuted chats are reported, at most 10, in list order; `<M>` and every other muted chat is listed by title and unread count only, never summarised and never read; the left-out line gives the exact number of unmuted unread chats on the pages it saw minus those reported, by title only (nothing from their previews), with "and more" if a `next_cursor` remained; in `<F>`, `get_messages` with `topic` for the Topics with new messages (or `get_chat_info` and then `topic`); per chat 1-3 sentences (count them), who waits for an answer with the sender and a quote, the `t.me` link for `<S>`'s message (none for `<P>`: chat and date instead); at the end a "Needs your reply" list with `<P>` and `<S>`. With no earlier message of yours, the report is in the language most of the chats it read use.
+4. catch_up with a request, in the same session: run `/mcp__<srv>__catch_up с <D> в <W>` (unquoted). If only the first word arrived (step 2), the model asks for the full request; answer `с <D> в <W>`. Expect a `find_chats` call with `<W>`'s title (or its words), then `get_messages` for that chat with `since` = `<D>` (older pages with `before_id`, at most 3), only `<W>` in the report, in Russian (your earlier messages). Then do the same with `2 чата с <D>`: at most 2 chats, read with `since`, the rest counted as left out.
+5. research. Run `/mcp__<srv>__research` without a request: it asks what to research and makes no call. Answer `что обсуждали про <t>`, let it finish, then ask the question of step 3 (for search_messages and get_messages) and also: «Какие сниппеты из search_messages были обрезаны (с «…»), и открыл ли ты каждый из них через get_messages?». Expect: several `search_messages` calls with short queries in different word forms, synonyms, Latin and Cyrillic spellings and the other languages of your chats; `get_messages` with `around_id` (or `thread_of`) for every hit whose `snippet` was cut and for every hit the answer uses; no quote in the answer ends or starts with `…`; a second page (`cursor`) only after an on-topic first page; every fact has its chat, sender and date, and its `t.me` link where the chat has them: open two links, each opens the very message quoted, with that date; inferences are marked apart from facts; a section lists the queries that found nothing on the topic; the answer is in Russian.
+6. research naming several chats: run `/mcp__<srv>__research <t> в чате <N>`; if only the first word arrived and the model asks, answer `<t> в чате <N>`. Expect a `find_chats` call that finds several chats, then a question which one, with no `search_messages` call before your answer.
+7. In claude.ai (web), with the connector added as in §1: look for the prompts in the chat input's "+" (or attachment) menu under the connector, and record whether and how they show up, whether one can be run with a request and how the `query` field looks. Nothing is expected: record what you see.
+
+`kamal app logs | grep -iF '<t>'`, `kamal app logs | grep -F 'один два'` and the same for `<W>`'s title find nothing: the `query`, like message content, is never logged.
 
 ## 50. A reused refresh Token revokes its Grant after a 60-second grace window, and logs its Telegram session out
 
@@ -597,7 +604,7 @@ ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /
 python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
-print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 3
+print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 3, or 4 once #41 (Scopes) is deployed
 print(db.execute("""SELECT count(*), coalesce(sum(wrapped_key IS NOT NULL
                       AND consumed_at < CAST(strftime('%s', 'now') AS INTEGER) - 300), 0)
                     FROM tokens WHERE consumed_at IS NOT NULL""").fetchone())
@@ -606,3 +613,78 @@ PY
 ```
 
 Finally, no false alarm in normal use: open two Claude Code sessions on the connector and use both across an hourly refresh (`whoami` in each after more than an hour). Both keep answering without a browser opening, and `logs` (with `--since` widened to cover the time) has no `refresh token misused` line for your own Grant. If one appears, a client kept a used refresh Token for more than 60 s: record which client and version.
+
+## 51. Scopes: a Grant from before keeps reading, a new one gets what Consent ticked, and the MCP surface says so
+
+Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client, asking for the Scopes in its first argument (`-`: none), and expects the second as granted; it never prints a Token and revokes its Grant at the end.
+
+1. **A Grant from before the deploy.** Use the connector you added before this release (no new login): in Claude Code ask "who am I on Telegram": `whoami` answers without a browser opening. Then the database:
+
+   ```sh
+   mkdir -p /tmp/tgmcp-dump
+   ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
+   python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+   import sqlite3, sys
+   db = sqlite3.connect(sys.argv[1])
+   print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 4
+   print(db.execute("SELECT scopes, count(*) FROM grants GROUP BY scopes").fetchall())
+   # expect [('read', N)]: every Grant from before is read-only (run this before steps 4-6, which add their own)
+   PY
+   ```
+
+   More than an hour later (its access Token has been refreshed), `whoami` still answers without a browser: the Scopes are on the Grant and survive a refresh.
+
+2. **Metadata advertises every Scope.**
+
+   ```sh
+   curl -s https://tgmcp.qelphybox.space/.well-known/oauth-authorization-server | jq -c .scopes_supported
+   # expect ["read","draft","send","organize"]
+   curl -s https://tgmcp.qelphybox.space/.well-known/oauth-protected-resource/mcp | jq -c '[.scopes_supported, .resource_name]'
+   # expect [["read","draft","send","organize"],"Telegram (unofficial)"]
+   ```
+
+3. **An unknown Scope is `invalid_scope`**, sent back to the client before any login starts:
+
+   ```sh
+   id=$(curl -s https://tgmcp.qelphybox.space/register -H 'content-type: application/json' \
+     -d '{"client_name": "scope-check (manual test)", "redirect_uris": ["https://example.com/cb"]}' | jq -r .client_id)
+   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://tgmcp.qelphybox.space/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=read%20write"
+   # expect 303 https://example.com/cb?error=invalid_scope&error_description=…&state=s&iss=https%3A%2F%2Ftgmcp.qelphybox.space
+   ```
+
+4. **A new Grant with only `read`.**
+
+   ```sh
+   python3 scripts/scope-check.py - read   # expect every line [PASS] and exit status 0
+   ```
+
+   On the Consent screen: "Read chats and messages…" is ticked and greyed out, "Write Drafts" is unticked, the heading reads "Allow … **read-only** access to all chats of …", and the line under the boxes reads "It can only read: it can't send, edit or delete anything." Leave it so and Allow. The script prints instructions starting "… Read-only access to the connected Telegram account: nothing is ever sent, edited or deleted." and the tool list; note how many tools it lists.
+
+5. **A Grant that asked for `draft`, unticked by the user.**
+
+   ```sh
+   python3 scripts/scope-check.py "read draft" read   # expect every line [PASS] and exit status 0
+   ```
+
+   "Write Drafts" opens ticked and the heading has no "read-only". Untick it: "read-only" comes back into the heading and the line under the boxes switches to "It can only read: …" (tick and untick once more to see both ways). Allow with it unticked.
+
+6. **A new Grant with `draft`.**
+
+   ```sh
+   python3 scripts/scope-check.py "read draft" "read draft"   # expect every line [PASS] and exit status 0
+   ```
+
+   Keep "Write Drafts" ticked and Allow. The token response and the refresh (which asks for every Scope) both say `read draft`; the instructions read "… Access to the connected Telegram account: you can read chats, messages and media, and write Drafts (text left in a chat's message field, which only the user sends); you cannot send, edit or delete messages. …"; the tool list is the same as in step 4 (no tool needs `draft` until the Drafts tools land).
+
+7. **What Claude Code asks for.** `claude mcp add --transport http telegram-scopes https://tgmcp.qelphybox.space/mcp`, then `/mcp` → `telegram-scopes` → Authenticate, and scan the QR. Record whether "Write Drafts" opens ticked (Claude Code asked for every advertised Scope) or not (it asked for none or `read`). Untick it, Allow, check `whoami` answers, then `claude mcp remove telegram-scopes` and end that session in Telegram → Settings → Devices.
+
+8. **The server's side**, within 15 minutes of the runs:
+
+   ```sh
+   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -E 'authorization code issued|grant created'
+   # expect a pair per login of steps 4-7 with client_id / grant_id and scopes=read, scopes=read, scopes=read draft, scopes=read
+   logs | grep -c 'tgm_'   # expect 0: no Token is ever logged
+   ```
+
+   In Telegram → Settings → Devices, no "Unofficial MCP Server" session from steps 4-7 is left.

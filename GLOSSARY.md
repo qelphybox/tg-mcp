@@ -50,7 +50,7 @@ The screen where the user chooses the Grant's Scopes (and, with `send`, its Send
 ## Writing on the Account's behalf
 
 **Scope**:
-A kind of access a Grant has: `read` (always), `draft`, `send`, `organize`. Chosen by the user on the Consent screen; changing Scopes means a new Grant.
+A kind of access a Grant has: `read` (always), `draft`, `send`, `organize`. Asked for by the client (`scope` on `/authorize`, pre-checking those boxes), chosen by the user on the Consent screen and stored with the Grant; changing Scopes means a new Grant. A tool needs exactly one Scope and is neither listed nor callable without it. Grants from before Scopes have `read` only.
 _Avoid_: permission, role, right
 
 **Send allow-list**:

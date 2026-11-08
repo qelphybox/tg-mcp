@@ -28,6 +28,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use self::crypto::KEY_LEN;
+use crate::scope::Scopes;
 
 const SESSION_AAD: &[u8] = b"tg-mcp/telegram-session/v1:";
 const WRAP_AAD: &[u8] = b"tg-mcp/wrapped-key/v1:";
@@ -97,6 +98,8 @@ impl fmt::Debug for Token {
 #[derive(Debug, Clone)]
 pub struct IssuedTokens {
     pub grant_id: GrantId,
+    /// The Grant's Scopes: what both Tokens give access to.
+    pub scopes: Scopes,
     pub access: Token,
     pub access_expires_in: Duration,
     pub refresh: Token,
@@ -108,6 +111,8 @@ pub struct IssuedTokens {
 pub struct OpenedGrant {
     pub grant_id: GrantId,
     pub account_id: i64,
+    /// What this Grant may do, as chosen on Consent.
+    pub scopes: Scopes,
     pub telegram_session: Zeroizing<Vec<u8>>,
     key: Zeroizing<[u8; KEY_LEN]>,
 }
@@ -117,6 +122,7 @@ impl fmt::Debug for OpenedGrant {
         f.debug_struct("OpenedGrant")
             .field("grant_id", &self.grant_id)
             .field("account_id", &self.account_id)
+            .field("scopes", &self.scopes)
             .field(
                 "telegram_session",
                 &format_args!("<{} bytes>", self.telegram_session.len()),
@@ -259,14 +265,27 @@ impl Vault {
         self.pool.close().await;
     }
 
-    /// Store a freshly logged-in Telegram session as a new Grant of `client_id` and
-    /// issue its first Token pair. The Session key exists only inside the returned
-    /// Tokens from now on.
+    /// [`Vault::create_grant_with_scopes`] for a Grant that may only read.
     pub async fn create_grant(
         &self,
         client_id: &str,
         account_id: i64,
         telegram_session: &[u8],
+    ) -> Result<IssuedTokens, VaultError> {
+        self.create_grant_with_scopes(client_id, account_id, telegram_session, Scopes::READ_ONLY)
+            .await
+    }
+
+    /// Store a freshly logged-in Telegram session as a new Grant of `client_id`
+    /// with `scopes`, and issue its first Token pair. The Session key exists only
+    /// inside the returned Tokens from now on. The Scopes never change after this
+    /// (ADR-0005): other Scopes mean a new Grant.
+    pub async fn create_grant_with_scopes(
+        &self,
+        client_id: &str,
+        account_id: i64,
+        telegram_session: &[u8],
+        scopes: Scopes,
     ) -> Result<IssuedTokens, VaultError> {
         let grant_id = GrantId(uuid::Uuid::new_v4().to_string());
         let key = Zeroizing::new(crypto::random::<KEY_LEN>());
@@ -275,21 +294,24 @@ impl Vault {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO grants (id, client_id, account_id, telegram_session, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO grants (id, client_id, account_id, telegram_session, scopes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(grant_id.as_str())
         .bind(client_id)
         .bind(account_id)
         .bind(sealed)
+        .bind(scopes.to_string())
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        let issued = self.insert_pair(&mut tx, &grant_id, &key, now).await?;
+        let issued = self
+            .insert_pair(&mut tx, &grant_id, scopes, &key, now)
+            .await?;
         tx.commit().await?;
 
-        tracing::info!(grant_id = %grant_id, "grant created");
+        tracing::info!(grant_id = %grant_id, scopes = %scopes, "grant created");
         Ok(issued)
     }
 
@@ -315,12 +337,12 @@ impl Vault {
     }
 
     async fn decrypt(&self, verified: Verified) -> Result<OpenedGrant, VaultError> {
-        let row: Option<(i64, Vec<u8>)> =
-            sqlx::query_as("SELECT account_id, telegram_session FROM grants WHERE id = ?")
+        let row: Option<(i64, Vec<u8>, String)> =
+            sqlx::query_as("SELECT account_id, telegram_session, scopes FROM grants WHERE id = ?")
                 .bind(verified.grant_id.as_str())
                 .fetch_optional(&self.pool)
                 .await?;
-        let (account_id, sealed) = row.ok_or(VaultError::InvalidToken)?;
+        let (account_id, sealed, scopes) = row.ok_or(VaultError::InvalidToken)?;
         let telegram_session =
             crypto::open(&verified.key, &sealed, &session_aad(&verified.grant_id)).ok_or_else(
                 || VaultError::Corrupt {
@@ -330,6 +352,7 @@ impl Vault {
         Ok(OpenedGrant {
             grant_id: verified.grant_id,
             account_id,
+            scopes: Scopes::from_stored(&scopes),
             telegram_session,
             key: verified.key,
         })
@@ -357,8 +380,9 @@ impl Vault {
         Ok(())
     }
 
-    /// Exchange a refresh Token for a new pair. Only the client the Grant was issued
-    /// to may do this. The presented refresh Token is consumed: it stays fully
+    /// Exchange a refresh Token for a new pair, with the Grant's Scopes as they are
+    /// (a refresh never changes them). Only the client the Grant was issued to may
+    /// do this. The presented refresh Token is consumed: it stays fully
     /// usable for [`REFRESH_GRACE`] after its first use (each use issues another
     /// pair), then it only serves to recognise a reuse.
     ///
@@ -373,11 +397,12 @@ impl Vault {
     ) -> Result<IssuedTokens, VaultError> {
         let now = self.now();
         let matched = self.find(refresh_token, &[Kind::Refresh], now).await?;
-        let owner: Option<String> = sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
-            .bind(matched.grant_id.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(owner) = owner else {
+        let grant: Option<(String, String)> =
+            sqlx::query_as("SELECT client_id, scopes FROM grants WHERE id = ?")
+                .bind(matched.grant_id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((owner, scopes)) = grant else {
             // Deleted since the Token was read.
             return Err(VaultError::InvalidToken);
         };
@@ -409,8 +434,9 @@ impl Vault {
             // Revoked, or its grace window ended, since it was verified.
             return Err(VaultError::InvalidToken);
         }
+        let scopes = Scopes::from_stored(&scopes);
         let issued = self
-            .insert_pair(&mut tx, &verified.grant_id, &verified.key, now)
+            .insert_pair(&mut tx, &verified.grant_id, scopes, &verified.key, now)
             .await?;
         tx.commit().await?;
         Ok(issued)
@@ -552,6 +578,7 @@ impl Vault {
         &self,
         tx: &mut sqlx::SqliteConnection,
         grant_id: &GrantId,
+        scopes: Scopes,
         key: &[u8; KEY_LEN],
         now: i64,
     ) -> Result<IssuedTokens, VaultError> {
@@ -559,6 +586,7 @@ impl Vault {
         let refresh = insert_token(tx, grant_id, key, Kind::Refresh, now, self.ttl.refresh).await?;
         Ok(IssuedTokens {
             grant_id: grant_id.clone(),
+            scopes,
             access,
             access_expires_in: self.ttl.access,
             refresh,
@@ -774,6 +802,72 @@ mod tests {
         let mut leaky = dump.clone();
         leaky.extend_from_slice(&real_key);
         assert!(any_window_opens(&leaky, &sealed, &aad));
+    }
+
+    /// A Grant made before Grants had Scopes (the schema of migrations 0001-0003)
+    /// can only have been read-only: after migrating it opens as `read`, its
+    /// Tokens keep working, and a refresh keeps it `read`.
+    #[tokio::test]
+    async fn a_grant_from_before_scopes_reads_only_and_keeps_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+
+        // The schema as it was before Scopes, and a Grant as that vault wrote it.
+        let old_migrations = tempfile::tempdir().unwrap();
+        let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        for entry in std::fs::read_dir(&migrations).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.as_str() < "0004" {
+                std::fs::copy(entry.path(), old_migrations.path().join(&name)).unwrap();
+            }
+        }
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::migrate::Migrator::new(old_migrations.path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        let grant_id = GrantId(uuid::Uuid::new_v4().to_string());
+        let key = Zeroizing::new(crypto::random::<KEY_LEN>());
+        let now = unix_now();
+        sqlx::query(
+            "INSERT INTO grants (id, client_id, account_id, telegram_session, created_at, updated_at)
+             VALUES (?, 'client', 42, ?, ?, ?)",
+        )
+        .bind(grant_id.as_str())
+        .bind(crypto::seal(&key, b"old session", &session_aad(&grant_id)))
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ttl = TokenTtl::default();
+        let mut conn = pool.acquire().await.unwrap();
+        let access = insert_token(&mut conn, &grant_id, &key, Kind::Access, now, ttl.access)
+            .await
+            .unwrap();
+        let refresh = insert_token(&mut conn, &grant_id, &key, Kind::Refresh, now, ttl.refresh)
+            .await
+            .unwrap();
+        drop(conn);
+        pool.close().await;
+
+        let vault = Vault::open_path(&path, ttl).await.unwrap();
+        let opened = vault.open(access.expose()).await.unwrap();
+        assert_eq!(opened.scopes, Scopes::READ_ONLY);
+        assert_eq!(opened.telegram_session.as_slice(), b"old session");
+        let rotated = vault.refresh(refresh.expose(), "client").await.unwrap();
+        assert_eq!(rotated.scopes, Scopes::READ_ONLY);
+        let reopened = vault.open(rotated.access.expose()).await.unwrap();
+        assert_eq!(reopened.scopes, Scopes::READ_ONLY);
     }
 
     /// After the grace window the sweep removes a consumed refresh Token's Wrapped

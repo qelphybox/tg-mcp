@@ -9,7 +9,10 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use super::rate_limit::ClientIp;
-use crate::tg::{LoggedIn, LoginAttempt};
+use crate::{
+    scope::Scopes,
+    tg::{LoggedIn, LoginAttempt},
+};
 
 const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const CODE_TTL: Duration = Duration::from_secs(60);
@@ -22,6 +25,8 @@ pub struct AuthRequest {
     pub redirect_uri: String,
     pub code_challenge: String,
     pub state: Option<String>,
+    /// The `scope` the client asked for (`read` at least): pre-checked on Consent.
+    pub scopes: Scopes,
 }
 
 pub enum Progress {
@@ -49,6 +54,8 @@ pub struct PasswordGate {
 pub struct IssuedCode {
     pub request: AuthRequest,
     pub logged_in: LoggedIn,
+    /// What the user allowed on Consent: the new Grant's Scopes.
+    pub scopes: Scopes,
     expires: Instant,
 }
 
@@ -192,7 +199,7 @@ impl Flows {
             .filter(|l| l.created.elapsed() < LOGIN_TTL)
     }
 
-    pub fn issue_code(&self, request: AuthRequest, logged_in: LoggedIn) -> String {
+    pub fn issue_code(&self, request: AuthRequest, logged_in: LoggedIn, scopes: Scopes) -> String {
         let mut codes = self.codes.lock().expect("flows lock");
         codes.retain(|_, c| c.expires > Instant::now());
         let code = new_id();
@@ -201,6 +208,7 @@ impl Flows {
             IssuedCode {
                 request,
                 logged_in,
+                scopes,
                 expires: Instant::now() + CODE_TTL,
             },
         );
@@ -251,6 +259,7 @@ mod tests {
             redirect_uri: "http://127.0.0.1/cb".into(),
             code_challenge: "x".into(),
             state: None,
+            scopes: Scopes::READ_ONLY,
         }
     }
 
