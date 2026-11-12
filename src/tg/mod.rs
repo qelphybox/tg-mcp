@@ -3,7 +3,8 @@
 //! - [`Login`] / [`LoginAttempt`]: the Telegram part of the Login flow (QR login, then
 //!   the Cloud password if the Account has one).
 //! - [`Connector`]: turns an opened Grant into a Live client.
-//! - [`Telegram`]: calls on one Account: reading, writing Drafts and sending messages.
+//! - [`Telegram`]: calls on one Account: reading, writing Drafts, sending messages,
+//!   reacting and marking as read.
 //!
 //! Tests drive the whole server through the fakes in [`fake`]; [`grammers`] is the
 //! real Telegram (QR login + Client pool).
@@ -17,11 +18,13 @@ pub mod fake;
 pub mod find;
 pub mod folders;
 pub mod grammers;
+pub mod mark_read;
 pub mod markdown;
 pub mod media;
 pub mod members;
 pub mod messages;
 mod pool;
+pub mod reactions;
 pub mod rich;
 pub mod sanitise;
 pub mod search;
@@ -238,6 +241,27 @@ pub trait Telegram: Send + Sync + 'static {
     /// twice. The MCP layer checks the Send allow-list and confirmation
     /// before calling this; nothing here does.
     async fn send_message(&self, message: send::NewMessage) -> Result<send::SentMessage, TgError>;
+
+    /// Set the Account's reaction on one message (`messages.sendReaction`,
+    /// method class Writes, not counted against the Chat's Send cap),
+    /// replacing its previous one there; `emoji: None` removes it. The emoji
+    /// must be one of Telegram's standard reactions
+    /// ([`reactions::standard`], against Telegram's list, fetched once per
+    /// Live client); setting the reaction already there is no error. A Chat
+    /// that doesn't allow it, or a message it doesn't have, is
+    /// [`TgError::InvalidInput`]. The MCP layer checks the Send allow-list
+    /// before calling this; nothing here does.
+    async fn react(&self, reaction: reactions::NewReaction) -> Result<reactions::Reacted, TgError>;
+
+    /// Mark a Chat read up to a message, or its latest
+    /// (`messages.readHistory` / `channels.readHistory`), or with `topic`
+    /// only that Topic of a forum (`messages.readDiscussion`, up to the
+    /// Topic's latest message unless `up_to` says otherwise). Method class
+    /// Writes, not counted against the Chat's Send cap. `topic` on a Chat
+    /// that is no forum, or a Topic it doesn't have, is
+    /// [`TgError::InvalidInput`]. The MCP layer checks the Send allow-list
+    /// before calling this; nothing here does.
+    async fn mark_read(&self, read: mark_read::MarkRead) -> Result<mark_read::MarkedRead, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

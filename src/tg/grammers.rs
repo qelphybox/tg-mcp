@@ -25,6 +25,7 @@ use super::{
     drafts::{self, Drafts, DraftsAnswer, NewDraft, RawDraft, SavedDraft},
     find::{self, FindRequest, FoundAnswer, FoundChats, QUERY_TOO_SHORT},
     folders::{self, ChatFolder, FolderCache, RawChatFolder},
+    mark_read::{MarkRead, MarkedRead},
     markdown::{Entity, EntityKind},
     media,
     media::{FileLocation, StoredFile},
@@ -37,6 +38,7 @@ use super::{
         MessageRequest, RawHistoryMessage, RawReaction, Reaction, read_history,
     },
     pool::{Evicted, Live, Pool},
+    reactions::{self, NewReaction, Reacted},
     rich::message_text,
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
@@ -451,6 +453,10 @@ pub struct LiveClient {
     /// This session's `updateTranscribedAudio` updates, for transcriptions
     /// waiting for their final text ([`forward_transcriptions`]).
     transcriptions: TranscriptionFeed,
+    /// Telegram's active standard reactions (`messages.getAvailableReactions`),
+    /// fetched by the first `react` and kept as long as this Live client
+    /// lives: Telegram changes them rarely.
+    reactions: tokio::sync::OnceCell<Vec<String>>,
     /// Every request handed to grammers (past the limiter), serialized, so tests can
     /// see what reached Telegram.
     #[cfg(test)]
@@ -1028,6 +1034,178 @@ impl Telegram for LiveClient {
             reply_to: placement.reply_to,
         })
     }
+
+    async fn react(&self, reaction: NewReaction) -> Result<Reacted, TgError> {
+        let NewReaction {
+            chat: id,
+            message_id,
+            emoji,
+        } = reaction;
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
+        let emoji = match emoji {
+            Some(emoji) => Some(reactions::standard(
+                &emoji,
+                self.available_reactions().await?,
+            )?),
+            None => None,
+        };
+        // Telegram's "nothing changed": the reaction was already so.
+        let unchanged = std::sync::atomic::AtomicBool::new(false);
+        let answer = self
+            .call_refusing(
+                &tl::functions::messages::SendReaction {
+                    big: false,
+                    add_to_recent: false,
+                    peer,
+                    msg_id: message_id,
+                    reaction: emoji.clone().map(|emoticon| {
+                        vec![tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                            emoticon,
+                        })]
+                    }),
+                },
+                Some(chat),
+                |err| match reaction_refusal(err, chat, message_id, emoji.as_deref())? {
+                    ReactionRefusal::Unchanged => {
+                        unchanged.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Some(TgError::Upstream("reaction unchanged".into()))
+                    }
+                    ReactionRefusal::Refused(err) => Some(err),
+                },
+            )
+            .await;
+        match answer {
+            Ok(_) => {}
+            Err(_) if unchanged.load(std::sync::atomic::Ordering::SeqCst) => {}
+            Err(err) => return Err(err),
+        }
+        Ok(Reacted {
+            chat,
+            message_id,
+            emoji,
+        })
+    }
+
+    async fn mark_read(&self, read: MarkRead) -> Result<MarkedRead, TgError> {
+        let MarkRead {
+            chat: id,
+            up_to,
+            topic,
+        } = read;
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
+        if let Some(topic) = topic {
+            self.require_forum(id).await?;
+            let up_to = match up_to {
+                Some(up_to) => up_to,
+                None => self.topic_top_message(&peer, chat, topic).await?,
+            };
+            self.call_refusing(
+                &tl::functions::messages::ReadDiscussion {
+                    peer,
+                    msg_id: topic,
+                    read_max_id: up_to,
+                },
+                Some(chat),
+                |err| {
+                    topic_refusal(Some(topic), err).or_else(|| {
+                        err.is("TOPIC_DELETED")
+                            .then(|| topics::unknown_topic(topic))
+                    })
+                },
+            )
+            .await?;
+            return Ok(MarkedRead {
+                chat,
+                topic: Some(topic),
+                up_to: Some(up_to),
+            });
+        }
+        // 0: up to the latest message.
+        let max_id = up_to.unwrap_or(0);
+        match peer {
+            tl::enums::InputPeer::Channel(c) => {
+                let channel = tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: c.channel_id,
+                    access_hash: c.access_hash,
+                });
+                self.call(
+                    &tl::functions::channels::ReadHistory { channel, max_id },
+                    Some(chat),
+                )
+                .await?;
+            }
+            peer => {
+                self.call(
+                    &tl::functions::messages::ReadHistory { peer, max_id },
+                    Some(chat),
+                )
+                .await?;
+            }
+        }
+        Ok(MarkedRead {
+            chat,
+            topic: None,
+            up_to,
+        })
+    }
+}
+
+/// What Telegram's refusal of a `messages.sendReaction` means.
+#[derive(Debug)]
+enum ReactionRefusal {
+    /// `MESSAGE_NOT_MODIFIED` (or `REACTION_EMPTY` for a removal): the
+    /// Account's reaction already was what was asked. Not an error: `react`
+    /// is idempotent.
+    Unchanged,
+    /// The caller's to fix, as what to fix.
+    Refused(TgError),
+}
+
+/// Telegram's refusals of a `messages.sendReaction` of `emoji` (`None`:
+/// removing it) on message `message_id` of `chat`. Only error codes are
+/// quoted, never Telegram's text.
+fn reaction_refusal(
+    err: &InvocationError,
+    chat: ChatId,
+    message_id: i32,
+    emoji: Option<&str>,
+) -> Option<ReactionRefusal> {
+    let InvocationError::Rpc(rpc) = err else {
+        return None;
+    };
+    let code = rpc.name.as_str();
+    let refused = |err: TgError| Some(ReactionRefusal::Refused(err));
+    let invalid = |msg: String| refused(TgError::InvalidInput(msg));
+    match (code, emoji) {
+        ("MESSAGE_NOT_MODIFIED", _) | ("REACTION_EMPTY", None) => Some(ReactionRefusal::Unchanged),
+        ("REACTION_INVALID" | "REACTION_EMPTY", Some(emoji)) => {
+            refused(reactions::not_allowed(chat, emoji))
+        }
+        ("MESSAGE_ID_INVALID" | "MSG_ID_INVALID", _) => {
+            refused(reactions::no_such_message(chat, message_id))
+        }
+        ("REACTIONS_TOO_MANY", _) => invalid(format!(
+            "message {message_id} already has as many different reactions as Telegram allows \
+             (REACTIONS_TOO_MANY): react with one it already has (get_messages shows them)"
+        )),
+        ("PREMIUM_ACCOUNT_REQUIRED", _) => invalid(format!(
+            "this reaction needs Telegram Premium, which this account doesn't have \
+             (PREMIUM_ACCOUNT_REQUIRED): react with another standard emoji in {chat}"
+        )),
+        (
+            "CHAT_WRITE_FORBIDDEN"
+            | "CHAT_ADMIN_REQUIRED"
+            | "CHAT_RESTRICTED"
+            | "USER_BANNED_IN_CHANNEL"
+            | "ANONYMOUS_REACTIONS_DISABLED",
+            _,
+        ) => invalid(format!(
+            "this account can't react in {chat}: Telegram refused the reaction ({code})"
+        )),
+        _ => None,
+    }
 }
 
 /// The new message in Telegram's answer to `messages.sendMessage`.
@@ -1603,6 +1781,59 @@ impl LiveClient {
             .copied()
     }
 
+    /// Telegram's active standard reactions, in its order: one
+    /// `messages.getAvailableReactions` the first time, kept from then on.
+    async fn available_reactions(&self) -> Result<&[String], TgError> {
+        self.reactions
+            .get_or_try_init(|| async {
+                match self
+                    .call(
+                        &tl::functions::messages::GetAvailableReactions { hash: 0 },
+                        None,
+                    )
+                    .await?
+                {
+                    tl::enums::messages::AvailableReactions::Reactions(answer) => {
+                        Ok(standard_reactions(answer.reactions))
+                    }
+                    tl::enums::messages::AvailableReactions::NotModified => Err(TgError::Upstream(
+                        "telegram sent no list of reactions".into(),
+                    )),
+                }
+            })
+            .await
+            .map(Vec::as_slice)
+    }
+
+    /// The id of Topic `topic`'s latest message (`top_message`): one
+    /// `messages.getForumTopicsByID`. A Topic the forum doesn't have is
+    /// [`topics::unknown_topic`].
+    async fn topic_top_message(
+        &self,
+        peer: &tl::enums::InputPeer,
+        chat: ChatId,
+        topic: i32,
+    ) -> Result<i32, TgError> {
+        let tl::enums::messages::ForumTopics::Topics(answer) = self
+            .call_refusing(
+                &tl::functions::messages::GetForumTopicsById {
+                    peer: peer.clone(),
+                    topics: vec![topic],
+                },
+                Some(chat),
+                |err| topic_refusal(Some(topic), err),
+            )
+            .await?;
+        answer
+            .topics
+            .into_iter()
+            .find_map(|t| match t {
+                tl::enums::ForumTopic::Topic(t) if t.id == topic => Some(t.top_message),
+                _ => None,
+            })
+            .ok_or_else(|| topics::unknown_topic(topic))
+    }
+
     /// `topic` needs a forum ([`Self::is_forum`]).
     async fn require_forum(&self, id: ChatRef) -> Result<(), TgError> {
         if self.is_forum(id).await? {
@@ -2131,6 +2362,14 @@ fn forum_flag(chat: &tl::enums::Chat) -> Option<(ChatId, bool)> {
 }
 
 /// A Topic Telegram describes; a deleted one is none.
+/// The emoji of Telegram's active standard reactions, in its order.
+fn standard_reactions(available: Vec<tl::enums::AvailableReaction>) -> Vec<String> {
+    available
+        .into_iter()
+        .filter_map(|tl::enums::AvailableReaction::Reaction(r)| (!r.inactive).then_some(r.reaction))
+        .collect()
+}
+
 fn raw_topic(topic: tl::enums::ForumTopic) -> Option<RawTopic> {
     match topic {
         tl::enums::ForumTopic::Topic(t) => Some(RawTopic {
@@ -2694,6 +2933,7 @@ impl GrammersConnector {
             dead: Default::default(),
             limiter: self.limits.for_account(account_id),
             transcriptions,
+            reactions: Default::default(),
             #[cfg(test)]
             sent: Default::default(),
             #[cfg(test)]
@@ -3945,6 +4185,7 @@ fn offline_live(grant: OpenedGrant, store: Arc<SessionStore>) -> LiveClient {
         dead: Default::default(),
         limiter: Arc::new(AccountLimiter::new(crate::limits::LimitsConfig::default())),
         transcriptions: transcribe::feed(),
+        reactions: Default::default(),
         sent: Default::default(),
         answers: Default::default(),
     }
@@ -6504,5 +6745,311 @@ mod send_tests {
         let answer = send_answer(long);
         assert_eq!(answer.sent(5, 9).unwrap(), (78, 9), "no message: now");
         assert!(answer.sent(6, 9).is_err());
+    }
+}
+
+/// Reactions and marking as read (#47): what `react` and `mark_read` send,
+/// Telegram's list of reactions asked for once, and how its refusals read.
+#[cfg(test)]
+mod react_tests {
+    use grammers_client::tl::Serializable;
+
+    use super::*;
+    use crate::{
+        limits::WriteLimit,
+        sessions::{TokenTtl, Vault},
+    };
+
+    const USER: ChatId = ChatId::User(7);
+    const FORUM: ChatId = ChatId::Channel(5);
+
+    async fn cold_client() -> (LiveClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let issued = vault.create_grant("client", 42, b"").await.unwrap();
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        (offline_live(grant, Arc::new(SessionStore::new())), dir)
+    }
+
+    /// A Live client that already has Telegram's list of reactions.
+    async fn client_with_reactions() -> (LiveClient, tempfile::TempDir) {
+        let (live, dir) = cold_client().await;
+        live.reactions
+            .set(["👍", "❤", "🔥"].into_iter().map(String::from).collect())
+            .unwrap();
+        (live, dir)
+    }
+
+    fn sent(live: &LiveClient) -> Vec<Vec<u8>> {
+        live.sent.lock().unwrap().clone()
+    }
+
+    fn at(chat: ChatId) -> ChatRef {
+        ChatRef::new(chat, Some(99))
+    }
+
+    fn reaction(chat: ChatId, message_id: i32, emoji: Option<&str>) -> NewReaction {
+        NewReaction {
+            chat: at(chat),
+            message_id,
+            emoji: emoji.map(String::from),
+        }
+    }
+
+    fn user_peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 99,
+        })
+    }
+
+    fn forum_peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: 99,
+        })
+    }
+
+    fn send_reaction(msg_id: i32, emoji: Option<&str>) -> Vec<u8> {
+        tl::functions::messages::SendReaction {
+            big: false,
+            add_to_recent: false,
+            peer: user_peer(),
+            msg_id,
+            reaction: emoji.map(|e| {
+                vec![tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                    emoticon: e.into(),
+                })]
+            }),
+        }
+        .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_reaction_is_one_send_reaction_with_telegrams_emoji_and_null_removes_it() {
+        let (live, _dir) = client_with_reactions().await;
+        // Offline, Telegram's answer is an error; the request is what counts.
+        assert!(live.react(reaction(USER, 5, Some("❤"))).await.is_err());
+        assert!(live.react(reaction(USER, 5, None)).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [send_reaction(5, Some("❤")), send_reaction(5, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn telegrams_list_of_reactions_is_asked_for_by_the_first_reaction_only() {
+        let (live, _dir) = cold_client().await;
+        let ask = tl::functions::messages::GetAvailableReactions { hash: 0 }.to_bytes();
+        // Offline the list can't be had: nothing is sent.
+        assert!(live.react(reaction(USER, 5, Some("👍"))).await.is_err());
+        assert_eq!(sent(&live), std::slice::from_ref(&ask));
+        // Removing needs no list.
+        assert!(live.react(reaction(USER, 5, None)).await.is_err());
+        assert_eq!(sent(&live), [ask, send_reaction(5, None)]);
+    }
+
+    #[tokio::test]
+    async fn an_emoji_telegram_doesnt_offer_never_reaches_it() {
+        let (live, _dir) = client_with_reactions().await;
+        match live.react(reaction(USER, 5, Some("🦖"))).await {
+            Err(TgError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("not one of Telegram's standard reactions"),
+                    "{msg}"
+                );
+                assert!(msg.ends_with("👍 ❤ 🔥"), "{msg}");
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+        assert!(sent(&live).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_same_reaction_again_is_no_error_and_refusals_say_what_to_fix() {
+        let (live, _dir) = client_with_reactions().await;
+        type React = tl::functions::messages::SendReaction;
+        live.answers.lock().unwrap().extend([
+            rpc::<React>(400, "MESSAGE_NOT_MODIFIED"),
+            rpc::<React>(400, "REACTION_EMPTY"),
+            rpc::<React>(400, "REACTION_INVALID"),
+            rpc::<React>(400, "REACTIONS_TOO_MANY"),
+            rpc::<React>(400, "MESSAGE_ID_INVALID"),
+            rpc::<React>(403, "CHAT_WRITE_FORBIDDEN"),
+            rpc::<React>(403, "PREMIUM_ACCOUNT_REQUIRED"),
+            rpc::<React>(400, "PEER_FLOOD"),
+            rpc::<React>(420, "FLOOD_WAIT_30"),
+        ]);
+        let reacted = live.react(reaction(USER, 5, Some("❤️"))).await.unwrap();
+        assert_eq!(
+            reacted,
+            Reacted {
+                chat: USER,
+                message_id: 5,
+                emoji: Some("❤".into())
+            }
+        );
+        let removed = live.react(reaction(USER, 5, None)).await.unwrap();
+        assert_eq!(removed.emoji, None, "nothing to remove is no error");
+
+        let refused = |expected: &'static str| {
+            move |result: Result<Reacted, TgError>| match result {
+                Err(TgError::InvalidInput(msg)) => assert!(msg.contains(expected), "{msg}"),
+                other => panic!("expected {expected}, got {other:?}"),
+            }
+        };
+        refused("user:7 doesn't allow the reaction 🔥 (REACTION_INVALID)")(
+            live.react(reaction(USER, 5, Some("🔥"))).await,
+        );
+        refused("already has as many different reactions")(
+            live.react(reaction(USER, 5, Some("🔥"))).await,
+        );
+        refused("message 6 is not a message of user:7")(
+            live.react(reaction(USER, 6, Some("🔥"))).await,
+        );
+        refused("can't react in user:7: Telegram refused the reaction (CHAT_WRITE_FORBIDDEN)")(
+            live.react(reaction(USER, 5, Some("🔥"))).await,
+        );
+        refused("needs Telegram Premium")(live.react(reaction(USER, 5, Some("🔥"))).await);
+        assert!(matches!(
+            live.react(reaction(USER, 5, Some("🔥"))).await,
+            Err(TgError::PeerFlood)
+        ));
+        assert!(matches!(
+            live.react(reaction(USER, 5, Some("🔥"))).await,
+            Err(TgError::FloodWait {
+                seconds: 30,
+                class: MethodClass::Writes
+            })
+        ));
+        assert_eq!(sent(&live).len(), 9, "each asked once, never retried");
+    }
+
+    #[tokio::test]
+    async fn reactions_spend_the_writes_budget_but_not_the_chats_send_cap() {
+        let (live, _dir) = client_with_reactions().await;
+        // More than the Send cap of 5 a minute, all to one chat.
+        for n in 0..20 {
+            assert!(matches!(
+                live.react(reaction(USER, n + 1, Some("👍"))).await,
+                Err(TgError::Upstream(_))
+            ));
+        }
+        assert_eq!(sent(&live).len(), 20);
+        // The writes budget (20 in 10 minutes) is used up, marking read too.
+        assert!(matches!(
+            live.react(reaction(USER, 21, Some("👍"))).await,
+            Err(TgError::WritesLimited {
+                limit: WriteLimit::Account,
+                ..
+            })
+        ));
+        assert!(matches!(
+            live.mark_read(MarkRead {
+                chat: at(USER),
+                up_to: None,
+                topic: None
+            })
+            .await,
+            Err(TgError::WritesLimited {
+                limit: WriteLimit::Account,
+                ..
+            })
+        ));
+        assert_eq!(sent(&live).len(), 20, "refused at home");
+    }
+
+    #[tokio::test]
+    async fn a_chat_is_read_up_to_its_latest_message_or_up_to() {
+        let (live, _dir) = cold_client().await;
+        let read = |chat, up_to| MarkRead {
+            chat: at(chat),
+            up_to,
+            topic: None,
+        };
+        assert!(live.mark_read(read(USER, None)).await.is_err());
+        assert!(live.mark_read(read(USER, Some(40))).await.is_err());
+        assert!(live.mark_read(read(FORUM, None)).await.is_err());
+        let channel = || {
+            tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                channel_id: 5,
+                access_hash: 99,
+            })
+        };
+        assert_eq!(
+            sent(&live),
+            [
+                tl::functions::messages::ReadHistory {
+                    peer: user_peer(),
+                    max_id: 0
+                }
+                .to_bytes(),
+                tl::functions::messages::ReadHistory {
+                    peer: user_peer(),
+                    max_id: 40
+                }
+                .to_bytes(),
+                tl::functions::channels::ReadHistory {
+                    channel: channel(),
+                    max_id: 0
+                }
+                .to_bytes(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_topic_is_read_with_read_discussion_up_to_its_latest_message() {
+        let (live, _dir) = cold_client().await;
+        live.forums.lock().unwrap().insert(FORUM, true);
+        let read = |up_to| MarkRead {
+            chat: at(FORUM),
+            up_to,
+            topic: Some(10),
+        };
+        assert!(live.mark_read(read(Some(12))).await.is_err());
+        // Up to the latest: the Topic's top message, asked for first.
+        assert!(live.mark_read(read(None)).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [
+                tl::functions::messages::ReadDiscussion {
+                    peer: forum_peer(),
+                    msg_id: 10,
+                    read_max_id: 12
+                }
+                .to_bytes(),
+                tl::functions::messages::GetForumTopicsById {
+                    peer: forum_peer(),
+                    topics: vec![10]
+                }
+                .to_bytes(),
+            ]
+        );
+
+        type Read = tl::functions::messages::ReadDiscussion;
+        live.answers
+            .lock()
+            .unwrap()
+            .push_back(rpc::<Read>(400, "TOPIC_ID_INVALID"));
+        assert!(matches!(
+            live.mark_read(read(Some(12))).await,
+            Err(TgError::InvalidInput(msg)) if msg.contains("topic 10 is not a Topic")
+        ));
+
+        // A user is no forum: refused before Telegram.
+        let before = sent(&live).len();
+        assert!(matches!(
+            live.mark_read(MarkRead {
+                chat: at(USER),
+                up_to: None,
+                topic: Some(1)
+            })
+            .await,
+            Err(TgError::InvalidInput(msg)) if msg.contains("is not a forum")
+        ));
+        assert_eq!(sent(&live).len(), before);
     }
 }

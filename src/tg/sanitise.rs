@@ -30,8 +30,10 @@ use super::{
     drafts::{Draft, DraftChat, Drafts, NewDraft, SavedDraft},
     find::{FoundChat, FoundChats},
     folders::ChatFolder,
+    mark_read::{MarkRead, MarkedRead},
     members::{Member, MemberPage, MembersQuery},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
+    reactions::{NewReaction, Reacted},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
     send::{NewMessage, SentMessage},
     topics::Topic,
@@ -733,6 +735,17 @@ impl Telegram for Sanitised {
     /// Ids and a date only: nothing to sanitise.
     async fn send_message(&self, message: NewMessage) -> Result<SentMessage, TgError> {
         self.0.send_message(message).await
+    }
+
+    /// Ids and an emoji from Telegram's own list of reactions: nothing to
+    /// sanitise.
+    async fn react(&self, reaction: NewReaction) -> Result<Reacted, TgError> {
+        self.0.react(reaction).await
+    }
+
+    /// Ids only.
+    async fn mark_read(&self, read: MarkRead) -> Result<MarkedRead, TgError> {
+        self.0.mark_read(read).await
     }
 }
 

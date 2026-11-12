@@ -25,6 +25,7 @@ use super::{
     drafts::{self, Drafts, DraftsAnswer, NewDraft, RawDraft, SavedDraft},
     find::{self, FindRequest, FoundAnswer, FoundChats},
     folders::{self, ChatFolder, FolderCache, RawChatFolder},
+    mark_read::{MarkRead, MarkedRead},
     markdown::FormattedText,
     media::{FileLocation, StoredFile},
     members::{
@@ -35,6 +36,7 @@ use super::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MediaKind, MediaSummary, MessageAnswer,
         MessageAt, MessagePage, MessageRequest, RawHistoryMessage, read_history,
     },
+    reactions::{self, NewReaction, Reacted},
     search::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
@@ -148,6 +150,35 @@ pub struct FakeData {
     /// answers like FLOOD_WAIT_<seconds>, and nothing else does.
     #[serde(default)]
     pub writes_flood_wait: Option<u32>,
+    /// Telegram's active standard reactions (`messages.getAvailableReactions`),
+    /// in its order.
+    #[serde(default = "fake_standard_reactions")]
+    pub available_reactions: Vec<String>,
+    /// Chats whose admins allow only these reactions (none: reactions are
+    /// off there); any other Chat allows every standard one.
+    #[serde(default)]
+    pub allowed_reactions: std::collections::HashMap<ChatId, Vec<String>>,
+}
+
+/// Some of Telegram's standard reactions, as its list names them (no
+/// variation selectors).
+pub fn fake_standard_reactions() -> Vec<String> {
+    [
+        "👍",
+        "👎",
+        "❤",
+        "🔥",
+        "🎉",
+        "😁",
+        "🤔",
+        "👌",
+        "🙏",
+        "❤\u{200D}🔥",
+        "☃",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// One Draft of a fake Account: a Chat's input field, or a forum Topic's.
@@ -279,6 +310,84 @@ struct SentState {
     sent: std::collections::HashMap<i64, Vec<FakeSentMessage>>,
     /// Errors the next sends get, in order, instead of being sent.
     refusals: std::collections::VecDeque<TgError>,
+}
+
+/// One Account's reactions, by Chat ([`peer_key`]) and message.
+type AccountReactions = std::collections::BTreeMap<(i64, i32), String>;
+
+/// The Account's own reactions as the fake models them (`messages.sendReaction`),
+/// shared by every Grant like Telegram is: at most one per message.
+#[derive(Debug, Default)]
+pub struct FakeReactions {
+    /// Each Account's reactions by Chat and message.
+    state: Mutex<std::collections::HashMap<i64, AccountReactions>>,
+    /// How many `messages.sendReaction` reached Telegram, per Account.
+    calls: Mutex<std::collections::HashMap<i64, usize>>,
+}
+
+impl FakeReactions {
+    /// The Account's reaction on message `message_id` of `chat`, if any.
+    pub fn on(&self, account: i64, chat: ChatId, message_id: i32) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .get(&account)?
+            .get(&(peer_key(chat), message_id))
+            .cloned()
+    }
+
+    /// How many reactions (set or removed) of the Account reached Telegram.
+    pub fn calls(&self, account: i64) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .get(&account)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn set(&self, account: i64, chat: ChatId, message_id: i32, emoji: Option<String>) {
+        *self.calls.lock().unwrap().entry(account).or_default() += 1;
+        let mut state = self.state.lock().unwrap();
+        let mine = state.entry(account).or_default();
+        let key = (peer_key(chat), message_id);
+        match emoji {
+            Some(emoji) => {
+                mine.insert(key, emoji);
+            }
+            None => {
+                mine.remove(&key);
+            }
+        }
+    }
+}
+
+/// What the fake Account marked read, oldest first, shared by every Grant
+/// like Telegram is.
+#[derive(Debug, Default)]
+pub struct FakeReads {
+    state: Mutex<std::collections::HashMap<i64, Vec<MarkedRead>>>,
+}
+
+impl FakeReads {
+    /// Everything the Account marked read, oldest first.
+    pub fn of(&self, account: i64) -> Vec<MarkedRead> {
+        self.state
+            .lock()
+            .unwrap()
+            .get(&account)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn mark(&self, account: i64, read: MarkedRead) {
+        self.state
+            .lock()
+            .unwrap()
+            .entry(account)
+            .or_default()
+            .push(read);
+    }
 }
 
 /// The id the fake gives the first message an Account sends.
@@ -760,7 +869,16 @@ impl FakeData {
             chat_folders_fail: false,
             drafts: Vec::new(),
             writes_flood_wait: None,
+            available_reactions: fake_standard_reactions(),
+            allowed_reactions: Default::default(),
         }
+    }
+
+    /// `chat`'s admins allow only `reactions` (none: reactions are off).
+    pub fn with_allowed_reactions(mut self, chat: ChatId, reactions: &[&str]) -> Self {
+        self.allowed_reactions
+            .insert(chat, reactions.iter().map(|r| r.to_string()).collect());
+        self
     }
 
     pub fn with_drafts(mut self, drafts: Vec<FakeDraft>) -> Self {
@@ -1098,6 +1216,8 @@ pub struct FakeTelegram {
     transcriber: Arc<FakeTranscriber>,
     drafts: Arc<FakeDrafts>,
     sent: Arc<FakeSent>,
+    reactions: Arc<FakeReactions>,
+    reads: Arc<FakeReads>,
 }
 
 /// Telegram's transcription service as the fake models it
@@ -1611,6 +1731,8 @@ impl FakeTelegram {
             transcriber: Arc::default(),
             drafts,
             sent: Arc::default(),
+            reactions: Arc::default(),
+            reads: Arc::default(),
         }
     }
 
@@ -1622,6 +1744,16 @@ impl FakeTelegram {
     /// Where this Account's sent messages are kept.
     pub fn sent(&self) -> &Arc<FakeSent> {
         &self.sent
+    }
+
+    /// Where this Account's reactions are kept.
+    pub fn reactions(&self) -> &Arc<FakeReactions> {
+        &self.reactions
+    }
+
+    /// Where what this Account marked read is kept.
+    pub fn reads(&self) -> &Arc<FakeReads> {
+        &self.reads
     }
 
     /// The transcription service this Account's transcriptions go to.
@@ -1664,14 +1796,7 @@ impl FakeTelegram {
         reply_to: Option<i32>,
         topic: Option<i32>,
     ) -> Result<(ChatId, compose::Placement), TgError> {
-        self.check_hash(at)?;
-        let chat = at.chat();
-        // Saved Messages is always there.
-        if !self.knows(chat) && chat != ChatId::User(self.data.account.id) {
-            return Err(TgError::InvalidInput(format!(
-                "{chat} is not one of your chats; chat ids come from list_chats"
-            )));
-        }
+        let chat = self.own_chat(at)?;
         let message_topic = |id| {
             get_message(&self.data.messages, chat, &MessageRequest { id })
                 .into_iter()
@@ -1686,12 +1811,7 @@ impl FakeTelegram {
             |id| std::future::ready(Ok(message_topic(id))),
         )
         .await?;
-        if let Some(seconds) = self.data.writes_flood_wait {
-            return Err(TgError::FloodWait {
-                seconds,
-                class: MethodClass::Writes,
-            });
-        }
+        self.writes_flood()?;
         if let Some(id) = placement.reply_to
             && message_topic(id).is_none()
         {
@@ -1703,6 +1823,32 @@ impl FakeTelegram {
             self.check_topic(chat, topic)?;
         }
         Ok((chat, placement))
+    }
+
+    /// A Chat of the Account's to write to: Telegram refuses a wrong access
+    /// hash and a Chat the Account doesn't have; Saved Messages is always
+    /// there.
+    fn own_chat(&self, at: ChatRef) -> Result<ChatId, TgError> {
+        self.check_hash(at)?;
+        let chat = at.chat();
+        if !self.knows(chat) && chat != ChatId::User(self.data.account.id) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        Ok(chat)
+    }
+
+    /// With `writes_flood_wait`, every write is refused like Telegram's
+    /// FLOOD_WAIT of writes.
+    fn writes_flood(&self) -> Result<(), TgError> {
+        match self.data.writes_flood_wait {
+            Some(seconds) => Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Writes,
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2253,6 +2399,74 @@ impl Telegram for FakeTelegram {
             topic: placement.topic,
             reply_to: placement.reply_to,
         })
+    }
+
+    /// Like the Live client: the emoji matched against Telegram's list,
+    /// then one `messages.sendReaction`, which Telegram refuses for a
+    /// message the Chat doesn't have or a reaction the Chat doesn't allow.
+    async fn react(&self, reaction: NewReaction) -> Result<Reacted, TgError> {
+        let chat = self.own_chat(reaction.chat)?;
+        let emoji = reaction
+            .emoji
+            .as_deref()
+            .map(|e| reactions::standard(e, &self.data.available_reactions))
+            .transpose()?;
+        self.writes_flood()?;
+        let request = MessageRequest {
+            id: reaction.message_id,
+        };
+        if !get_message(&self.data.messages, chat, &request)
+            .iter()
+            .any(|found| found.chat == chat)
+        {
+            return Err(reactions::no_such_message(chat, reaction.message_id));
+        }
+        if let (Some(emoji), Some(allowed)) = (&emoji, self.data.allowed_reactions.get(&chat))
+            && !allowed.contains(emoji)
+        {
+            return Err(reactions::not_allowed(chat, emoji));
+        }
+        self.reactions.set(
+            self.data.account.id,
+            chat,
+            reaction.message_id,
+            emoji.clone(),
+        );
+        Ok(Reacted {
+            chat,
+            message_id: reaction.message_id,
+            emoji,
+        })
+    }
+
+    /// Like the Live client: a Topic needs a forum that has it, and by
+    /// default is read up to its latest message (its top message).
+    async fn mark_read(&self, read: MarkRead) -> Result<MarkedRead, TgError> {
+        let chat = self.own_chat(read.chat)?;
+        if let Some(topic) = read.topic {
+            self.check_topic(chat, topic)?;
+        }
+        self.writes_flood()?;
+        let up_to = match (read.topic, read.up_to) {
+            (Some(topic), None) => Some(
+                self.data
+                    .messages
+                    .get(&chat)
+                    .into_iter()
+                    .flatten()
+                    .filter(|m| topic_of(m.topic) == topic)
+                    .map(|m| m.id)
+                    .fold(topic, i32::max),
+            ),
+            (_, up_to) => up_to,
+        };
+        let marked = MarkedRead {
+            chat,
+            topic: read.topic,
+            up_to,
+        };
+        self.reads.mark(self.data.account.id, marked);
+        Ok(marked)
     }
 }
 
@@ -2999,6 +3213,10 @@ struct FakeTelegramSide {
     drafts: Arc<FakeDrafts>,
     /// Every Account's sent messages.
     sent: Arc<FakeSent>,
+    /// Every Account's reactions.
+    reactions: Arc<FakeReactions>,
+    /// What every Account marked read.
+    reads: Arc<FakeReads>,
     /// Each Grant's [`FolderCache`], kept like `known`.
     folder_caches: Mutex<std::collections::HashMap<String, Arc<FolderCache>>>,
     /// The folder requests answered, for every Grant, in order.
@@ -3048,6 +3266,16 @@ impl FakeConnector {
     /// Every Account's sent messages, kept by Telegram for all of its Grants.
     pub fn sent(&self) -> Arc<FakeSent> {
         self.telegram.sent.clone()
+    }
+
+    /// Every Account's reactions, kept by Telegram for all of its Grants.
+    pub fn reactions(&self) -> Arc<FakeReactions> {
+        self.telegram.reactions.clone()
+    }
+
+    /// What every Account marked read, for all of its Grants.
+    pub fn reads(&self) -> Arc<FakeReads> {
+        self.telegram.reads.clone()
     }
 
     /// How many Live clients the Consent screen opened, for sessions without a Grant.
@@ -3154,6 +3382,8 @@ impl Connector for FakeConnector {
             transcriber: self.telegram.transcriber.clone(),
             drafts: self.telegram.drafts.clone(),
             sent: self.telegram.sent.clone(),
+            reactions: self.telegram.reactions.clone(),
+            reads: self.telegram.reads.clone(),
         }))
     }
 
@@ -3187,6 +3417,8 @@ impl Connector for FakeConnector {
             transcriber: self.telegram.transcriber.clone(),
             drafts: self.telegram.drafts.clone(),
             sent: self.telegram.sent.clone(),
+            reactions: self.telegram.reactions.clone(),
+            reads: self.telegram.reads.clone(),
         }))
     }
 
