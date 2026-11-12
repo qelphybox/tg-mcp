@@ -5,7 +5,8 @@ Logs in through the real Login flow in your browser, asking for the Scopes you
 name (`-` asks for none). On the Consent screen, tick or untick "Write Drafts"
 so that the Grant gets EXPECTED. Then it checks the token response's `scope`,
 that a refresh asking for every Scope keeps it, what the server's instructions
-say, which tools are listed (save_draft only with `draft`, get_drafts always),
+say, which tools are listed (save_draft only with `draft`, send_message, react and
+mark_read only with `send`, get_drafts always),
 that a Grant without `draft` can't call save_draft (nothing is written: the call
 is refused before Telegram) and that whoami works, and finally revokes the
 Grant (so "Unofficial MCP Server" leaves Telegram -> Settings -> Devices).
@@ -119,6 +120,10 @@ def main():
     drafts = "draft" in EXPECTED.split()
     results.append(rc.check(f"save_draft is {'' if drafts else 'not '}listed",
                             ("save_draft" in names) == drafts))
+    sending = "send" in EXPECTED.split()
+    for tool in ("send_message", "react", "mark_read"):
+        results.append(rc.check(f"{tool} is {'' if sending else 'not '}listed",
+                                (tool in names) == sending))
     if not drafts:
         # Refused by the Scope check before anything reaches Telegram.
         _, _, answer = rc.mcp_post(access, {
