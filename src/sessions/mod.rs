@@ -279,6 +279,11 @@ impl Vault {
         now < consumed_at.saturating_add(grace_secs())
     }
 
+    /// How long the Tokens it issues live.
+    pub fn ttl(&self) -> TokenTtl {
+        self.ttl
+    }
+
     /// Close the pool, checkpointing the WAL into the main database file.
     pub async fn close(self) {
         self.pool.close().await;
@@ -505,6 +510,18 @@ impl Vault {
             .await?;
         tx.commit().await?;
         Ok(issued)
+    }
+
+    /// The OAuth client a Grant was issued to, while the Grant exists. Needs
+    /// no Token and opens nothing: for the confirmation page, which carries
+    /// no Token and shows who asks.
+    pub async fn grant_client(&self, grant_id: &GrantId) -> Result<Option<String>, VaultError> {
+        Ok(
+            sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
+                .bind(grant_id.as_str())
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     /// Whether a Grant still exists (it isn't revoked or purged). Needs no

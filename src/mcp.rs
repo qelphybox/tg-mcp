@@ -29,6 +29,7 @@ mod scoped;
 use self::scoped::ScopedTools;
 use crate::{
     auth::Caller,
+    confirm::PendingSends,
     limits::{MethodClass, WriteLimit},
     links::{MAX_DOWNLOAD_BYTES, MediaDownload, MediaLinks},
     scope::{Scope, Scopes},
@@ -249,6 +250,9 @@ pub struct TgMcp {
     prompt_router: PromptRouter<Self>,
     /// Where get_media's Media links are kept.
     links: Arc<MediaLinks>,
+    /// Where sends wait for the user's confirmation; `None` on a server
+    /// without the confirmation page, where nothing can be confirmed.
+    confirmations: Option<Arc<PendingSends>>,
     /// EXPERIMENTAL (#58 prototype): get_media takes mode `document`.
     experimental_documents: bool,
 }
@@ -289,8 +293,16 @@ impl TgMcp {
             tools: Arc::new(tools),
             prompt_router: Self::prompt_router(),
             links,
+            confirmations: None,
             experimental_documents,
         }
+    }
+
+    /// Sends that need the user's confirmation wait in `confirmations`,
+    /// decided on its `/confirm` page.
+    pub fn with_confirmations(mut self, confirmations: Arc<PendingSends>) -> Self {
+        self.confirmations = Some(confirmations);
+        self
     }
 }
 

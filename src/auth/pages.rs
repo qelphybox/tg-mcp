@@ -37,6 +37,16 @@ pub fn esc(s: &str) -> String {
 }
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    page_with_csp(status, title, body, CSP)
+}
+
+/// A page under `csp` instead of the Login flow's.
+pub(crate) fn page_with_csp(
+    status: StatusCode,
+    title: &str,
+    body: &str,
+    csp: &'static str,
+) -> Response {
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -84,6 +94,14 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
   label.chat input {{ width:auto; padding:0; margin:5px 0 0; flex:none; }}
   .search {{ display:flex; gap:8px; margin:0 0 8px; }}
   .search button, .row button.pick {{ flex:none; }}
+  .message {{ white-space:pre-wrap; overflow-wrap:anywhere; unicode-bidi:isolate; margin:0 0 14px; padding:12px 14px; border:1px solid var(--line); border-radius:12px; max-height:50vh; overflow:auto; }}
+  .message code {{ font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }}
+  .message .url {{ color:var(--muted); font-size:14px; }}
+  .reply {{ margin:0 0 10px; padding:6px 10px; border-left:3px solid var(--accent); font-size:14px; overflow-wrap:anywhere; unicode-bidi:isolate; }}
+  dl.facts {{ margin:0 0 14px; display:grid; grid-template-columns:auto 1fr; gap:4px 12px; }}
+  dl.facts dt {{ color:var(--muted); }}
+  dl.facts dd {{ margin:0; overflow-wrap:anywhere; unicode-bidi:isolate; }}
+  .row form {{ flex:1; display:flex; }}
   footer {{ margin-top:22px; font-size:12px; color:var(--muted); }}
 </style>
 </head>
@@ -104,7 +122,7 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
+        HeaderValue::from_static(csp),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
@@ -391,7 +409,7 @@ fn chat_box(chat: &ChatChoice, picked: &Picked) -> String {
     )
 }
 
-fn kind_label(kind: ChatKind) -> &'static str {
+pub(crate) fn kind_label(kind: ChatKind) -> &'static str {
     match kind {
         ChatKind::Private => "person",
         ChatKind::Bot => "bot",

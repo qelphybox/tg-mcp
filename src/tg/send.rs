@@ -96,14 +96,14 @@ impl SendAnswer {
     }
 }
 
+/// What [`already_sent`] says.
+pub const ALREADY_SENT: &str = "Telegram already has this message (RANDOM_ID_DUPLICATE): it \
+                                was sent before and is not sent again";
+
 /// What a send whose `random_id` Telegram already has says: it went out
 /// before (a retry after a lost answer), and isn't sent again.
 pub fn already_sent() -> TgError {
-    TgError::InvalidInput(
-        "Telegram already has this message (RANDOM_ID_DUPLICATE): it was sent before and is \
-         not sent again"
-            .into(),
-    )
+    TgError::InvalidInput(ALREADY_SENT.into())
 }
 
 #[cfg(test)]

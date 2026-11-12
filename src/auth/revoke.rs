@@ -65,6 +65,11 @@ pub async fn revoke(State(auth): State<Arc<AuthState>>, Form(form): Form<RevokeF
     if links > 0 {
         tracing::info!(grant_id = %grant_id, links, "media links of a revoked grant dropped");
     }
+    // So do its pending sends: they are decided without a Token.
+    let sends = auth.confirmations.revoke_grant(&grant_id);
+    if sends > 0 {
+        tracing::info!(grant_id = %grant_id, sends, "pending sends of a revoked grant dropped");
+    }
     if let Err(err) = auth.vault.delete_grant(&grant_id).await {
         tracing::error!(grant_id = %grant_id, error = %err, "deleting revoked grant failed");
         return no_store(

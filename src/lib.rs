@@ -1,9 +1,10 @@
 //! tg-mcp: a remote MCP server for a personal Telegram account: reading, and
-//! the writes a Grant's Scopes allow (Drafts so far).
+//! the writes a Grant's Scopes allow (Drafts, and sends the user confirms).
 
 pub mod allow_list;
 pub mod auth;
 pub mod config;
+pub mod confirm;
 pub mod db;
 pub mod limits;
 pub mod links;
@@ -53,11 +54,15 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         links.clone(),
         config.oauth_limits,
     ));
+    let confirmations = auth.confirmations.clone();
     auth::spawn_flow_sweeper(&auth);
 
     let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
-        move || Ok(TgMcp::new(links.clone(), experimental_documents)),
+        move || {
+            Ok(TgMcp::new(links.clone(), experimental_documents)
+                .with_confirmations(confirmations.clone()))
+        },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_allowed_hosts(config.allowed_hosts())
@@ -88,5 +93,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         .layer(cors)
         // Media links are for curl in an agent's shell, never for a page:
         // merged after the CORS layer, so no browser may read them cross-origin.
-        .merge(links::router(auth))
+        .merge(links::router(auth.clone()))
+        // Nor may a page read or post the confirmation page cross-origin.
+        .merge(confirm::router(auth))
 }

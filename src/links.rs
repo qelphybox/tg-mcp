@@ -258,7 +258,7 @@ fn key(ticket: &str) -> [u8; 32] {
     Sha256::digest(ticket.as_bytes()).into()
 }
 
-fn expires_at(at: SystemTime) -> String {
+pub(crate) fn expires_at(at: SystemTime) -> String {
     time::OffsetDateTime::from(at)
         .replace_nanosecond(0)
         .ok()

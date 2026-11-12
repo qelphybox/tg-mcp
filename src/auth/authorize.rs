@@ -30,6 +30,7 @@ use super::{
 };
 use crate::{
     allow_list::{MAX_CHATS, SendAllowList},
+    confirm::cookie,
     scope::{Scope, Scopes},
     tg::{LoggedIn, LoginState, TgError},
 };
@@ -169,11 +170,7 @@ pub async fn authorize(
     let login_id = auth.flows.start_login(slot, request, attempt);
 
     let mut response = Redirect::to(&format!("/login/{login_id}")).into_response();
-    let secure = if auth.base_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = if auth.is_https() { "; Secure" } else { "" };
     let cookie =
         format!("{COOKIE}={login_id}; Path=/login; HttpOnly; SameSite=Lax; Max-Age=600{secure}");
     response.headers_mut().insert(
@@ -646,16 +643,31 @@ pub async fn consent_submit(
             let auto_send = send_allow_list
                 .as_ref()
                 .is_some_and(SendAllowList::auto_send);
+            // With `send`, this browser gets the Confirmation cookie: the
+            // only place its pending sends can be sent from (#45).
+            let cookie = send_allow_list
+                .is_some()
+                .then(|| cookie::issue(auth.vault.ttl().refresh, auth.is_https()));
+            let send_allow_list = send_allow_list.map(|list| match &cookie {
+                Some(cookie) => list.with_confirm_cookie(cookie.verifier),
+                None => list,
+            });
             let code = auth
                 .flows
                 .issue_code(request, logged_in, scopes, send_allow_list);
             tracing::info!(client_id = %client_id, scopes = %scopes, send_chats, auto_send, "authorization code issued");
-            redirect_with(
+            let mut response = redirect_with(
                 &redirect_uri,
                 &[("code", &code)],
                 state.as_deref(),
                 &auth.base_url,
-            )
+            );
+            if let Some(cookie) = cookie {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.set_cookie);
+            }
+            response
         }
         ("allow", Progress::InProgress(_)) => pages::error(
             StatusCode::BAD_REQUEST,
@@ -780,7 +792,7 @@ fn redirect_with(
 }
 
 /// What the Consent screen tells the user they'll be sent to.
-fn redirect_target(redirect_uri: &str) -> String {
+pub(crate) fn redirect_target(redirect_uri: &str) -> String {
     match Url::parse(redirect_uri) {
         Ok(url) => match url.host_str() {
             Some(host) if url.scheme() == "https" || url.scheme() == "http" => host.to_string(),
@@ -793,7 +805,7 @@ fn redirect_target(redirect_uri: &str) -> String {
 
 /// An `http(s)` redirect to this computer. A private-use scheme
 /// (`myapp://localhost/…`) keeps its name, which says more than "this computer".
-fn redirect_is_loopback(redirect_uri: &str) -> bool {
+pub(crate) fn redirect_is_loopback(redirect_uri: &str) -> bool {
     Url::parse(redirect_uri).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https") && clients::is_loopback_host(&url)
     })
