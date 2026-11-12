@@ -533,12 +533,27 @@ async fn every_modes_structured_content_matches_the_declared_output_schema() {
         answers.push(view(&client, id).await.unwrap());
     }
     for answer in answers {
-        let structured = answer.structured_content.unwrap();
+        let structured = answer.structured_content.clone().unwrap();
         let errors: Vec<String> = validator
             .iter_errors(&structured)
             .map(|e| e.to_string())
             .collect();
         assert!(errors.is_empty(), "{structured}: {errors:?}");
+        // Clients that show the model only `content` (claude.ai) still give
+        // it the structured result: the text block ends with it as JSON.
+        let text = answer
+            .content
+            .iter()
+            .find_map(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap();
+        let json = text
+            .rsplit_once("Result: ")
+            .map_or(text.as_str(), |(_, j)| j);
+        assert_eq!(
+            serde_json::from_str::<Value>(json).unwrap(),
+            structured,
+            "{text}"
+        );
     }
     // The schema describes every mode, and the input takes `size`.
     let output = schema.to_string();

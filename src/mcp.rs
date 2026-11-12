@@ -1299,15 +1299,7 @@ fn view_result(asked: i32, shown: View) -> Result<CallToolResult, ErrorData> {
             ids(&missing)
         ));
     }
-    let mut content = vec![ContentBlock::text(text)];
-    content.extend(
-        shown
-            .images
-            .iter()
-            .map(|image| ContentBlock::image(BASE64.encode(&image.bytes), image.mime_type)),
-    );
-    let mut result = CallToolResult::success(content);
-    result.structured_content = Some(structured(&MediaResult {
+    let value = structured(&MediaResult {
         mode: MediaMode::View,
         kind,
         download: None,
@@ -1318,8 +1310,30 @@ fn view_result(asked: i32, shown: View) -> Result<CallToolResult, ErrorData> {
         }),
         transcribe: None,
         document: None,
-    })?);
-    Ok(result)
+    })?;
+    let images = shown
+        .images
+        .iter()
+        .map(|image| ContentBlock::image(BASE64.encode(&image.bytes), image.mime_type));
+    Ok(described(text, value, images))
+}
+
+/// A result whose text block says what the rest is and then repeats the
+/// structured result as JSON: clients that show the model only `content`
+/// (claude.ai does) still give it the structured fields, as the MCP spec
+/// asks of a tool with structured content.
+fn described(
+    mut text: String,
+    value: serde_json::Value,
+    rest: impl IntoIterator<Item = ContentBlock>,
+) -> CallToolResult {
+    text.push_str("\n\nResult: ");
+    text.push_str(&value.to_string());
+    let mut content = vec![ContentBlock::text(text)];
+    content.extend(rest);
+    let mut result = CallToolResult::success(content);
+    result.structured_content = Some(value);
+    result
 }
 
 /// A transcription as structured content, its text cut to
@@ -1446,19 +1460,15 @@ fn document_result(chat: ChatRef, asked: i32, read: Document) -> Result<CallTool
             " The text was cut to its first {MAX_DOCUMENT_TEXT_CHARS} characters."
         ));
     }
-    let mut result = CallToolResult::success(vec![
-        ContentBlock::text(text),
-        ContentBlock::resource(resource),
-    ]);
-    result.structured_content = Some(structured(&MediaResult {
+    let value = structured(&MediaResult {
         mode: MediaMode::Document,
         kind: media.kind,
         download: None,
         view: None,
         transcribe: None,
         document: Some(document),
-    })?);
-    Ok(result)
+    })?;
+    Ok(described(text, value, [ContentBlock::resource(resource)]))
 }
 
 fn ids(ids: &[i32]) -> String {

@@ -315,12 +315,26 @@ async fn document_results_match_the_declared_output_schema() {
         answers.push(read(&client, id).await.unwrap());
     }
     for answer in answers {
-        let structured = answer.structured_content.unwrap();
+        let structured = answer.structured_content.clone().unwrap();
         let errors: Vec<String> = validator
             .iter_errors(&structured)
             .map(|e| e.to_string())
             .collect();
         assert!(errors.is_empty(), "{structured}: {errors:?}");
+        // The text block ends with the structured result as JSON (#67).
+        let text = answer
+            .content
+            .iter()
+            .find_map(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap();
+        let json = text
+            .rsplit_once("Result: ")
+            .map_or(text.as_str(), |(_, j)| j);
+        assert_eq!(
+            serde_json::from_str::<Value>(json).unwrap(),
+            structured,
+            "{text}"
+        );
     }
     let input = Value::Object((*tool.input_schema).clone());
     assert_eq!(
