@@ -81,6 +81,10 @@ _Avoid_: write quota, rate limit (unqualified)
 How many messages the Account may send to one Chat in any minute, 5 by default. Only sent messages count, not reactions, marking as read or Drafts. Counted when the message goes to Telegram, so a Pending send doesn't count until the user confirms it, and can still be refused then; over the cap it fails at once with the wait and is never queued.
 _Avoid_: per-chat limit, throttle
 
+**Duplicate guard**:
+`send_message`'s refusal to send the same text (as the Chat shows it: text and formatting) to the same Chat again within 60 seconds of a send by the same Account, whichever Grant asks and whether it went out by Auto-send or from the Confirmation page; it answers "already sent: message N". Keeps only a keyed hash of the text, in memory. Unrelated to `random_id`, which stops one message from going out twice.
+_Avoid_: dedup, idempotency
+
 **Draft**:
 Unsent text in a Chat's input field of the Account, synced to all its devices: one per Chat, or per Topic in a forum, and a new one replaces it. Only the user sends it.
 _Avoid_: pending message, unsent message

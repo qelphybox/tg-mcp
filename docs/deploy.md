@@ -19,7 +19,7 @@ Media links (`get_media`, #36): `GET /media/{ticket}` carries its credential in 
 ## What survives a deploy
 
 - **Survives:** everything in SQLite (Grants, Tokens, encrypted Telegram sessions) on the `tg-mcp-data` volume, mounted at `/data`.
-- **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call; Telegram session changes they held, such as a DC migration, are re-sealed on a graceful shutdown, but lost on SIGKILL or a crash), authorization codes and logins in progress (the user starts the browser flow again), Media links (their downloads 404; the agent calls `get_media` again), pending sends (their page says "no longer valid", a tool call waiting for one ends with an error as its MCP session does, and nothing was sent; the model asks again), rate-limit counters (they start full again).
+- **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call; Telegram session changes they held, such as a DC migration, are re-sealed on a graceful shutdown, but lost on SIGKILL or a crash), authorization codes and logins in progress (the user starts the browser flow again), Media links (their downloads 404; the agent calls `get_media` again), pending sends (their page says "no longer valid", a tool call waiting for one ends with an error as its MCP session does, and nothing was sent; the model asks again), the duplicate guard of `send_message` (a text sent in the minute before the deploy can be sent again right after it), rate-limit counters (they start full again).
 
 ## First deploy
 
