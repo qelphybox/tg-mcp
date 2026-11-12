@@ -1,5 +1,7 @@
-//! Delivering a message a tool sends (#45), for `send_message` (#46) to call
-//! once it has checked and formatted its input:
+//! Delivering a message a tool sends (#45): what `send_message` (#46) calls
+//! once it has checked and formatted its input. Only into the caller's Send
+//! allow-list, and never the same text to the same Chat twice within a
+//! minute of a send ([`crate::recent_sends`]); then:
 //!
 //! - a Grant with Auto-send sends at once (its Send allow-list was chosen at
 //!   Consent, and only it may be written to);
@@ -13,12 +15,6 @@
 //! Either way the send is the Live client's, so the Writes budget and the
 //! Chat's Send cap count it when it goes to Telegram; a confirmed send they
 //! refuse is an error saying when to retry.
-
-// Only tests drive it until send_message (#46) does.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "send_message (#46) is its caller")
-)]
 
 use std::str::FromStr;
 
@@ -34,6 +30,7 @@ use super::{TgMcp, tool_error};
 use crate::{
     auth::Caller,
     confirm::{Outcome, PENDING_TTL, RequestError},
+    recent_sends::{Duplicate, SendKey},
     tg::{
         chats::{CHAT_REF_MAX_LEN, rfc3339},
         send::NewMessage,
@@ -116,7 +113,8 @@ impl TgMcp {
     /// Auto-send, else once the user confirms it (see the module docs).
     /// `context` is the tool call's: its client is asked to open the
     /// confirmation page when it can be ([`elicits_urls`]). The Chat must be
-    /// in the caller's Send allow-list.
+    /// in the caller's Send allow-list, and the same text must not have gone
+    /// to it in the last minute.
     pub(super) async fn deliver(
         &self,
         context: &RequestContext<RoleServer>,
@@ -127,16 +125,24 @@ impl TgMcp {
         caller
             .may_write_to(message.chat.chat())
             .map_err(|refused| ErrorData::invalid_params(refused.to_string(), None))?;
+        let key = self
+            .recent_sends
+            .key(caller.account_id, message.chat.chat(), &message.text);
         if caller
             .send_allow_list
             .as_ref()
             .is_some_and(|list| list.auto_send())
         {
+            let claim = self
+                .recent_sends
+                .claim(key)
+                .map_err(|duplicate| refuse_duplicate(caller, &key, duplicate))?;
             let sent = caller
                 .telegram
                 .send_message(message.clone())
                 .await
                 .map_err(tool_error)?;
+            claim.sent(sent.id);
             tracing::info!(
                 grant_id = %caller.grant_id,
                 chat = %sent.chat,
@@ -145,6 +151,9 @@ impl TgMcp {
             );
             return outcome(&message, Outcome::Sent(sent));
         }
+        self.recent_sends
+            .check(&key)
+            .map_err(|duplicate| refuse_duplicate(caller, &key, duplicate))?;
         let Some(confirmations) = &self.confirmations else {
             return Err(ErrorData::internal_error(
                 "this server can't ask the user to confirm a message",
@@ -210,6 +219,21 @@ impl TgMcp {
     }
 }
 
+/// What a send of a message already sent says. Ids only in the log.
+fn refuse_duplicate(caller: &Caller, key: &SendKey, duplicate: Duplicate) -> ErrorData {
+    let message_id = match duplicate {
+        Duplicate::Sent { id, .. } => Some(id),
+        Duplicate::Sending { .. } => None,
+    };
+    tracing::info!(
+        grant_id = %caller.grant_id,
+        chat = %key.chat(),
+        message_id,
+        "same text to the same chat within a minute: not sent again"
+    );
+    ErrorData::invalid_params(duplicate.to_string(), None)
+}
+
 /// Can this call's client be asked to open a URL? It declared URL-mode
 /// elicitation, and its protocol lets a server send it requests (2026-07-28
 /// forbids them: such a client gets the link instead, never a request it
@@ -246,55 +270,6 @@ fn outcome(message: &NewMessage, outcome: Outcome) -> Result<SendResult, ErrorDa
             return Err(ErrorData::internal_error(refusal.message, None));
         }
     })
-}
-
-/// A stand-in for `send_message` (#46), so the delivery is driven through
-/// `/mcp` as a tool would drive it. Tests only.
-#[cfg(test)]
-mod test_tool {
-    use rmcp::{
-        handler::server::{
-            tool::Extension,
-            wrapper::{Json, Parameters},
-        },
-        tool, tool_router,
-    };
-    use serde::Deserialize;
-
-    use super::*;
-    use crate::{
-        mcp::caller,
-        tg::{TgError, chats::ChatRef, compose, markdown::TextFormat},
-    };
-
-    #[derive(Debug, Deserialize, schemars::JsonSchema)]
-    pub struct TestSendParams {
-        pub chat_id: String,
-        pub text: String,
-        pub reply_to: Option<i32>,
-        pub topic: Option<i32>,
-    }
-
-    #[tool_router(router = test_send_tools, vis = "pub(crate)")]
-    impl TgMcp {
-        #[tool(description = "Tests only: deliver a message as send_message will.")]
-        async fn test_send(
-            &self,
-            Extension(parts): Extension<http::request::Parts>,
-            context: RequestContext<RoleServer>,
-            Parameters(params): Parameters<TestSendParams>,
-        ) -> Result<Json<SendResult>, ErrorData> {
-            let chat: ChatRef = params
-                .chat_id
-                .parse()
-                .map_err(|e: TgError| ErrorData::invalid_params(e.to_string(), None))?;
-            let text = compose::prepare(&params.text, TextFormat::Markdown).map_err(tool_error)?;
-            let message = NewMessage::new(chat, text, params.reply_to, params.topic);
-            self.deliver(&context, caller(&parts)?, message)
-                .await
-                .map(Json)
-        }
-    }
 }
 
 #[cfg(test)]

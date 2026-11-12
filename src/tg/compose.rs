@@ -1,7 +1,8 @@
 //! What every tool that writes text into a Chat checks before Telegram sees
-//! it (#43): `save_draft` now, `send_message` later. The text in its format
-//! ([`prepare`]) and where in the Chat it goes ([`place`]): a forum needs a
-//! Topic, given as `topic` or by replying to a message in one.
+//! it (#43): `save_draft` and `send_message` (#46). The text in its format
+//! ([`prepare`] for a Draft, [`prepare_message`] for a message) and where in
+//! the Chat it goes ([`place`]): a forum needs a Topic, given as `topic` or
+//! by replying to a message in one.
 
 use std::future::Future;
 
@@ -23,6 +24,29 @@ pub const MAX_INPUT_CHARS: usize = 16_384;
 /// formatted (never split), and not only whitespace. Empty stays empty (a
 /// Draft's way to clear).
 pub fn prepare(text: &str, format: TextFormat) -> Result<FormattedText, TgError> {
+    let formatted = formatted(text, format)?;
+    if !text.is_empty() && formatted.text.trim().is_empty() {
+        return Err(TgError::InvalidInput(
+            "text is only whitespace: write some text, or pass \"\" to clear".into(),
+        ));
+    }
+    Ok(formatted)
+}
+
+/// A message's text: as [`prepare`], but never empty or only whitespace
+/// once formatted, as a message (unlike a Draft) has nothing to clear.
+pub fn prepare_message(text: &str, format: TextFormat) -> Result<FormattedText, TgError> {
+    let formatted = formatted(text, format)?;
+    if formatted.text.trim().is_empty() {
+        return Err(TgError::InvalidInput(
+            "text is empty once formatted: a message needs some text".into(),
+        ));
+    }
+    Ok(formatted)
+}
+
+/// `text` read as `format`, within the limits.
+fn formatted(text: &str, format: TextFormat) -> Result<FormattedText, TgError> {
     let given = text.chars().count();
     if given > MAX_INPUT_CHARS {
         return Err(TgError::InvalidInput(format!(
@@ -34,11 +58,6 @@ pub fn prepare(text: &str, format: TextFormat) -> Result<FormattedText, TgError>
     let chars = formatted.text.chars().count();
     if chars > MAX_TEXT_CHARS {
         return Err(TgError::InvalidInput(too_long(chars)));
-    }
-    if !text.is_empty() && formatted.text.trim().is_empty() {
-        return Err(TgError::InvalidInput(
-            "text is only whitespace: write some text, or pass \"\" to clear".into(),
-        ));
     }
     Ok(formatted)
 }
@@ -199,6 +218,27 @@ mod tests {
         for text in [" ", "\n\t "] {
             for format in [TextFormat::Markdown, TextFormat::Plain] {
                 assert!(invalid(prepare(text, format)).contains("pass \"\""));
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_has_the_same_limits_and_never_no_text() {
+        let at_limit = "x".repeat(MAX_TEXT_CHARS);
+        assert_eq!(
+            prepare_message(&format!("**{at_limit}**"), TextFormat::Markdown).unwrap(),
+            prepare(&format!("**{at_limit}**"), TextFormat::Markdown).unwrap()
+        );
+        let msg = invalid(prepare_message(
+            &"y".repeat(MAX_TEXT_CHARS + 1),
+            TextFormat::Markdown,
+        ));
+        assert!(msg.contains("4097") && msg.contains("not split"), "{msg}");
+        for text in ["", " ", "\n\t "] {
+            for format in [TextFormat::Markdown, TextFormat::Plain] {
+                let msg = invalid(prepare_message(text, format));
+                assert!(msg.contains("a message needs some text"), "{msg}");
+                assert!(!msg.contains("clear"), "{msg}");
             }
         }
     }

@@ -1,10 +1,15 @@
-//! Delivery through `/mcp` with rmcp's own client: Auto-send sends at once;
-//! a client with URL elicitation is asked to open the confirmation page and
-//! the call returns the user's decision; any other gets the link.
+//! send_message (#46) and its delivery through `/mcp` with rmcp's own
+//! client: Auto-send sends at once; a client with URL elicitation is asked
+//! to open the confirmation page and the call returns the user's decision;
+//! any other gets the link. Only into the Send allow-list, never the same
+//! text twice within a minute, with save_draft's text and forum rules.
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{extract::Request, middleware::Next};
@@ -43,20 +48,47 @@ use crate::{
     tg::{
         Account, Connector, FakeConnector, FakeLogin, TgError,
         chats::{ChatId, ChatKind, ChatSummary},
-        fake::{FIRST_SENT_ID, FakeData, fake_issued_id},
-        markdown::markdown,
+        fake::{FIRST_SENT_ID, FakeData, FakeTopic, fake_issued_id},
+        messages::RawHistoryMessage,
     },
 };
 
 const ME: i64 = 42;
 const ALICE: ChatId = ChatId::User(101);
+/// One of the Account's chats, not in the Send allow-list.
 const BOB: ChatId = ChatId::User(102);
+/// A forum in the Send allow-list: General (1) and Releases (10), where
+/// message 12 is.
+const FORUM: ChatId = ChatId::Channel(505);
+
+fn raw(id: i32, topic: Option<i32>) -> RawHistoryMessage {
+    RawHistoryMessage {
+        id,
+        date: 1_793_923_200 + id,
+        from: None,
+        out: false,
+        text: "earlier".into(),
+        media: None,
+        reply_to: None,
+        reply_elsewhere: None,
+        forwarded: false,
+        forwarded_from: None,
+        edited: false,
+        reactions: Vec::new(),
+        pinned: false,
+        topic,
+    }
+}
 
 fn data() -> FakeData {
     let chat = |id: ChatId, title: &str| ChatSummary {
         id: id.to_string(),
         title: title.into(),
-        kind: ChatKind::Private,
+        kind: if id == FORUM {
+            ChatKind::Supergroup
+        } else {
+            ChatKind::Private
+        },
         username: None,
         is_self: false,
         unread_count: 0,
@@ -71,7 +103,19 @@ fn data() -> FakeData {
         last_name: None,
         username: None,
     })
-    .with_chats(vec![chat(ALICE, "Alice"), chat(BOB, "Bob")])
+    .with_chats(vec![
+        chat(ALICE, "Alice"),
+        chat(BOB, "Bob"),
+        chat(FORUM, "Dev forum"),
+    ])
+    .with_messages(
+        FORUM,
+        vec![raw(5, None), raw(10, Some(10)), raw(12, Some(10))],
+    )
+    .with_topics(
+        FORUM,
+        vec![FakeTopic::new(10, "Releases"), FakeTopic::new(1, "General")],
+    )
 }
 
 /// The server: `/mcp` for one Grant with `send` to Alice, and `/confirm`.
@@ -124,7 +168,7 @@ async fn server(auto_send: bool) -> Server {
         .next()
         .unwrap()
         .to_string();
-    let list = SendAllowList::new([ALICE], auto_send)
+    let list = SendAllowList::new([ALICE, FORUM], auto_send)
         .unwrap()
         .with_confirm_cookie(issued_cookie.verifier);
     let scopes: Scopes = [Scope::Send].into_iter().collect();
@@ -141,6 +185,7 @@ async fn server(auto_send: bool) -> Server {
     let grant = vault.open(issued.access.expose()).await.unwrap();
     let caller = Caller {
         grant_id: grant.grant_id.clone(),
+        account_id: grant.account_id,
         scopes: grant.scopes,
         send_allow_list: grant.send_allow_list.clone().map(Arc::new),
         telegram: connector.connect(grant).await.unwrap(),
@@ -150,9 +195,10 @@ async fn server(auto_send: bool) -> Server {
     let (links, confirmations) = (auth.links.clone(), auth.confirmations.clone());
     let mcp = StreamableHttpService::new(
         move || {
-            let tools = TgMcp::scoped_tools().with(Scope::Send, TgMcp::test_send_tools());
-            Ok(TgMcp::with_tools(links.clone(), tools, false)
-                .with_confirmations(confirmations.clone()))
+            Ok(
+                TgMcp::with_tools(links.clone(), TgMcp::scoped_tools(), false)
+                    .with_confirmations(confirmations.clone()),
+            )
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
@@ -275,14 +321,14 @@ async fn connect(server: &Server, app: App) -> RunningService<RoleClient, App> {
     app.serve(transport).await.expect("initialize")
 }
 
-async fn send(
+/// send_message with `arguments`: its structured result, or the error.
+async fn call(
     client: &RunningService<RoleClient, App>,
-    chat: ChatId,
+    arguments: Value,
 ) -> Result<Value, rmcp::ServiceError> {
-    let arguments = json!({ "chat_id": fake_issued_id(chat), "text": "**hi** Alice" });
     client
         .call_tool(
-            CallToolRequestParams::new("test_send")
+            CallToolRequestParams::new("send_message")
                 .with_arguments(arguments.as_object().unwrap().clone()),
         )
         .await
@@ -290,6 +336,33 @@ async fn send(
             assert_eq!(r.is_error, Some(false), "{r:?}");
             r.structured_content.expect("structured output")
         })
+}
+
+/// A text no other send of this test binary has: the duplicate guard lets
+/// each through.
+fn fresh_text() -> String {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    format!("**hi** Alice, number {}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+/// send_message of a fresh text to `chat`.
+async fn send(
+    client: &RunningService<RoleClient, App>,
+    chat: ChatId,
+) -> Result<Value, rmcp::ServiceError> {
+    send_text(client, chat, &fresh_text()).await
+}
+
+async fn send_text(
+    client: &RunningService<RoleClient, App>,
+    chat: ChatId,
+    text: &str,
+) -> Result<Value, rmcp::ServiceError> {
+    call(
+        client,
+        json!({ "chat_id": fake_issued_id(chat), "text": text }),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -318,7 +391,8 @@ async fn with_url_elicitation_the_call_waits_and_returns_sent() {
     );
     let sent = server.connector.sent().of(ME);
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].text, markdown("**hi** Alice"));
+    assert!(sent[0].text.text.starts_with("hi Alice"), "{:?}", sent[0]);
+    assert_eq!(sent[0].text.entities.len(), 1, "the bold");
     assert!(server.auth.confirmations.is_empty());
 }
 
@@ -433,6 +507,254 @@ async fn a_chat_outside_the_allow_list_is_refused_before_anything_waits() {
     let client = connect(&server, app.clone()).await;
     let err = send(&client, BOB).await.unwrap_err().to_string();
     assert!(err.contains("Send allow-list"), "{err}");
+    assert!(app.opened().is_empty());
+    assert!(server.auth.confirmations.is_empty());
+}
+
+#[tokio::test]
+async fn send_message_is_listed_with_send_as_a_bounded_write_that_isnt_read_only() {
+    let server = server(false).await;
+    let client = connect(&server, App::new(None)).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "send_message")
+        .expect("listed for a send Grant");
+    let hints = tool.annotations.as_ref().unwrap();
+    assert_eq!(hints.read_only_hint, Some(false));
+    assert_eq!(hints.idempotent_hint, Some(false));
+    assert_eq!(hints.open_world_hint, Some(false));
+    assert_eq!(
+        hints.destructive_hint,
+        Some(false),
+        "it only adds a message"
+    );
+    let description = tool.description.as_deref().unwrap();
+    for words in [
+        "Send a message as the user",
+        "confirm_url",
+        "the browser where they connected this app",
+        "get_messages",
+        "already sent: message N",
+        "never retry it on your own",
+    ] {
+        assert!(description.contains(words), "{words}: {description}");
+    }
+    let input = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+    assert_eq!(input["properties"]["text"]["maxLength"], 16_384);
+    assert_eq!(input["properties"]["text"]["minLength"], 1);
+    assert!(input["properties"]["chat_id"]["maxLength"].is_u64());
+    assert_eq!(input["required"], json!(["chat_id", "text"]));
+    let output = serde_json::to_value(tool.output_schema.as_ref().unwrap().as_ref()).unwrap();
+    assert!(
+        output["properties"]["confirm_url"]["maxLength"].is_u64(),
+        "{output}"
+    );
+    // A send Grant is told what it can do now.
+    let said = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .unwrap();
+    assert!(
+        said.contains("send messages to the chats the user allowed"),
+        "{said}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_text_to_the_same_chat_within_a_minute_is_already_sent() {
+    let server = server(true).await;
+    let client = connect(&server, App::new(None)).await;
+    let text = fresh_text();
+    let first = send_text(&client, ALICE, &text).await.unwrap();
+    assert_eq!(first["status"], "sent");
+    let err = send_text(&client, ALICE, &text)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("already sent: message {FIRST_SENT_ID}")),
+        "{err}"
+    );
+    // The same as the chat shows it: Markdown that formats nothing is plain.
+    let plain = json!({ "chat_id": fake_issued_id(ALICE), "text": "see you", "format": "plain" });
+    assert_eq!(call(&client, plain).await.unwrap()["status"], "sent");
+    let err = send_text(&client, ALICE, "see you")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already sent"), "{err}");
+
+    // Another chat, or another text, is another message.
+    let in_general = json!({ "chat_id": fake_issued_id(FORUM), "text": text, "topic": 1 });
+    assert_eq!(call(&client, in_general).await.unwrap()["status"], "sent");
+    let more = format!("{text}!");
+    assert_eq!(
+        send_text(&client, ALICE, &more).await.unwrap()["status"],
+        "sent"
+    );
+    assert_eq!(server.connector.sent().of(ME).len(), 4);
+    // Only a hash, and only of what was sent.
+    assert_eq!(server.auth.confirmations.recent_sends().len(), 4);
+}
+
+#[tokio::test]
+async fn a_confirmed_send_is_already_sent_too_however_it_was_confirmed() {
+    let server = server(false).await;
+    // Through the link the call returned.
+    let client = connect(&server, App::new(None)).await;
+    let text = fresh_text();
+    let pending = send_text(&client, ALICE, &text).await.unwrap();
+    assert_eq!(pending["status"], "pending_confirmation");
+    // Not sent yet: asking again is another pending send, not a duplicate.
+    let again = send_text(&client, ALICE, &text).await.unwrap();
+    assert_eq!(again["status"], "pending_confirmation");
+    let url = pending["confirm_url"].as_str().unwrap().to_string();
+    let html = press(url, "send", Some(server.cookie.clone())).await;
+    assert!(html.contains("The message was sent"), "{html}");
+    let err = send_text(&client, ALICE, &text)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("already sent: message {FIRST_SENT_ID}")),
+        "{err}"
+    );
+
+    // In the page the client opened, while the call waited.
+    let app = App {
+        press: Some(("send", Some(server.cookie.clone()))),
+        ..App::with_url_elicitation()
+    };
+    let client = connect(&server, app.clone()).await;
+    let text = fresh_text();
+    assert_eq!(
+        send_text(&client, ALICE, &text).await.unwrap()["status"],
+        "sent"
+    );
+    let err = send_text(&client, ALICE, &text)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already sent"), "{err}");
+    assert_eq!(app.opened().len(), 1, "the duplicate asked nobody");
+    assert_eq!(server.connector.sent().of(ME).len(), 2);
+}
+
+#[tokio::test]
+async fn a_refused_send_says_when_to_retry_and_holds_nothing_back() {
+    let server = server(true).await;
+    let client = connect(&server, App::new(None)).await;
+    let text = fresh_text();
+    for (refusal, says) in [
+        (
+            TgError::WritesLimited {
+                seconds: 42,
+                limit: WriteLimit::Chat,
+            },
+            "Too many messages to this chat right now; retry in 42 s",
+        ),
+        (
+            TgError::SlowMode { seconds: 17 },
+            "slow mode: each member may send one message per set interval; retry in 17 s",
+        ),
+        (TgError::PeerFlood, "PEER_FLOOD"),
+    ] {
+        server.connector.sent().refuse_next(refusal);
+        let err = send_text(&client, ALICE, &text)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(says), "{says}: {err}");
+        assert!(server.connector.sent().of(ME).is_empty());
+    }
+    // Nothing was sent, so nothing is a duplicate.
+    assert!(server.auth.confirmations.recent_sends().is_empty());
+    assert_eq!(
+        send_text(&client, ALICE, &text).await.unwrap()["status"],
+        "sent"
+    );
+}
+
+#[tokio::test]
+async fn text_and_forum_rules_are_save_drafts() {
+    let server = server(true).await;
+    let client = connect(&server, App::new(None)).await;
+    let forum = fake_issued_id(FORUM);
+    let alice = fake_issued_id(ALICE);
+    let refused = |arguments: Value| {
+        let client = &client;
+        async move { call(client, arguments).await.unwrap_err().to_string() }
+    };
+
+    let msg = refused(json!({ "chat_id": forum, "text": fresh_text() })).await;
+    assert!(
+        msg.contains("is a forum") && msg.contains("General is 1"),
+        "{msg}"
+    );
+    let msg = refused(json!({ "chat_id": alice, "text": fresh_text(), "topic": 1 })).await;
+    assert!(msg.contains("not a forum"), "{msg}");
+    let msg =
+        refused(json!({ "chat_id": forum, "text": fresh_text(), "reply_to": 12, "topic": 1 }))
+            .await;
+    assert!(msg.contains("in Topic 10, not in topic 1"), "{msg}");
+    let msg = refused(json!({ "chat_id": alice, "text": fresh_text(), "reply_to": 0 })).await;
+    assert!(msg.contains("reply_to must be a positive id"), "{msg}");
+    let msg = refused(json!({ "chat_id": alice, "text": "x".repeat(4097) })).await;
+    assert!(msg.contains("4097") && msg.contains("not split"), "{msg}");
+    for blank in ["", "  \n"] {
+        let msg = refused(json!({ "chat_id": alice, "text": blank })).await;
+        assert!(msg.contains("a message needs some text"), "{msg}");
+    }
+    assert!(server.connector.sent().of(ME).is_empty());
+
+    // In a Topic, a reply that finds its Topic, and plain text as given.
+    let in_topic = call(
+        &client,
+        json!({ "chat_id": forum, "text": fresh_text(), "topic": 10 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (in_topic["status"].as_str(), in_topic["topic"].as_i64()),
+        (Some("sent"), Some(10))
+    );
+    let reply = call(
+        &client,
+        json!({ "chat_id": forum, "text": fresh_text(), "reply_to": 12 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["topic"], 10, "{reply}");
+    assert_eq!(reply["reply_to"], 12, "{reply}");
+    let plain = call(
+        &client,
+        json!({ "chat_id": alice, "text": "**as is**", "format": "plain" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plain["status"], "sent");
+    let sent = server.connector.sent().of(ME);
+    assert_eq!(sent.len(), 3);
+    assert_eq!((sent[0].topic, sent[0].reply_to), (Some(10), None));
+    assert_eq!((sent[1].topic, sent[1].reply_to), (Some(10), Some(12)));
+    assert_eq!(sent[2].text.text, "**as is**");
+    assert!(sent[2].text.entities.is_empty());
+}
+
+#[tokio::test]
+async fn without_auto_send_a_message_that_cant_go_there_never_waits() {
+    let server = server(false).await;
+    let app = App::with_url_elicitation();
+    let client = connect(&server, app.clone()).await;
+    let msg = call(
+        &client,
+        json!({ "chat_id": fake_issued_id(FORUM), "text": fresh_text() }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(msg.contains("is a forum"), "{msg}");
     assert!(app.opened().is_empty());
     assert!(server.auth.confirmations.is_empty());
 }

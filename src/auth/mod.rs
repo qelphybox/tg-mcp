@@ -145,6 +145,8 @@ pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
 #[derive(Clone)]
 pub struct Caller {
     pub grant_id: GrantId,
+    /// The Grant's Account: what the duplicate guard of sends counts by.
+    pub account_id: i64,
     /// The Grant's Scopes: which tools this caller sees and may call.
     pub scopes: Scopes,
     /// With `send`: the Chats the Grant may write to, opened with its Token.
@@ -240,6 +242,7 @@ pub async fn require_bearer(
         }
     };
     let grant_id = grant.grant_id.clone();
+    let account_id = grant.account_id;
     let scopes = grant.scopes;
     let send_allow_list = grant.send_allow_list.clone().map(Arc::new);
     let telegram = match auth.connector.connect(grant).await {
@@ -262,6 +265,7 @@ pub async fn require_bearer(
     };
     request.extensions_mut().insert(Caller {
         grant_id,
+        account_id,
         scopes,
         send_allow_list,
         telegram,

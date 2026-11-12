@@ -623,10 +623,10 @@ impl Write for Sink {
     }
 }
 
-/// No tool sends yet (#46): a `send` Grant lists the tools a read Grant does,
-/// and is told it is read-only, which is what it can do so far.
+/// A `send` Grant lists the tools a read Grant does and send_message (#46),
+/// and is told it may send to the chats the user allowed.
 #[tokio::test]
-async fn a_send_grant_is_told_only_what_it_can_do_today() {
+async fn a_send_grant_lists_send_message_and_is_told_where_it_may_send() {
     let server = server().await;
     let (_, reader) = server.login_scoped(None, &[ALLOW]).await;
     let flow = on_consent(&server).await;
@@ -644,18 +644,24 @@ async fn a_send_grant_is_told_only_what_it_can_do_today() {
             .map(|t| t.name.to_string())
             .collect::<Vec<_>>()
     };
+    let mut sender_tools = names(sender.list_all_tools().await.unwrap());
+    let reader_tools = names(reader.list_all_tools().await.unwrap());
+    assert!(!reader_tools.contains(&"send_message".to_string()));
+    assert!(sender_tools.contains(&"send_message".to_string()));
+    sender_tools.retain(|name| name != "send_message");
     assert_eq!(
-        names(sender.list_all_tools().await.unwrap()),
-        names(reader.list_all_tools().await.unwrap())
+        sender_tools, reader_tools,
+        "send_message is the only addition"
     );
     let said = sender
         .peer_info()
         .and_then(|info| info.instructions.clone())
         .unwrap();
     assert!(
-        said.contains("Read-only access to the connected Telegram account"),
+        said.contains("send messages to the chats the user allowed (each confirmed by the user"),
         "{said}"
     );
+    assert!(!said.contains("Read-only"), "{said}");
     reader.cancel().await.unwrap();
     sender.cancel().await.unwrap();
 }

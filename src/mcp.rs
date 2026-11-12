@@ -26,6 +26,7 @@ mod confirm;
 mod drafts;
 mod prompts;
 mod scoped;
+mod send;
 
 use self::scoped::ScopedTools;
 use crate::{
@@ -33,6 +34,7 @@ use crate::{
     confirm::PendingSends,
     limits::{MethodClass, WriteLimit},
     links::{MAX_DOWNLOAD_BYTES, MediaDownload, MediaLinks},
+    recent_sends::RecentSends,
     scope::{Scope, Scopes},
     tg::{
         Account, Telegram, TgError,
@@ -158,7 +160,10 @@ pub fn instructions(scopes: Scopes) -> String {
             );
         }
         if scopes.contains(Scope::Send) {
-            can.push("send messages to the chats the user allowed");
+            can.push(
+                "send messages to the chats the user allowed (each confirmed by the user, unless \
+                 they chose to let this app send without asking)",
+            );
         }
         if scopes.contains(Scope::Organize) {
             can.push("organize chats");
@@ -219,6 +224,20 @@ mod instructions_tests {
     }
 
     #[test]
+    fn a_send_grant_is_told_where_it_may_send_and_that_the_user_confirms() {
+        let sending: Scopes = [Scope::Send].into_iter().collect();
+        assert_eq!(
+            instructions(sending),
+            format!(
+                "Unofficial Telegram MCP server (uses the Telegram API). Access to the connected \
+                 Telegram account: you can read chats, messages and media, and send messages to \
+                 the chats the user allowed (each confirmed by the user, unless they chose to let \
+                 this app send without asking); you cannot edit or delete messages. {UNTRUSTED}"
+            )
+        );
+    }
+
+    #[test]
     fn the_wording_follows_every_scope() {
         let all: Scopes = Scope::ALL.into_iter().collect();
         let text = instructions(all);
@@ -254,6 +273,9 @@ pub struct TgMcp {
     /// Where sends wait for the user's confirmation; `None` on a server
     /// without the confirmation page, where nothing can be confirmed.
     confirmations: Option<Arc<PendingSends>>,
+    /// The duplicate guard of sends: the confirmation page's, which records
+    /// confirmed sends, once there is one.
+    recent_sends: Arc<RecentSends>,
     /// EXPERIMENTAL (#58 prototype): get_media takes mode `document`.
     experimental_documents: bool,
 }
@@ -282,6 +304,7 @@ impl TgMcp {
             .with(Scope::Read, Self::read_tools())
             .with(Scope::Read, Self::draft_read_tools())
             .with(Scope::Draft, Self::draft_tools())
+            .with(Scope::Send, Self::send_tools())
     }
 
     fn with_tools(
@@ -295,6 +318,7 @@ impl TgMcp {
             prompt_router: Self::prompt_router(),
             links,
             confirmations: None,
+            recent_sends: Arc::default(),
             experimental_documents,
         }
     }
@@ -302,6 +326,7 @@ impl TgMcp {
     /// Sends that need the user's confirmation wait in `confirmations`,
     /// decided on its `/confirm` page.
     pub fn with_confirmations(mut self, confirmations: Arc<PendingSends>) -> Self {
+        self.recent_sends = confirmations.recent_sends().clone();
         self.confirmations = Some(confirmations);
         self
     }

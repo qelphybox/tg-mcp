@@ -117,6 +117,7 @@ fn list(auto_send: bool) -> SendAllowList {
 fn caller_without_db(telegram: Arc<dyn Telegram>) -> Caller {
     Caller {
         grant_id: GrantId::from("g".to_string()),
+        account_id: ME,
         scopes: sending(),
         send_allow_list: Some(Arc::new(list(false).with_confirm_cookie([1; 32]))),
         telegram,
@@ -327,6 +328,43 @@ async fn a_decision_with_telegram_is_neither_expired_nor_revoked_under_it() {
     assert!(store.is_empty());
 }
 
+#[tokio::test]
+async fn a_confirmed_send_is_what_the_duplicate_guard_remembers_and_only_it() {
+    let (store, caller, _) = store_and_caller();
+    let key = store
+        .recent_sends()
+        .key(ME, ALICE, &message(ALICE, None, None).text);
+    let decide = |decision| {
+        let store = &store;
+        let caller = &caller;
+        async move {
+            let requested = store
+                .request(caller, message(ALICE, None, None))
+                .await
+                .unwrap();
+            let id = id_of(&requested.url).to_string();
+            let csrf = store.view(&id).unwrap().csrf;
+            if let Ok(Ok(job)) = store.begin(&id, &csrf, decision, true) {
+                let answer = job.run().await;
+                store.finish(&job, answer);
+            }
+            store.wait(requested).await
+        }
+    };
+    // Cancelled, made a Draft or refused: nothing was sent, nothing to remember.
+    assert_eq!(decide(Decision::Cancel).await, Outcome::Cancelled);
+    assert!(matches!(decide(Decision::Draft).await, Outcome::Drafted(_)));
+    store.recent_sends().check(&key).unwrap();
+
+    let Outcome::Sent(sent) = decide(Decision::Send).await else {
+        panic!("sent");
+    };
+    match store.recent_sends().check(&key) {
+        Err(crate::recent_sends::Duplicate::Sent { id, .. }) => assert_eq!(id, sent.id),
+        other => panic!("the guard knows the confirmed send: {other:?}"),
+    }
+}
+
 #[test]
 fn refusals_say_what_happened_and_when_to_retry() {
     let chat = refusal(
@@ -451,6 +489,7 @@ async fn page_server(limits: OAuthLimits) -> Page {
     let grant = vault.open(issued.access.expose()).await.unwrap();
     let caller = Caller {
         grant_id: grant.grant_id.clone(),
+        account_id: grant.account_id,
         scopes: grant.scopes,
         send_allow_list: grant.send_allow_list.clone().map(Arc::new),
         telegram: connector.connect(grant).await.unwrap(),

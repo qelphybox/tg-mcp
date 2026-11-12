@@ -132,21 +132,34 @@ mod tests {
         [Scope::Draft].into_iter().collect()
     }
 
+    fn sending() -> Scopes {
+        [Scope::Send].into_iter().collect()
+    }
+
     #[test]
-    fn every_tool_needs_read_but_save_draft() {
+    fn every_tool_needs_read_but_save_draft_and_send_message() {
         let tools = TgMcp::scoped_tools();
         let all = tools.router().list_all();
         assert!(all.iter().any(|t| t.name == "whoami"));
         assert!(all.iter().any(|t| t.name == "get_drafts"));
         for tool in &all {
-            let needed = if tool.name == "save_draft" {
-                Scope::Draft
-            } else {
-                Scope::Read
+            let needed = match tool.name.as_ref() {
+                "save_draft" => Scope::Draft,
+                "send_message" => Scope::Send,
+                _ => Scope::Read,
             };
             assert_eq!(tools.required[tool.name.as_ref()], needed, "{}", tool.name);
         }
-        assert_eq!(tools.listed(Scopes::READ_ONLY).len(), all.len() - 1);
+        assert_eq!(tools.listed(Scopes::READ_ONLY).len(), all.len() - 2);
+        assert_eq!(tools.listed(sending()).len(), all.len() - 1);
+        assert!(
+            !tools
+                .listed(drafts())
+                .iter()
+                .any(|t| t.name == "send_message")
+        );
+        assert!(tools.check("send_message", drafts()).is_err());
+        assert!(tools.check("send_message", sending()).is_ok());
     }
 
     #[test]
@@ -205,6 +218,7 @@ mod tests {
         let grant = vault.open(issued.access.expose()).await.unwrap();
         let caller = Caller {
             grant_id: grant.grant_id.clone(),
+            account_id: grant.account_id,
             scopes: grant.scopes,
             send_allow_list: None,
             telegram: FakeConnector::default().connect(grant).await.unwrap(),
@@ -292,12 +306,13 @@ mod tests {
     fn only_scopes_with_tools_are_usable() {
         let tools = tools();
         let all: Scopes = Scope::ALL.into_iter().collect();
-        // No tool sends or organizes yet: such a Grant can read and write Drafts.
-        assert_eq!(tools.usable(all), drafts());
+        // No tool organizes yet: such a Grant can read, write Drafts and send.
+        assert_eq!(tools.usable(all), drafts().with(Scope::Send));
         assert_eq!(tools.usable(drafts()), drafts());
         assert_eq!(tools.usable(Scopes::READ_ONLY), Scopes::READ_ONLY);
-        let sending: Scopes = [Scope::Send].into_iter().collect();
-        assert_eq!(tools.usable(sending), Scopes::READ_ONLY);
+        assert_eq!(tools.usable(sending()), sending());
+        let organizing: Scopes = [Scope::Organize].into_iter().collect();
+        assert_eq!(tools.usable(organizing), Scopes::READ_ONLY);
     }
 
     #[tokio::test]
@@ -314,9 +329,12 @@ mod tests {
         assert_eq!(said(&drafter), crate::mcp::instructions(drafts()));
         assert_ne!(said(&reader), said(&drafter));
 
-        // Granted `send` while no tool sends: told only what it can do.
-        let (sender, _guard3) = serve(drafts().with(Scope::Send)).await;
-        assert_eq!(said(&sender), crate::mcp::instructions(drafts()));
-        assert!(said(&sender).contains("you cannot send, edit or delete messages"));
+        // Granted `send`: told it can send, and how.
+        let (sender, _guard3) = serve(sending()).await;
+        assert_eq!(said(&sender), crate::mcp::instructions(sending()));
+        assert!(said(&sender).contains("you cannot edit or delete messages"));
+        // Granted `organize` while no tool organizes: told only what it can do.
+        let (organizer, _guard4) = serve(drafts().with(Scope::Organize)).await;
+        assert_eq!(said(&organizer), crate::mcp::instructions(drafts()));
     }
 }

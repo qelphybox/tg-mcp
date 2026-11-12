@@ -20,7 +20,9 @@
 //! surfaces the page through URL elicitation, and otherwise hands out the
 //! URL ([`crate::mcp`]). The send itself is the Live client's
 //! `messages.sendMessage`, so the Writes budget and the Chat's Send cap count
-//! it when the user confirms, and may still refuse it then.
+//! it when the user confirms, and may still refuse it then. A confirmed
+//! send is recorded with the duplicate guard ([`RecentSends`]) as it is
+//! sent, whether or not a tool call still waits for it.
 
 pub mod cookie;
 mod page;
@@ -51,6 +53,7 @@ use crate::{
     },
     limits::WriteLimit,
     links::expires_at,
+    recent_sends::{RecentSends, SendKey},
     sessions::GrantId,
     tg::{
         Telegram, TgError,
@@ -162,6 +165,8 @@ struct Entry {
     grant_id: GrantId,
     telegram: Arc<dyn Telegram>,
     message: NewMessage,
+    /// What the duplicate guard records it as once it is sent.
+    sent_key: SendKey,
     shown: Shown,
     /// The Grant's Confirmation cookie verifier; `None` (a Grant sealed
     /// before #45): no browser can send, every browser can make a Draft.
@@ -230,6 +235,7 @@ struct Job {
     grant_id: GrantId,
     telegram: Arc<dyn Telegram>,
     message: NewMessage,
+    sent_key: SendKey,
 }
 
 impl Job {
@@ -265,6 +271,8 @@ pub struct PendingSends {
     /// `scheme://host[:port]` of the public URL, no trailing slash.
     base_url: String,
     entries: Mutex<HashMap<[u8; 32], Entry>>,
+    /// The duplicate guard, which learns of every confirmed send here.
+    recent_sends: Arc<RecentSends>,
 }
 
 impl PendingSends {
@@ -272,7 +280,14 @@ impl PendingSends {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             entries: Mutex::default(),
+            recent_sends: Arc::default(),
         }
+    }
+
+    /// The duplicate guard of sends: confirmed ones are recorded here, and
+    /// a tool checks it before it sends or asks.
+    pub fn recent_sends(&self) -> &Arc<RecentSends> {
+        &self.recent_sends
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Entry>> {
@@ -294,6 +309,9 @@ impl PendingSends {
             .may_write_to(chat)
             .map_err(|refused| TgError::InvalidInput(refused.to_string()))?;
         let shown = shown(&Sanitised::new(caller.telegram.clone()), &message).await?;
+        let sent_key = self
+            .recent_sends
+            .key(caller.account_id, chat, &message.text);
         let cookie = caller
             .send_allow_list
             .as_ref()
@@ -328,6 +346,7 @@ impl PendingSends {
                 grant_id: caller.grant_id.clone(),
                 telegram: caller.telegram.clone(),
                 message,
+                sent_key,
                 shown,
                 cookie,
                 csrf: URL_SAFE_NO_PAD.encode(crate::sessions::random_bytes::<32>()),
@@ -504,6 +523,7 @@ impl PendingSends {
             grant_id: entry.grant_id.clone(),
             telegram: entry.telegram.clone(),
             message: entry.message.clone(),
+            sent_key: entry.sent_key,
         }))
     }
 
@@ -526,14 +546,17 @@ impl PendingSends {
             }
         };
         match &outcome {
-            Outcome::Sent(sent) => tracing::info!(
-                grant_id = %job.grant_id,
-                chat = %chat,
-                message_id = sent.id,
-                topic = sent.topic,
-                reply_to = sent.reply_to,
-                "pending send confirmed: message sent"
-            ),
+            Outcome::Sent(sent) => {
+                self.recent_sends.sent(&job.sent_key, sent.id);
+                tracing::info!(
+                    grant_id = %job.grant_id,
+                    chat = %chat,
+                    message_id = sent.id,
+                    topic = sent.topic,
+                    reply_to = sent.reply_to,
+                    "pending send confirmed: message sent"
+                );
+            }
             Outcome::Drafted(saved) => tracing::info!(
                 grant_id = %job.grant_id,
                 chat = %chat,
