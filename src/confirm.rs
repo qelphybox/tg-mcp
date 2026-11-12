@@ -413,12 +413,14 @@ impl PendingSends {
     }
 
     /// Drop every pending send of a Grant (revoked, or its session ended),
-    /// and with them their hold on its Live client. Returns how many.
+    /// and with them their hold on its Live client. Returns how many. One
+    /// that is with Telegram right now is left to finish: it may be sent
+    /// already, and its outcome must say so.
     pub fn revoke_grant(&self, grant_id: &GrantId) -> usize {
         let mut entries = self.entries();
         let before = entries.len();
         entries.retain(|_, entry| {
-            if &entry.grant_id != grant_id {
+            if &entry.grant_id != grant_id || entry.stage == Stage::Deciding {
                 return true;
             }
             entry.outcome.send_replace(Some(Outcome::Refused(Refusal {

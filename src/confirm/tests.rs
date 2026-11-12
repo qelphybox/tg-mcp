@@ -296,6 +296,37 @@ async fn the_client_declining_cancels_and_revoking_ends_them() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_decision_with_telegram_is_neither_expired_nor_revoked_under_it() {
+    let (store, caller, _) = store_and_caller();
+    let requested = store
+        .request(&caller, message(ALICE, None, None))
+        .await
+        .unwrap();
+    let id = id_of(&requested.url).to_string();
+    let csrf = store.view(&id).unwrap().csrf;
+    let Ok(Ok(job)) = store.begin(&id, &csrf, Decision::Send, true) else {
+        panic!("taken up");
+    };
+    // A second press, or another tab, while Telegram is asked.
+    assert_eq!(
+        store.begin(&id, &csrf, Decision::Send, true).err(),
+        Some(NotTaken::Busy)
+    );
+    assert!(store.view(&id).unwrap().deciding);
+    tokio::time::advance(PENDING_TTL * 2).await;
+    assert_eq!(store.sweep(), 0, "not expired while deciding");
+    assert_eq!(store.revoke_grant(&caller.grant_id), 0, "nor revoked");
+    assert!(!store.cancel(&requested), "nor cancelled by the client");
+    let answer = job.run().await;
+    assert!(matches!(
+        store.finish(&job, answer),
+        Finished::Decided(Outcome::Sent(_))
+    ));
+    assert!(matches!(store.wait(requested).await, Outcome::Sent(_)));
+    assert!(store.is_empty());
+}
+
 #[test]
 fn refusals_say_what_happened_and_when_to_retry() {
     let chat = refusal(
