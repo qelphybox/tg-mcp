@@ -841,3 +841,98 @@ Needs an account with at least one Chat folder that is a plain list of chats ("W
    ```
 
 8. **Clean up.** `claude mcp remove telegram-send` and `claude mcp remove telegram-send2`, and end both sessions (and step 2's, if the script left one) in Telegram → Settings → Devices.
+
+## 55. Sends wait on a confirmation page that only the Consent browser can send from, offered by URL elicitation; elsewhere a Draft
+
+Steps 1-4 need only this release. Steps 5-12 need `send_message` (#46) deployed: run them then, against its tool as #46 describes it (`send_message(chat_id, text, reply_to?, topic?, format?)`, result `sent` with `message_id` and `date`, `cancelled`, `drafted`, `expired` or `pending_confirmation` with `confirm_url` and `expires_at`). Needs Claude Code in a desktop browser session (the "Consent browser"), a phone with a browser and Telegram, a chat "A" where test messages do no harm (a friend who agreed, or a test group), and a forum of yours with a Topic "Releases" and a message in it. The boundaries are also covered by fake-backed tests: `cargo test --lib confirm::` (the cookie, the page, CSRF, CSP, expiry, decided once, the Send cap at confirmation, a retry after no answer, rate limit, logs) and `cargo test --lib mcp::confirm::` (URL elicitation waits and returns the decision, declining cancels, other clients get the link, auto-send).
+
+1. **An unknown link is no longer valid, on a locked-down page.**
+
+   ```sh
+   curl -s -D - -o /tmp/confirm.html -H 'Origin: https://evil.example' https://tgmcp.qelphybox.space/confirm/garbage
+   # expect HTTP/2 410, and among the headers:
+   #   content-security-policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+   #   x-frame-options: DENY
+   #   cache-control: no-store
+   #   referrer-policy: no-referrer
+   # and no access-control-allow-origin header
+   grep -o 'This request is no longer valid[^<]*' /tmp/confirm.html   # expect the sentence
+   grep -c '<script' /tmp/confirm.html                                # expect 0
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST -d 'csrf=x&decision=send' https://tgmcp.qelphybox.space/confirm/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   # expect 410
+   ```
+
+2. **The page is rate-limited per client IP** (30 a minute, a burst of 10; GET and POST share it). Then wait a minute before the next steps from the same network.
+
+   ```sh
+   for i in $(seq 1 13); do curl -s -o /dev/null -w '%{http_code} ' https://tgmcp.qelphybox.space/confirm/guess$i; done; echo
+   # expect 410 about ten times (the bucket refills a little while the loop runs), then 429
+   curl -s -D - -o /dev/null https://tgmcp.qelphybox.space/confirm/guess | grep -i '^retry-after'   # expect a few seconds
+   ```
+
+3. **Consent with `send` sets the Confirmation cookie in that browser only.** In the Consent browser, open the developer tools (Network, "Preserve log" on) before authenticating. `claude mcp add --transport http telegram-send https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-send` → Authenticate, scan the QR, tick "Send messages", Choose chats, tick A and the forum, leave "without asking me" **unticked**, Allow.
+   - The `consent` POST's response (303) has one `set-cookie: tgm_confirm_<9 random characters>=<43 characters>; Path=/confirm; HttpOnly; SameSite=Strict; Max-Age=2592000; Secure`.
+   - Application → Cookies → `https://tgmcp.qelphybox.space`: `tgm_confirm_…` with HttpOnly ✓, Secure ✓, SameSite Strict, Path `/confirm`, expiring in 30 days. `document.cookie` in the console doesn't show it (HttpOnly).
+   - Connect a read-only connector the same way (§51, `scripts/scope-check.py - read` is enough): its Consent POST sets no `tgm_confirm_` cookie.
+   - Note the cookie's value (`V` below) for step 4. Don't paste it anywhere else.
+
+4. **The database holds no cookie.** Dump the database as in §51 step 1, then:
+
+   ```sh
+   grep -c -F '<V, the cookie value of step 3>' /tmp/tgmcp-dump/tg-mcp.db*   # expect 0 for every file: the cookie is not stored
+   grep -c -F 'tgm_confirm_' /tmp/tgmcp-dump/tg-mcp.db*                      # expect 0 for every file: nor its name
+   python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
+   import sqlite3, sys
+   db = sqlite3.connect(sys.argv[1])
+   for scopes, n in db.execute("SELECT scopes, length(send_allow_list) FROM grants WHERE send_allow_list IS NOT NULL"):
+       print(scopes, n % 512)   # expect: read send 40 (the verifier is inside the sealed, padded blob)
+   PY
+   ```
+
+5. **(#46) URL elicitation opens the page; Send sends once.** In a new Claude Code session with `telegram-send`, ask: "send_message to A: `**§55** check: _elicitation_, see [the spec](https://modelcontextprotocol.io)`". Claude Code asks to open a URL starting `https://tgmcp.qelphybox.space/confirm/` (the message reads "Telegram: a message waits for your confirmation …"); accept. The Consent browser opens the page:
+   - heading "**an app on this computer (localhost)** asks to send a message as you", then "The app calls itself “Claude Code” (not verified)." (claude.ai's connector: **claude.ai** instead);
+   - "To A person" (or group), the text with "§55" bold, "elicitation" italic, "the spec" underlined followed by "(https://modelcontextprotocol.io)";
+   - buttons Cancel, Make it a Draft, Send. Response headers as in step 1, plus a `set-cookie` renewing `tgm_confirm_…` for another 30 days.
+
+   While Claude Code still waits, check the page from the model's side: copy the URL into a terminal (`U` below) and run
+
+   ```sh
+   csrf=$(curl -s "$U" | grep -o 'name="csrf" value="[^"]*"' | cut -d'"' -f4)
+   curl -s "$U" | grep -c 'value="send"'                  # expect 0: without the cookie only the Draft button
+   curl -s -o /tmp/shell.html -w '%{http_code}\n' -d "csrf=$csrf&decision=send" "$U"     # expect 403
+   grep -c 'only send or cancel this message in the browser where you connected' /tmp/shell.html   # expect 1
+   curl -s -o /dev/null -w '%{http_code}\n' -d "csrf=$csrf&decision=cancel" "$U"         # expect 403
+   curl -s -o /dev/null -w '%{http_code}\n' -b 'tgm_confirm_x=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' -d "csrf=$csrf&decision=send" "$U"   # expect 403
+   ```
+
+   Nothing was sent (A shows nothing new on the phone). Now press **Send** in the Consent browser: "Sent". Claude Code's call returns `status: "sent"` with `message_id` and `date`; A shows the message once, formatted, on the phone. Reload the page (or press Send again via the browser's back button): "No longer valid", nothing sent twice. `curl -s -o /dev/null -w '%{http_code}\n' "$U"` → 410.
+
+6. **(#46) A forum reply shows its Topic and the message replied to.** Ask: "send_message to the forum, replying to <the id of a message in Releases>: 'got it'". The page shows "Topic Releases" and "Replying to <sender> (message N): <its text, cut at 200 characters>". Send: the reply is in Releases.
+
+7. **(#46) Cancel, and declining the elicitation, send nothing.** Ask for another message to A; on the page press **Cancel**: "Cancelled. Nothing was sent.", the call returns `status: "cancelled"`. Ask once more and decline Claude Code's prompt to open the URL: the call returns `status: "cancelled"` at once, and that URL (if shown) answers 410.
+
+8. **(#46) A phone without the cookie can only make it a Draft.** Ask for a message to A; when Claude Code asks to open the URL, accept but open the URL on the phone instead (copy it over; ignore the desktop tab). The phone shows the page with "You can only send this message in the browser where you connected this app." and only **Make it a Draft**. Press it: "Saved as a Draft"; Telegram on the phone (and desktop) shows the text in A's message field, formatted, not sent. The call returns `status: "drafted"`. Clear the Draft.
+
+9. **(#46) A link from another site.** If a client hands out the link instead of eliciting (`status: "pending_confirmation"` with `confirm_url` and `expires_at` 10 minutes ahead; claude.ai's connector, when it doesn't support URL elicitation), click it in that client in the Consent browser: the page briefly says "Opening the request…" and reloads itself with Send offered (the browser left the SameSite=Strict cookie off the cross-site click; the reload carries it). Send; then `get_messages` on A shows it. Clients that elicit: skip.
+
+10. **(#46) Expiry.** Ask for a message to A and leave the page open without pressing anything for 10 minutes. The call returns `status: "expired"`; pressing Send afterwards answers "No longer valid". Nothing was sent.
+
+11. **(#46) The Send cap at confirmation.** Within one minute, confirm 5 messages to A (step 5's flow, quickly), then confirm a 6th: the page says "Not sent" with "Too many messages to this chat in the last minute (the server's Send cap). The message was not sent, and it is not queued: try again in N s", and the call is an error with the same text. A shows exactly 5. (§52 has the cap itself.)
+
+12. **(#46) Auto-send skips the page, only for its chats.** Connect `telegram-send2` (step 3 with "without asking me" ticked, A only). "send_message to A: 'auto §55'": `status: "sent"` at once, no URL prompt. To any other chat: an error naming the Send allow-list, nothing sent.
+
+13. **The server's side**, within 15 minutes of the steps:
+
+    ```sh
+    logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+    logs | grep -E 'pending send|confirmed write|sent without confirmation'
+    # expect "pending send made" (grant_id, chat, chars, entities), "pending send confirmed: message sent" (grant_id, chat, message_id),
+    # "pending send made a draft", "pending send cancelled", "pending send decision refused: not the consent browser",
+    # "confirmed write refused" (step 11): ids and sizes only
+    logs | grep -c 'confirm/'               # expect 0: the page's id never reaches the app's log
+    logs | grep -cE '§55|modelcontextprotocol|the spec|got it'   # expect 0: message text is never logged
+    logs | grep -c 'tgm_'                   # expect 0: neither the cookie nor a Token
+    ```
+
+    (`kamal proxy logs` records request paths, `/confirm/<id>` included: accepted, see `docs/deploy.md`.)
+
+14. **Clean up.** `claude mcp remove telegram-send` and `claude mcp remove telegram-send2`, end their sessions in Telegram → Settings → Devices, delete the test messages in A, and delete the `tgm_confirm_…` cookies in the browser's developer tools (or leave them: they are useless once the connection is gone).
