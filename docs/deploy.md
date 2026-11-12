@@ -1,6 +1,6 @@
 # Deploy
 
-Production runs at `https://tgmcp.qelphybox.space` on one VPS, deployed with [Kamal 2](https://kamal-deploy.org): `config/deploy.yml`, `.kamal/secrets`, `.github/workflows/deploy.yml`.
+Production runs at `https://connector.tgmcp.dev` on one VPS, deployed with [Kamal 2](https://kamal-deploy.org): `config/deploy.yml`, `.kamal/secrets`, `.github/workflows/deploy.yml`.
 
 ## How a rollout works
 
@@ -65,6 +65,21 @@ kamal rollback <sha>     # switch back to a previous image (kamal app containers
 A rollback can't cross a database migration: an image older than a migration the database already ran refuses to start (sqlx: "migration N was previously applied but is missing"). Check `migrations/` between the two commits; if one was added, fix forward instead.
 
 The image is distroless (no shell), so `kamal app exec` with a shell does not work, by design.
+
+## Landing page
+
+`https://tgmcp.dev` is GitHub Pages, published from `site/` by `.github/workflows/pages.yml` on every push to `main` that touches it. There is no build step: what is in `site/` is what is served. The custom domain lives in **Settings → Pages**, not in a `CNAME` file (Pages ignores it when deploying from Actions).
+
+DNS for `tgmcp.dev`, at its registrar:
+
+| Name | Type | Value |
+| --- | --- | --- |
+| `@` | A | `185.199.108.153`, `185.199.109.153`, `185.199.110.153`, `185.199.111.153` |
+| `@` | AAAA | `2606:50c0:8000::153`, `2606:50c0:8001::153`, `2606:50c0:8002::153`, `2606:50c0:8003::153` |
+| `www` | CNAME | `qelphybox.github.io` |
+| `connector` | A | the server's IPv4 (`KAMAL_HOST`), no CDN proxying |
+
+`.dev` is on the HSTS preload list, so browsers only ever use HTTPS: the site and the connector open once their certificates are issued (Pages: after the domain check in Settings → Pages; kamal-proxy: on the first HTTPS request).
 
 ## Releases
 

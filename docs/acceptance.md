@@ -12,7 +12,7 @@ With a stopwatch, from a machine where the server was never added:
 
 ```sh
 claude mcp remove telegram 2>/dev/null
-claude mcp add --transport http telegram https://tgmcp.qelphybox.space/mcp
+claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp
 ```
 
 `/mcp` → `telegram` → Authenticate → scan the QR → Allow → back in Claude Code ask "list my latest Telegram chats". Stop when the chats appear. No token is copied by hand at any point.
@@ -66,7 +66,7 @@ Allocators don't always return memory to the OS immediately, so step 3 may sit s
 From one machine, each block a minute after the previous one (buckets refill at their per-minute rate). Defaults: `/register` 5 at once, `/authorize` 5, `/token` and `/revoke` 10 each.
 
 ```sh
-BASE=https://tgmcp.qelphybox.space
+BASE=https://connector.tgmcp.dev
 hit() { curl -s -o /dev/null -w '%{http_code} ' "$@"; }
 
 # /register: 5 pass, then 429. A forged X-Forwarded-For doesn't help.
@@ -92,7 +92,7 @@ for i in 1 2 3 4; do
   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
     "$BASE/authorize?response_type=code&client_id=$CID&redirect_uri=http://127.0.0.1:43123/callback&code_challenge=$CH&code_challenge_method=S256"
 done
-# expect: 3 × "303 https://tgmcp.qelphybox.space/login/…", then "303 http://127.0.0.1:43123/callback?error=temporarily_unavailable…"
+# expect: 3 × "303 https://connector.tgmcp.dev/login/…", then "303 http://127.0.0.1:43123/callback?error=temporarily_unavailable…"
 # One more within the minute: 429 (5 /authorize requests per burst).
 ```
 
@@ -156,13 +156,13 @@ If Telegram itself already drops a character from a title or name, that field's 
 ## 11. Consent leads with where the login goes, not the self-declared name
 
 1. Claude Code (§1, `/mcp` → Authenticate): after the QR the heading reads "Allow **an app on this computer (localhost)** read-only access to all chats of **{your name}**?", and below it, small and grey, "The app calls itself "Claude Code" (not verified)." (or whatever name the client registered).
-2. claude.ai → Settings → Connectors → add `https://tgmcp.qelphybox.space/mcp` → Connect: the heading names **claude.ai**.
+2. claude.ai → Settings → Connectors → add `https://connector.tgmcp.dev/mcp` → Connect: the heading names **claude.ai**.
 3. A hostile name, by hand:
 
    ```sh
-   id=$(curl -s https://tgmcp.qelphybox.space/register -H 'content-type: application/json' \
+   id=$(curl -s https://connector.tgmcp.dev/register -H 'content-type: application/json' \
      -d "$(python3 -c 'import json; print(json.dumps({"client_name": "<b>Claude</b>\u202e\u200bevil", "redirect_uris": ["https://example.com/cb"]}))')" | jq -r .client_id)
-   open "https://tgmcp.qelphybox.space/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&resource=https%3A%2F%2Ftgmcp.qelphybox.space%2Fmcp"
+   open "https://connector.tgmcp.dev/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&resource=https%3A%2F%2Fconnector.tgmcp.dev%2Fmcp"
    ```
 
    Scan the QR: the heading names **example.com**; the grey line reads `The app calls itself "<b>Claude</b>evil" (not verified).` with the tags shown literally, nothing bold and nothing reversed. Deny.
@@ -331,7 +331,7 @@ Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with a voice message (525381
 Через Telegram MCP, в чате user:408551275~0xo8DFRPKC4. 1) get_messages с around_id=525381 и limit=12: выведи для 525379, 525380, 525381, 525384 только id и media целиком, и id одного сообщения без media. 2) get_media с mode="download" для 525379, 525380, 525381, 525384, затем ещё раз для 525381. Для каждого ответа выведи kind и download без url (mime_type, size_bytes, duration_s, suggested_filename, expires_at). url никуда не вставляй и не выводи, используй только в команде curl. Скачай каждый файл по ссылке из первого вызова: curl -fsS -D headers-<id>.txt -o <suggested_filename> '<url>', потом выведи wc -c <suggested_filename>, строки Content-Type, Content-Length, Content-Disposition, Cache-Control, X-Content-Type-Options из headers-<id>.txt и вывод file <suggested_filename>. 3) Расшифруй голосовое локально (ffmpeg в wav 16 кГц, затем whisper) и выведи первые слова; из кружка вытащи звук так же и расшифруй. 4) По первой ссылке на 525381 (она уже скачана один раз) сделай ещё три запроса: curl -s -o /dev/null -w '%{http_code}\n' '<url>'. Запроси <база сервера>/media/ и 43 буквы A тем же способом. 5) get_media для сообщения без media из шага 1 и выведи текст ошибки. 6) Через 6 минут после шага 2 запроси вторую ссылку на 525381 (её ещё не скачивали) и выведи HTTP-код.
 ```
 
-1. `get_media` answers `kind` exactly as `get_messages` describes the message: 525379 `photo` with `mime_type: "image/jpeg"`, 525380 `video_note` with `video/mp4`, 525381 `voice` with `audio/ogg` and `duration_s: 9`, 525384 `document` with `application/pdf` and `suggested_filename: "tickets.pdf"`; `size_bytes` equals the message's `media.size_bytes` for each. A file with a name of its own keeps it (the video note is `round_<date>_<time>.mp4`, as `get_messages` shows its `file_name`); the others get `<kind>-<id>.<ext>` names (`voice-525381.ogg`, `photo-525379.jpg`). `expires_at` is 5 minutes after the call. No answer has a file reference, access hash or DC id; the URL is `https://tgmcp.qelphybox.space/media/` + 43 characters.
+1. `get_media` answers `kind` exactly as `get_messages` describes the message: 525379 `photo` with `mime_type: "image/jpeg"`, 525380 `video_note` with `video/mp4`, 525381 `voice` with `audio/ogg` and `duration_s: 9`, 525384 `document` with `application/pdf` and `suggested_filename: "tickets.pdf"`; `size_bytes` equals the message's `media.size_bytes` for each. A file with a name of its own keeps it (the video note is `round_<date>_<time>.mp4`, as `get_messages` shows its `file_name`); the others get `<kind>-<id>.<ext>` names (`voice-525381.ogg`, `photo-525379.jpg`). `expires_at` is 5 minutes after the call. No answer has a file reference, access hash or DC id; the URL is `https://connector.tgmcp.dev/media/` + 43 characters.
 2. Each download's `wc -c` equals `size_bytes` and `Content-Length`; `Content-Type` equals `mime_type`; `Content-Disposition: attachment; filename="…"; filename*=UTF-8''…`; `Cache-Control: no-store`; `X-Content-Type-Options: nosniff`. `file` says Ogg data, Opus audio (voice), ISO Media MP4 (video note), PDF document (tickets.pdf), JPEG image data (photo), and the PDF and photo open as the app shows them.
 3. Both transcribe locally into what was said; nothing was converted on the server.
 4. The three extra requests answer `200 200 404` (3 downloads per link); the made-up ticket `404`; neither 404 has a body.
@@ -342,7 +342,7 @@ Then on the server: `kamal app logs | grep 'media link'` shows `media link issue
 
 ## 20. get_media `view` puts the picture itself in front of the model, in claude.ai too
 
-This is the mode for clients without a shell, so the primary check is **claude.ai on the web** with the connector added (Settings → Connectors → Add custom connector → `https://tgmcp.qelphybox.space/mcp`); run the same prompt in Claude Code afterwards and note whether both show and describe the images (and, if you try them, which other clients do: Claude desktop, the Claude mobile apps, Cursor).
+This is the mode for clients without a shell, so the primary check is **claude.ai on the web** with the connector added (Settings → Connectors → Add custom connector → `https://connector.tgmcp.dev/mcp`); run the same prompt in Claude Code afterwards and note whether both show and describe the images (and, if you try them, which other clients do: Claude desktop, the Claude mobile apps, Cursor).
 
 Needs Saved Messages (`user:408551275~0xo8DFRPKC4`) with the photo 525379 (960×1280, 135013 bytes) and the round video message 525380 (it has a thumbnail), as in §19. **Prepare before the run** (send them to Saved Messages yourself and note their ids):
 
@@ -385,7 +385,7 @@ If a first call comes back `{ "status": "pending", "retry_after_s": 10 }` after 
 
 ### (b) A second account without Premium (the weekly trial)
 
-Connect a second account as a separate connector: in claude.ai another custom connector with the same URL under another name (e.g. `telegram-free`), or in Claude Code `claude mcp add --transport http telegram-free https://tgmcp.qelphybox.space/mcp`, then authenticate and scan the QR with the account **without** Premium. **Prepare before the run** in that account's Saved Messages (send them yourself and note their ids; its Saved Messages id is the `user:` id `whoami`/`list_chats` give for it, `<SM>` below):
+Connect a second account as a separate connector: in claude.ai another custom connector with the same URL under another name (e.g. `telegram-free`), or in Claude Code `claude mcp add --transport http telegram-free https://connector.tgmcp.dev/mcp`, then authenticate and scan the QR with the account **without** Premium. **Prepare before the run** in that account's Saved Messages (send them yourself and note their ids; its Saved Messages id is the `user:` id `whoami`/`list_chats` give for it, `<SM>` below):
 
 - `<W1>`, `<W3>`, `<W4>`, `<W5>`: four short voice messages (under 30 s, each saying something different);
 - `<W2>`: a short round video message.
@@ -637,19 +637,19 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 2. **Metadata advertises every Scope.**
 
    ```sh
-   curl -s https://tgmcp.qelphybox.space/.well-known/oauth-authorization-server | jq -c .scopes_supported
+   curl -s https://connector.tgmcp.dev/.well-known/oauth-authorization-server | jq -c .scopes_supported
    # expect ["read","draft","send","organize"]
-   curl -s https://tgmcp.qelphybox.space/.well-known/oauth-protected-resource/mcp | jq -c '[.scopes_supported, .resource_name]'
+   curl -s https://connector.tgmcp.dev/.well-known/oauth-protected-resource/mcp | jq -c '[.scopes_supported, .resource_name]'
    # expect [["read","draft","send","organize"],"Telegram (unofficial)"]
    ```
 
 3. **An unknown Scope is `invalid_scope`**, sent back to the client before any login starts:
 
    ```sh
-   id=$(curl -s https://tgmcp.qelphybox.space/register -H 'content-type: application/json' \
+   id=$(curl -s https://connector.tgmcp.dev/register -H 'content-type: application/json' \
      -d '{"client_name": "scope-check (manual test)", "redirect_uris": ["https://example.com/cb"]}' | jq -r .client_id)
-   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://tgmcp.qelphybox.space/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=read%20write"
-   # expect 303 https://example.com/cb?error=invalid_scope&error_description=…&state=s&iss=https%3A%2F%2Ftgmcp.qelphybox.space
+   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://connector.tgmcp.dev/authorize?response_type=code&client_id=$id&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=read%20write"
+   # expect 303 https://example.com/cb?error=invalid_scope&error_description=…&state=s&iss=https%3A%2F%2Fconnector.tgmcp.dev
    ```
 
 4. **A new Grant with only `read`.**
@@ -676,7 +676,7 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 
    Keep "Write Drafts" ticked and Allow. The token response and the refresh (which asks for every Scope) both say `read draft`; the instructions read "… Access to the connected Telegram account: you can read chats, messages and media, and write Drafts (text left in a chat's message field, replacing the Draft there; only the user sends it); you cannot send, edit or delete messages. …"; the tool list is step 4's plus `save_draft` (§53 checks what it does).
 
-7. **What Claude Code asks for.** `claude mcp add --transport http telegram-scopes https://tgmcp.qelphybox.space/mcp`, then `/mcp` → `telegram-scopes` → Authenticate, and scan the QR. Record whether "Write Drafts" opens ticked (Claude Code asked for every advertised Scope) or not (it asked for none or `read`). Untick it, Allow, check `whoami` answers, then `claude mcp remove telegram-scopes` and end that session in Telegram → Settings → Devices.
+7. **What Claude Code asks for.** `claude mcp add --transport http telegram-scopes https://connector.tgmcp.dev/mcp`, then `/mcp` → `telegram-scopes` → Authenticate, and scan the QR. Record whether "Write Drafts" opens ticked (Claude Code asked for every advertised Scope) or not (it asked for none or `read`). Untick it, Allow, check `whoami` answers, then `claude mcp remove telegram-scopes` and end that session in Telegram → Settings → Devices.
 
 8. **The server's side**, within 15 minutes of the runs:
 
@@ -732,7 +732,7 @@ Needs Telegram open on a phone and on Telegram Desktop with the account, a priva
    python3 scripts/scope-check.py "read draft" "read draft" # expect every line [PASS] and exit status 0
    ```
 
-   The first lists `get_drafts` but not `save_draft`, and "calling save_draft is refused for the missing Scope" passes: the error reads "save_draft needs the `draft` Scope, which this connection was not granted (it has: read). …". The second lists both. Then add the connector the steps below use: `claude mcp add --transport http telegram-drafts https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-drafts` → Authenticate, scan the QR, tick **Write Drafts**, Allow. In a new Claude Code session `/mcp` shows both servers; with only the regular `telegram` connector (a `read` Grant), "save a Telegram draft 'hi' in my Saved Messages" can't be done: no `save_draft` is offered.
+   The first lists `get_drafts` but not `save_draft`, and "calling save_draft is refused for the missing Scope" passes: the error reads "save_draft needs the `draft` Scope, which this connection was not granted (it has: read). …". The second lists both. Then add the connector the steps below use: `claude mcp add --transport http telegram-drafts https://connector.tgmcp.dev/mcp`, `/mcp` → `telegram-drafts` → Authenticate, scan the QR, tick **Write Drafts**, Allow. In a new Claude Code session `/mcp` shows both servers; with only the regular `telegram` connector (a `read` Grant), "save a Telegram draft 'hi' in my Saved Messages" can't be done: no `save_draft` is offered.
 
 2. **Markdown becomes formatting, on phone and desktop.** With `telegram-drafts`, ask:
 
@@ -798,7 +798,7 @@ Needs an account with at least one Chat folder that is a plain list of chats ("W
 
 2. **Read-only is unchanged and asks Telegram nothing more.** `python3 scripts/scope-check.py - read` (expect every line [PASS]). On its Consent screen "Send messages as you, react and mark chats as read, only in the chats you choose below." is offered and **unticked**, and no chat list is shown; leave it so and Allow. Then `logs | grep -c 'consent chat pickers loaded'` (as in step 7) is 0.
 
-3. **The pickers.** `claude mcp add --transport http telegram-send https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-send` → Authenticate, scan the QR. On the Consent screen:
+3. **The pickers.** `claude mcp add --transport http telegram-send https://connector.tgmcp.dev/mcp`, `/mcp` → `telegram-send` → Authenticate, scan the QR. On the Consent screen:
    - "Send messages" is unticked even though Claude Code may have asked for every Scope (§51 step 7). Tick it: "Chats it may send to" appears with a "Choose chats" button, and the line under the boxes reads "It can't send anywhere else, and can't edit or delete messages."
    - Press **Choose chats**. The page comes back with "Send messages" still ticked, "Send to these chats **without asking me** each time" **unticked**, then:
      - **Chat folders**: one box per folder that is a list ("Work"), none for a folder by rules ("Unread"); compare with `whoami`'s `chat_folders` (`rules: false` ones only).
@@ -825,7 +825,7 @@ Needs an account with at least one Chat folder that is a plain list of chats ("W
    PY
    ```
 
-6. **Auto-send is stored only when ticked.** Connect once more: `claude mcp add --transport http telegram-send2 https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-send2` → Authenticate, scan the QR; tick "Send messages", Choose chats, tick one chat **and** "without asking me", Allow.
+6. **Auto-send is stored only when ticked.** Connect once more: `claude mcp add --transport http telegram-send2 https://connector.tgmcp.dev/mcp`, `/mcp` → `telegram-send2` → Authenticate, scan the QR; tick "Send messages", Choose chats, tick one chat **and** "without asking me", Allow.
 
 7. **The server's side**, within 15 minutes of steps 2-6:
 
@@ -849,7 +849,7 @@ Steps 1-4 need only #45. Steps 5-12 use `send_message` (#46, its own checks are 
 1. **An unknown link is no longer valid, on a locked-down page.**
 
    ```sh
-   curl -s -D - -o /tmp/confirm.html -H 'Origin: https://evil.example' https://tgmcp.qelphybox.space/confirm/garbage
+   curl -s -D - -o /tmp/confirm.html -H 'Origin: https://evil.example' https://connector.tgmcp.dev/confirm/garbage
    # expect HTTP/2 410, and among the headers:
    #   content-security-policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
    #   x-frame-options: DENY
@@ -858,20 +858,20 @@ Steps 1-4 need only #45. Steps 5-12 use `send_message` (#46, its own checks are 
    # and no access-control-allow-origin header
    grep -o 'This request is no longer valid[^<]*' /tmp/confirm.html   # expect the sentence
    grep -c '<script' /tmp/confirm.html                                # expect 0
-   curl -s -o /dev/null -w '%{http_code}\n' -X POST -d 'csrf=x&decision=send' https://tgmcp.qelphybox.space/confirm/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   # expect 410
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST -d 'csrf=x&decision=send' https://connector.tgmcp.dev/confirm/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   # expect 410
    ```
 
 2. **The page is rate-limited per client IP** (30 a minute, a burst of 10; GET and POST share it). Then wait a minute before the next steps from the same network.
 
    ```sh
-   for i in $(seq 1 13); do curl -s -o /dev/null -w '%{http_code} ' https://tgmcp.qelphybox.space/confirm/guess$i; done; echo
+   for i in $(seq 1 13); do curl -s -o /dev/null -w '%{http_code} ' https://connector.tgmcp.dev/confirm/guess$i; done; echo
    # expect 410 about ten times (the bucket refills a little while the loop runs), then 429
-   curl -s -D - -o /dev/null https://tgmcp.qelphybox.space/confirm/guess | grep -i '^retry-after'   # expect a few seconds
+   curl -s -D - -o /dev/null https://connector.tgmcp.dev/confirm/guess | grep -i '^retry-after'   # expect a few seconds
    ```
 
-3. **Consent with `send` sets the Confirmation cookie in that browser only.** In the Consent browser, open the developer tools (Network, "Preserve log" on) before authenticating. `claude mcp add --transport http telegram-send https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-send` → Authenticate, scan the QR, tick "Send messages", Choose chats, tick A and the forum, leave "without asking me" **unticked**, Allow.
+3. **Consent with `send` sets the Confirmation cookie in that browser only.** In the Consent browser, open the developer tools (Network, "Preserve log" on) before authenticating. `claude mcp add --transport http telegram-send https://connector.tgmcp.dev/mcp`, `/mcp` → `telegram-send` → Authenticate, scan the QR, tick "Send messages", Choose chats, tick A and the forum, leave "without asking me" **unticked**, Allow.
    - The `consent` POST's response (303) has one `set-cookie: tgm_confirm_<9 random characters>=<43 characters>; Path=/confirm; HttpOnly; SameSite=Strict; Max-Age=2592000; Secure`.
-   - Application → Cookies → `https://tgmcp.qelphybox.space`: `tgm_confirm_…` with HttpOnly ✓, Secure ✓, SameSite Strict, Path `/confirm`, expiring in 30 days. `document.cookie` in the console doesn't show it (HttpOnly).
+   - Application → Cookies → `https://connector.tgmcp.dev`: `tgm_confirm_…` with HttpOnly ✓, Secure ✓, SameSite Strict, Path `/confirm`, expiring in 30 days. `document.cookie` in the console doesn't show it (HttpOnly).
    - Connect a read-only connector the same way (§51, `scripts/scope-check.py - read` is enough): its Consent POST sets no `tgm_confirm_` cookie.
    - Note the cookie's value (`V` below) for step 4. Don't paste it anywhere else.
 
@@ -888,7 +888,7 @@ Steps 1-4 need only #45. Steps 5-12 use `send_message` (#46, its own checks are 
    PY
    ```
 
-5. **(#46) URL elicitation opens the page; Send sends once.** In a new Claude Code session with `telegram-send`, ask: "send_message to A: `**§55** check: _elicitation_, see [the spec](https://modelcontextprotocol.io)`". Claude Code asks to open a URL starting `https://tgmcp.qelphybox.space/confirm/` (the message reads "Telegram: a message waits for your confirmation …"); accept. The Consent browser opens the page:
+5. **(#46) URL elicitation opens the page; Send sends once.** In a new Claude Code session with `telegram-send`, ask: "send_message to A: `**§55** check: _elicitation_, see [the spec](https://modelcontextprotocol.io)`". Claude Code asks to open a URL starting `https://connector.tgmcp.dev/confirm/` (the message reads "Telegram: a message waits for your confirmation …"); accept. The Consent browser opens the page:
    - heading "**an app on this computer (localhost)** asks to send a message as you", then "The app calls itself “Claude Code” (not verified)." (claude.ai's connector: **claude.ai** instead);
    - "To A person" (or group), the text with "§55" bold, "elicitation" italic, "the spec" underlined followed by "(https://modelcontextprotocol.io)";
    - buttons Cancel, Make it a Draft, Send. Response headers as in step 1, plus a `set-cookie` renewing `tgm_confirm_…` for another 30 days.
@@ -952,7 +952,7 @@ Needs what §55 needs, its two connectors, `telegram-send` (step 3: A and the fo
 
 2. **Confirmation in Claude Code (URL elicitation), with formatting.** Run §55 steps 5, 7 and 8 if not done since #46 was deployed. Step 5's message is the Markdown check: on the phone, A shows "§55" bold, "elicitation" italic and "the spec" as a link to modelcontextprotocol.io. Then ask "send_message to A with format plain: `**§56** stays as typed`" and press Send on the page: the page shows the asterisks, the call returns `status: "sent"`, and A shows `**§56** stays as typed` literally, with no bold.
 
-3. **Confirmation through the link.** In the same desktop browser, add the server in claude.ai (Settings → Connectors → Add custom connector → `https://tgmcp.qelphybox.space/mcp`), connect, tick "Send messages", choose A only, leave "without asking me" unticked, Allow. In a new claude.ai chat ask "Send '§56 link check' to A on Telegram". If claude.ai elicits (it opens or offers the page itself), this is step 2 again: note that and skip to step 4. Otherwise the tool returns `status: "pending_confirmation"` with `confirm_url` (`https://tgmcp.qelphybox.space/confirm/…`) and `expires_at` 10 minutes ahead, and Claude gives you the link and does not call `send_message` again. Click it: §55 step 9's page (reloads itself once, Send offered); press **Send**: "Sent". Back in the chat, ask "Did it go out?": Claude checks with `get_messages` on A (not another `send_message`) and finds "§56 link check" once. Remove the claude.ai connector afterwards (Settings → Connectors).
+3. **Confirmation through the link.** In the same desktop browser, add the server in claude.ai (Settings → Connectors → Add custom connector → `https://connector.tgmcp.dev/mcp`), connect, tick "Send messages", choose A only, leave "without asking me" unticked, Allow. In a new claude.ai chat ask "Send '§56 link check' to A on Telegram". If claude.ai elicits (it opens or offers the page itself), this is step 2 again: note that and skip to step 4. Otherwise the tool returns `status: "pending_confirmation"` with `confirm_url` (`https://connector.tgmcp.dev/confirm/…`) and `expires_at` 10 minutes ahead, and Claude gives you the link and does not call `send_message` again. Click it: §55 step 9's page (reloads itself once, Send offered); press **Send**: "Sent". Back in the chat, ask "Did it go out?": Claude checks with `get_messages` on A (not another `send_message`) and finds "§56 link check" once. Remove the claude.ai connector afterwards (Settings → Connectors).
 
 4. **A chat outside the list is refused before anything waits.** With `telegram-send`, ask "send_message to B (`<B's chat id>`): '§56 not for B'". Claude Code opens no URL; the call fails with "user:… is not one of the chats this connection may send to (its Send allow-list, chosen on the consent screen when it was connected): the user connects again to choose other chats". With `telegram-send2` the same. B shows nothing.
 
@@ -989,7 +989,7 @@ Needs what §55 needs, its two connectors, `telegram-send` (step 3: A and the fo
 
 ## 57. react and mark_read write only into the Send allow-list, never ask, and show on the phone at once
 
-Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its Send allow-list, "without asking me" unticked; keep it, or set it up again as in §55 step 3) and chat B of yours outside it; the forum's Topic "Releases" with id `R` (§56); a group G you administer, with a few messages; and a second account, or a friend, that can post in A and in the forum. Connect a further connector for this section from the same desktop browser: `claude mcp add --transport http telegram-react https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-react` → Authenticate, tick "Send messages", choose A, the forum and G, leave "without asking me" unticked, Allow. In Telegram, set G's reactions to only 👍 (G → Edit → Reactions → "Some reactions", only 👍). The boundaries are also covered by fake-backed tests: `cargo test --lib mcp::send::` (set, replace, remove; custom emoji, paid and non-standard emoji refused before Telegram; `emoji` required; a chat that allows only some reactions or none; mark_read up to the latest, up to `up_to`, a Topic, not a forum or not a Topic; outside the list; neither listed nor callable without `send`; annotations and schemas), `cargo test --lib tg::grammers::react_tests` (the requests that reach Telegram, its list of reactions asked for once, refusals, the writes budget but not the Send cap) and `cargo test --lib tg::reactions` (matching against Telegram's list).
+Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its Send allow-list, "without asking me" unticked; keep it, or set it up again as in §55 step 3) and chat B of yours outside it; the forum's Topic "Releases" with id `R` (§56); a group G you administer, with a few messages; and a second account, or a friend, that can post in A and in the forum. Connect a further connector for this section from the same desktop browser: `claude mcp add --transport http telegram-react https://connector.tgmcp.dev/mcp`, `/mcp` → `telegram-react` → Authenticate, tick "Send messages", choose A, the forum and G, leave "without asking me" unticked, Allow. In Telegram, set G's reactions to only 👍 (G → Edit → Reactions → "Some reactions", only 👍). The boundaries are also covered by fake-backed tests: `cargo test --lib mcp::send::` (set, replace, remove; custom emoji, paid and non-standard emoji refused before Telegram; `emoji` required; a chat that allows only some reactions or none; mark_read up to the latest, up to `up_to`, a Topic, not a forum or not a Topic; outside the list; neither listed nor callable without `send`; annotations and schemas), `cargo test --lib tg::grammers::react_tests` (the requests that reach Telegram, its list of reactions asked for once, refusals, the writes budget but not the Send cap) and `cargo test --lib tg::reactions` (matching against Telegram's list).
 
 1. **Only a `send` Grant has them, and is told what they do.**
 

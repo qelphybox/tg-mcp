@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-BASE = (sys.argv[1] if len(sys.argv) > 1 else "https://tgmcp.qelphybox.space").rstrip("/")
+BASE = (sys.argv[1] if len(sys.argv) > 1 else "https://connector.tgmcp.dev").rstrip("/")
 
 
 def request(method, path, *, form=None, body=None, headers=None):

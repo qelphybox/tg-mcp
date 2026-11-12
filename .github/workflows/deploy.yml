@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://tgmcp.qelphybox.space
+      url: https://connector.tgmcp.dev
     env:
       KAMAL_HOST: ${{ vars.KAMAL_HOST }}
       KAMAL_SSH_USER: ${{ vars.KAMAL_SSH_USER }}
@@ -65,7 +65,7 @@ jobs:
       - name: Smoke test
         run: |
           for i in $(seq 1 30); do
-            curl -fsS https://tgmcp.qelphybox.space/healthz && exit 0
+            curl -fsS https://connector.tgmcp.dev/healthz && exit 0
             sleep 2
           done
           echo "healthz did not answer over HTTPS" >&2

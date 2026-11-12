@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### New address
+
+- **The public instance moved to `https://connector.tgmcp.dev/mcp`.** `https://tgmcp.qelphybox.space/mcp` stops answering: remove the connector and add it again with the new URL (claude.ai: Settings → Connectors; Claude Code: `claude mcp remove telegram`, then `claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp`). You sign in again with the QR code; then end the old **Unofficial MCP Server** session in Telegram → Settings → Devices.
+- A landing page at [tgmcp.dev](https://tgmcp.dev), published from `site/` with GitHub Pages.
+
 ### New
 
 - **Drafts, the first write.** `save_draft` (Scope `draft`) puts text into a chat's message field on all the account's devices, replacing the Draft there; `""` clears it, and nothing is ever sent: the user sends it from Telegram. Text is a small Markdown subset by default (bold, italic, inline code, code blocks, links; anything else stays as typed) or `format: "plain"`, at most 4096 characters once formatted (longer is an error, never split). `reply_to` replies to a message of the chat; in a forum, `topic` (or a `reply_to` in a Topic) names the Topic, and neither is an error. Any chat of the account's, no allow-list. Each call spends the writes budget; the text is never logged, only ids and sizes. Annotated not read-only, not destructive, idempotent.

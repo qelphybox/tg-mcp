@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tg-mcp: your Telegram in ChatGPT, Claude and Gemini</title>
+<meta name="description" content="Connect your Telegram to ChatGPT, Claude or Gemini. Unofficial, open source, built by an independent developer.">
+<meta name="theme-color" content="#000000">
+<meta property="og:title" content="tg-mcp: your Telegram in ChatGPT, Claude and Gemini">
+<meta property="og:description" content="Ask your AI what you missed, find what was said, book a table. Unofficial and open source.">
+<meta property="og:url" content="https://tgmcp.dev/">
+<meta property="og:type" content="website">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700&amp;family=Golos+Text:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#000}
+html{scrollbar-color:#3A3247 #000}
+::selection{background:#E4B2EA;color:#1F0F24}
+a{color:#C9B3FF;text-underline-offset:3px}
+a:hover{color:#E2D6FF}
+:focus-visible{outline:2px solid #C9B3FF;outline-offset:3px;border-radius:6px}
+code,pre,.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-variant-ligatures:none}
+.view{animation:viewIn 480ms cubic-bezier(0.16,1,0.3,1) both}
+.stag>*{animation:lnIn 420ms cubic-bezier(0.16,1,0.3,1) both}
+.stag>*:nth-child(2){animation-delay:120ms}
+.stag>*:nth-child(3){animation-delay:240ms}
+.stag>*:nth-child(4){animation-delay:360ms}
+.stag>*:nth-child(5){animation-delay:480ms}
+.tick{animation:tick 380ms cubic-bezier(0.16,1,0.3,1) both}
+@keyframes viewIn{from{opacity:0;filter:blur(6px);transform:translateY(6px)}to{opacity:1;filter:blur(0);transform:none} }
+@keyframes tick{from{transform:scale(0.6);opacity:0}to{transform:none;opacity:1} }
+.spin{animation:spin 900ms linear infinite}
+summary::-webkit-details-marker{display:none}
+.chev{transition:transform 200ms ease-out}
+details[open] .chev{transform:rotate(180deg)}
+summary:hover{color:#FFFFFF}
+.bub{animation:bub 520ms cubic-bezier(0.16,1,0.3,1) both}
+.slide{animation:slide 560ms cubic-bezier(0.16,1,0.3,1) both}
+.caret{animation:caret 1s steps(1,end) infinite}
+@keyframes spin{to{transform:rotate(360deg)} }
+@keyframes bub{from{opacity:0;transform:translateY(14px) scale(0.97)}to{opacity:1;transform:none} }
+@keyframes slide{from{transform:translateX(100%)}to{transform:none} }
+@keyframes caret{50%{opacity:0} }
+@media (prefers-reduced-motion: reduce){
+.bub,.slide{animation:fadeOnly 200ms ease-out both}
+.spin,.caret{animation:none}
+.view,.stag>*,.tick{animation:fadeOnly 200ms ease-out both}
+@keyframes fadeOnly{from{opacity:0}to{opacity:1} }
+}
+[hidden]{display:none!important}
+.wall,.wall-in{pointer-events:none;opacity:.35;background:radial-gradient(circle at 80% 10%,#e4b2ea 0,rgba(228,178,234,0) 60%),radial-gradient(circle at 15% 30%,#8376c2 0,rgba(131,118,194,0) 60%),radial-gradient(circle at 25% 90%,#eab9d9 0,rgba(234,185,217,0) 60%),radial-gradient(circle at 85% 80%,#b493e6 0,rgba(180,147,230,0) 60%),#b493e6;-webkit-mask-image:url(pattern.svg);mask-image:url(pattern.svg);-webkit-mask-size:420px auto;mask-size:420px auto}
+.wall{position:fixed;inset:0;z-index:-1}
+.wall-in{position:absolute;inset:0;-webkit-mask-size:260px auto;mask-size:260px auto}
+.tgs>:not(.wall-in){position:relative}
+.sheet{max-width:1288px;width:calc(100% - 24px);margin:96px auto 24px;border-radius:36px;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.01));-webkit-backdrop-filter:blur(6px) saturate(1.3);backdrop-filter:blur(6px) saturate(1.3);border:1px solid rgba(255,255,255,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 30px 80px -30px rgba(0,0,0,.7)}
+.halo{text-shadow:0 0 2px #000,0 1px 14px #000}
+</style>
+</head>
+<body>
+<div class="wall" aria-hidden="true"></div>
+<div style="color: #F1ECF7; font-family: 'Golos Text', system-ui, sans-serif; font-size: 17px; line-height: 1.6">
+
+<header style="max-width: 1240px; margin: 0 auto; padding: 0 24px">
+<nav aria-label="Main" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 24px; min-height: 76px">
+<a href="#top" style="display: inline-flex; align-items: center; gap: 10px; color: #F1ECF7; text-decoration: none; min-height: 44px">
+<svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><rect x="1.5" y="3.5" width="23" height="17" rx="6" stroke="#F1ECF7" stroke-width="2"></rect><path d="M7 20.5 6 24.5l5-4" stroke="#F1ECF7" stroke-width="2" stroke-linejoin="round"></path><circle cx="19" cy="7" r="4" fill="#E4B2EA" stroke="#000" stroke-width="2"></circle></svg>
+<span style="font-family: Unbounded, sans-serif; font-weight: 600; font-size: 18px; letter-spacing: -0.01em">tg-mcp</span>
+</a>
+<div class="halo" style="display: flex; flex-wrap: wrap; align-items: center; gap: 0 22px; font-size: 15px">
+<a href="#control" style="color: #D9D0E6; text-decoration: none; padding: 12px 0">Your data</a>
+<a href="#verify" style="color: #D9D0E6; text-decoration: none; padding: 12px 0">Self-host</a>
+<a href="#faq" style="color: #D9D0E6; text-decoration: none; padding: 12px 0">FAQ</a>
+<a href="https://github.com/qelphybox/tg-mcp" style="display: inline-flex; align-items: center; gap: 8px; color: #F1ECF7; text-decoration: none; padding: 10px 16px; border: 1px solid rgba(241,236,247,.16); border-radius: 10px; background: rgba(30,25,40,.45); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);">
+<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"></path></svg>
+GitHub
+</a>
+</div>
+</nav>
+</header>
+
+<section id="top" style="max-width: 1240px; margin: 0 auto; padding: 40px 24px 0; display: flex; flex-wrap: wrap; gap: 48px 72px; align-items: center">
+<div style="flex: 1 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 22px">
+<h1 style="margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(36px, 5vw, 66px); line-height: 1.04; letter-spacing: -0.03em; text-wrap: balance">Tell your AI what to do in Telegram.</h1>
+<ul aria-label="Things you can ask" style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; font-size: 17px">
+<li style="background: rgba(30,25,40,.6); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(241,236,247,.08); border-radius: 18px 18px 18px 6px; padding: 9px 16px; color: #F1ECF7">“What did I miss in my work chats?”</li>
+<li style="background: rgba(30,25,40,.6); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(241,236,247,.08); border-radius: 18px 18px 18px 6px; padding: 9px 16px; color: #F1ECF7">“Find the restaurant in Tbilisi someone recommended me.”</li>
+<li style="background: rgba(30,25,40,.6); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(241,236,247,.08); border-radius: 18px 18px 18px 6px; padding: 9px 16px; color: #F1ECF7">“Book a table for four on Friday.”</li>
+</ul>
+<div style="max-width: 560px; display: flex; flex-direction: column; gap: 14px">
+<div style="display: flex; flex-wrap: wrap; gap: 10px">
+<button type="button" data-app="0" aria-expanded="false" aria-controls="install-steps" style="-webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); display: inline-flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 22px; border-radius: 14px; border: 1px solid rgba(241,236,247,.14); background: rgba(30,25,40,.6); color: #F1ECF7; font: 600 16px 'Golos Text', sans-serif; cursor: pointer; transition: background 200ms ease-out, color 200ms ease-out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Add to ChatGPT</button>
+<button type="button" data-app="1" aria-expanded="false" aria-controls="install-steps" style="-webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); display: inline-flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 22px; border-radius: 14px; border: 1px solid rgba(241,236,247,.14); background: rgba(30,25,40,.6); color: #F1ECF7; font: 600 16px 'Golos Text', sans-serif; cursor: pointer; transition: background 200ms ease-out, color 200ms ease-out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Add to Claude</button>
+<button type="button" data-app="2" aria-expanded="false" aria-controls="install-steps" style="-webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); display: inline-flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 22px; border-radius: 14px; border: 1px solid rgba(241,236,247,.14); background: rgba(30,25,40,.6); color: #F1ECF7; font: 600 16px 'Golos Text', sans-serif; cursor: pointer; transition: background 200ms ease-out, color 200ms ease-out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Add to Gemini</button>
+</div>
+<div data-if="appOpen" hidden style="display: contents">
+<div id="install-steps" class="view" style="background: rgba(24,19,32,.72); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px); border: 1px solid rgba(241,236,247,.08); border-radius: 16px; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 10px 30px -12px rgba(0,0,0,0.6)">
+<ol id="app-steps" style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px"></ol>
+<div style="display: flex; align-items: stretch; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.1); border-radius: 12px">
+<code style="flex: 1 1 auto; min-width: 0; padding: 12px 14px; font-size: 14px; color: #F1ECF7; white-space: nowrap; overflow-x: auto">https://connector.tgmcp.dev/mcp</code>
+<button type="button" data-copy aria-label="Copy the link" style="flex: none; min-width: 88px; min-height: 46px; border: 0; border-radius: 0 12px 12px 0; background: #E4B2EA; color: #1F0F24; font: 600 14px 'Golos Text', sans-serif; cursor: pointer"><span data-text="copyLabel"></span></button>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 4px 20px; align-items: center; justify-content: space-between">
+<a href="https://chatgpt.com" data-app-url target="_blank" rel="noopener" style="font-weight: 600; padding: 10px 0">Open <span data-text="appName"></span></a>
+<span style="font-size: 13.5px; color: #8C809E"><span data-text="appNote"></span></span>
+</div>
+</div>
+</div>
+<p class="halo" style="margin: 0; font-size: 13.5px; color: #B4A9C4">Unofficial. Made by <a href="https://github.com/qelphybox">Kirill Bobykin</a>, an independent developer; not affiliated with Telegram. Developers: <a href="#dev">Claude Code, Cursor, self-host</a>.</p>
+</div>
+</div>
+
+<div style="flex: 0 1 360px; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 22px; margin: 0 auto">
+<div id="phone" role="img" aria-label="A demo in the Claude app on a phone" style="width: 350px; max-width: 100%; height: 720px; box-sizing: border-box; padding: 11px; border-radius: 54px; background: #04070C; border: 1px solid #3A3247; box-shadow: 0 40px 80px -30px rgba(0,0,0,0.85), 0 12px 24px -12px rgba(0,0,0,0.6)">
+<div style="position: relative; width: 100%; height: 100%; border-radius: 44px; overflow: hidden; background: #1F1E1C">
+
+<div data-if="chat" hidden style="display: contents">
+<div style="position: absolute; inset: 0; display: flex; flex-direction: column; color: #ECEAE4; font-size: 14.5px; line-height: 1.5">
+<div style="flex: none; display: flex; align-items: center; justify-content: space-between; padding: 34px 18px 10px">
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ECEAE4" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"></path></svg>
+<span style="font-weight: 600; font-size: 15px">Claude</span>
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ECEAE4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+</div>
+<div style="flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 14px; padding: 0 16px 12px">
+
+<div data-if="user" hidden style="display: contents">
+<div class="bub" style="align-self: flex-end; max-width: 86%; display: flex; flex-direction: column; align-items: flex-end; gap: 6px">
+<div data-if="attach" hidden style="display: contents">
+<div style="display: flex; gap: 6px">
+<span style="width: 60px; height: 60px; border-radius: 12px; background: #2F6F6A; display: flex; align-items: center; justify-content: center"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="16" r="3.5"></circle><circle cx="18.5" cy="16" r="3.5"></circle><path d="M5.5 16 9 9h6.5l3 7M9 9l3 7M14 6h2.5"></path></svg></span>
+<span style="width: 60px; height: 60px; border-radius: 12px; background: #8A4B2E; display: flex; align-items: center; justify-content: center"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 11V7a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v4"></path><path d="M2 18v-5a2 2 0 1 1 4 0v2h12v-2a2 2 0 1 1 4 0v5ZM5 18v2M19 18v2"></path></svg></span>
+<span style="width: 60px; height: 60px; border-radius: 12px; background: #4B3F8A; display: flex; align-items: center; justify-content: center"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg></span>
+</div>
+</div>
+<div style="background: #393834; border-radius: 18px 18px 6px 18px; padding: 10px 14px"><span data-text="msg"></span></div>
+</div>
+</div>
+
+<div data-if="a1" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 8px">
+<span><span data-text="intro"></span></span>
+<div data-chips style="display: contents"></div>
+</div>
+</div>
+
+<div data-if="rSell" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 10px">
+<span>Done. <strong>Weekend garage sale</strong> is live with three posts, one per item, photos and prices included. Share this link:</span>
+<div style="display: flex; align-items: center; gap: 12px; background: #2A2926; border: 1px solid #3A3934; border-radius: 14px; padding: 10px 12px">
+<span style="flex: none; width: 36px; height: 36px; border-radius: 50%; background: #E4B2EA; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1F0F24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 14px">Weekend garage sale</span><span class="mono" style="display: block; font-size: 12px; color: #C9B3FF">t.me/weekend_garage_sale</span></span>
+</div>
+</div>
+</div>
+
+<div data-if="rCatch" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 10px">
+<span>Six chats, 94 new messages. <strong>Two need your reply:</strong></span>
+<div class="stag" style="display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; gap: 10px; background: #2A2926; border: 1px solid #3A3934; border-radius: 12px; padding: 10px 12px"><span style="flex: none; width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: #E4B2EA"></span><span style="font-size: 13.5px"><strong>Anna, Design team.</strong> Needs the deck by Friday: the investor call moved up.<span class="mono" style="display: block; font-size: 11.5px; color: #C9B3FF; margin-top: 2px">t.me/c/1835/4812</span></span></div>
+<div style="display: flex; gap: 10px; background: #2A2926; border: 1px solid #3A3934; border-radius: 12px; padding: 10px 12px"><span style="flex: none; width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: #E4B2EA"></span><span style="font-size: 13.5px"><strong>Landlord.</strong> Asks you to confirm the viewing on Tuesday at 10:00.</span></div>
+</div>
+<span style="font-size: 13.5px; color: #A8A49A">Family, Book club and 2 more: nothing for you.</span>
+</div>
+</div>
+
+<div data-if="rTable" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 10px">
+<span>Booked. Osteria Lume confirmed in Telegram:</span>
+<div style="display: flex; align-items: center; gap: 12px; background: #2A2926; border: 1px solid #3A3934; border-radius: 14px; padding: 10px 12px">
+<span style="flex: none; width: 44px; height: 48px; border-radius: 10px; background: #ECEAE4; color: #1F1E1C; display: flex; flex-direction: column; align-items: center; justify-content: center; line-height: 1.1"><span style="font-size: 10px; font-weight: 600; text-transform: uppercase; color: #B4472C">Fri</span><span style="font-size: 18px; font-weight: 700">13</span></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 14px">20:30 · Table for 4, terrace</span><span style="display: block; font-size: 12.5px; color: #A8A49A">Osteria Lume</span></span>
+</div>
+</div>
+</div>
+
+</div>
+<div style="flex: none; padding: 8px 12px 26px">
+<div style="display: flex; align-items: flex-end; gap: 8px; background: #2A2926; border: 1px solid #3A3934; border-radius: 22px; padding: 8px 8px 8px 16px; min-height: 44px; box-sizing: border-box">
+<span style="flex: 1 1 auto; min-width: 0; padding: 4px 0; font-size: 14px; line-height: 1.45">
+<div data-if="typing" hidden style="display: contents"><span><span data-text="typed"></span></span><span class="caret" style="display: inline-block; width: 2px; height: 16px; margin-left: 1px; vertical-align: -3px; background: #E4B2EA"></span></div>
+<div data-if="idle" hidden style="display: contents"><span style="color: #8F8B82">Reply to Claude…</span></div>
+</span>
+<span data-send style="flex: none; width: 32px; height: 32px; border-radius: 50%; background: #4A4842; display: flex; align-items: center; justify-content: center; transition: background 200ms ease-out"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1F0F24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></span>
+</div>
+</div>
+</div>
+</div>
+
+<div data-if="tgSell" hidden style="display: contents">
+<div class="slide tgs" style="position: absolute; inset: 0; display: flex; flex-direction: column; background: #000; color: #F1ECF7; font-size: 14px; line-height: 1.45">
+<div class="wall-in" aria-hidden="true"></div>
+<div style="flex: none; display: flex; align-items: center; gap: 12px; padding: 34px 16px 12px; background: #141118">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#C9B3FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+<span style="flex: none; width: 38px; height: 38px; border-radius: 50%; background: #E4B2EA; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1F0F24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 15px">Weekend garage sale</span><span style="display: block; font-size: 12.5px; color: #A99FBB">channel · 1 subscriber</span></span>
+</div>
+<div style="flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 10px; padding: 12px 12px 10px">
+<div data-if="it1" hidden style="display: contents">
+<div class="bub" style="width: 88%; background: #1E1A26; border-radius: 14px; overflow: hidden">
+<div style="height: 92px; background: #2F6F6A; display: flex; align-items: center; justify-content: center"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="16" r="3.5"></circle><circle cx="18.5" cy="16" r="3.5"></circle><path d="M5.5 16 9 9h6.5l3 7M9 9l3 7M14 6h2.5"></path></svg></div>
+<div style="padding: 8px 12px 6px"><strong>City bike, size M · $140</strong><br>Two summers ridden, new chain. Pickup downtown.<span style="display: block; text-align: right; font-size: 11.5px; color: #9A8FAD">14:02</span></div>
+</div>
+</div>
+<div data-if="it2" hidden style="display: contents">
+<div class="bub" style="width: 88%; background: #1E1A26; border-radius: 14px; overflow: hidden">
+<div style="height: 92px; background: #8A4B2E; display: flex; align-items: center; justify-content: center"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 11V7a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v4"></path><path d="M2 18v-5a2 2 0 1 1 4 0v2h12v-2a2 2 0 1 1 4 0v5ZM5 18v2M19 18v2"></path></svg></div>
+<div style="padding: 8px 12px 6px"><strong>Velvet armchair · $90</strong><br>Green, no scratches, pet-free home.<span style="display: block; text-align: right; font-size: 11.5px; color: #9A8FAD">14:02</span></div>
+</div>
+</div>
+<div data-if="it3" hidden style="display: contents">
+<div class="bub" style="width: 88%; background: #1E1A26; border-radius: 14px; overflow: hidden">
+<div style="height: 92px; background: #4B3F8A; display: flex; align-items: center; justify-content: center"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg></div>
+<div style="padding: 8px 12px 6px"><strong>27″ monitor, 1440p · $110</strong><br>Box and cables included.<span style="display: block; text-align: right; font-size: 11.5px; color: #9A8FAD">14:03</span></div>
+</div>
+</div>
+</div>
+<div style="flex: none; padding: 10px 16px 26px; background: #141118; text-align: center; font-weight: 600; color: #C9B3FF">Share channel</div>
+</div>
+</div>
+
+<div data-if="tgTable" hidden style="display: contents">
+<div class="slide tgs" style="position: absolute; inset: 0; display: flex; flex-direction: column; background: #000; color: #F1ECF7; font-size: 14px; line-height: 1.45">
+<div class="wall-in" aria-hidden="true"></div>
+<div style="flex: none; display: flex; align-items: center; gap: 12px; padding: 34px 16px 12px; background: #141118">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#C9B3FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+<span style="flex: none; width: 38px; height: 38px; border-radius: 50%; background: #3B5B8C; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#F1ECF7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 2v7a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2V2M7 2v20M21 15V2a5 5 0 0 0-5 5v6a2 2 0 0 0 2 2h3Zm0 0v7"></path></svg></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 15px">Osteria Lume</span><span style="display: block; font-size: 12.5px; color: #A99FBB">online</span></span>
+</div>
+<div style="flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 8px; padding: 12px 12px 14px">
+<div data-if="it1" hidden style="display: contents">
+<div class="bub" style="align-self: flex-end; max-width: 80%; background: #6E5BB8; border-radius: 16px 16px 4px 16px; padding: 8px 12px">Hi! Do you have a table for 4 on Friday around 20:00?<span style="display: block; text-align: right; font-size: 11px; color: #E0D7F5">14:10 ✓✓</span></div>
+</div>
+<div data-if="it2" hidden style="display: contents">
+<div class="bub" style="align-self: flex-start; max-width: 80%; background: #1E1A26; border-radius: 16px 16px 16px 4px; padding: 8px 12px">Hi! 20:00 is full, but we have 20:30 on the terrace. Shall we hold it?<span style="display: block; text-align: right; font-size: 11px; color: #9A8FAD">14:12</span></div>
+</div>
+<div data-if="it3" hidden style="display: contents">
+<div class="bub" style="align-self: flex-end; max-width: 80%; background: #6E5BB8; border-radius: 16px 16px 4px 16px; padding: 8px 12px">20:30 on the terrace works, thank you!<span style="display: block; text-align: right; font-size: 11px; color: #E0D7F5">14:12 ✓✓</span></div>
+</div>
+<div data-if="it4" hidden style="display: contents">
+<div class="bub" style="align-self: flex-start; max-width: 80%; background: #1E1A26; border-radius: 16px 16px 16px 4px; padding: 8px 12px">Booked: Friday 20:30, terrace, 4 guests. See you!<span style="display: block; text-align: right; font-size: 11px; color: #9A8FAD">14:13</span></div>
+</div>
+</div>
+<div style="flex: none; display: flex; align-items: center; gap: 10px; padding: 10px 14px 26px; background: #141118; color: #9A8FAD">Message</div>
+</div>
+</div>
+
+</div>
+</div>
+<div data-if="cap0" hidden style="display: contents"><p class="view" style="margin: 0; font-size: 16px; font-weight: 500; color: #D9D0E6; text-align: center">Sell your stuff</p></div>
+<div data-if="cap1" hidden style="display: contents"><p class="view" style="margin: 0; font-size: 16px; font-weight: 500; color: #D9D0E6; text-align: center">Catch up</p></div>
+<div data-if="cap2" hidden style="display: contents"><p class="view" style="margin: 0; font-size: 16px; font-weight: 500; color: #D9D0E6; text-align: center">Book a table</p></div>
+</div>
+</section>
+
+<div class="sheet">
+<section id="control" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 0">
+<h2 style="margin: 0 0 16px; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em; text-wrap: balance">You stay in control.</h2>
+<p style="margin: 0 0 48px; max-width: 58ch; color: #B4A9C4; font-size: 18px">Not “it's safe”, but exactly what tg-mcp can't do with your account.</p>
+<div role="table" aria-label="Common worries and what actually happens" style="display: flex; flex-direction: column">
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 0 40px; padding: 0 0 14px; font-size: 13.5px; color: #8C809E">
+<span role="columnheader" style="flex: 1 1 260px">You worry</span>
+<span role="columnheader" style="flex: 1.6 1 340px">What actually happens</span>
+<span role="columnheader" style="flex: 1.2 1 280px">Why that's true</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">“It will send something as me.”</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">Out of the box it only reads. Writing stays off until you allow it when you sign in, only for the chats you pick, and every message waits for your OK, or becomes a draft you send yourself.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">You choose permissions on the sign-in screen. Tools you didn't allow aren't even visible to the AI.</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">“The developer will read my chats.”</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">Your messages aren't stored anywhere. Your Telegram session is locked with a key the developer doesn't have.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">The key lives only in the sign-in tokens your AI app holds. The server keeps the session encrypted and can't open it on its own.</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">“Someone will steal my password or my account.”</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">You type your password on tg-mcp's own sign-in page, and the AI never sees it. A stolen database has nothing readable in it.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">The QR login and the cloud password happen outside the AI app. The session in the database is encrypted.</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1); border-bottom: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">“I won't be able to turn it off.”</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">One tap: Telegram → Settings → Devices → end the “Unofficial MCP Server” session.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">That logs the server out for real. Your AI gets an error on its next request.</span>
+</div>
+</div>
+<p style="margin: 24px 0 0"><a href="privacy.html" style="display: inline-block; padding: 10px 0">Read the privacy policy</a></p>
+</section>
+
+<section id="verify" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 0">
+<h2 style="margin: 0 0 28px; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em">Don't trust. Verify.</h2>
+<div style="display: flex; flex-wrap: wrap; gap: 24px 64px; align-items: flex-start">
+<p style="flex: 1.4 1 480px; margin: 0; font-size: 20px; line-height: 1.55; color: #F1ECF7; max-width: 60ch">Encryption protects what's stored. While your AI reads a chat, the messages pass through the server's memory, so whoever runs the server could, in theory, see them. And whatever you ask goes to your AI provider: OpenAI, Anthropic or Google.</p>
+<p style="flex: 1 1 320px; margin: 0; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 22px; line-height: 1.3; letter-spacing: -0.01em; color: #E4B2EA">Don't want to trust even me? Run your own copy.</p>
+</div>
+<ul style="margin: 56px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 0 48px">
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Open source, MIT.</strong><span style="color: #B4A9C4">Free, forever. The code is yours to read, fork and run.</span><a href="https://github.com/qelphybox/tg-mcp" style="align-self: flex-start; padding: 8px 0">github.com/qelphybox/tg-mcp</a></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">One command to self-host.</strong><span style="color: #B4A9C4">Ready images for amd64 and arm64, built from every release tag. Nothing to compile.</span></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Deployed in public.</strong><span style="color: #B4A9C4">The public instance deploys from the public main branch through GitHub Actions, with open build logs. No one can prove what a server runs; self-hosting is the answer to that.</span><a href="https://github.com/qelphybox/tg-mcp/actions" style="align-self: flex-start; padding: 8px 0">See the deploys</a></li>
+</ul>
+<pre style="margin: 32px 0 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 14px; padding: 20px 22px; font-size: 13.5px; line-height: 1.75; color: #F1ECF7; white-space: pre-wrap; word-break: break-word">docker run -d --name tg-mcp --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data \
+  -e TG_MCP_PUBLIC_URL=https://tg.example.com \
+  -e TG_MCP_DB_PATH=/data/tg-mcp.db \
+  -e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash \
+  ghcr.io/qelphybox/tg-mcp:latest</pre>
+<p style="margin: 14px 0 0; font-size: 14.5px; color: #8C809E">You need HTTPS on a public hostname and your own app id from <a href="https://my.telegram.org/apps">my.telegram.org</a>. <a href="https://github.com/qelphybox/tg-mcp#self-hosting">Full guide</a></p>
+</section>
+
+<section id="faq" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 104px; display: flex; flex-wrap: wrap; gap: 24px 64px">
+<h2 style="flex: 1 1 280px; margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em">Questions.</h2>
+<div style="flex: 2.4 1 560px; min-width: 0; display: flex; flex-direction: column">
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Can Telegram block my account for this?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">It uses Telegram's official API through its own registered app, stays within Telegram's rate limits, and when Telegram asks it to wait, it waits instead of retrying around the limit. We can't speak for Telegram, so nobody can honestly promise that nothing will ever happen.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Who makes this?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">I do: <a href="https://github.com/qelphybox">Kirill Bobykin</a>, an independent developer, <a href="https://github.com/qelphybox">@qelphybox</a> on GitHub. tg-mcp is unofficial and not affiliated with Telegram, OpenAI, Anthropic or Google. All the code is public, and issues go straight to me.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">What does my AI provider see?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">The messages the AI reads to answer your question, the same as if you had pasted them into the chat yourself.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1); border-bottom: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">I removed it from my AI app. Is it disconnected?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Not always. Some apps only forget their keys, and the Telegram session stays. To be sure, end it in Telegram → Settings → Devices → Unofficial MCP Server.</p>
+</details>
+</div>
+</section>
+<footer id="dev" style="margin-top: 24px; border-top: 1px solid rgba(241,236,247,.1)">
+<div style="max-width: 1240px; margin: 0 auto; padding: 48px 24px 64px; display: flex; flex-wrap: wrap; gap: 40px 64px">
+<div style="flex: 1 1 300px; display: flex; flex-direction: column; gap: 10px">
+<span style="font-family: Unbounded, sans-serif; font-weight: 600; font-size: 18px">tg-mcp</span>
+<p style="margin: 0; max-width: 42ch; font-size: 14.5px; color: #B4A9C4">Unofficial. Made by <a href="https://github.com/qelphybox">Kirill Bobykin</a>, an independent developer; not affiliated with Telegram. MIT licensed.</p>
+</div>
+<div style="flex: 2 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 10px">
+<span style="font-weight: 600; font-size: 15px">For developers</span>
+<pre style="margin: 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; color: #D9D0E6; white-space: pre-wrap; word-break: break-all">claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</pre>
+<p style="margin: 0; font-size: 14.5px; color: #B4A9C4">Any client that speaks streamable HTTP discovers OAuth on its own. Written in Rust: tokio, axum, rmcp, grammers, SQLite.</p>
+<div style="display: flex; flex-wrap: wrap; gap: 0 24px; font-size: 14.5px">
+<a href="https://github.com/qelphybox/tg-mcp#tools" style="padding: 10px 0">Tools and prompts</a>
+<a href="https://github.com/qelphybox/tg-mcp/tree/main/docs/adr" style="padding: 10px 0">Architecture decisions</a>
+<a href="https://github.com/qelphybox/tg-mcp#security-model" style="padding: 10px 0">Security model</a>
+</div>
+</div>
+<div style="flex: 1 1 160px; display: flex; flex-direction: column; font-size: 14.5px">
+<span style="font-weight: 600; font-size: 15px; margin-bottom: 4px">Project</span>
+<a href="https://github.com/qelphybox/tg-mcp" style="padding: 8px 0">GitHub</a>
+<a href="https://github.com/qelphybox/tg-mcp/releases" style="padding: 8px 0">Releases</a>
+<a href="https://github.com/qelphybox/tg-mcp/issues" style="padding: 8px 0">Support</a>
+<a href="privacy.html" style="padding: 8px 0">Privacy policy</a>
+</div>
+</div>
+</footer>
+</div>
+
+</div>
+<script>
+var MCP_URL = 'https://connector.tgmcp.dev/mcp';
+var APPS = [
+  { name: 'ChatGPT', url: 'https://chatgpt.com', note: 'Paid ChatGPT plans.',
+    steps: ['Open Settings → Apps & Connectors → Advanced and turn on Developer mode.',
+      'Click Create, name it Telegram and paste the link below.',
+      'Sign in by scanning the QR code with Telegram on your phone.'] },
+  { name: 'Claude', url: 'https://claude.ai', note: 'Works on the free plan too.',
+    steps: ['Open Settings → Connectors and click Add custom connector.',
+      'Name it Telegram and paste the link below.',
+      'Click Connect and scan the QR code with Telegram on your phone.'] },
+  { name: 'Gemini', url: 'https://gemini.google.com', note: 'Personal Google accounts. Add it on the web, use it on your phone.',
+    steps: ['On gemini.google.com, open Settings → Connected apps.',
+      'Choose Add a custom app and paste the link below.',
+      'Approve, then scan the QR code with Telegram on your phone.'] }
+];
+// Phone demo. Phases: 0 typing, 1 sent, one per tool call, the reply, then (with a Telegram
+// screen) the screen opening and one phase per item appearing on it.
+var PCASES = [
+  { key: 'sell', label: 'Sell your stuff', attach: true, tg: 'sell', items: 3, replyMs: 2800,
+    msg: 'I want to sell a few things: my bike, an armchair and a monitor. Make a Telegram channel for the sale',
+    intro: 'On it. Setting up your channel.',
+    chips: [
+      { name: 'create_channel', detail: 'Weekend garage sale', ms: 1300 },
+      { name: 'send_photo ×3', detail: 'bike, armchair, monitor', ms: 1700 },
+      { name: 'export_invite_link', detail: 't.me/weekend_garage_sale', ms: 1000 }
+    ],
+    label2: 'someone asks to sell a bike, an armchair and a monitor; Claude creates a Telegram channel, posts each item with its photo and returns an invite link.' },
+  { key: 'catch', label: 'Catch up', attach: false, tg: '', items: 0, replyMs: 6500,
+    msg: 'What did I miss since yesterday evening? Anything I need to answer?',
+    intro: 'Let me go through your unread chats.',
+    chips: [
+      { name: 'list_chats', detail: 'unread only → 6 chats, 94 messages', ms: 1300 },
+      { name: 'get_messages ×6', detail: 'since yesterday 18:00 → read 94 of 94', ms: 2000 }
+    ],
+    label2: 'someone asks what they missed; Claude reads six unread chats and lists the two that need a reply.' },
+  { key: 'table', label: 'Book a table', attach: false, tg: 'table', items: 4, replyMs: 2600,
+    msg: 'Book a table for 4 at Osteria Lume on Friday, around 8 pm',
+    intro: 'Sure, I\'ll message them.',
+    chips: [
+      { name: 'find_chats', detail: 'Osteria Lume', ms: 1100 },
+      { name: 'send_message', detail: 'a table for 4, Friday around 20:00?', ms: 1300 },
+      { name: 'get_messages', detail: 'reply: 20:30 on the terrace', ms: 1900 },
+      { name: 'send_message', detail: '20:30 on the terrace works', ms: 1100 }
+    ],
+    label2: 'someone asks to book a table for four at Osteria Lume on Friday; Claude messages the restaurant in Telegram, reads the offer of 20:30 on the terrace and confirms it.' }
+];
+function phaseMs(pc) {
+  var ms = [700, 900];
+  pc.chips.forEach(function (c) { ms.push(c.ms); });
+  ms.push(pc.replyMs);
+  if (pc.tg) {
+    ms.push(700);
+    for (var i = 1; i <= pc.items; i++) ms.push(i === pc.items ? 4200 : 900);
+  }
+  return ms;
+}
+
+(function () {
+  var ACCENT = '#E4B2EA';
+  var SPIN = '<svg class="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#A8A49A" stroke-width="2.5" stroke-linecap="round" aria-hidden="true" style="flex: none"><path d="M21 12a9 9 0 1 1-6.2-8.6"></path></svg>';
+  var TICK = '<svg class="tick" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6FD39A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m5 12 5 5 9-10"></path></svg>';
+
+  var state = { ps: 0, ph: 0, chars: 0, app: -1, copied: false };
+  var phone = document.getElementById('phone');
+  var reduce = false;
+  try { reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+  var auto = !reduce;
+  var visible = true;
+  var builtCase = -1;
+  var pt, ti, ct;
+
+  function all(sel) { return Array.prototype.slice.call(document.querySelectorAll(sel)); }
+  function esc(t) {
+    return String(t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+  }
+  function chip(c, i) {
+    return '<div data-if="c' + i + 'show" hidden style="display: contents">' +
+      '<div class="bub" style="display: flex; align-items: center; gap: 10px; background: #2A2926; border: 1px solid #3A3934; border-radius: 12px; padding: 8px 12px">' +
+      '<div data-if="c' + i + 'run" hidden style="display: contents">' + SPIN + '</div>' +
+      '<div data-if="c' + i + 'done" hidden style="display: contents">' + TICK + '</div>' +
+      '<span style="min-width: 0; display: flex; flex-direction: column">' +
+      '<span class="mono" style="font-size: 12px; color: #D9D5CC">telegram · ' + esc(c.name) + '</span>' +
+      '<span style="font-size: 12px; color: #A8A49A; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">' + esc(c.detail) + '</span>' +
+      '</span></div></div>';
+  }
+
+  function render() {
+    var pc = PCASES[state.ps];
+    var ph = state.ph;
+    var R = 2 + pc.chips.length;
+    var T = R + 1;
+    var typing = ph === 0;
+    var onTg = !!pc.tg && ph >= T;
+    var reply = ph >= R;
+
+    if (builtCase !== state.ps) {
+      all('[data-chips]').forEach(function (box) { box.innerHTML = pc.chips.map(chip).join(''); });
+      builtCase = state.ps;
+    }
+
+    var v = {
+      typing: typing, idle: !typing, attach: pc.attach,
+      user: ph >= 1, a1: ph >= 2,
+      rSell: reply && pc.key === 'sell', rCatch: reply && pc.key === 'catch', rTable: reply && pc.key === 'table',
+      chat: !onTg, tgSell: onTg && pc.tg === 'sell', tgTable: onTg && pc.tg === 'table',
+      it1: ph >= T + 1, it2: ph >= T + 2, it3: ph >= T + 3, it4: ph >= T + 4,
+      cap0: state.ps === 0, cap1: state.ps === 1, cap2: state.ps === 2,
+      appOpen: state.app >= 0
+    };
+    pc.chips.forEach(function (c, i) {
+      v['c' + i + 'show'] = ph >= 2 + i;
+      v['c' + i + 'run'] = ph === 2 + i;
+      v['c' + i + 'done'] = ph > 2 + i;
+    });
+    // Only flip what changed: an element leaving display:none replays its entrance.
+    all('[data-if]').forEach(function (el) {
+      var on = !!v[el.getAttribute('data-if')];
+      if (el.hidden === on) el.hidden = !on;
+    });
+
+    var cur = APPS[state.app] || APPS[0];
+    var text = {
+      msg: pc.msg, intro: pc.intro, typed: pc.msg.slice(0, state.chars),
+      appName: cur.name, appNote: cur.note, copyLabel: state.copied ? 'Copied' : 'Copy'
+    };
+    all('[data-text]').forEach(function (el) {
+      var t = text[el.getAttribute('data-text')];
+      if (el.textContent !== t) el.textContent = t;
+    });
+    all('[data-send]').forEach(function (el) {
+      el.style.background = typing && state.chars > 0 ? ACCENT : '#4A4842';
+    });
+    if (phone) phone.setAttribute('aria-label', 'Demo in the Claude app on a phone: ' + pc.label2);
+
+    all('[data-app]').forEach(function (btn) {
+      var on = +btn.getAttribute('data-app') === state.app;
+      btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+      btn.style.background = on ? '#F1ECF7' : 'rgba(30,25,40,.6)';
+      btn.style.color = on ? '#000' : '#F1ECF7';
+      btn.style.borderColor = on ? '#F1ECF7' : 'rgba(241,236,247,.14)';
+    });
+    all('[data-app-url]').forEach(function (a) { a.href = cur.url; });
+    var steps = document.getElementById('app-steps');
+    if (steps && steps.getAttribute('data-for') !== cur.name) {
+      steps.setAttribute('data-for', cur.name);
+      steps.innerHTML = cur.steps.map(function (t, i) {
+        return '<li style="display: flex; gap: 12px; align-items: baseline"><span class="mono" style="flex: none; width: 22px; height: 22px; border-radius: 50%; background: #2D2738; color: #F1ECF7; font-size: 12px; display: inline-flex; align-items: center; justify-content: center">' + (i + 1) + '</span><span style="color: #D9D0E6">' + esc(t) + '</span></li>';
+      }).join('');
+    }
+  }
+
+  function staticPhone(ps) {
+    var pc = PCASES[ps];
+    state.ps = ps;
+    state.ph = 2 + pc.chips.length;
+    state.chars = pc.msg.length;
+  }
+
+  function schedule() {
+    clearTimeout(pt);
+    clearInterval(ti);
+    if (!(auto && visible && !document.hidden)) return;
+    var pc = PCASES[state.ps];
+    var ph = state.ph;
+    var len = pc.msg.length;
+    if (ph === 0 && state.chars < len) {
+      ti = setInterval(function () {
+        state.chars += 1;
+        if (state.chars >= len) {
+          state.chars = len;
+          clearInterval(ti);
+          render();
+          schedule();
+        } else {
+          render();
+        }
+      }, 30);
+      return;
+    }
+    var ms = phaseMs(pc);
+    pt = setTimeout(function () {
+      if (ph + 1 < ms.length) {
+        state.ph = ph + 1;
+      } else {
+        state.ps = (state.ps + 1) % PCASES.length;
+        state.ph = 0;
+        state.chars = 0;
+      }
+      render();
+      schedule();
+    }, ms[ph]);
+  }
+
+  all('[data-app]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var i = +btn.getAttribute('data-app');
+      state.app = state.app === i ? -1 : i;
+      render();
+    });
+  });
+  all('[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      try {
+        navigator.clipboard.writeText(MCP_URL).then(function () {
+          state.copied = true;
+          render();
+          clearTimeout(ct);
+          ct = setTimeout(function () { state.copied = false; render(); }, 1600);
+        }, function () {});
+      } catch (e) {}
+    });
+  });
+
+  if (!auto) staticPhone(0);
+  try {
+    if (phone && 'IntersectionObserver' in window) {
+      new IntersectionObserver(function (entries) {
+        visible = entries[0].isIntersecting;
+        schedule();
+      }).observe(phone);
+    }
+  } catch (e) {}
+  document.addEventListener('visibilitychange', schedule);
+  render();
+  schedule();
+})();
+</script>
+</body>
+</html>

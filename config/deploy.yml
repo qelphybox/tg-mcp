@@ -21,7 +21,7 @@ builder:
   arch: amd64
 
 proxy:
-  host: tgmcp.qelphybox.space
+  host: connector.tgmcp.dev
   # forward_headers stays unset (false with ssl): kamal-proxy drops any client-sent
   # X-Forwarded-For and sets it to the TCP peer it saw, which the app trusts
   # (TG_MCP_TRUST_FORWARDED_FOR). With forward_headers: true it would append that
@@ -44,7 +44,7 @@ proxy:
 
 env:
   clear:
-    TG_MCP_PUBLIC_URL: https://tgmcp.qelphybox.space
+    TG_MCP_PUBLIC_URL: https://connector.tgmcp.dev
     TG_MCP_BIND: 0.0.0.0:8080
     TG_MCP_DB_PATH: /data/tg-mcp.db
     # kamal-proxy is the only way in; client IPs (for rate limits) come from its XFF.

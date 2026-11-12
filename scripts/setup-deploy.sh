@@ -201,7 +201,7 @@ finish() {
 run_wizard() {
 
 TOTAL_STAGES=6
-DOMAIN="tgmcp.qelphybox.space"
+DOMAIN="connector.tgmcp.dev"
 DEPLOY_KEY="$HOME/.ssh/tg-mcp-deploy"
 KAMAL_SSH_USER=deploy   # created by scripts/harden-server.sh
 
@@ -242,7 +242,7 @@ printf '  %s✓%s root@%s accepts your key\n' "$GREEN" "$RESET" "$KAMAL_HOST"
 
 stage "DNS: point $DOMAIN at the server"
 say "Let's Encrypt only issues the certificate once the name resolves to this server."
-step "At the DNS provider for qelphybox.space, create:  A  tgmcp  →  $KAMAL_HOST  (TTL 300, no CDN proxying)."
+step "At the DNS provider for tgmcp.dev, create:  A  connector  →  $KAMAL_HOST  (TTL 300, no CDN proxying)."
 step "If your VPS provider has its own cloud firewall, allow inbound TCP 22, 80 and 443 there too."
 pause "Press Enter once the record is saved."
 while true; do

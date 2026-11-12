@@ -6,12 +6,12 @@
 
 ## Quick start
 
-Public instance: `https://tgmcp.qelphybox.space/mcp`
+Website: [tgmcp.dev](https://tgmcp.dev). Public instance: `https://connector.tgmcp.dev/mcp`
 
 **Claude Code**
 
 ```sh
-claude mcp add --transport http telegram https://tgmcp.qelphybox.space/mcp
+claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp
 ```
 
 Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser opens:
