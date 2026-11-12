@@ -7,6 +7,11 @@
 //! only a Token opens it; it is in memory only while a request holds the
 //! opened Grant. Chat ids are as sensitive as the Chats' names: logs carry
 //! only how many there are.
+//!
+//! Sealed with it is the verifier of the Confirmation cookie Consent set in
+//! its browser (#45, [`crate::confirm`]): the only browser where a pending
+//! send can be confirmed. Inside the seal, a database writer can't swap in
+//! a cookie of their own.
 
 use std::fmt;
 
@@ -22,11 +27,16 @@ use crate::{
 pub const MAX_CHATS: usize = 1000;
 
 /// Format of the sealed plaintext: `VERSION`, flags, the Chat count (u32 LE),
+/// with [`FLAG_CONFIRM_COOKIE`] the Confirmation cookie's 32-byte verifier,
 /// then per Chat its kind (1 byte) and id (i64 LE), then zeros up to a
-/// multiple of [`PAD_TO`] bytes.
-const VERSION: u8 = 1;
+/// multiple of [`PAD_TO`] bytes. Version 1 (#44) had no verifier and no such
+/// flag; it still opens, as a list no browser can confirm sends for.
+const VERSION: u8 = 2;
+const VERSION_WITHOUT_COOKIE: u8 = 1;
 const FLAG_AUTO_SEND: u8 = 1;
+const FLAG_CONFIRM_COOKIE: u8 = 2;
 const HEADER_LEN: usize = 6;
+const VERIFIER_LEN: usize = 32;
 const ENTRY_LEN: usize = 9;
 /// The plaintext is padded to a multiple of this, so the ciphertext's length
 /// tells the list's size only to within 56 Chats.
@@ -39,6 +49,9 @@ pub struct SendAllowList {
     /// Sorted, each once.
     chats: Vec<ChatId>,
     auto_send: bool,
+    /// What checks the Confirmation cookie of the Consent browser
+    /// ([`crate::confirm::cookie`]); never the cookie itself.
+    confirm_cookie: Option<[u8; VERIFIER_LEN]>,
 }
 
 /// A list Consent can't make.
@@ -63,7 +76,11 @@ impl SendAllowList {
         match chats.len() {
             0 => Err(AllowListError::Empty),
             n if n > MAX_CHATS => Err(AllowListError::TooMany(n)),
-            _ => Ok(Self { chats, auto_send }),
+            _ => Ok(Self {
+                chats,
+                auto_send,
+                confirm_cookie: None,
+            }),
         }
     }
 
@@ -77,6 +94,19 @@ impl SendAllowList {
     /// confirming each one. Off unless they ticked it.
     pub fn auto_send(&self) -> bool {
         self.auto_send
+    }
+
+    /// The list with the verifier of the Confirmation cookie Consent set in
+    /// its browser: sends are confirmed there, and nowhere else.
+    pub fn with_confirm_cookie(mut self, verifier: [u8; VERIFIER_LEN]) -> Self {
+        self.confirm_cookie = Some(verifier);
+        self
+    }
+
+    /// The verifier of the Confirmation cookie, if Consent set one (every
+    /// Grant since #45 has one).
+    pub fn confirm_cookie(&self) -> Option<&[u8; VERIFIER_LEN]> {
+        self.confirm_cookie.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -94,12 +124,27 @@ impl SendAllowList {
 
     /// The plaintext the vault seals. Wiped on drop.
     pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
-        let body = HEADER_LEN + self.chats.len() * ENTRY_LEN;
+        let verifier = if self.confirm_cookie.is_some() {
+            VERIFIER_LEN
+        } else {
+            0
+        };
+        let body = HEADER_LEN + verifier + self.chats.len() * ENTRY_LEN;
         let mut out = Zeroizing::new(Vec::with_capacity(body.next_multiple_of(PAD_TO)));
         out.push(VERSION);
-        out.push(if self.auto_send { FLAG_AUTO_SEND } else { 0 });
+        let mut flags = 0;
+        if self.auto_send {
+            flags |= FLAG_AUTO_SEND;
+        }
+        if self.confirm_cookie.is_some() {
+            flags |= FLAG_CONFIRM_COOKIE;
+        }
+        out.push(flags);
         let count = u32::try_from(self.chats.len()).expect("at most MAX_CHATS");
         out.extend_from_slice(&count.to_le_bytes());
+        if let Some(verifier) = &self.confirm_cookie {
+            out.extend_from_slice(verifier);
+        }
         for chat in &self.chats {
             let (kind, id) = key(*chat);
             out.push(kind);
@@ -112,12 +157,22 @@ impl SendAllowList {
     /// Reverse of [`Self::encode`]; `None` for anything it can't have written.
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         let (&[version, flags], rest) = bytes.split_first_chunk::<2>()?;
-        if version != VERSION || flags & !FLAG_AUTO_SEND != 0 || !bytes.len().is_multiple_of(PAD_TO)
-        {
+        let known_flags = match version {
+            VERSION => FLAG_AUTO_SEND | FLAG_CONFIRM_COOKIE,
+            VERSION_WITHOUT_COOKIE => FLAG_AUTO_SEND,
+            _ => return None,
+        };
+        if flags & !known_flags != 0 || !bytes.len().is_multiple_of(PAD_TO) {
             return None;
         }
         let (count, mut rest) = rest.split_first_chunk::<4>()?;
         let count = usize::try_from(u32::from_le_bytes(*count)).ok()?;
+        let mut confirm_cookie = None;
+        if flags & FLAG_CONFIRM_COOKIE != 0 {
+            let (verifier, after) = rest.split_first_chunk::<VERIFIER_LEN>()?;
+            confirm_cookie = Some(*verifier);
+            rest = after;
+        }
         if count > MAX_CHATS || count * ENTRY_LEN > rest.len() {
             return None;
         }
@@ -131,7 +186,8 @@ impl SendAllowList {
         if rest.iter().any(|&b| b != 0) {
             return None;
         }
-        let list = Self::new(chats, flags & FLAG_AUTO_SEND != 0).ok()?;
+        let mut list = Self::new(chats, flags & FLAG_AUTO_SEND != 0).ok()?;
+        list.confirm_cookie = confirm_cookie;
         (list.len() == count).then_some(list)
     }
 }
@@ -141,6 +197,7 @@ impl fmt::Debug for SendAllowList {
         f.debug_struct("SendAllowList")
             .field("chats", &format_args!("<{}>", self.chats.len()))
             .field("auto_send", &self.auto_send)
+            .field("confirm_cookie", &self.confirm_cookie.is_some())
             .finish()
     }
 }
@@ -300,8 +357,10 @@ mod tests {
             (Vec::new(), "empty"),
             (good[..PAD_TO - 1].to_vec(), "not padded"),
             ([good.to_vec(), vec![0]].concat(), "padded wrong"),
-            (changed(0, 2), "unknown version"),
-            (changed(1, 2), "unknown flag"),
+            (changed(0, 3), "unknown version"),
+            (changed(0, 0), "version 0"),
+            (changed(1, 4), "unknown flag"),
+            (changed(1, 3), "a verifier the bytes don't have"),
             (changed(2, 0), "no chats"),
             (changed(2, 3), "more chats than entries"),
             (changed(6, 4), "unknown kind"),
@@ -315,10 +374,44 @@ mod tests {
     }
 
     #[test]
+    fn the_confirmation_cookies_verifier_is_sealed_with_the_list() {
+        let verifier = [0xA5; 32];
+        let list = SendAllowList::new([ALICE, TEAM], false)
+            .unwrap()
+            .with_confirm_cookie(verifier);
+        assert_eq!(list.confirm_cookie(), Some(&verifier));
+        let encoded = list.encode();
+        assert_eq!(encoded.len(), PAD_TO);
+        let opened = SendAllowList::decode(&encoded).unwrap();
+        assert_eq!(opened.confirm_cookie(), Some(&verifier));
+        assert_eq!(opened, list);
+        assert!(opened.contains(TEAM) && !opened.auto_send());
+        assert_eq!(
+            SendAllowList::new([ALICE], false).unwrap().confirm_cookie(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_list_sealed_before_confirmation_cookies_opens_without_one() {
+        // Version 1 (#44): ALICE with auto-send, no verifier.
+        let mut v1 = vec![1u8, 1, 1, 0, 0, 0, 1];
+        v1.extend_from_slice(&7i64.to_le_bytes());
+        v1.resize(PAD_TO, 0);
+        let list = SendAllowList::decode(&v1).unwrap();
+        assert!(list.contains(ALICE) && list.auto_send());
+        assert_eq!(list.confirm_cookie(), None);
+        v1[1] = 3;
+        assert_eq!(SendAllowList::decode(&v1), None, "v1 had no such flag");
+    }
+
+    #[test]
     fn debug_shows_only_the_count() {
         let list = SendAllowList::new([ALICE, TEAM], true).unwrap();
+        let list = list.with_confirm_cookie([0x37; 32]);
         let shown = format!("{list:?}");
         assert!(shown.contains("<2>"), "{shown}");
+        assert!(shown.contains("confirm_cookie: true"), "{shown}");
         assert!(!shown.contains('7') && !shown.contains('9'), "{shown}");
     }
 }
