@@ -3,7 +3,7 @@
 //! - [`Login`] / [`LoginAttempt`]: the Telegram part of the Login flow (QR login, then
 //!   the Cloud password if the Account has one).
 //! - [`Connector`]: turns an opened Grant into a Live client.
-//! - [`Telegram`]: calls on one Account: reading, and writing Drafts.
+//! - [`Telegram`]: calls on one Account: reading, writing Drafts and sending messages.
 //!
 //! Tests drive the whole server through the fakes in [`fake`]; [`grammers`] is the
 //! real Telegram (QR login + Client pool).
@@ -25,6 +25,7 @@ mod pool;
 pub mod rich;
 pub mod sanitise;
 pub mod search;
+pub mod send;
 mod session;
 pub mod topics;
 pub mod transcribe;
@@ -224,6 +225,14 @@ pub trait Telegram: Send + Sync + 'static {
     /// goes is [`compose::place`]'s rule. Any Chat of the Account's; a Chat
     /// it doesn't have, or can't write in, is [`TgError::InvalidInput`].
     async fn save_draft(&self, draft: drafts::NewDraft) -> Result<drafts::SavedDraft, TgError>;
+
+    /// Send `message` as the Account (`messages.sendMessage`, method class
+    /// Writes, counted against its Chat's Send cap when it goes to Telegram).
+    /// Where it goes is [`compose::place`]'s rule, as for a Draft. A
+    /// `random_id` Telegram already has is [`send::already_sent`]: never sent
+    /// twice. The MCP layer checks the Send allow-list and confirmation
+    /// before calling this; nothing here does.
+    async fn send_message(&self, message: send::NewMessage) -> Result<send::SentMessage, TgError>;
 }
 
 /// Turns a Grant opened with a valid Token into a Live client for its Account.

@@ -39,6 +39,7 @@ use super::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
+    send::{self, NewMessage, SentMessage},
     topics::{self, RawForums, RawTopic, topic_of},
     transcribe::{
         self, Refusal, TranscribedAudio, Transcription, TranscriptionFeed, TranscriptionUpdate,
@@ -247,6 +248,85 @@ impl FakeDrafts {
             });
             state.last_date = date;
         }
+    }
+}
+
+/// One message a fake Account sent (`messages.sendMessage`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeSentMessage {
+    pub chat: ChatId,
+    pub id: i32,
+    /// The Topic's top message (`top_msg_id`); `None` in General and outside
+    /// forums.
+    pub topic: Option<i32>,
+    pub reply_to: Option<i32>,
+    pub text: FormattedText,
+    pub random_id: i64,
+}
+
+/// Telegram's sent messages as the fake models them, shared by every Grant
+/// like Telegram is: each `random_id` is sent once (a repeat is
+/// `RANDOM_ID_DUPLICATE`), and tests may have Telegram, or the limiter in
+/// front of it, refuse the next sends.
+#[derive(Debug, Default)]
+pub struct FakeSent {
+    state: Mutex<SentState>,
+}
+
+#[derive(Debug, Default)]
+struct SentState {
+    /// Each Account's sent messages, oldest first.
+    sent: std::collections::HashMap<i64, Vec<FakeSentMessage>>,
+    /// Errors the next sends get, in order, instead of being sent.
+    refusals: std::collections::VecDeque<TgError>,
+}
+
+/// The id the fake gives the first message an Account sends.
+pub const FIRST_SENT_ID: i32 = 10_001;
+
+impl FakeSent {
+    fn state(&self) -> std::sync::MutexGuard<'_, SentState> {
+        self.state.lock().unwrap()
+    }
+
+    /// An Account's sent messages, oldest first.
+    pub fn of(&self, account: i64) -> Vec<FakeSentMessage> {
+        self.state().sent.get(&account).cloned().unwrap_or_default()
+    }
+
+    /// The next send gets `err` instead of going out (e.g. a Send cap's
+    /// [`TgError::WritesLimited`], or `PEER_FLOOD`).
+    pub fn refuse_next(&self, err: TgError) {
+        self.state().refusals.push_back(err);
+    }
+
+    fn send(
+        &self,
+        account: i64,
+        chat: ChatId,
+        topic: Option<i32>,
+        reply_to: Option<i32>,
+        text: FormattedText,
+        random_id: i64,
+    ) -> Result<i32, TgError> {
+        let mut state = self.state();
+        if let Some(err) = state.refusals.pop_front() {
+            return Err(err);
+        }
+        let sent = state.sent.entry(account).or_default();
+        if sent.iter().any(|m| m.random_id == random_id) {
+            return Err(send::already_sent());
+        }
+        let id = FIRST_SENT_ID + i32::try_from(sent.len()).unwrap_or(i32::MAX - FIRST_SENT_ID);
+        sent.push(FakeSentMessage {
+            chat,
+            id,
+            topic,
+            reply_to,
+            text,
+            random_id,
+        });
+        Ok(id)
     }
 }
 
@@ -1017,6 +1097,7 @@ pub struct FakeTelegram {
     files: Arc<FakeFiles>,
     transcriber: Arc<FakeTranscriber>,
     drafts: Arc<FakeDrafts>,
+    sent: Arc<FakeSent>,
 }
 
 /// Telegram's transcription service as the fake models it
@@ -1529,12 +1610,18 @@ impl FakeTelegram {
             files: Arc::default(),
             transcriber: Arc::default(),
             drafts,
+            sent: Arc::default(),
         }
     }
 
     /// Where this Account's Drafts are kept.
     pub fn drafts(&self) -> &Arc<FakeDrafts> {
         &self.drafts
+    }
+
+    /// Where this Account's sent messages are kept.
+    pub fn sent(&self) -> &Arc<FakeSent> {
+        &self.sent
     }
 
     /// The transcription service this Account's transcriptions go to.
@@ -1563,6 +1650,60 @@ pub fn fake_access_hash(chat: ChatId) -> Option<i64> {
 /// The id the fake hands out for `chat`, access hash included.
 pub fn fake_issued_id(chat: ChatId) -> String {
     ChatRef::new(chat, fake_access_hash(chat)).to_string()
+}
+
+impl FakeTelegram {
+    /// Where a text to `at` with `reply_to` and `topic` goes, as Telegram
+    /// takes a Draft or a sent message: [`compose::place`] with what
+    /// Telegram knows of the Chat; a Chat the Account doesn't have, a reply
+    /// to a message it doesn't have and a Topic the forum doesn't have are
+    /// refused, and with `writes_flood_wait` every write is.
+    async fn place_text(
+        &self,
+        at: ChatRef,
+        reply_to: Option<i32>,
+        topic: Option<i32>,
+    ) -> Result<(ChatId, compose::Placement), TgError> {
+        self.check_hash(at)?;
+        let chat = at.chat();
+        // Saved Messages is always there.
+        if !self.knows(chat) && chat != ChatId::User(self.data.account.id) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        let message_topic = |id| {
+            get_message(&self.data.messages, chat, &MessageRequest { id })
+                .into_iter()
+                .find(|found| found.chat == chat)
+                .map(|found| found.message.topic)
+        };
+        let placement = compose::place(
+            chat,
+            reply_to,
+            topic,
+            || std::future::ready(Ok(self.data.topics.contains_key(&chat))),
+            |id| std::future::ready(Ok(message_topic(id))),
+        )
+        .await?;
+        if let Some(seconds) = self.data.writes_flood_wait {
+            return Err(TgError::FloodWait {
+                seconds,
+                class: MethodClass::Writes,
+            });
+        }
+        if let Some(id) = placement.reply_to
+            && message_topic(id).is_none()
+        {
+            return Err(TgError::InvalidInput(format!(
+                "reply_to {id} is not a message of {chat}"
+            )));
+        }
+        if let (None, Some(topic)) = (placement.reply_to, placement.topic) {
+            self.check_topic(chat, topic)?;
+        }
+        Ok((chat, placement))
+    }
 }
 
 #[async_trait::async_trait]
@@ -2065,44 +2206,9 @@ impl Telegram for FakeTelegram {
     /// the Chat, then one `messages.saveDraft`, which Telegram refuses for a
     /// reply to a message the Chat doesn't have or a Topic the forum doesn't.
     async fn save_draft(&self, draft: NewDraft) -> Result<SavedDraft, TgError> {
-        self.check_hash(draft.chat)?;
-        let chat = draft.chat.chat();
-        // Saved Messages is always there.
-        if !self.knows(chat) && chat != ChatId::User(self.data.account.id) {
-            return Err(TgError::InvalidInput(format!(
-                "{chat} is not one of your chats; chat ids come from list_chats"
-            )));
-        }
-        let message_topic = |id| {
-            get_message(&self.data.messages, chat, &MessageRequest { id })
-                .into_iter()
-                .find(|found| found.chat == chat)
-                .map(|found| found.message.topic)
-        };
-        let placement = compose::place(
-            chat,
-            draft.reply_to,
-            draft.topic,
-            || std::future::ready(Ok(self.data.topics.contains_key(&chat))),
-            |id| std::future::ready(Ok(message_topic(id))),
-        )
-        .await?;
-        if let Some(seconds) = self.data.writes_flood_wait {
-            return Err(TgError::FloodWait {
-                seconds,
-                class: MethodClass::Writes,
-            });
-        }
-        if let Some(id) = placement.reply_to
-            && message_topic(id).is_none()
-        {
-            return Err(TgError::InvalidInput(format!(
-                "reply_to {id} is not a message of {chat}"
-            )));
-        }
-        if let (None, Some(topic)) = (placement.reply_to, placement.topic) {
-            self.check_topic(chat, topic)?;
-        }
+        let (chat, placement) = self
+            .place_text(draft.chat, draft.reply_to, draft.topic)
+            .await?;
         let top = placement.reply_header().and_then(|(_, top)| top);
         let cleared = draft.text.text.is_empty();
         self.drafts.save(
@@ -2117,6 +2223,35 @@ impl Telegram for FakeTelegram {
             topic: placement.topic,
             reply_to: placement.reply_to,
             cleared,
+        })
+    }
+
+    /// Like the Live client: placed like a Draft, then one
+    /// `messages.sendMessage`, each `random_id` once.
+    async fn send_message(&self, message: NewMessage) -> Result<SentMessage, TgError> {
+        let (chat, placement) = self
+            .place_text(message.chat, message.reply_to, message.topic)
+            .await?;
+        if message.text.text.trim().is_empty() {
+            return Err(TgError::InvalidInput(
+                "a message needs text (MESSAGE_EMPTY)".into(),
+            ));
+        }
+        let top = placement.reply_header().and_then(|(_, top)| top);
+        let id = self.sent.send(
+            self.data.account.id,
+            chat,
+            top,
+            placement.reply_to,
+            message.text,
+            message.random_id,
+        )?;
+        Ok(SentMessage {
+            chat,
+            id,
+            date: i32::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0),
+            topic: placement.topic,
+            reply_to: placement.reply_to,
         })
     }
 }
@@ -2862,6 +2997,8 @@ struct FakeTelegramSide {
     transcriber: Arc<FakeTranscriber>,
     /// Every Account's Drafts, kept by Telegram for all of its Grants.
     drafts: Arc<FakeDrafts>,
+    /// Every Account's sent messages.
+    sent: Arc<FakeSent>,
     /// Each Grant's [`FolderCache`], kept like `known`.
     folder_caches: Mutex<std::collections::HashMap<String, Arc<FolderCache>>>,
     /// The folder requests answered, for every Grant, in order.
@@ -2906,6 +3043,11 @@ impl FakeConnector {
     /// Telegram's Drafts, where every Grant's Drafts go.
     pub fn drafts(&self) -> Arc<FakeDrafts> {
         self.telegram.drafts.clone()
+    }
+
+    /// Every Account's sent messages, kept by Telegram for all of its Grants.
+    pub fn sent(&self) -> Arc<FakeSent> {
+        self.telegram.sent.clone()
     }
 
     /// How many Live clients the Consent screen opened, for sessions without a Grant.
@@ -3011,6 +3153,7 @@ impl Connector for FakeConnector {
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
             drafts: self.telegram.drafts.clone(),
+            sent: self.telegram.sent.clone(),
         }))
     }
 
@@ -3043,6 +3186,7 @@ impl Connector for FakeConnector {
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
             drafts: self.telegram.drafts.clone(),
+            sent: self.telegram.sent.clone(),
         }))
     }
 
@@ -3072,6 +3216,37 @@ impl Connector for FakeConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_random_id_is_sent_once_and_refusals_come_first() {
+        let me = default_account();
+        let saved = ChatRef::new(ChatId::User(me.id), fake_access_hash(ChatId::User(me.id)));
+        let fake = FakeTelegram::new(FakeData::new(me.clone()));
+        let message = |random_id| NewMessage {
+            chat: saved,
+            text: FormattedText::plain("hi"),
+            reply_to: None,
+            topic: None,
+            random_id,
+        };
+        let first = fake.send_message(message(7)).await.unwrap();
+        assert_eq!((first.chat, first.id), (ChatId::User(me.id), FIRST_SENT_ID));
+        assert!(matches!(
+            fake.send_message(message(7)).await,
+            Err(TgError::InvalidInput(msg)) if msg.contains("RANDOM_ID_DUPLICATE")
+        ));
+        fake.sent().refuse_next(TgError::PeerFlood);
+        assert!(matches!(
+            fake.send_message(message(8)).await,
+            Err(TgError::PeerFlood)
+        ));
+        let second = fake.send_message(message(8)).await.unwrap();
+        assert_eq!(second.id, FIRST_SENT_ID + 1);
+        let sent = fake.sent().of(me.id);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].text.text, "hi");
+        assert_eq!(sent[1].random_id, 8);
+    }
 
     /// Ids with gaps (deleted messages, or a private chat's account-wide ids),
     /// shuffled: the model must not rely on the order it is given.

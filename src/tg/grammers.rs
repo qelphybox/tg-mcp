@@ -42,6 +42,7 @@ use super::{
         self, ChatType, MediaFilter, QUERY_REQUIRED, RawFoundMessage, RequestScope, SearchAnswer,
         SearchFrom, SearchPage, SearchQuery, SearchRequest, SearchScope,
     },
+    send::{self, NewMessage, SendAnswer, SentMessage},
     session::SessionStore,
     topics::{self, RawForums, RawTopic},
     transcribe::{
@@ -952,7 +953,7 @@ impl Telegram for LiveClient {
                     rich_message: None,
                 },
                 Some(chat),
-                |err| draft_refusal(err, chat, placement),
+                |err| write_refusal(err, chat, placement, "the Draft"),
             )
             .await?;
         if !saved {
@@ -967,6 +968,98 @@ impl Telegram for LiveClient {
             cleared,
         })
     }
+
+    async fn send_message(&self, message: NewMessage) -> Result<SentMessage, TgError> {
+        let NewMessage {
+            chat: id,
+            text,
+            reply_to,
+            topic,
+            random_id,
+        } = message;
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
+        let placement = compose::place(
+            chat,
+            reply_to,
+            topic,
+            || self.is_forum(id),
+            |message| self.message_topic(&peer, chat, message),
+        )
+        .await?;
+        let updates = self
+            .call_refusing(
+                &tl::functions::messages::SendMessage {
+                    no_webpage: false,
+                    silent: false,
+                    background: false,
+                    clear_draft: false,
+                    noforwards: false,
+                    update_stickersets_order: false,
+                    invert_media: false,
+                    allow_paid_floodskip: false,
+                    peer,
+                    reply_to: input_reply_to(placement),
+                    message: text.text,
+                    random_id,
+                    reply_markup: None,
+                    entities: (!text.entities.is_empty())
+                        .then(|| text.entities.into_iter().map(message_entity).collect()),
+                    schedule_date: None,
+                    schedule_repeat_period: None,
+                    send_as: None,
+                    quick_reply_shortcut: None,
+                    effect: None,
+                    allow_paid_stars: None,
+                    suggested_post: None,
+                    rich_message: None,
+                },
+                Some(chat),
+                |err| write_refusal(err, chat, placement, "the message"),
+            )
+            .await?;
+        let now = i32::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+        let (sent, date) = send_answer(updates).sent(random_id, now)?;
+        Ok(SentMessage {
+            chat,
+            id: sent,
+            date,
+            topic: placement.topic,
+            reply_to: placement.reply_to,
+        })
+    }
+}
+
+/// The new message in Telegram's answer to `messages.sendMessage`.
+fn send_answer(updates: tl::enums::Updates) -> SendAnswer {
+    let updates = match updates {
+        tl::enums::Updates::UpdateShortSentMessage(short) => {
+            return SendAnswer {
+                ids: None,
+                message: Some((short.id, short.date)),
+            };
+        }
+        tl::enums::Updates::Updates(u) => u.updates,
+        tl::enums::Updates::Combined(u) => u.updates,
+        tl::enums::Updates::UpdateShort(u) => vec![u.update],
+        _ => Vec::new(),
+    };
+    let mut answer = SendAnswer::default();
+    for update in updates {
+        match update {
+            tl::enums::Update::MessageId(u) => answer.ids = Some((u.random_id, u.id)),
+            tl::enums::Update::NewMessage(tl::types::UpdateNewMessage {
+                message: tl::enums::Message::Message(m),
+                ..
+            })
+            | tl::enums::Update::NewChannelMessage(tl::types::UpdateNewChannelMessage {
+                message: tl::enums::Message::Message(m),
+                ..
+            }) if m.out => answer.message = Some((m.id, m.date)),
+            _ => {}
+        }
+    }
+    answer
 }
 
 /// A Draft from one update of `messages.getAllDrafts`: `None` for another
@@ -1048,17 +1141,25 @@ fn message_entity(entity: Entity) -> tl::enums::MessageEntity {
     }
 }
 
-/// Telegram's refusals of a `messages.saveDraft` that are the caller's to
+/// Telegram's refusals of a `messages.saveDraft` or `messages.sendMessage`
+/// (`what` it refused: "the Draft", "the message") that are the caller's to
 /// fix, as what to fix. Only error codes are quoted, never the text.
-fn draft_refusal(err: &InvocationError, chat: ChatId, placement: Placement) -> Option<TgError> {
+fn write_refusal(
+    err: &InvocationError,
+    chat: ChatId,
+    placement: Placement,
+    what: &str,
+) -> Option<TgError> {
     let InvocationError::Rpc(rpc) = err else {
         return None;
     };
     let code = rpc.name.as_str();
     let invalid = |msg: String| Some(TgError::InvalidInput(msg));
     match code {
+        "RANDOM_ID_DUPLICATE" => Some(send::already_sent()),
+        "MESSAGE_EMPTY" => invalid("a message needs text (MESSAGE_EMPTY)".into()),
         "MESSAGE_TOO_LONG" => invalid(format!(
-            "Telegram refused the Draft as too long (MESSAGE_TOO_LONG): it counts some \
+            "Telegram refused {what} as too long (MESSAGE_TOO_LONG): it counts some \
              characters double; shorten it below {} characters",
             compose::MAX_TEXT_CHARS
         )),
@@ -1084,7 +1185,7 @@ fn draft_refusal(err: &InvocationError, chat: ChatId, placement: Placement) -> O
         | "CHAT_SEND_PLAIN_FORBIDDEN"
         | "USER_BANNED_IN_CHANNEL"
         | "TOPIC_CLOSED" => invalid(format!(
-            "this account can't write in {chat}{}: Telegram refused the Draft ({code})",
+            "this account can't write in {chat}{}: Telegram refused {what} ({code})",
             placement
                 .topic
                 .map(|t| format!(" (Topic {t})"))
@@ -6142,5 +6243,241 @@ mod draft_tests {
             draft: tl::enums::DraftMessage::Empty(tl::types::DraftMessageEmpty { date: Some(5) }),
         });
         assert_eq!(raw_draft(empty), None);
+    }
+}
+
+/// Sent messages (#45): what `send_message` sends, its `random_id`, the Send
+/// cap, how Telegram's refusals read and how its answer names the message.
+#[cfg(test)]
+mod send_tests {
+    use grammers_client::tl::Serializable;
+
+    use super::*;
+    use crate::{
+        limits::WriteLimit,
+        sessions::{TokenTtl, Vault},
+        tg::markdown::{FormattedText, TextFormat},
+    };
+
+    async fn cold_client() -> (LiveClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_path(&dir.path().join("vault.db"), TokenTtl::default())
+            .await
+            .unwrap();
+        let issued = vault.create_grant("client", 42, b"").await.unwrap();
+        let grant = vault.open(issued.access.expose()).await.unwrap();
+        (offline_live(grant, Arc::new(SessionStore::new())), dir)
+    }
+
+    fn sent(live: &LiveClient) -> Vec<Vec<u8>> {
+        live.sent.lock().unwrap().clone()
+    }
+
+    const USER: ChatId = ChatId::User(7);
+    const FORUM: ChatId = ChatId::Channel(5);
+
+    fn message(chat: ChatId, text: &str, topic: Option<i32>, random_id: i64) -> NewMessage {
+        NewMessage {
+            chat: ChatRef::new(chat, Some(99)),
+            text: FormattedText::new(text, TextFormat::Markdown),
+            reply_to: None,
+            topic,
+            random_id,
+        }
+    }
+
+    fn send_request(
+        peer: tl::enums::InputPeer,
+        text: &str,
+        entities: Option<Vec<tl::enums::MessageEntity>>,
+        reply_to: Option<(i32, Option<i32>)>,
+        random_id: i64,
+    ) -> Vec<u8> {
+        tl::functions::messages::SendMessage {
+            no_webpage: false,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer,
+            reply_to: reply_to.map(|(reply_to_msg_id, top_msg_id)| {
+                tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                    reply_to_msg_id,
+                    top_msg_id,
+                    reply_to_peer_id: None,
+                    quote_text: None,
+                    quote_entities: None,
+                    quote_offset: None,
+                    monoforum_peer_id: None,
+                    todo_item_id: None,
+                    poll_option: None,
+                })
+            }),
+            message: text.into(),
+            random_id,
+            reply_markup: None,
+            entities,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+            rich_message: None,
+        }
+        .to_bytes()
+    }
+
+    fn user_peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: 7,
+            access_hash: 99,
+        })
+    }
+
+    fn forum_peer() -> tl::enums::InputPeer {
+        tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: 99,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_message_goes_out_as_one_send_message_with_its_random_id_and_topic() {
+        let (live, _dir) = cold_client().await;
+        live.forums.lock().unwrap().insert(FORUM, true);
+        // Offline, Telegram's answer is an error; the request is what counts.
+        assert!(
+            live.send_message(message(USER, "**hi**", None, 41))
+                .await
+                .is_err()
+        );
+        assert!(
+            live.send_message(message(FORUM, "x", Some(10), 42))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sent(&live),
+            [
+                send_request(
+                    user_peer(),
+                    "hi",
+                    Some(vec![tl::enums::MessageEntity::Bold(
+                        tl::types::MessageEntityBold {
+                            offset: 0,
+                            length: 2
+                        }
+                    )]),
+                    None,
+                    41
+                ),
+                send_request(forum_peer(), "x", None, Some((10, Some(10))), 42),
+            ]
+        );
+        // A forum without a Topic is refused before Telegram.
+        assert!(matches!(
+            live.send_message(message(FORUM, "z", None, 43)).await,
+            Err(TgError::InvalidInput(msg)) if msg.contains("is a forum")
+        ));
+        assert_eq!(sent(&live).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_sixth_message_to_a_chat_in_a_minute_never_reaches_telegram() {
+        let (live, _dir) = cold_client().await;
+        for n in 0..5 {
+            assert!(matches!(
+                live.send_message(message(USER, "cap check", None, 100 + n))
+                    .await,
+                Err(TgError::Upstream(_))
+            ));
+        }
+        assert!(matches!(
+            live.send_message(message(USER, "cap check", None, 105))
+                .await,
+            Err(TgError::WritesLimited {
+                limit: WriteLimit::Chat,
+                ..
+            })
+        ));
+        assert_eq!(sent(&live).len(), 5, "the 6th was refused at home");
+    }
+
+    #[tokio::test]
+    async fn telegrams_refusals_of_a_send_say_what_happened() {
+        let (live, _dir) = cold_client().await;
+        type Send = tl::functions::messages::SendMessage;
+        live.answers.lock().unwrap().extend([
+            rpc::<Send>(400, "RANDOM_ID_DUPLICATE"),
+            rpc::<Send>(403, "CHAT_WRITE_FORBIDDEN"),
+            rpc::<Send>(400, "PEER_FLOOD"),
+            rpc::<Send>(420, "FLOOD_WAIT_30"),
+        ]);
+        match live.send_message(message(USER, "a", None, 1)).await {
+            Err(TgError::InvalidInput(msg)) => {
+                assert!(msg.contains("RANDOM_ID_DUPLICATE"), "{msg}");
+                assert!(msg.contains("not sent again"), "{msg}");
+            }
+            other => panic!("expected already sent, got {other:?}"),
+        }
+        match live.send_message(message(USER, "b", None, 2)).await {
+            Err(TgError::InvalidInput(msg)) => assert!(
+                msg.contains("can't write in user:7: Telegram refused the message"),
+                "{msg}"
+            ),
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+        assert!(matches!(
+            live.send_message(message(USER, "c", None, 3)).await,
+            Err(TgError::PeerFlood)
+        ));
+        assert!(matches!(
+            live.send_message(message(USER, "d", None, 4)).await,
+            Err(TgError::FloodWait {
+                seconds: 30,
+                class: MethodClass::Writes
+            })
+        ));
+    }
+
+    #[test]
+    fn the_answer_names_the_message_sent_with_our_random_id() {
+        let short = tl::enums::Updates::UpdateShortSentMessage(tl::types::UpdateShortSentMessage {
+            out: true,
+            id: 77,
+            pts: 1,
+            pts_count: 1,
+            date: 1_700_000_000,
+            media: None,
+            entities: None,
+            ttl_period: None,
+        });
+        assert_eq!(send_answer(short).sent(5, 1).unwrap(), (77, 1_700_000_000));
+
+        let long = tl::enums::Updates::Updates(tl::types::Updates {
+            updates: vec![
+                tl::enums::Update::MessageId(tl::types::UpdateMessageId {
+                    id: 78,
+                    random_id: 5,
+                }),
+                tl::enums::Update::DeleteMessages(tl::types::UpdateDeleteMessages {
+                    messages: vec![1],
+                    pts: 1,
+                    pts_count: 1,
+                }),
+            ],
+            users: vec![],
+            chats: vec![],
+            date: 1_700_000_001,
+            seq: 0,
+        });
+        let answer = send_answer(long);
+        assert_eq!(answer.sent(5, 9).unwrap(), (78, 9), "no message: now");
+        assert!(answer.sent(6, 9).is_err());
     }
 }

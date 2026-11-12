@@ -33,6 +33,7 @@ use super::{
     members::{Member, MemberPage, MembersQuery},
     messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
+    send::{NewMessage, SentMessage},
     topics::Topic,
     transcribe::{Transcript, Transcription},
     view::{Album, AlbumItem},
@@ -727,6 +728,11 @@ impl Telegram for Sanitised {
     /// what comes back from Telegram, never the Account's own words.
     async fn save_draft(&self, draft: NewDraft) -> Result<SavedDraft, TgError> {
         self.0.save_draft(draft).await.map(sanitised)
+    }
+
+    /// Ids and a date only: nothing to sanitise.
+    async fn send_message(&self, message: NewMessage) -> Result<SentMessage, TgError> {
+        self.0.send_message(message).await
     }
 }
 
