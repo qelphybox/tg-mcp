@@ -623,10 +623,11 @@ impl Write for Sink {
     }
 }
 
-/// A `send` Grant lists the tools a read Grant does and send_message (#46),
-/// and is told it may send to the chats the user allowed.
+/// A `send` Grant lists the tools a read Grant does, send_message (#46),
+/// react and mark_read (#47), and is told it may write to the chats the user
+/// allowed.
 #[tokio::test]
-async fn a_send_grant_lists_send_message_and_is_told_where_it_may_send() {
+async fn a_send_grant_lists_the_send_tools_and_is_told_where_it_may_write() {
     let server = server().await;
     let (_, reader) = server.login_scoped(None, &[ALLOW]).await;
     let flow = on_consent(&server).await;
@@ -646,19 +647,25 @@ async fn a_send_grant_lists_send_message_and_is_told_where_it_may_send() {
     };
     let mut sender_tools = names(sender.list_all_tools().await.unwrap());
     let reader_tools = names(reader.list_all_tools().await.unwrap());
-    assert!(!reader_tools.contains(&"send_message".to_string()));
-    assert!(sender_tools.contains(&"send_message".to_string()));
-    sender_tools.retain(|name| name != "send_message");
+    let send_tools = ["send_message", "react", "mark_read"];
+    for tool in send_tools {
+        assert!(!reader_tools.contains(&tool.to_string()), "{tool}");
+        assert!(sender_tools.contains(&tool.to_string()), "{tool}");
+    }
+    sender_tools.retain(|name| !send_tools.contains(&name.as_str()));
     assert_eq!(
         sender_tools, reader_tools,
-        "send_message is the only addition"
+        "the send tools are the additions"
     );
     let said = sender
         .peer_info()
         .and_then(|info| info.instructions.clone())
         .unwrap();
     assert!(
-        said.contains("send messages to the chats the user allowed (each confirmed by the user"),
+        said.contains(
+            "send messages, react to messages and mark chats as read in the chats the user \
+             allowed (each message confirmed by the user"
+        ),
         "{said}"
     );
     assert!(!said.contains("Read-only"), "{said}");

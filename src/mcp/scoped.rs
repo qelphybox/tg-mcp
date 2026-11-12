@@ -137,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_needs_read_but_save_draft_and_send_message() {
+    fn every_tool_needs_read_but_save_draft_and_the_send_tools() {
         let tools = TgMcp::scoped_tools();
         let all = tools.router().list_all();
         assert!(all.iter().any(|t| t.name == "whoami"));
@@ -145,21 +145,18 @@ mod tests {
         for tool in &all {
             let needed = match tool.name.as_ref() {
                 "save_draft" => Scope::Draft,
-                "send_message" => Scope::Send,
+                "send_message" | "react" | "mark_read" => Scope::Send,
                 _ => Scope::Read,
             };
             assert_eq!(tools.required[tool.name.as_ref()], needed, "{}", tool.name);
         }
-        assert_eq!(tools.listed(Scopes::READ_ONLY).len(), all.len() - 2);
+        assert_eq!(tools.listed(Scopes::READ_ONLY).len(), all.len() - 4);
         assert_eq!(tools.listed(sending()).len(), all.len() - 1);
-        assert!(
-            !tools
-                .listed(drafts())
-                .iter()
-                .any(|t| t.name == "send_message")
-        );
-        assert!(tools.check("send_message", drafts()).is_err());
-        assert!(tools.check("send_message", sending()).is_ok());
+        for name in ["send_message", "react", "mark_read"] {
+            assert!(!tools.listed(drafts()).iter().any(|t| t.name == name));
+            assert!(tools.check(name, drafts()).is_err());
+            assert!(tools.check(name, sending()).is_ok());
+        }
     }
 
     #[test]

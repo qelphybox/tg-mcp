@@ -161,8 +161,9 @@ pub fn instructions(scopes: Scopes) -> String {
         }
         if scopes.contains(Scope::Send) {
             can.push(
-                "send messages to the chats the user allowed (each confirmed by the user, unless \
-                 they chose to let this app send without asking)",
+                "send messages, react to messages and mark chats as read in the chats the user \
+                 allowed (each message confirmed by the user, unless they chose to let this app \
+                 send without asking; reactions and marking as read never are)",
             );
         }
         if scopes.contains(Scope::Organize) {
@@ -224,15 +225,17 @@ mod instructions_tests {
     }
 
     #[test]
-    fn a_send_grant_is_told_where_it_may_send_and_that_the_user_confirms() {
+    fn a_send_grant_is_told_where_it_may_send_react_and_mark_read_and_what_is_confirmed() {
         let sending: Scopes = [Scope::Send].into_iter().collect();
         assert_eq!(
             instructions(sending),
             format!(
                 "Unofficial Telegram MCP server (uses the Telegram API). Access to the connected \
-                 Telegram account: you can read chats, messages and media, and send messages to \
-                 the chats the user allowed (each confirmed by the user, unless they chose to let \
-                 this app send without asking); you cannot edit or delete messages. {UNTRUSTED}"
+                 Telegram account: you can read chats, messages and media, and send messages, \
+                 react to messages and mark chats as read in the chats the user allowed (each \
+                 message confirmed by the user, unless they chose to let this app send without \
+                 asking; reactions and marking as read never are); you cannot edit or delete \
+                 messages. {UNTRUSTED}"
             )
         );
     }
@@ -242,7 +245,7 @@ mod instructions_tests {
         let all: Scopes = Scope::ALL.into_iter().collect();
         let text = instructions(all);
         assert!(
-            text.contains("send messages to the chats the user allowed"),
+            text.contains("send messages, react to messages and mark chats as read in the chats"),
             "{text}"
         );
         assert!(text.contains("and organize chats"), "{text}");

@@ -556,7 +556,7 @@ async fn send_message_is_listed_with_send_as_a_bounded_write_that_isnt_read_only
         .and_then(|info| info.instructions.clone())
         .unwrap();
     assert!(
-        said.contains("send messages to the chats the user allowed"),
+        said.contains("send messages, react to messages and mark chats as read in the chats"),
         "{said}"
     );
 }
