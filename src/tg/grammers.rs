@@ -1157,6 +1157,10 @@ fn write_refusal(
     let invalid = |msg: String| Some(TgError::InvalidInput(msg));
     match code {
         "RANDOM_ID_DUPLICATE" => Some(send::already_sent()),
+        // Before it is classified: a 420, but of this group, not the Account.
+        "SLOWMODE_WAIT" => Some(TgError::SlowMode {
+            seconds: rpc.value.unwrap_or(60),
+        }),
         "MESSAGE_EMPTY" => invalid("a message needs text (MESSAGE_EMPTY)".into()),
         "MESSAGE_TOO_LONG" => invalid(format!(
             "Telegram refused {what} as too long (MESSAGE_TOO_LONG): it counts some \
@@ -6443,6 +6447,27 @@ mod send_tests {
                 class: MethodClass::Writes
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn slow_mode_is_this_chats_wait_not_retried_and_blocks_nothing_else() {
+        let (live, _dir) = cold_client().await;
+        type Send = tl::functions::messages::SendMessage;
+        live.answers
+            .lock()
+            .unwrap()
+            .push_back(rpc::<Send>(420, "SLOWMODE_WAIT_17"));
+        assert!(matches!(
+            live.send_message(message(USER, "a", None, 1)).await,
+            Err(TgError::SlowMode { seconds: 17 })
+        ));
+        assert_eq!(sent(&live).len(), 1, "asked once, never retried");
+        // Not an Account flood: the next write goes to Telegram.
+        assert!(matches!(
+            live.send_message(message(USER, "b", None, 2)).await,
+            Err(TgError::Upstream(_))
+        ));
+        assert_eq!(sent(&live).len(), 2);
     }
 
     #[test]

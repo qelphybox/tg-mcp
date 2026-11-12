@@ -367,6 +367,13 @@ fn refusals_say_what_happened_and_when_to_retry() {
         "{}",
         again.message
     );
+    let slow = refusal(&TgError::SlowMode { seconds: 17 }, Decision::Send);
+    assert_eq!(slow.retry_after_s, Some(17));
+    assert!(
+        slow.message.contains("slow mode") && slow.message.contains("try again in 17 s"),
+        "{}",
+        slow.message
+    );
     let flood = refusal(&TgError::PeerFlood, Decision::Send);
     assert_eq!(flood.retry_after_s, None);
     assert!(flood.message.contains("don't retry"), "{}", flood.message);

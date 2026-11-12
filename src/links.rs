@@ -378,7 +378,8 @@ fn refused(auth: &AuthState, taken: &Taken, err: TgError) -> Response {
         }
         TgError::FloodWait { seconds, .. }
         | TgError::RateLimited { seconds }
-        | TgError::WritesLimited { seconds, .. } => {
+        | TgError::WritesLimited { seconds, .. }
+        | TgError::SlowMode { seconds } => {
             auth.links.refund(&taken.key);
             let mut response = bare(StatusCode::SERVICE_UNAVAILABLE);
             response

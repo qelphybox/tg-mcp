@@ -2086,6 +2086,17 @@ fn tool_error(err: TgError) -> ErrorData {
             };
             ErrorData::internal_error(message, None)
         }
+        TgError::SlowMode { seconds } => {
+            tracing::warn!(seconds, "tool call hit SLOWMODE_WAIT");
+            ErrorData::internal_error(
+                format!(
+                    "This group is in slow mode: each member may send one message per set \
+                     interval; retry in {seconds} s. Nothing was sent, and the message is not \
+                     queued: send it again then if it is still wanted."
+                ),
+                None,
+            )
+        }
         TgError::PeerFlood => {
             tracing::warn!("tool call hit PEER_FLOOD: telegram limits the account for spam");
             ErrorData::internal_error(
@@ -2409,6 +2420,22 @@ mod tests {
             "reading tools",
         ] {
             assert!(account.contains(words), "{words}: {account}");
+        }
+    }
+
+    #[test]
+    fn slow_mode_says_the_group_limits_messages_and_when_to_retry() {
+        let message = tool_error(TgError::SlowMode { seconds: 17 })
+            .message
+            .to_string();
+        for words in [
+            "slow mode",
+            "one message per",
+            "retry in 17 s",
+            "Nothing was sent",
+            "not queued",
+        ] {
+            assert!(message.contains(words), "{words}: {message}");
         }
     }
 

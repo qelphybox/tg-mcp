@@ -726,6 +726,10 @@ fn refusal(err: &TgError, decision: Decision) -> Refusal {
             *seconds,
             "Too many requests for this account right now".into(),
         ),
+        TgError::SlowMode { seconds } => wait(
+            *seconds,
+            "This group is in slow mode: each member may send one message per set interval".into(),
+        ),
         TgError::PeerFlood => Refusal {
             message: format!(
                 "Telegram limits this account for spam (PEER_FLOOD). {what}. This is not a wait: \

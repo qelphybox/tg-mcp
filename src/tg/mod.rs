@@ -88,6 +88,11 @@ pub enum TgError {
     /// nothing reached Telegram; retry after `seconds`. Writes are never queued.
     #[error("too many writes ({}); retry in {seconds} s", limit.name())]
     WritesLimited { seconds: u32, limit: WriteLimit },
+    /// Telegram's `SLOWMODE_WAIT_X`: the group is in slow mode, and this
+    /// member may send its next message there in `seconds`. Limits one Chat,
+    /// not the Account; never retried.
+    #[error("this chat is in slow mode; the next message may go in {seconds} s")]
+    SlowMode { seconds: u32 },
     /// Telegram's `PEER_FLOOD`: the Account is limited for spam and may not
     /// write there now. Not a wait: never retried.
     #[error("telegram limits this account for spam (PEER_FLOOD)")]
