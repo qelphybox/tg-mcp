@@ -986,3 +986,45 @@ Needs what §55 needs, its two connectors, `telegram-send` (step 3: A and the fo
    ```
 
 10. **Clean up.** §55 step 14, and delete the §56 test messages in A, B (none expected) and the forum.
+
+## 57. react and mark_read write only into the Send allow-list, never ask, and show on the phone at once
+
+Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its Send allow-list, "without asking me" unticked; keep it, or set it up again as in §55 step 3) and chat B of yours outside it; the forum's Topic "Releases" with id `R` (§56); a group G you administer, with a few messages; and a second account, or a friend, that can post in A and in the forum. Connect a further connector for this section from the same desktop browser: `claude mcp add --transport http telegram-react https://tgmcp.qelphybox.space/mcp`, `/mcp` → `telegram-react` → Authenticate, tick "Send messages", choose A, the forum and G, leave "without asking me" unticked, Allow. In Telegram, set G's reactions to only 👍 (G → Edit → Reactions → "Some reactions", only 👍). The boundaries are also covered by fake-backed tests: `cargo test --lib mcp::send::` (set, replace, remove; custom emoji, paid and non-standard emoji refused before Telegram; `emoji` required; a chat that allows only some reactions or none; mark_read up to the latest, up to `up_to`, a Topic, not a forum or not a Topic; outside the list; neither listed nor callable without `send`; annotations and schemas), `cargo test --lib tg::grammers::react_tests` (the requests that reach Telegram, its list of reactions asked for once, refusals, the writes budget but not the Send cap) and `cargo test --lib tg::reactions` (matching against Telegram's list).
+
+1. **Only a `send` Grant has them, and is told what they do.**
+
+   ```sh
+   python3 scripts/scope-check.py - read                    # expect every line [PASS]; the printed tools/list has neither react nor mark_read
+   python3 scripts/scope-check.py "read draft" "read draft" # expect every line [PASS]; save_draft listed, still neither
+   ```
+
+   In a new Claude Code session with `telegram-react`, `/mcp` → `telegram-react` → View tools lists `react` and `mark_read` next to `send_message` (with the regular `telegram` connector none of the three). Ask "Quote verbatim the instructions the telegram-react server gave you, and the first sentence of the react and mark_read tool descriptions." Expect the instructions to contain "you can read chats, messages and media, and send messages, react to messages and mark chats as read in the chats the user allowed (each message confirmed by the user, unless they chose to let this app send without asking; reactions and marking as read never are); you cannot edit or delete messages", and the descriptions to begin "React to a message as the user: set the account's reaction on message `message_id` …" and "Mark a chat as read as the user …".
+
+2. **A reaction shows on the phone, without any page.** With `telegram-react`: "Call get_messages on A (limit 5)" and note the id N of a message from A, not yours, and its `reactions`. Then "react to message N in A with 👍". Expect `{"status": "set", "chat_id": "<A's id>", "message_id": N, "emoji": "👍"}` at once: Claude Code opens no URL and no confirmation page exists for it. On the phone, message N shows your 👍 within a few seconds (tap it: you are listed), and "get_messages on A around_id N" shows its `reactions` with 👍 one higher than noted.
+
+3. **Replace.** "react to message N in A with ❤️" (with the variation selector, as a keyboard types it): `"emoji": "❤"`, Telegram's own spelling. On the phone N shows your ❤ and no longer your 👍 (one reaction of yours); `get_messages` agrees. "Call react again with exactly the same arguments": the same answer, no error, nothing changes on the phone.
+
+4. **Remove with null.** "react to message N in A with emoji null": `{"status": "removed", "chat_id": …, "message_id": N}` with no `emoji`; your ❤ is gone on the phone and in `get_messages`. The same call again: `removed` again, no error. "Call react on N with no emoji argument at all": an error naming the missing field `emoji` (leaving it out never removes a reaction); N unchanged.
+
+5. **Custom emoji, paid and unknown emoji are refused before Telegram.** In turn, react on N with `emoji` `custom`, `5368324170671202286` (a custom emoji's id), `paid` and `🦖`. Expect errors "custom emoji reactions are not supported: react with a standard emoji such as 👍" (twice), "paid reactions (Telegram Stars) are not supported: …" and "🦖 is not one of Telegram's standard reactions (custom emoji and paid reactions are not supported); they are: 👍 👎 ❤ 🔥 …" (Telegram's current list, in its order). N shows no reaction of yours after any of them.
+
+6. **A chat that restricts reactions refuses the others clearly.** In G, with message id K from `get_messages`: react with ❤ → an error "… doesn't allow the reaction ❤ (REACTION_INVALID): its admins turned reactions off there or allow only some of them"; react with 👍 → `set`, visible in G. Now turn G's reactions off (G → Edit → Reactions → "No reactions"): react with 👍 on another message → the same REACTION_INVALID error, and nothing shows. Remove your 👍 on K with `emoji: null` (`removed`; if Telegram refuses that while reactions are off, note it and remove it in the app), then set G's reactions back as they were.
+
+7. **Outside the Send allow-list.** "react to a message of B with 👍" and "mark_read B": both fail with "user:… is not one of the chats this connection may send to (its Send allow-list, chosen on the consent screen when it was connected): the user connects again to choose other chats". B shows no reaction, and if B has unread messages its badge stays.
+
+8. **mark_read clears the unread badge on every device.** Have the second account send three messages to A ("§57 one", "two", "three"); open A nowhere. The phone's chat list shows A with 3 unread. Ask "call get_messages on A (limit 3)" (reading marks nothing read: the badge stays 3) and note the ids X1 < X2 < X3. Then "mark_read A up_to X1": `{"chat_id": "<A's id>", "up_to": X1}`; within seconds the phone shows 2 unread on A. Then "mark_read A": `{"chat_id": "<A's id>"}` (no `up_to`: up to the latest); the badge disappears on the phone and in Telegram Desktop, and on the second account the three messages show two ticks (read). The same call again: the same answer, no error.
+
+9. **One Topic of a forum.** Have the second account post one message in Releases (R) and one in General of the forum; the phone shows both Topics unread. "mark_read the forum with topic R": `{"chat_id": …, "topic": R, "up_to": <the id of the message just posted in Releases>}`; on the phone Releases is read, General is still unread. Then "mark_read the forum with topic 1": `"topic": 1`, and General is read too. (If Telegram refuses General, the error names the Topic: record it, it is a bug.) Then `topic: R` on A: an error "… is not a forum: only forum supergroups have Topics. Leave out topic"; `topic: 99999` on the forum: "topic 99999 is not a Topic of this forum (get_chat_info lists them)".
+
+10. **The server's side**, within 15 minutes of the steps:
+
+    ```sh
+    logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+    logs | grep -E 'reaction written|chat marked read'
+    # expect "reaction written" with grant_id, chat, message_id and set=true/false,
+    # and "chat marked read" with grant_id, chat, topic and up_to: ids only
+    logs | grep -cE '👍|❤|🦖|5368324170671202286|§57'   # expect 0: neither emoji nor message text is logged
+    logs | grep -c 'tgm_'                              # expect 0: neither a cookie nor a Token
+    ```
+
+11. **Clean up.** Remove any reaction of yours left from these steps (`react` with `emoji: null`, or in the app), delete the §57 messages, and remove `telegram-react` (`claude mcp remove telegram-react`; it stays in the account's Active sessions until revoked there or with §56's clean-up).
