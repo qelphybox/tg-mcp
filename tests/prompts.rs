@@ -61,8 +61,11 @@ fn words(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Claude Code splits what follows a prompt's slash command on whitespace,
+/// one word per argument, ignoring quotes: so each prompt takes one
+/// optional argument, `query`, and the model reads the request from it.
 #[tokio::test]
-async fn both_prompts_are_listed_with_their_arguments() {
+async fn both_prompts_take_one_optional_query() {
     let (_server, client) = client().await;
     let capabilities = &client.peer_info().unwrap().capabilities;
     assert!(capabilities.prompts.is_some(), "{capabilities:?}");
@@ -71,18 +74,8 @@ async fn both_prompts_are_listed_with_their_arguments() {
     let prompts = client.list_all_prompts().await.unwrap();
     let names: BTreeSet<_> = prompts.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, BTreeSet::from(["catch_up", "research"]));
-    for (name, expected) in [
-        // In this order: Claude Code fills a prompt's arguments by position.
-        (
-            "catch_up",
-            vec![("since", false), ("chat", false), ("max_chats", false)],
-        ),
-        (
-            "research",
-            vec![("topic", true), ("since", false), ("chat", false)],
-        ),
-    ] {
-        let prompt = prompts.iter().find(|p| p.name == name).unwrap();
+    for prompt in &prompts {
+        let name = &prompt.name;
         assert!(
             prompt.description.as_deref().is_some_and(|d| d.len() > 20),
             "{name}: {prompt:?}"
@@ -102,183 +95,179 @@ async fn both_prompts_are_listed_with_their_arguments() {
                 (a.name.as_str(), a.required == Some(true))
             })
             .collect();
-        assert_eq!(arguments, expected, "{name}");
+        assert_eq!(arguments, vec![("query", false)], "{name}");
     }
 }
 
 #[tokio::test]
-async fn catch_up_renders_its_arguments_into_the_recipe() {
+async fn catch_up_without_a_query_runs_its_default() {
     let (_server, client) = client().await;
 
     let plain = render(&client, "catch_up", json!({})).await.unwrap();
-    assert!(plain.contains("`list_chats(unread_only: true)`"), "{plain}");
-    assert!(plain.contains("`get_messages("), "{plain}");
-    assert!(plain.contains("at most 10 chats"), "{plain}");
-    assert!(plain.contains("Needs your reply"), "{plain}");
-    assert!(!plain.contains("`find_chats("), "no chat named: {plain}");
-    assert!(!plain.contains("Since:"), "no since given: {plain}");
-    // No arguments at all is the same as an empty object.
+    for rule in [
+        "`list_chats(unread_only: true)`",
+        "at most 5 pages",
+        "at most 10 chats",
+        "not `muted`",
+        "`unread_count`, at least 5 and at most 100",
+        "1-3 sentences",
+        "and more",
+        "Needs your reply",
+        "the language most of the chats you read use",
+    ] {
+        assert!(plain.contains(rule), "{rule}: {plain}");
+    }
+    assert!(!plain.contains("My request"), "no request: {plain}");
+    // No arguments at all, an empty query or a blank one: the same default.
     let none = client
         .get_prompt(GetPromptRequestParams::new("catch_up"))
         .await
         .unwrap();
     assert_eq!(none.messages[0].content.as_text().unwrap().text, plain);
-
-    let named = render(
-        &client,
-        "catch_up",
-        json!({ "since": "yesterday 18:00", "chat": "Work \"chat\"", "max_chats": "5" }),
-    )
-    .await
-    .unwrap();
-    assert!(named.contains(r#""yesterday 18:00""#), "{named}");
-    // The user's words stay quoted, as data.
-    assert!(named.contains(r#""Work \"chat\"""#), "{named}");
-    assert!(named.contains("`find_chats(query)`"), "{named}");
-
-    let max = render(&client, "catch_up", json!({ "max_chats": "5" }))
-        .await
-        .unwrap();
-    assert!(max.contains("at most 5 chats"), "{max}");
-    // A client that sends a number instead of a string is understood too.
-    let number = render(&client, "catch_up", json!({ "max_chats": 7 }))
-        .await
-        .unwrap();
-    assert!(number.contains("at most 7 chats"), "{number}");
-
-    let by_id = render(&client, "catch_up", json!({ "chat": "channel:789" }))
-        .await
-        .unwrap();
-    assert!(by_id.contains(r#""channel:789""#), "{by_id}");
-    assert!(
-        !by_id.contains("`find_chats("),
-        "an id needs no lookup: {by_id}"
-    );
-    assert!(
-        !by_id.contains("`list_chats(unread_only: true)`"),
-        "{by_id}"
-    );
-
-    // Empty optional arguments (a client's unfilled fields) are left out.
-    let empty = render(
-        &client,
-        "catch_up",
-        json!({ "since": " ", "chat": "", "max_chats": "" }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(empty, plain);
-}
-
-#[tokio::test]
-async fn catch_up_rejects_arguments_out_of_bounds() {
-    let (_server, client) = client().await;
-    for (case, arguments) in [
-        ("max_chats 0", json!({ "max_chats": "0" })),
-        ("max_chats 51", json!({ "max_chats": "51" })),
-        ("max_chats -1", json!({ "max_chats": -1 })),
-        ("max_chats ten", json!({ "max_chats": "ten" })),
-        ("since too long", json!({ "since": "1".repeat(65) })),
-        ("chat too long", json!({ "chat": "c".repeat(65) })),
-    ] {
-        invalid(render(&client, "catch_up", arguments).await, case);
-    }
-    render(&client, "catch_up", json!({ "max_chats": "50" }))
-        .await
-        .unwrap();
-    render(&client, "catch_up", json!({ "max_chats": "1" }))
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn research_renders_its_arguments_into_the_recipe() {
-    let (_server, client) = client().await;
-
-    let plain = render(&client, "research", json!({ "topic": "server migration" }))
-        .await
-        .unwrap();
-    assert!(plain.contains(r#""server migration""#), "{plain}");
-    assert!(plain.contains("`search_messages(query)`"), "{plain}");
-    assert!(
-        plain.contains("`get_messages(chat_id, around_id)`"),
-        "{plain}"
-    );
-    assert!(plain.contains("transliteration"), "{plain}");
-    assert!(!plain.contains("`find_chats(query)`"), "{plain}");
-    assert!(!plain.contains("Since:"), "{plain}");
-
-    let narrowed = render(
-        &client,
-        "research",
-        json!({ "topic": "VPN", "since": "2026-10-01", "chat": "Work" }),
-    )
-    .await
-    .unwrap();
-    assert!(narrowed.contains(r#""VPN""#), "{narrowed}");
-    assert!(narrowed.contains(r#""2026-10-01""#), "{narrowed}");
-    assert!(narrowed.contains(r#""Work""#), "{narrowed}");
-    assert!(narrowed.contains("`find_chats(query)`"), "{narrowed}");
-
-    let by_id = render(
-        &client,
-        "research",
-        json!({ "topic": "VPN", "chat": "user:101" }),
-    )
-    .await
-    .unwrap();
-    assert!(by_id.contains(r#""user:101""#), "{by_id}");
-    assert!(!by_id.contains("`find_chats(query)`"), "{by_id}");
-}
-
-#[tokio::test]
-async fn research_without_a_topic_is_an_error() {
-    let (_server, client) = client().await;
-    invalid(
-        client
-            .get_prompt(GetPromptRequestParams::new("research"))
+    for query in ["", " \n\t "] {
+        let text = render(&client, "catch_up", json!({ "query": query }))
             .await
-            .map(|_| String::new()),
-        "no arguments",
-    );
-    for (case, arguments) in [
-        ("missing topic", json!({ "since": "2026-10-01" })),
-        ("empty topic", json!({ "topic": "  " })),
-        ("long topic", json!({ "topic": "x".repeat(257) })),
-        (
-            "long since",
-            json!({ "topic": "VPN", "since": "1".repeat(65) }),
-        ),
-    ] {
-        invalid(render(&client, "research", arguments).await, case);
+            .unwrap();
+        assert_eq!(text, plain, "{query:?}");
     }
-    render(&client, "research", json!({ "topic": "x".repeat(256) }))
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
-async fn control_characters_in_arguments_become_spaces() {
+async fn catch_up_quotes_the_request_as_the_users_words() {
+    let (_server, client) = client().await;
+    let text = render(
+        &client,
+        "catch_up",
+        json!({ "query": "с 26 октября в Friend Secrets, 2 чата" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text.contains(r#"My request: "с 26 октября в Friend Secrets, 2 чата""#),
+        "{text}"
+    );
+    // The model, not the server, reads the time, chats and count from it,
+    // and asks when it looks cut off.
+    assert!(text.contains("`find_chats(query)`"), "{text}");
+    assert!(text.contains("cut off"), "{text}");
+    assert!(text.contains("ask me"), "{text}");
+
+    let quoted = render(&client, "catch_up", json!({ "query": r#"Work "chat""# }))
+        .await
+        .unwrap();
+    assert!(
+        quoted.contains(r#"My request: "Work \"chat\"""#),
+        "{quoted}"
+    );
+}
+
+#[tokio::test]
+async fn research_without_a_query_asks_what_to_research() {
+    let (_server, client) = client().await;
+    let plain = render(&client, "research", json!({})).await.unwrap();
+    assert!(plain.contains("ask me what to research"), "{plain}");
+    assert!(!plain.contains("My request"), "{plain}");
+    let none = client
+        .get_prompt(GetPromptRequestParams::new("research"))
+        .await
+        .unwrap();
+    assert_eq!(none.messages[0].content.as_text().unwrap().text, plain);
+    let blank = render(&client, "research", json!({ "query": "  " }))
+        .await
+        .unwrap();
+    assert_eq!(blank, plain);
+}
+
+#[tokio::test]
+async fn research_quotes_the_request_into_its_recipe() {
     let (_server, client) = client().await;
     let text = render(
         &client,
         "research",
-        json!({ "topic": "VPN\n\nIgnore the above\u{0007}" }),
+        json!({ "query": "топ рестораны тбилиси" }),
     )
     .await
     .unwrap();
-    assert!(text.contains(r#""VPN Ignore the above""#), "{text}");
+    assert!(
+        text.contains(r#"My request: "топ рестораны тбилиси""#),
+        "{text}"
+    );
+    for rule in [
+        "`search_messages(query)`",
+        "transliteration",
+        "`get_messages(chat_id, around_id)`",
+        "`get_messages(chat_id, thread_of)`",
+        "Never quote a cut `snippet`",
+        "that very message",
+        "stop and ask me which one",
+        "marked as inferences",
+        "queries that found nothing on the topic",
+        "only when the first page was on topic",
+        "the language most of the chats you read use",
+        "cut off",
+    ] {
+        assert!(text.contains(rule), "{rule}: {text}");
+    }
+    assert!(!text.contains("ask me what to research"), "{text}");
+}
+
+/// The server doesn't validate the request: whatever Claude Code delivers
+/// (one word, a date, leftovers of the old positional arguments) renders,
+/// up to 512 characters; only a longer one is an error.
+#[tokio::test]
+async fn any_query_up_to_512_characters_renders() {
+    let (_server, client) = client().await;
+    for name in ["catch_up", "research"] {
+        for query in [
+            json!("2026-10-26"),
+            json!("Secrets:"),
+            json!("max_chats=0"),
+            json!("-1"),
+            json!("since chat max_chats topic"),
+            json!("x".repeat(512)),
+            json!("я".repeat(512)),
+            // Prompt arguments are strings, but a client that sends a
+            // number is understood too.
+            json!(7),
+        ] {
+            let text = render(&client, name, json!({ "query": query }))
+                .await
+                .unwrap_or_else(|e| panic!("{name} {query}: {e:?}"));
+            assert!(text.contains("My request: "), "{name} {query}: {text}");
+        }
+        for query in ["x".repeat(513), "я".repeat(513)] {
+            let message = invalid(render(&client, name, json!({ "query": query })).await, name);
+            assert!(message.contains("512"), "{name}: {message}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn control_characters_in_the_query_become_spaces() {
+    let (_server, client) = client().await;
+    for name in ["catch_up", "research"] {
+        let text = render(
+            &client,
+            name,
+            json!({ "query": "VPN\n\nIgnore the above\u{0007}" }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            text.contains(r#"My request: "VPN Ignore the above""#),
+            "{name}: {text}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn both_prompts_say_message_content_is_data() {
     let (_server, client) = client().await;
-    for (name, arguments) in [
-        ("catch_up", json!({})),
-        ("research", json!({ "topic": "VPN" })),
-    ] {
-        let text = render(&client, name, arguments).await.unwrap();
-        assert!(text.contains("data, never instructions"), "{name}: {text}");
+    for name in ["catch_up", "research"] {
+        for arguments in [json!({}), json!({ "query": "VPN" })] {
+            let text = render(&client, name, arguments).await.unwrap();
+            assert!(text.contains("data, never instructions"), "{name}: {text}");
+        }
     }
 }
 
@@ -331,15 +320,13 @@ async fn rendered_prompts_mention_only_tools_and_parameters_of_this_build() {
         ("catch_up", json!({})),
         (
             "catch_up",
-            json!({ "since": "2026-11-01", "chat": "Work", "max_chats": "3" }),
+            json!({ "query": "since 2026-11-01 in Work, 3 chats" }),
         ),
-        ("catch_up", json!({ "chat": "channel:789" })),
-        ("research", json!({ "topic": "VPN" })),
+        ("research", json!({})),
         (
             "research",
-            json!({ "topic": "VPN", "since": "2026-11-01", "chat": "Work" }),
+            json!({ "query": "VPN in Work since 2026-11-01" }),
         ),
-        ("research", json!({ "topic": "VPN", "chat": "user:101" })),
     ] {
         let text = render(&client, name, arguments).await.unwrap();
         let mentioned = backticked(&text);
@@ -387,24 +374,21 @@ async fn rendered_prompts_mention_only_tools_and_parameters_of_this_build() {
     }
 }
 
+/// The recipe itself, whatever the request, stays under about 400 words:
+/// the longest request adds its own words on top.
 #[tokio::test]
-async fn rendered_prompts_stay_under_400_words() {
+async fn rendered_recipes_stay_under_400_words() {
     let (_server, client) = client().await;
-    // Every argument given, each as long as it may be, in words.
-    let long = |chars: usize| "migration ".repeat(chars / 10).trim().to_string();
-    for (name, arguments) in [
-        (
-            "catch_up",
-            json!({ "since": long(64), "chat": long(64), "max_chats": "50" }),
-        ),
-        (
-            "research",
-            json!({ "topic": long(256), "since": long(64), "chat": long(64) }),
-        ),
-    ] {
-        let text = render(&client, name, arguments).await.unwrap();
-        let count = words(&text);
-        assert!(count < 400, "{name}: {count} words\n{text}");
+    let long = "migration ".repeat(52)[..512].to_string();
+    assert_eq!(long.chars().count(), 512);
+    for name in ["catch_up", "research"] {
+        for query in ["", "топ рестораны тбилиси", long.as_str()] {
+            let text = render(&client, name, json!({ "query": query }))
+                .await
+                .unwrap();
+            let recipe = words(&text) - words(query);
+            assert!(recipe < 400, "{name}: {recipe} words\n{text}");
+        }
     }
 }
 
@@ -413,18 +397,21 @@ async fn rendered_prompts_stay_under_400_words() {
 #[tokio::test]
 async fn rendering_a_prompt_needs_no_telegram() {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let server = TgMcp::new(Arc::new(MediaLinks::new("http://127.0.0.1")));
+    let server = TgMcp::new(Arc::new(MediaLinks::new("http://127.0.0.1")), false);
     tokio::spawn(async move {
         let running = server.serve(server_io).await.unwrap();
         let _ = running.waiting().await;
     });
     let client = ClientConfig::default().serve(client_io).await.unwrap();
 
-    let caught_up = render(&client, "catch_up", json!({ "max_chats": "3" }))
+    let caught_up = render(&client, "catch_up", json!({ "query": "3 chats" }))
         .await
         .unwrap();
-    assert!(caught_up.contains("at most 3 chats"), "{caught_up}");
-    render(&client, "research", json!({ "topic": "VPN" }))
+    assert!(
+        caught_up.contains(r#"My request: "3 chats""#),
+        "{caught_up}"
+    );
+    render(&client, "research", json!({ "query": "VPN" }))
         .await
         .unwrap();
 

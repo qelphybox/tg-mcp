@@ -22,7 +22,7 @@ use super::{
     },
     download::{self, FileError, FilePart, FileRequest, MediaFile, RawMediaMessage},
     find::{self, FindRequest, FoundAnswer, FoundChats},
-    folders::{self, ChatFolder, RawChatFolder},
+    folders::{self, ChatFolder, FolderCache, RawChatFolder},
     media::{FileLocation, StoredFile},
     members::{
         self, ChannelAccess, GroupAnswer, MemberPage, MemberSource, MembersQuery,
@@ -124,6 +124,11 @@ pub struct FakeData {
     /// `messages.getForumTopicsByID`.
     #[serde(default)]
     pub topics_in_answers: bool,
+    /// The bytes of messages' files, by Chat and message id; a file
+    /// without them is [`fake_file_bytes`]. The message's `size_bytes`
+    /// should be their length.
+    #[serde(default)]
+    pub file_contents: std::collections::HashMap<ChatId, Vec<(i32, Vec<u8>)>>,
     /// The Account's Chat folders, in the user's order (#29).
     #[serde(default)]
     pub chat_folders: Vec<FakeChatFolder>,
@@ -171,6 +176,15 @@ impl FakeChatFolder {
             excluded: self.excluded.clone(),
         }
     }
+}
+
+/// A folder request the fake Telegram answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderRpc {
+    /// `messages.getDialogFilters`.
+    DialogFilters,
+    /// `messages.getPeerDialogs` for this many Chats.
+    PeerDialogs(usize),
 }
 
 /// One Topic of a fake forum.
@@ -546,6 +560,7 @@ impl FakeData {
             pictures: Default::default(),
             topics: Default::default(),
             topics_in_answers: false,
+            file_contents: Default::default(),
             transcriptions: Default::default(),
             transcribe: FakeTranscribeAccess::default(),
             chat_folders: Vec::new(),
@@ -575,6 +590,15 @@ impl FakeData {
 
     pub fn with_transcribe_access(mut self, access: FakeTranscribeAccess) -> Self {
         self.transcribe = access;
+        self
+    }
+
+    /// Message `id` of `chat`'s file is `bytes`.
+    pub fn with_file_contents(mut self, chat: ChatId, id: i32, bytes: Vec<u8>) -> Self {
+        self.file_contents
+            .entry(chat)
+            .or_default()
+            .push((id, bytes));
         self
     }
 
@@ -866,6 +890,10 @@ fn media_matches(filter: MediaFilter, m: &RawHistoryMessage) -> bool {
 pub struct FakeTelegram {
     data: FakeData,
     known: KnownPeers,
+    /// Like a Live client's, kept across requests per Grant.
+    folder_cache: Arc<FolderCache>,
+    /// The folder requests answered, for every Grant.
+    folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
     files: Arc<FakeFiles>,
     transcriber: Arc<FakeTranscriber>,
 }
@@ -1310,10 +1338,20 @@ fn fake_picture(
 /// What a fake file's bytes are.
 #[derive(Debug, Clone, Copy)]
 enum FakeContent<'a> {
-    /// The message's file: [`fake_file_bytes`].
+    /// The message's file: [`fake_file_bytes`], or the fixture's bytes.
     File,
     /// A size of its picture: [`fake_picture_bytes`].
     Picture(&'a str, FakeFormat),
+}
+
+/// What a fake file request is served from, once found.
+enum Served<'a> {
+    /// [`fake_file_bytes`].
+    Pattern,
+    /// The fixture's ([`FakeData::with_file_contents`]).
+    Given(&'a [u8]),
+    /// [`fake_picture_bytes`].
+    Picture(String, FakeFormat),
 }
 
 /// The file of a fake message's media: kinds with a file whose size the
@@ -1363,6 +1401,8 @@ impl FakeTelegram {
         Self {
             data,
             known: Arc::default(),
+            folder_cache: Arc::default(),
+            folder_rpcs: Arc::default(),
             files: Arc::default(),
             transcriber: Arc::default(),
         }
@@ -1404,11 +1444,9 @@ impl Telegram for FakeTelegram {
     }
 
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, TgError> {
-        Ok(self
-            .dialog_filters()?
-            .into_iter()
-            .map(|f| f.folder)
-            .collect())
+        let folders = self.dialog_filters()?;
+        self.folder_cache.remember(&folders);
+        Ok(folders.into_iter().map(|f| f.folder).collect())
     }
 
     /// The same `messages.getDialogs` calls as the Live client, answered by
@@ -1418,6 +1456,7 @@ impl Telegram for FakeTelegram {
             return folders::list_folder_chats(
                 &query,
                 folder,
+                &self.folder_cache,
                 || std::future::ready(self.dialog_filters()),
                 |peers| std::future::ready(self.peer_dialogs(&peers)),
             )
@@ -1803,6 +1842,12 @@ impl Telegram for FakeTelegram {
                             (p.at(&s.size), s.size.bytes, content)
                         })
                 });
+                let given = self
+                    .data
+                    .file_contents
+                    .get(&chat)
+                    .and_then(|files| files.iter().find(|(id, _)| *id == m.id))
+                    .map(|(_, bytes)| bytes.as_slice());
                 let whole = fake_file(&current, chat, m)
                     .map(|(stored, size)| (stored, size.unwrap_or(0), FakeContent::File));
                 pictures
@@ -1811,14 +1856,18 @@ impl Telegram for FakeTelegram {
                         stored.same_file(&location) && stored.access_hash == location.access_hash
                     })
                     .map(|(stored, size, content)| match content {
-                        FakeContent::File => (stored.id, size, None),
+                        FakeContent::File => (
+                            stored.id,
+                            size,
+                            given.map_or(Served::Pattern, Served::Given),
+                        ),
                         FakeContent::Picture(r#type, format) => {
-                            (stored.id, size, Some((r#type.to_string(), format)))
+                            (stored.id, size, Served::Picture(r#type.to_string(), format))
                         }
                     })
             })
         });
-        let Some((file_id, size, picture)) = file else {
+        let Some((file_id, size, content)) = file else {
             return Err(FileError::Failed(TgError::Upstream(
                 "rpc error 400: FILE_ID_INVALID".into(),
             )));
@@ -1839,11 +1888,16 @@ impl Telegram for FakeTelegram {
         state.served += 1;
         let size = state.cut_at.map_or(size, |cut| cut.min(size)) as i64;
         let (start, end) = (offset.min(size), (offset + i64::from(limit)).min(size));
-        Ok(FilePart::Bytes(match picture {
-            None => fake_file_range(file_id, start as u64..end as u64),
-            Some((r#type, format)) => fake_picture_bytes(file_id, &r#type, size as u64, format)
-                [start as usize..end as usize]
-                .to_vec(),
+        Ok(FilePart::Bytes(match content {
+            Served::Pattern => fake_file_range(file_id, start as u64..end as u64),
+            Served::Given(bytes) => {
+                bytes[(start as usize).min(bytes.len())..(end as usize).min(bytes.len())].to_vec()
+            }
+            Served::Picture(r#type, format) => {
+                fake_picture_bytes(file_id, &r#type, size as u64, format)
+                    [start as usize..end as usize]
+                    .to_vec()
+            }
         }))
     }
 }
@@ -2019,6 +2073,10 @@ impl FakeTelegram {
     /// answers none for a Chat it doesn't have or a wrong access hash.
     fn peer_dialogs(&self, peers: &[ChatRef]) -> Result<DialogsAnswer, TgError> {
         self.flood()?;
+        self.folder_rpcs
+            .lock()
+            .unwrap()
+            .push(FolderRpc::PeerDialogs(peers.len()));
         assert!(
             peers.len() <= folders::PEER_DIALOGS_CHUNK,
             "Telegram's limit"
@@ -2084,6 +2142,10 @@ impl FakeTelegram {
     /// One `messages.getDialogFilters`: the Account's Chat folders.
     fn dialog_filters(&self) -> Result<Vec<RawChatFolder>, TgError> {
         self.flood()?;
+        self.folder_rpcs
+            .lock()
+            .unwrap()
+            .push(FolderRpc::DialogFilters);
         if self.data.chat_folders_fail {
             return Err(TgError::Upstream("rpc error 500: INTERNAL".into()));
         }
@@ -2579,6 +2641,10 @@ struct FakeTelegramSide {
     files: Arc<FakeFiles>,
     /// Telegram's transcription service, the same for every Grant.
     transcriber: Arc<FakeTranscriber>,
+    /// Each Grant's [`FolderCache`], kept like `known`.
+    folder_caches: Mutex<std::collections::HashMap<String, Arc<FolderCache>>>,
+    /// The folder requests answered, for every Grant, in order.
+    folder_rpcs: Arc<Mutex<Vec<FolderRpc>>>,
 }
 
 impl FakeConnector {
@@ -2614,6 +2680,11 @@ impl FakeConnector {
         self.telegram.transcriber.clone()
     }
 
+    /// The folder requests Telegram answered since the last call, in order.
+    pub fn take_folder_rpcs(&self) -> Vec<FolderRpc> {
+        std::mem::take(&mut *self.telegram.folder_rpcs.lock().unwrap())
+    }
+
     /// Make every call to Telegram fail as if it were down.
     pub fn set_unreachable(&self, unreachable: bool) {
         self.telegram
@@ -2630,6 +2701,11 @@ impl FakeConnector {
     fn evict(&self, grant_id: &GrantId) -> Option<i64> {
         self.telegram
             .known
+            .lock()
+            .unwrap()
+            .remove(grant_id.as_str());
+        self.telegram
+            .folder_caches
             .lock()
             .unwrap()
             .remove(grant_id.as_str());
@@ -2683,9 +2759,19 @@ impl Connector for FakeConnector {
             .lock()
             .unwrap()
             .insert(grant.grant_id.as_str().to_string(), data.account.id);
+        let folder_cache = self
+            .telegram
+            .folder_caches
+            .lock()
+            .unwrap()
+            .entry(grant.grant_id.as_str().to_string())
+            .or_default()
+            .clone();
         Ok(Arc::new(FakeTelegram {
             data,
             known,
+            folder_cache,
+            folder_rpcs: self.telegram.folder_rpcs.clone(),
             files: self.telegram.files.clone(),
             transcriber: self.telegram.transcriber.clone(),
         }))

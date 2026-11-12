@@ -68,6 +68,12 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
         }
     }
 
+    /// The definition of tool `name`, to adjust what it lists (description,
+    /// schemas) before serving. Its Scope stays as declared.
+    pub fn tool_mut(&mut self, name: &str) -> Option<&mut Tool> {
+        self.router.map.get_mut(name).map(|route| &mut route.attr)
+    }
+
     /// Every tool, whatever the Scope: what the router dispatches to once
     /// [`ScopedTools::check`] passed.
     pub fn router(&self) -> &ToolRouter<S> {
@@ -203,7 +209,7 @@ mod tests {
         let links = Arc::new(MediaLinks::new("http://127.0.0.1"));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mcp = StreamableHttpService::new(
-            move || Ok(TgMcp::with_tools(links.clone(), tools())),
+            move || Ok(TgMcp::with_tools(links.clone(), tools(), false)),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 .with_allowed_hosts(["127.0.0.1"])

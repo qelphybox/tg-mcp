@@ -25,6 +25,7 @@ use std::{cmp::Ordering, sync::Arc};
 use super::{
     Account, Telegram, TgError,
     chats::{ChatInfo, ChatPage, ChatRef, ChatSummary, ChatsQuery, MessagePreview},
+    document::{self, Document, DocumentContent},
     download::{FileError, FilePart, FileRequest, MediaFile},
     find::{FoundChat, FoundChats},
     folders::ChatFolder,
@@ -563,6 +564,24 @@ impl Untrusted for Transcription {
     }
 }
 
+/// EXPERIMENTAL (#58 prototype): a document's text is someone's writing,
+/// sanitised like message text; a PDF's bytes are the file, passed as they
+/// are (like a view's images).
+impl Untrusted for Document {
+    fn sanitise(&mut self) {
+        let Document {
+            media,
+            size: _,
+            content,
+        } = self;
+        clean_media(media);
+        match content {
+            DocumentContent::Pdf(_) => {}
+            DocumentContent::Text { mime_type: _, text } => clean_text(text, sanitise, false),
+        }
+    }
+}
+
 fn sanitised<T: Untrusted>(mut value: T) -> T {
     value.sanitise();
     value
@@ -574,6 +593,16 @@ pub struct Sanitised(Arc<dyn Telegram>);
 impl Sanitised {
     pub fn new(telegram: Arc<dyn Telegram>) -> Self {
         Self(telegram)
+    }
+
+    /// EXPERIMENTAL (#58 prototype): message `message_id`'s document, read
+    /// whole ([`document::fetch`]) from the client behind this seam, its
+    /// text, file name and MIME type sanitised. Not a [`Telegram`] method:
+    /// it is downloads ([`Telegram::get_file`]) put together, like a view.
+    pub async fn document(&self, chat: ChatRef, message_id: i32) -> Result<Document, TgError> {
+        document::fetch(self.0.clone(), chat, message_id)
+            .await
+            .map(sanitised)
     }
 }
 
