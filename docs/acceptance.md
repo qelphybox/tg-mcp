@@ -782,7 +782,7 @@ Needs Telegram open on a phone and on Telegram Desktop with the account, a priva
 
 ## 54. Send allow-list: chosen on Consent from folders, recent chats and a search, refused empty, sealed in the database, counted in the logs
 
-Needs an account with at least one Chat folder that is a plain list of chats ("Work" below; one defined by rules, such as "Unread", if you have one too), more than 100 chats, an old chat that is not among the 100 most recent ("Old" below), a contact you never wrote to (no chat with them: "Carol" below), and the name of a public channel you are not in. No tool sends yet (#46), so nothing here can send a message. The boundaries are also covered by fake-backed tests: `cargo test --test send_allow_list` (exactly the chosen chats come back, empty is refused, strangers never offered, folders read into their chats, logs) and `cargo test --lib sessions::` (the dump test covers the list's blob).
+Needs an account with at least one Chat folder that is a plain list of chats ("Work" below; one defined by rules, such as "Unread", if you have one too), more than 100 chats, an old chat that is not among the 100 most recent ("Old" below), a contact you never wrote to (no chat with them: "Carol" below), and the name of a public channel you are not in. Nothing here sends a message (sending is §55 and §56). The boundaries are also covered by fake-backed tests: `cargo test --test send_allow_list` (exactly the chosen chats come back, empty is refused, strangers never offered, folders read into their chats, logs) and `cargo test --lib sessions::` (the dump test covers the list's blob).
 
 1. **The migration.** After the deploy, dump the database as in §51 step 1:
 
@@ -805,7 +805,7 @@ Needs an account with at least one Chat folder that is a plain list of chats ("W
      - **Recent chats**: 100 boxes, in the order of the app's main chat list (pinned first), Saved Messages as "Saved Messages"; "Old" is not among them.
    - **Find a chat by name**: type part of Old's name and press Enter (Enter searches, it never allows): "Found 1 of your chats." (or more) and Old under the box. Type Carol's name: "None of your chats has that name." (a contact without a chat is never offered). Type the public channel's name: it is not offered either. Tick Old, then search for something else: Old is still listed, ticked.
 
-4. **Empty is refused.** Untick every chat and folder, keep "Send messages" ticked, press **Allow**: the same page comes back (HTTP 422 in the browser's network tab) with "Choose at least one chat it may send to, or untick “Send messages”." and nothing reaches Claude Code. Now tick the "Work" folder, one recent chat ("A") and Old, leave auto-send unticked, and **Allow**. In a new Claude Code session, `/mcp` lists `telegram-send` connected; ask "who am I on Telegram": `whoami` answers. Its tool list is the regular connector's (no send tool until #46), and its instructions begin "… Read-only access to the connected Telegram account …" (no tool can write yet). Note the numeric ids of A, Old and one chat of Work (`list_chats`, and `list_chats` with `chat_folder`: `user:N~…` → N).
+4. **Empty is refused.** Untick every chat and folder, keep "Send messages" ticked, press **Allow**: the same page comes back (HTTP 422 in the browser's network tab) with "Choose at least one chat it may send to, or untick “Send messages”." and nothing reaches Claude Code. Now tick the "Work" folder, one recent chat ("A") and Old, leave auto-send unticked, and **Allow**. In a new Claude Code session, `/mcp` lists `telegram-send` connected; ask "who am I on Telegram": `whoami` answers. Its tool list is the regular connector's plus `send_message` (#46; before #46 it was the regular one, and its instructions began "… Read-only access …"), and its instructions say it can "send messages to the chats the user allowed (each confirmed by the user, …)" (§56 step 1). Note the numeric ids of A, Old and one chat of Work (`list_chats`, and `list_chats` with `chat_folder`: `user:N~…` → N).
 
 5. **The database holds only an opaque blob.** Dump it again (§51 step 1), then, with the ids of step 4:
 
@@ -844,7 +844,7 @@ Needs an account with at least one Chat folder that is a plain list of chats ("W
 
 ## 55. Sends wait on a confirmation page that only the Consent browser can send from, offered by URL elicitation; elsewhere a Draft
 
-Steps 1-4 need only this release. Steps 5-12 need `send_message` (#46) deployed: run them then, against its tool as #46 describes it (`send_message(chat_id, text, reply_to?, topic?, format?)`, result `sent` with `message_id` and `date`, `cancelled`, `drafted`, `expired` or `pending_confirmation` with `confirm_url` and `expires_at`). Needs Claude Code in a desktop browser session (the "Consent browser"), a phone with a browser and Telegram, a chat "A" where test messages do no harm (a friend who agreed, or a test group), and a forum of yours with a Topic "Releases" and a message in it. The boundaries are also covered by fake-backed tests: `cargo test --lib confirm::` (the cookie, the page, CSRF, CSP, expiry, decided once, the Send cap at confirmation, a retry after no answer, rate limit, logs) and `cargo test --lib mcp::confirm::` (URL elicitation waits and returns the decision, declining cancels, other clients get the link, auto-send).
+Steps 1-4 need only #45. Steps 5-12 use `send_message` (#46, its own checks are §56): `send_message(chat_id, text, reply_to?, topic?, format?)`, result `sent` with `message_id` and `date`, `cancelled`, `drafted`, `expired` or `pending_confirmation` with `confirm_url` and `expires_at`. Give every message a text of its own: the same text to the same chat within a minute of sending it is refused as "already sent" (§56 step 5). Needs Claude Code in a desktop browser session (the "Consent browser"), a phone with a browser and Telegram, a chat "A" where test messages do no harm (a friend who agreed, or a test group), and a forum of yours with a Topic "Releases" and a message in it. The boundaries are also covered by fake-backed tests: `cargo test --lib confirm::` (the cookie, the page, CSRF, CSP, expiry, decided once, the Send cap at confirmation, a retry after no answer, rate limit, logs) and `cargo test --lib mcp::confirm::` (`send_message` through `/mcp`: URL elicitation waits and returns the decision, declining cancels, other clients get the link, auto-send).
 
 1. **An unknown link is no longer valid, on a locked-down page.**
 
@@ -916,7 +916,7 @@ Steps 1-4 need only this release. Steps 5-12 need `send_message` (#46) deployed:
 
 10. **(#46) Expiry.** Ask for a message to A and leave the page open without pressing anything for 10 minutes. The call returns `status: "expired"`; pressing Send afterwards answers "No longer valid". Nothing was sent.
 
-11. **(#46) The Send cap at confirmation.** Within one minute, confirm 5 messages to A (step 5's flow, quickly), then confirm a 6th: the page says "Not sent" with "Too many messages to this chat in the last minute (the server's Send cap). The message was not sent, and it is not queued: try again in N s", and the call is an error with the same text. A shows exactly 5. (§52 has the cap itself.)
+11. **(#46) The Send cap at confirmation.** Within one minute, confirm 5 messages with different texts to A (step 5's flow, quickly), then confirm a 6th: the page says "Not sent" with "Too many messages to this chat in the last minute (the server's Send cap). The message was not sent, and it is not queued: try again in N s", and the call is an error with the same text. A shows exactly 5. (§52 has the cap itself.)
 
 12. **(#46) Auto-send skips the page, only for its chats.** Connect `telegram-send2` (step 3 with "without asking me" ticked, A only). "send_message to A: 'auto §55'": `status: "sent"` at once, no URL prompt. To any other chat: an error naming the Send allow-list, nothing sent.
 
@@ -936,3 +936,53 @@ Steps 1-4 need only this release. Steps 5-12 need `send_message` (#46) deployed:
     (`kamal proxy logs` records request paths, `/confirm/<id>` included: accepted, see `docs/deploy.md`.)
 
 14. **Clean up.** `claude mcp remove telegram-send` and `claude mcp remove telegram-send2`, end their sessions in Telegram → Settings → Devices, delete the test messages in A, and delete the `tgm_confirm_…` cookies in the browser's developer tools (or leave them: they are useless once the connection is gone).
+
+## 56. send_message sends only into the Send allow-list, confirmed in Claude Code or through the link, never the same text twice within a minute
+
+Needs what §55 needs, its two connectors, `telegram-send` (step 3: A and the forum, "without asking me" unticked) and `telegram-send2` (step 12: A only, "without asking me" ticked), connected from the same desktop browser (keep them from §55 and run its step 14 after this section, or set them up again), and a chat B of yours that is in neither list. Note with `get_chat_info` on the forum the id `R` of its Topic "Releases", and with `get_messages` there the id `M` of a message in Releases. The boundaries are also covered by fake-backed tests: `cargo test --lib mcp::confirm::` (listed only with `send`, annotations and bounded schemas, auto-send, confirmation by URL elicitation and by link, a chat outside the list, the duplicate guard after either, the Send cap, slow mode and `PEER_FLOOD` refusals, the forum and length rules), `cargo test --lib recent_sends::` (what counts as the same text, per account, the 60 s, only a keyed hash) and `cargo test --test send_message` (the whole server from Consent to a sent message, logs carry ids only).
+
+1. **Only a `send` Grant has `send_message`, and is told how it works.**
+
+   ```sh
+   python3 scripts/scope-check.py - read                    # expect every line [PASS]; the printed tools/list has no send_message
+   python3 scripts/scope-check.py "read draft" "read draft" # expect every line [PASS]; save_draft listed, still no send_message
+   ```
+
+   In a new Claude Code session with `telegram-send`, run `/mcp` → `telegram-send` → View tools: `send_message` is listed (with the regular `telegram` connector it is not). Ask "Quote verbatim the instructions the telegram-send server gave you, and the first two sentences of its send_message tool's description." Expect the instructions to contain "you can read chats, messages and media, and send messages to the chats the user allowed (each confirmed by the user, unless they chose to let this app send without asking); you cannot edit or delete messages", and the description to begin "Send a message as the user: `text` into one chat (…), where everyone in it reads it as written by the user. Only the chats the user allowed when connecting this app work; any other is an error."
+
+2. **Confirmation in Claude Code (URL elicitation), with formatting.** Run §55 steps 5, 7 and 8 if not done since #46 was deployed. Step 5's message is the Markdown check: on the phone, A shows "§55" bold, "elicitation" italic and "the spec" as a link to modelcontextprotocol.io. Then ask "send_message to A with format plain: `**§56** stays as typed`" and press Send on the page: the page shows the asterisks, the call returns `status: "sent"`, and A shows `**§56** stays as typed` literally, with no bold.
+
+3. **Confirmation through the link.** In the same desktop browser, add the server in claude.ai (Settings → Connectors → Add custom connector → `https://tgmcp.qelphybox.space/mcp`), connect, tick "Send messages", choose A only, leave "without asking me" unticked, Allow. In a new claude.ai chat ask "Send '§56 link check' to A on Telegram". If claude.ai elicits (it opens or offers the page itself), this is step 2 again: note that and skip to step 4. Otherwise the tool returns `status: "pending_confirmation"` with `confirm_url` (`https://tgmcp.qelphybox.space/confirm/…`) and `expires_at` 10 minutes ahead, and Claude gives you the link and does not call `send_message` again. Click it: §55 step 9's page (reloads itself once, Send offered); press **Send**: "Sent". Back in the chat, ask "Did it go out?": Claude checks with `get_messages` on A (not another `send_message`) and finds "§56 link check" once. Remove the claude.ai connector afterwards (Settings → Connectors).
+
+4. **A chat outside the list is refused before anything waits.** With `telegram-send`, ask "send_message to B (`<B's chat id>`): '§56 not for B'". Claude Code opens no URL; the call fails with "user:… is not one of the chats this connection may send to (its Send allow-list, chosen on the consent screen when it was connected): the user connects again to choose other chats". With `telegram-send2` the same. B shows nothing.
+
+5. **The same text twice within a minute is sent once.**
+   - With `telegram-send2` (auto-send): "send_message to A: '§56 dup HH:MM'" (the current time, so the text is new): `status: "sent"` at once, `message_id` N, `date` in UTC ending `Z`. Within a few seconds: "Call send_message again with exactly the same arguments": an error beginning "already sent: message N in user:… has this very text, sent S s ago; it is not sent twice. get_messages shows it. Send the same text again only if the user asks for it twice, after T s" (S + T = 60, give or take a second). Then the same text with `format: "plain"` (it has no markup, so the chat would show the same): the same error. Then the text with "!" added: sent (another text). A shows "§56 dup HH:MM" exactly once and the "!" one once.
+   - Across connections of the account: with `telegram-send2`, "send_message to A: '§56 both HH:MM'" (sent); at once, in the `telegram-send` session, ask for the same text to A: an error "already sent: message …", no URL opened.
+   - After a confirmation: with `telegram-send`, "send_message to A: '§56 confirmed HH:MM'", press **Send** on the page; then ask for the same text again: an error "already sent: message …" at once, no URL opened.
+   - After the minute: wait until T has passed and ask `telegram-send2` for '§56 dup HH:MM' once more: sent, a second copy in A (the guard is for accidents, not a ban).
+
+6. **A forum Topic.** With `telegram-send`, in turn:
+   - "send_message to the forum: '§56 x'" (neither `topic` nor `reply_to`): an error "… is a forum: say which Topic to write in with topic (an id from get_chat_info topics; General is 1), or give reply_to, a message in that Topic"; no URL opened.
+   - `topic: R`, text "§56 in releases": the page shows "Topic Releases"; Send: the call returns `status: "sent"` with `topic: R`, and the message is in Releases only.
+   - `reply_to: M`, no `topic`, text "§56 reply": §55 step 6's page; Send: `topic: R`, `reply_to: M`, a reply in Releases.
+   - `topic: 1` with `reply_to: M`: an error "reply_to M is in Topic R, not in topic 1 …"; `topic: R` on A: an error "… is not a forum …". Neither opens a URL.
+
+7. **Length.** "send_message to A with a text of exactly 4097 'x' characters (generate it, don't type it)": an error "text is 4097 characters once formatted; Telegram takes at most 4096. It is not split: …", no URL opened, nothing sent. 4096 'x' characters with `telegram-send2`: sent, one message.
+
+8. **Auto-send.** §55 step 12 with this tool: `telegram-send2` sends to A at once (`status: "sent"`, no URL prompt, no page), and to B or the forum (not in its list) it is the error of step 4. Optionally, if you are a member but not an admin of a group with slow mode on, connect a third auto-send connector with that group only and send two different texts in a row: the second fails with "This group is in slow mode: each member may send one message per set interval; retry in N s. Nothing was sent, and the message is not queued …", and only the first is in the group.
+
+9. **The server's side**, within 15 minutes of the steps:
+
+   ```sh
+   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -E 'sent without confirmation|not sent again|pending send'
+   # expect "message sent without confirmation (auto-send)" (grant_id, chat, message_id),
+   # "same text to the same chat within a minute: not sent again" (grant_id, chat, message_id of the earlier one),
+   # and §55's pending-send lines: ids and sizes only
+   logs | grep -cE '§56|stays as typed|link check|in releases|xxxxxxxx'   # expect 0: message text is never logged
+   logs | grep -c 'confirm/'                                              # expect 0: the page's id never reaches the app's log
+   logs | grep -c 'tgm_'                                                  # expect 0: neither the cookie nor a Token
+   ```
+
+10. **Clean up.** §55 step 14, and delete the §56 test messages in A, B (none expected) and the forum.
