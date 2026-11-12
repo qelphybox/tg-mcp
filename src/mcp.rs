@@ -22,6 +22,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+mod confirm;
 mod drafts;
 mod prompts;
 mod scoped;
