@@ -7,7 +7,7 @@ use axum::{
 };
 
 use super::{
-    CONSENT_OFFERS,
+    CONSENT_OFFERS, qr,
     send_list::{ChatChoice, Choices, FolderChoice, MAX_QUERY_CHARS, Picked},
 };
 use crate::{
@@ -19,7 +19,8 @@ use crate::{
 /// scripts only from us. No `form-action`: Chrome applies it to the redirect after
 /// the Consent POST, which goes to the client's own redirect_uri.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
-                   img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
+                   img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
+                   frame-ancestors 'none'";
 
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -40,6 +41,11 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     page_with_csp(status, title, body, CSP)
 }
 
+/// The Consent screen: two columns on a wide screen, one on a phone.
+fn page_wide(status: StatusCode, title: &str, body: &str) -> Response {
+    render(status, title, body, CSP, r#" class="wide""#)
+}
+
 /// A page under `csp` instead of the Login flow's.
 pub(crate) fn page_with_csp(
     status: StatusCode,
@@ -47,66 +53,38 @@ pub(crate) fn page_with_csp(
     body: &str,
     csp: &'static str,
 ) -> Response {
+    render(status, title, body, csp, "")
+}
+
+/// The tg-mcp mark: a chat bubble with an unread dot.
+const MARK: &str = r##"<svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><rect x="1.5" y="3.5" width="23" height="17" rx="6" stroke="#F1ECF7" stroke-width="2"/><path d="M7 20.5 6 24.5l5-4" stroke="#F1ECF7" stroke-width="2" stroke-linejoin="round"/><circle cx="19" cy="7" r="4" fill="#E4B2EA" stroke="#000" stroke-width="2"/></svg>"##;
+
+/// The look of every page: the landing page's (tgmcp.dev) wallpaper, glass
+/// card and type. Fonts and the wallpaper pattern come from `/login/assets/`.
+const STYLE: &str = include_str!("pages.css");
+
+fn render(
+    status: StatusCode,
+    title: &str,
+    body: &str,
+    csp: &'static str,
+    main_class: &str,
+) -> Response {
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>{title} · Telegram MCP (unofficial)</title>
 <style>
-  :root {{ color-scheme: light dark; --fg:#1b1b1f; --muted:#6b6b76; --bg:#f6f6f8; --card:#fff; --accent:#2a8bd8; --line:#e2e2e8; }}
-  @media (prefers-color-scheme: dark) {{ :root {{ --fg:#ececf1; --muted:#9a9aa6; --bg:#121216; --card:#1c1c22; --accent:#4aa3ea; --line:#2c2c34; }} }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin:0; min-height:100vh; display:grid; place-items:center; padding:16px;
-         font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--fg); background:var(--bg); }}
-  main {{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:28px; }}
-  h1 {{ font-size:20px; margin:0 0 8px; }}
-  h1.ask {{ font-weight:400; line-height:1.4; }}
-  h1.ask b {{ font-weight:700; overflow-wrap:anywhere; }}
-  p {{ margin:0 0 14px; }}
-  .muted {{ color:var(--muted); font-size:14px; }}
-  .qr {{ display:grid; place-items:center; min-height:240px; margin:16px 0; border:1px dashed var(--line); border-radius:12px; padding:12px; word-break:break-all; text-align:center; }}
-  .qr img {{ width:100%; max-width:240px; height:auto; background:#fff; border-radius:8px; }}
-  .row {{ display:flex; gap:10px; margin-top:20px; }}
-  button {{ flex:1; font:inherit; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--fg); cursor:pointer; }}
-  button.primary {{ background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }}
-  label {{ display:block; font-weight:600; margin:0 0 6px; }}
-  input {{ width:100%; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--fg); }}
-  .error {{ color:#d93a3a; font-weight:600; }}
-  fieldset.scopes {{ border:0; padding:0; margin:0 0 14px; }}
-  label.scope {{ display:flex; gap:10px; align-items:flex-start; font-weight:400; margin:0 0 8px; }}
-  label.scope input {{ width:auto; padding:0; margin:5px 0 0; flex:none; }}
-  main:has(input.write:checked) span.read-only, main:has(input.write:checked) p.read-only {{ display:none; }}
-  main:has(input.write:checked) p.writes {{ display:block; }}
-  main:not(:has(input.write:checked)) p.writes {{ display:none; }}
-  main:not(:has(input.write:checked)) span.read-only {{ display:inline; }}
-  main:not(:has(input.write:checked)) p.read-only {{ display:block; }}
-  main:has(input.send:checked) p.writes {{ display:none; }}
-  main:has(input.send:checked) p.sends, main:has(input.send:checked) section.send {{ display:block; }}
-  main:not(:has(input.send:checked)) p.sends, main:not(:has(input.send:checked)) section.send {{ display:none; }}
-  section.send {{ margin:0 0 14px; padding:14px; border:1px solid var(--line); border-radius:12px; }}
-  h2 {{ font-size:16px; margin:0 0 8px; }}
-  fieldset.pick {{ border:0; padding:0; margin:14px 0 0; min-width:0; }}
-  fieldset.pick legend {{ font-weight:600; padding:0; margin:0 0 6px; }}
-  .chats {{ max-height:260px; overflow:auto; }}
-  label.chat {{ display:flex; gap:8px; align-items:flex-start; font-weight:400; margin:0 0 6px; overflow-wrap:anywhere; }}
-  label.chat input {{ width:auto; padding:0; margin:5px 0 0; flex:none; }}
-  .search {{ display:flex; gap:8px; margin:0 0 8px; }}
-  .search button, .row button.pick {{ flex:none; }}
-  .message {{ white-space:pre-wrap; overflow-wrap:anywhere; unicode-bidi:isolate; margin:0 0 14px; padding:12px 14px; border:1px solid var(--line); border-radius:12px; max-height:50vh; overflow:auto; }}
-  .message code {{ font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }}
-  .message .url {{ color:var(--muted); font-size:14px; }}
-  .reply {{ margin:0 0 10px; padding:6px 10px; border-left:3px solid var(--accent); font-size:14px; overflow-wrap:anywhere; unicode-bidi:isolate; }}
-  dl.facts {{ margin:0 0 14px; display:grid; grid-template-columns:auto 1fr; gap:4px 12px; }}
-  dl.facts dt {{ color:var(--muted); }}
-  dl.facts dd {{ margin:0; overflow-wrap:anywhere; unicode-bidi:isolate; }}
-  .row form {{ flex:1; display:flex; }}
-  footer {{ margin-top:22px; font-size:12px; color:var(--muted); }}
-</style>
+{STYLE}</style>
 </head>
 <body>
-<main>
+<div class="wall" aria-hidden="true"></div>
+<header class="brand">{MARK}tg-mcp</header>
+<main{main_class}>
 {body}
 <footer>Unofficial Telegram MCP server. Uses the Telegram API; not affiliated with Telegram.</footer>
 </main>
@@ -148,10 +126,11 @@ pub fn login(login_id: &str) -> Response {
         &format!(
             r#"<h1>Log in with Telegram</h1>
 <p>Open Telegram on your phone → <b>Settings → Devices → Link Desktop Device</b>, and scan this code.</p>
-<div class="qr" id="qr" data-login="{id}"><span class="muted">Preparing a login code…</span></div>
+<div class="qr" id="qr" data-login="{id}">{loader}<span class="muted">Preparing a login code…</span></div>
 <p class="muted" id="status">The code refreshes by itself. Keep this page open.</p>
 <script src="/login/assets/login.js"></script>"#,
             id = esc(login_id),
+            loader = qr::loader_svg(),
         ),
     )
 }
@@ -239,18 +218,36 @@ fn scope_label(scope: Scope) -> &'static str {
     }
 }
 
+/// A Scope's icon on the Consent screen: an eye, a pencil, a paper plane.
+fn scope_icon(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Read => {
+            r#"<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>"#
+        }
+        Scope::Draft => {
+            r#"<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>"#
+        }
+        Scope::Send | Scope::Organize => {
+            r#"<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>"#
+        }
+    }
+}
+
 /// One box per Scope: `read` checked and fixed, the offered ones as `checked`
 /// says. Checking a write Scope hides the read-only wording (CSS only); the
 /// page as served already matches the boxes as checked.
 fn scope_boxes(checked: Scopes) -> String {
     let mut boxes = format!(
-        r#"<label class="scope"><input type="checkbox" checked disabled> <span>{}</span></label>"#,
+        r#"<label class="scope"><span class="ico">{}</span><input type="checkbox" checked disabled> <span>{}</span></label>"#,
+        scope_icon(Scope::Read),
         scope_label(Scope::Read)
     );
     for &scope in CONSENT_OFFERS {
         boxes.push_str(&format!(
             r#"
-    <label class="scope"><input type="checkbox" class="{class}" name="scope" value="{value}"{checked}> <span>{label}</span></label>"#,
+    <label class="scope"><span class="ico">{icon}</span><input type="checkbox"{id} class="{class}" name="scope" value="{value}"{checked}> <span>{label}</span></label>"#,
+            icon = scope_icon(scope),
+            id = if scope == Scope::Send { r#" id="scope-send""# } else { "" },
             class = if scope == Scope::Send { "write send" } else { "write" },
             value = scope.as_str(),
             checked = if checked.contains(scope) { " checked" } else { "" },
@@ -285,28 +282,41 @@ fn consent_body(view: &ConsentView<'_>) -> String {
     let writes = hidden(view.checked.writes() && !sends);
     let send_hidden = hidden(sends);
     format!(
-        r#"<h1 class="ask">Allow <b>{recipient}</b> <span class="read-only"{read_only}>read-only </span>access to all chats of <b>{account}</b>{username}?</h1>
+        r#"<form method="post" action="/login/{id}/consent" class="consent">
+<div class="who">
+  <h1 class="ask">Allow <b>{recipient}</b> <span class="read-only"{read_only}>read-only </span>access to all chats of <b>{account}</b>{username}?</h1>
 <p class="muted">{client}</p>
-<form method="post" action="/login/{id}/consent">
   <fieldset class="scopes">
     <legend class="muted">It may:</legend>
     {boxes}
   </fieldset>
-  {send_section}
   <p class="muted read-only"{read_only}>It can only read: it can't send, edit or delete anything.</p>
   <p class="muted writes"{writes}>It can't send, edit or delete messages.</p>
   <p class="muted sends"{send_hidden}>It can't send anywhere else, and can't edit or delete messages.</p>
-  <p class="muted"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in the app alone does not end that session.</p>
-  <p class="muted">If you didn't just connect an app to this Telegram account, deny.</p>
+  <p class="muted note"><b>To disconnect later</b>, end the <b>Unofficial MCP Server</b> session in Telegram → Settings → Devices. Removing or disconnecting this server in the app alone does not end that session.</p>
+</div>
+<div class="side">
+  {send_section}
+  <div class="send-off">
+    <span class="ico big">{plane}</span>
+    <h2>Sending is off</h2>
+    <p class="muted">It won't send messages, react or mark anything as read. Turn on <b>Send messages</b> to pick the chats it may write to; you can still confirm every message.</p>
+    <label for="scope-send" class="button">Turn on sending</label>
+  </div>
+</div>
+<div class="actions">
+  <p class="muted deny">If you didn't just connect an app to this Telegram account, deny.</p>
   <div class="row">
     <button type="submit" name="decision" value="deny">Deny</button>
     <button type="submit" name="decision" value="allow" class="primary">Allow</button>
   </div>
+</div>
 </form>"#,
         account = esc(&sanitise(view.account_name)),
         id = esc(view.login_id),
         boxes = scope_boxes(view.checked),
         send_section = send_section(view.login_id, &view.send, send_hidden),
+        plane = scope_icon(Scope::Send),
     )
 }
 
@@ -419,7 +429,7 @@ pub(crate) fn kind_label(kind: ChatKind) -> &'static str {
 }
 
 pub fn consent(status: StatusCode, view: &ConsentView<'_>) -> Response {
-    page(status, "Allow access", &consent_body(view))
+    page_wide(status, "Allow access", &consent_body(view))
 }
 
 /// Polls the login status and swaps the QR; moves on to Consent when logged in.

@@ -7,6 +7,13 @@
 - **The public instance moved to `https://connector.tgmcp.dev/mcp`.** `https://tgmcp.qelphybox.space/mcp` stops answering: remove the connector and add it again with the new URL (claude.ai: Settings → Connectors; Claude Code: `claude mcp remove telegram`, then `claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp`). You sign in again with the QR code; then end the old **Unofficial MCP Server** session in Telegram → Settings → Devices.
 - A landing page at [tgmcp.dev](https://tgmcp.dev), published from `site/` with GitHub Pages.
 
+### Sign-in pages in the landing page's look
+
+- Login, cloud password, Consent, the send confirmation and every error page share the landing page's wallpaper, glass card and type (Unbounded, Golos Text). Dark only.
+- **The login QR code is drawn by the server**: round dots, rounded finder patterns, the tg-mcp mark in the middle, error correction H (was M) so the covered centre still scans. While it is prepared, a loader in the same grid; the code settles in with a diagonal reveal.
+- **The Consent screen has two columns on a wide screen**: who asks and what it may do on the left, the chats it may send to on the right, Deny / Allow in a bar under both (one column with that bar pinned to the bottom on a phone). Write Scopes and "without asking me" are switches; with sending off, the right column says so and offers to turn it on. Same form fields and the same text as before.
+- The fonts (SIL Open Font License, licences in `assets/fonts/`) and the wallpaper pattern are served from `/login/assets/`. The pages load nothing from anywhere else: the confirmation page's CSP now allows images and fonts from `'self'`, the Login flow's fonts from `'self'`.
+
 ### New
 
 - **Drafts, the first write.** `save_draft` (Scope `draft`) puts text into a chat's message field on all the account's devices, replacing the Draft there; `""` clears it, and nothing is ever sent: the user sends it from Telegram. Text is a small Markdown subset by default (bold, italic, inline code, code blocks, links; anything else stays as typed) or `format: "plain"`, at most 4096 characters once formatted (longer is an error, never split). `reply_to` replies to a message of the chat; in a forum, `topic` (or a `reply_to` in a Topic) names the Topic, and neither is an error. Any chat of the account's, no allow-list. Each call spends the writes budget; the text is never logged, only ids and sizes. Annotated not read-only, not destructive, idempotent.
