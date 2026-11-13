@@ -63,9 +63,8 @@ pub fn styled_svg(data: &str) -> Option<String> {
 pub fn loader_svg() -> String {
     let logo = logo_side(LOADER);
     let mut seed: u64 = 7;
-    let mut svg = format!(
-        r#"<svg class="qr-load" viewBox="0 0 {LOADER} {LOADER}" aria-hidden="true">"#
-    );
+    let mut svg =
+        format!(r#"<svg class="qr-load" viewBox="0 0 {LOADER} {LOADER}" aria-hidden="true">"#);
     for y in 0..LOADER {
         for x in 0..LOADER {
             if in_finder(x, y, LOADER) || in_logo(x, y, LOADER, logo) {

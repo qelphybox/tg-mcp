@@ -413,11 +413,17 @@ async fn pattern_svg() -> Response {
 }
 
 async fn unbounded_woff2() -> Response {
-    static_asset("font/woff2", include_bytes!("../../assets/fonts/unbounded.woff2"))
+    static_asset(
+        "font/woff2",
+        include_bytes!("../../assets/fonts/unbounded.woff2"),
+    )
 }
 
 async fn golos_woff2() -> Response {
-    static_asset("font/woff2", include_bytes!("../../assets/fonts/golos-text.woff2"))
+    static_asset(
+        "font/woff2",
+        include_bytes!("../../assets/fonts/golos-text.woff2"),
+    )
 }
 
 async fn login_js() -> Response {
