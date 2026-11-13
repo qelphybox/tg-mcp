@@ -11,7 +11,7 @@
 
 - Login, cloud password, Consent, the send confirmation and every error page share the landing page's wallpaper, glass card and type (Unbounded, Golos Text). Dark only.
 - **The login QR code is drawn by the server**: round dots, rounded finder patterns, the tg-mcp mark in the middle, error correction H (was M) so the covered centre still scans. While it is prepared, a loader in the same grid; the code settles in with a diagonal reveal.
-- **The Consent screen has two columns on a wide screen**: who asks and what it may do on the left, the chats it may send to on the right, Deny / Allow in a bar under both (one column with that bar pinned to the bottom on a phone). Write Scopes and "without asking me" are switches; with sending off, the right column says so and offers to turn it on. Same form fields and the same text as before.
+- **The Consent screen has two columns on a wide screen**: who asks and what it may do on the left, the chats it may send to on the right, Deny / Allow in a bar under both (one column with that bar pinned to the bottom on a phone). Write Scopes are switches; how a message goes out is a choice between "Ask me first" (the default: a confirmation page in this browser) and "Send right away", instead of a "without asking me" box; with sending off, the right column says so and offers to turn it on. Same form fields and the same text as before.
 - The fonts (SIL Open Font License, licences in `assets/fonts/`) and the wallpaper pattern are served from `/login/assets/`. The pages load nothing from anywhere else: the confirmation page's CSP now allows images and fonts from `'self'`, the Login flow's fonts from `'self'`.
 
 ### New

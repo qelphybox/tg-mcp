@@ -365,8 +365,6 @@ fn send_section(login_id: &str, send: &SendView<'_>, hidden: &str) -> String {
         r#"<section class="send"{hidden}>
     <h2>Chats it may send to</h2>
     {error}<p class="muted">Only these chats. To change them later, connect again.</p>
-    <label class="chat"><input type="checkbox" name="auto_send" value="on"{auto_send}> <span>Send to these chats <b>without asking me</b> each time</span></label>
-    <p class="muted">Unticked, each message waits until you confirm it in this browser.</p>
     <fieldset class="pick"><legend>Chat folders</legend>
       {folders}
     </fieldset>
@@ -377,7 +375,12 @@ fn send_section(login_id: &str, send: &SendView<'_>, hidden: &str) -> String {
       <div class="search"><input type="search" name="q" maxlength="{max_query}" value="{query}" aria-label="Chat name"><button type="submit" formaction="{action}" formmethod="post">Search</button></div>
       {notice}<div class="chats">{found}</div>
     </fieldset>
+    <fieldset class="pick mode"><legend>When it writes a message</legend>
+      <label class="chat"><input type="radio" name="auto_send" value="off"{ask}> <span><b>Ask me first</b> <span class="muted">You get a link to a page in this browser that shows the chat and the text. Nothing is sent until you press Send there; you can also make it a Draft or cancel.</span></span></label>
+      <label class="chat"><input type="radio" name="auto_send" value="on"{auto_send}> <span><b>Send right away</b> <span class="muted">Messages to these chats go out as soon as the app writes them.</span></span></label>
+    </fieldset>
   </section>"#,
+        ask = if send.picked.auto_send { "" } else { " checked" },
         auto_send = if send.picked.auto_send {
             " checked"
         } else {
@@ -833,8 +836,12 @@ mod tests {
             ..view("Claude", "claude.ai", false)
         });
         assert!(
-            html.contains(r#"<input type="checkbox" name="auto_send" value="on"> "#),
+            html.contains(r#"<input type="radio" name="auto_send" value="on"> "#),
             "auto-send is off unless ticked: {html}"
+        );
+        assert!(
+            html.contains(r#"<input type="radio" name="auto_send" value="off" checked> "#),
+            "asking first is the default: {html}"
         );
         assert!(
             html.contains(r#"name="folder" value="3" checked>"#),
