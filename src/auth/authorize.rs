@@ -811,17 +811,12 @@ pub(crate) fn redirect_is_loopback(redirect_uri: &str) -> bool {
     })
 }
 
-/// The `tg://login` URL as an SVG QR code, base64 for a `data:` URL. The fake
-/// login's URL is rendered too; only an unencodable URL yields `None`.
+/// The `tg://login` URL as the styled SVG QR code ([`super::qr`]), base64 for
+/// a `data:` URL. The fake login's URL is rendered too; only an unencodable URL
+/// yields `None`.
 fn qr_svg_base64(qr_url: &str) -> Option<String> {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    let code = qrcode::QrCode::with_error_correction_level(qr_url, qrcode::EcLevel::M).ok()?;
-    let svg = code
-        .render::<qrcode::render::svg::Color<'_>>()
-        .min_dimensions(240, 240)
-        .quiet_zone(true)
-        .build();
-    Some(STANDARD.encode(svg))
+    super::qr::styled_svg(qr_url).map(|svg| STANDARD.encode(svg))
 }
 
 #[cfg(test)]
