@@ -195,7 +195,19 @@ mod tests {
         assert!(svg.contains(r#"aria-hidden="true""#));
         let circles = svg.matches("<circle ").count();
         assert!((200..400).contains(&circles), "{circles}");
-        assert!(svg.contains("animation-delay:0ms") || svg.contains("animation-delay:45ms"));
+        // Each dot's delay grows with its distance from the top-left corner.
+        for circle in svg.split("<circle ").skip(1) {
+            let number = |key: &str| -> usize {
+                let rest = &circle[circle.find(key).expect(key) + key.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().unwrap()
+            };
+            assert_eq!(
+                number("animation-delay:"),
+                (number("cx=\"") + number("cy=\"")) * 45,
+                "{circle}"
+            );
+        }
         assert_eq!(svg.matches(r#"<g class="fp">"#).count(), 3);
         // Fixed pattern: the same every time, so the page doesn't flicker.
         assert_eq!(svg, loader_svg());
