@@ -1,0 +1,157 @@
+@font-face { font-family: Unbounded; src: url(/login/assets/unbounded.woff2) format("woff2"); font-weight: 200 900; font-display: swap; }
+@font-face { font-family: "Golos Text"; src: url(/login/assets/golos-text.woff2) format("woff2"); font-weight: 400 900; font-display: swap; }
+:root { color-scheme: dark; --fg: #F1ECF7; --muted: #B4A9C4; --dim: #8C809E; --accent: #E4B2EA; --on-accent: #1F0F24; --link: #C9B3FF; --line: rgba(255,255,255,.14); --soft: rgba(0,0,0,.24); --tint: rgba(228,178,234,.09); --tint-line: rgba(228,178,234,.3); }
+* { box-sizing: border-box; }
+html { background: #000; scrollbar-color: #3A3247 #000; }
+body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 28px 16px 40px;
+       font: 16px/1.55 "Golos Text", system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: #000; }
+::selection { background: var(--accent); color: var(--on-accent); }
+a { color: var(--link); text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+
+/* The landing page's wallpaper: a four-colour gradient seen through the pattern. */
+.wall { position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .35;
+        background: radial-gradient(circle at 80% 10%, #e4b2ea 0, rgba(228,178,234,0) 60%), radial-gradient(circle at 15% 30%, #8376c2 0, rgba(131,118,194,0) 60%),
+                    radial-gradient(circle at 25% 90%, #eab9d9 0, rgba(234,185,217,0) 60%), radial-gradient(circle at 85% 80%, #b493e6 0, rgba(180,147,230,0) 60%), #b493e6;
+        -webkit-mask-image: url(/login/assets/pattern.svg); mask-image: url(/login/assets/pattern.svg); -webkit-mask-size: 420px auto; mask-size: 420px auto; }
+.brand { display: flex; align-items: center; gap: 10px; font: 600 17px/1 Unbounded, system-ui, sans-serif; letter-spacing: -.01em; text-shadow: 0 0 2px #000, 0 1px 14px #000; }
+
+/* The glass card. */
+main { width: 100%; max-width: 440px; padding: 30px 28px 22px; border-radius: 28px;
+       background: linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.02));
+       -webkit-backdrop-filter: blur(10px) saturate(1.3); backdrop-filter: blur(10px) saturate(1.3);
+       border: 1px solid rgba(255,255,255,.16); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 30px 80px -30px rgba(0,0,0,.8); }
+h1 { font: 600 22px/1.25 Unbounded, system-ui, sans-serif; letter-spacing: -.02em; margin: 0 0 12px; text-wrap: balance; }
+h1.ask { font-weight: 500; font-size: 20px; line-height: 1.35; }
+h1.ask b { font-weight: 600; color: #F3D9F6; overflow-wrap: anywhere; }
+h2 { font: 600 16px/1.3 Unbounded, system-ui, sans-serif; letter-spacing: -.01em; margin: 0 0 8px; }
+p { margin: 0 0 14px; }
+b { font-weight: 600; }
+.muted { color: var(--muted); font-size: 14px; }
+.error { color: #FFB3C1; font-weight: 600; background: rgba(255,120,150,.1); border: 1px solid rgba(255,140,165,.25); border-radius: 12px; padding: 10px 12px; }
+footer { margin-top: 22px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,.08); font-size: 12px; color: var(--dim); }
+
+/* Buttons and fields. */
+.row { display: flex; gap: 10px; margin-top: 20px; }
+.row form { flex: 1; display: flex; }
+button, .button { flex: 1; display: inline-flex; align-items: center; justify-content: center; min-height: 46px; font: 500 15px/1.2 "Golos Text", system-ui, sans-serif; padding: 11px 16px;
+                  border-radius: 14px; border: 1px solid var(--line); background: rgba(30,25,40,.6); color: var(--fg); cursor: pointer; }
+button:hover, .button:hover { background: rgba(48,40,62,.75); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+button.primary:hover { background: #EEC6F2; }
+label { display: block; font-weight: 600; margin: 0 0 8px; }
+input { font: inherit; color: var(--fg); }
+input:not([type=checkbox]) { width: 100%; padding: 11px 14px; border-radius: 14px; border: 1px solid var(--line); background: rgba(0,0,0,.32); }
+input::placeholder { color: var(--dim); }
+input[type=checkbox] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+
+/* The login code: a loader in the same grid, then the code settling in. */
+.qr { display: grid; place-items: center; row-gap: 14px; min-height: 250px; margin: 18px 0; border: 1px dashed rgba(255,255,255,.2); border-radius: 18px; padding: 14px; text-align: center; background: rgba(0,0,0,.18); }
+.qr img { width: 100%; max-width: 240px; height: auto; border-radius: 18px; box-shadow: 0 18px 40px -18px rgba(0,0,0,.7);
+          -webkit-mask-image: linear-gradient(135deg, #000 40%, transparent 60%); mask-image: linear-gradient(135deg, #000 40%, transparent 60%);
+          -webkit-mask-size: 300% 300%; mask-size: 300% 300%; -webkit-mask-position: 0 0; mask-position: 0 0; animation: qr-in 1.1s cubic-bezier(.16,1,.3,1) both; }
+.qr-load { width: 200px; height: 200px; color: var(--accent); }
+.qr-load circle { fill: var(--accent); transform-box: fill-box; transform-origin: center; animation: qr-wave 1.8s ease-in-out infinite both; }
+.qr-load .fp { animation: qr-pulse 1.8s ease-in-out infinite; }
+@keyframes qr-in { from { -webkit-mask-position: 100% 100%; mask-position: 100% 100%; transform: scale(.96); } to { -webkit-mask-position: 0 0; mask-position: 0 0; transform: none; } }
+@keyframes qr-wave { 0%, 100% { opacity: .12; transform: scale(.45); } 35% { opacity: 1; transform: scale(1); } 70% { opacity: .12; transform: scale(.45); } }
+@keyframes qr-pulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+
+/* The send confirmation: the message as Telegram will show it. */
+dl.facts { margin: 0 0 14px; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; padding: 12px 14px; border-radius: 16px; background: var(--soft); border: 1px solid rgba(255,255,255,.08); }
+dl.facts dt { color: var(--muted); font-size: 14px; }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; unicode-bidi: isolate; }
+.reply { margin: 0 0 8px; padding: 8px 12px; border-radius: 14px 14px 14px 4px; background: var(--tint); font-size: 14px; color: #D9D0E6; overflow-wrap: anywhere; unicode-bidi: isolate; }
+.message { white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: isolate; margin: 0 0 14px; padding: 12px 14px; border-radius: 16px 16px 4px 16px; background: #6E5BB8; color: #fff; max-height: 50vh; overflow: auto; }
+.message code { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: rgba(0,0,0,.22); padding: 1px 5px; border-radius: 6px; }
+.message .url { color: #E0D7F5; font-size: 14px; }
+
+/* The Consent screen. */
+fieldset.scopes { border: 0; padding: 0; margin: 4px 0 16px; min-width: 0; }
+fieldset.scopes legend { padding: 0; margin: 0 0 10px; }
+label.scope { display: flex; gap: 12px; align-items: flex-start; font-weight: 400; font-size: 15px; margin: 0 0 8px; padding: 12px 14px; border-radius: 16px;
+              background: var(--soft); border: 1px solid rgba(255,255,255,.08); cursor: pointer; transition: background .2s ease-out, border-color .2s ease-out; }
+label.scope:has(input:checked) { background: var(--tint); border-color: var(--tint-line); }
+label.scope > span:not(.ico) { order: 2; flex: 1; }
+label.scope input { order: 3; }
+label.scope input:disabled { display: none; }
+.ico { flex: none; width: 34px; height: 34px; border-radius: 11px; display: flex; align-items: center; justify-content: center; color: #F3D9F6; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); }
+label.scope:has(input:checked) .ico { background: rgba(228,178,234,.16); border-color: var(--tint-line); }
+.ico.big { width: 60px; height: 60px; border-radius: 20px; color: var(--muted); }
+
+/* Write scopes and auto-send are switches. */
+label.scope input.write, input[name=auto_send] { -webkit-appearance: none; appearance: none; flex: none; position: relative; width: 44px; height: 26px; margin: 3px 0 0; border-radius: 13px;
+  background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18); cursor: pointer; transition: background .2s ease-out; }
+label.scope input.write::before, input[name=auto_send]::before { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: var(--fg); transition: transform .22s cubic-bezier(.16,1,.3,1); }
+label.scope input.write:checked, input[name=auto_send]:checked { background: var(--accent); border-color: var(--accent); }
+label.scope input.write:checked::before, input[name=auto_send]:checked::before { transform: translateX(18px); background: var(--on-accent); }
+
+/* What it can't do, how to disconnect, when to deny: each with its icon. */
+p.read-only, p.writes, p.sends { color: var(--fg); font-weight: 500; font-size: 15px; padding-left: 28px; background: no-repeat 0 2px / 18px
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239FE2BF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E"); }
+p.note { padding: 14px 16px 14px 44px; border-radius: 16px; background: var(--soft) no-repeat 16px 16px / 18px
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23C9B3FF' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 11v5M12 8h.01'/%3E%3C/svg%3E");
+  border: 1px solid rgba(255,255,255,.08); }
+p.note b { color: var(--fg); }
+p.deny { padding-left: 28px; background: no-repeat 0 1px / 18px
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23FFB3C1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 9v4M12 17h.01'/%3E%3Cpath d='M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z'/%3E%3C/svg%3E"); }
+
+/* What the boxes show, kept in step by CSS alone (the page runs no script). */
+main:has(input.write:checked) span.read-only, main:has(input.write:checked) p.read-only { display: none; }
+main:has(input.write:checked) p.writes { display: block; }
+main:not(:has(input.write:checked)) p.writes { display: none; }
+main:not(:has(input.write:checked)) span.read-only { display: inline; }
+main:not(:has(input.write:checked)) p.read-only { display: block; }
+main:has(input.send:checked) p.writes { display: none; }
+main:has(input.send:checked) p.sends, main:has(input.send:checked) section.send { display: block; }
+main:not(:has(input.send:checked)) p.sends, main:not(:has(input.send:checked)) section.send { display: none; }
+main:has(input.send:checked) .send-off { display: none; }
+
+/* The chats it may send to. */
+section.send { margin: 0; }
+section.send > h2 { font-size: 18px; }
+.send-off { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; min-height: 360px; padding: 20px; text-align: center; }
+.send-off h2 { font-size: 18px; margin-top: 10px; }
+.send-off p { max-width: 380px; }
+.send-off .button { flex: none; }
+fieldset.pick { border: 0; padding: 0; margin: 18px 0 0; min-width: 0; }
+fieldset.pick legend { font-weight: 600; font-size: 14px; color: #D9D0E6; padding: 0; margin: 0 0 8px; }
+.chats { max-height: 280px; overflow: auto; margin: 0 -4px; padding: 0 4px; scrollbar-color: #3A3247 transparent; }
+label.chat { display: flex; gap: 12px; align-items: center; font-weight: 400; font-size: 15px; margin: 0 0 2px; padding: 8px 10px; border-radius: 12px; overflow-wrap: anywhere; cursor: pointer; }
+label.chat:hover { background: rgba(255,255,255,.05); }
+label.chat:has(input:checked) { background: var(--tint); }
+label.chat > span { flex: 1; min-width: 0; }
+label.chat span .muted { display: inline-block; margin-left: 6px; padding: 0 8px; border-radius: 999px; background: rgba(255,255,255,.08); font-size: 12px; color: #D9D0E6; }
+label.chat:has(input[name=auto_send]) { margin: 12px 0 4px; padding: 14px 16px; border-radius: 16px; background: var(--soft); border: 1px solid rgba(255,255,255,.08); }
+label.chat:has(input[name=auto_send]:checked) { background: var(--tint); border-color: var(--tint-line); }
+label.chat input[name=auto_send] { order: 2; margin: 0; }
+.search { display: flex; gap: 8px; margin: 0 0 8px; }
+.search button, .row button.pick { flex: none; }
+
+/* Wide: the Consent screen in two columns, the decision in a bar under both. */
+main.wide { max-width: 1180px; padding: 0; overflow: clip; }
+.consent { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
+.consent .who { padding: 34px 34px 22px; }
+.consent .side { padding: 34px; background: rgba(0,0,0,.2); border-left: 1px solid rgba(255,255,255,.08); }
+.consent .actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 20px; padding: 16px 34px; border-top: 1px solid rgba(255,255,255,.1); background: rgba(0,0,0,.2); }
+.actions p.deny { margin: 0; flex: 1; }
+.actions .row { margin: 0; flex: none; }
+.actions button { min-width: 130px; }
+main.wide footer { margin: 0; padding: 14px 34px 18px; border-top: 0; }
+@media (max-width: 860px) {
+  main.wide { max-width: 560px; }
+  .consent { grid-template-columns: minmax(0, 1fr); }
+  .consent .who, .consent .side { padding: 24px 20px; }
+  .consent .side { border-left: 0; border-top: 1px solid rgba(255,255,255,.08); }
+  .send-off { min-height: 0; }
+  .consent .actions { position: sticky; bottom: 0; flex-direction: column; align-items: stretch; gap: 10px; padding: 12px 16px 16px;
+                      background: rgba(14,11,20,.92); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+  .actions .row { display: grid; grid-template-columns: 1fr 2fr; }
+  .actions button { min-width: 0; }
+  main.wide footer { padding: 14px 20px 18px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .qr-load circle, .qr-load .fp { animation: none; opacity: .45; }
+  .qr img { animation: none; -webkit-mask-image: none; mask-image: none; }
+  label.scope, label.scope input.write::before, input[name=auto_send]::before { transition: none; }
+}

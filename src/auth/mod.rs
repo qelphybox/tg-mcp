@@ -11,6 +11,7 @@ pub mod clients;
 mod flows;
 pub(crate) mod pages;
 mod pkce;
+mod qr;
 pub mod rate_limit;
 mod revoke;
 mod send_list;
@@ -212,6 +213,9 @@ pub fn router(auth: Arc<AuthState>) -> Router {
             post(authorize::consent_chats).route_layer(limited(Endpoint::ConsentChats)),
         )
         .route("/login/assets/login.js", get(login_js))
+        .route("/login/assets/pattern.svg", get(pattern_svg))
+        .route("/login/assets/unbounded.woff2", get(unbounded_woff2))
+        .route("/login/assets/golos-text.woff2", get(golos_woff2))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(auth)
 }
@@ -390,6 +394,36 @@ async fn register(State(auth): State<Arc<AuthState>>, body: Json<RegisterRequest
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// The pages' wallpaper pattern and fonts: never change within a release.
+fn static_asset(content_type: &'static str, body: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn pattern_svg() -> Response {
+    static_asset("image/svg+xml", include_bytes!("../../assets/pattern.svg"))
+}
+
+async fn unbounded_woff2() -> Response {
+    static_asset(
+        "font/woff2",
+        include_bytes!("../../assets/fonts/unbounded.woff2"),
+    )
+}
+
+async fn golos_woff2() -> Response {
+    static_asset(
+        "font/woff2",
+        include_bytes!("../../assets/fonts/golos-text.woff2"),
+    )
 }
 
 async fn login_js() -> Response {

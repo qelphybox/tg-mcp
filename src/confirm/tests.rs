@@ -791,8 +791,8 @@ async fn csrf_is_enforced_and_the_page_runs_no_script_and_is_never_framed() {
     let shown = page.get(&path, Some(&page.cookie), None).await;
     assert_eq!(
         shown.headers[header::CONTENT_SECURITY_POLICY],
-        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; \
-         frame-ancestors 'none'"
+        "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     );
     assert_eq!(shown.headers[header::X_FRAME_OPTIONS], "DENY");
     assert_eq!(shown.headers[header::CACHE_CONTROL], "no-store");

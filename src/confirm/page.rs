@@ -18,9 +18,10 @@ use crate::{
     },
 };
 
-/// No scripts, no framing, forms only to us, nothing loaded from anywhere.
-const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; \
-                   form-action 'self'; frame-ancestors 'none'";
+/// No scripts, no framing, forms only to us, nothing loaded from anywhere else.
+/// Images and fonts only from here: the wallpaper pattern and the pages' fonts.
+const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'; \
+                   base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// Most redirect targets named as the requester.
 const MAX_TARGETS: usize = 3;
