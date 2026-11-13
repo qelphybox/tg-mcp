@@ -2,7 +2,7 @@
 @font-face { font-family: "Golos Text"; src: url(/login/assets/golos-text.woff2) format("woff2"); font-weight: 400 900; font-display: swap; }
 :root { color-scheme: dark; --fg: #F1ECF7; --muted: #B4A9C4; --dim: #8C809E; --accent: #E4B2EA; --on-accent: #1F0F24; --link: #C9B3FF; --line: rgba(255,255,255,.14); --soft: rgba(0,0,0,.24); --tint: rgba(228,178,234,.09); --tint-line: rgba(228,178,234,.3); }
 * { box-sizing: border-box; }
-html { background: #000; scrollbar-color: #3A3247 #000; }
+html { scrollbar-color: #3A3247 #000; }
 body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 28px 16px 40px;
        font: 16px/1.55 "Golos Text", system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: #000; }
 ::selection { background: var(--accent); color: var(--on-accent); }
