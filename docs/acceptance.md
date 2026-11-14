@@ -1045,3 +1045,19 @@ Needs an account with at least 4 pinned chats in the main list (pin some in the 
 A cursor kept from before this deploy (e.g. a `next_cursor` of `list_chats` with `limit=1` saved earlier) still works: it continues with the unpinned chats from the top, as it did.
 
 Positions are counted per page: pinning, unpinning or reordering pinned chats in the app while you page can skip or repeat a pinned chat once. Don't touch the pins during the steps.
+
+## 63. A misspelt or unknown tool parameter is an error that names it and suggests the right one
+
+Needs nothing beyond §1. The mechanism is covered by fake-backed tests over every tool: `cargo test --lib mcp::scoped::` (each tool's published input schema has `additionalProperties: false`; through `/mcp`, each tool refuses `foo` with its list of parameters, and a camelCase or upper-case spelling of each of its parameters with the right suggestion; the known parameters still work; a long unknown name is shortened). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+
+```text
+Через Telegram MCP, аргументы передавай ровно как я пишу, ничего не исправляй. Текст сообщений не выводи. 1) get_messages с chat_id=<id любого чата из list_chats> и pinnedOnly=true. 2) list_chats с archive=true. 3) search_messages с query="привет" и chat=<тот же id>. 4) whoami с foo=1. 5) list_chats с limit=3. Для каждого шага выведи: ошибка или нет, код и текст ошибки.
+```
+
+1. Step 1: `invalid_params` `` unknown parameter `pinnedOnly`; did you mean `pinned_only`? ``. Before #60 it returned the whole history.
+2. Step 2: `` unknown parameter `archive`; did you mean `archived`? ``. Before #60 it returned the main list.
+3. Step 3: `` unknown parameter `chat`; did you mean `chat_id`? ``. Before #60 it searched every chat.
+4. Step 4: `` unknown parameter `foo`; this tool takes no parameters ``.
+5. Step 5: three chats, no error. If Claude corrects the spelling on its own in steps 1–3 (it may, since the schema now forbids other keys), the call succeeds: note it, and that is fine too.
+
+Then in claude.ai, in a chat with the connector (Settings → Connectors, `https://connector.tgmcp.dev/mcp`), ask "list my 3 most recent Telegram chats" and "what did I miss on Telegram?": both answer without an `unknown parameter` error. Record on #60 that Claude Code and claude.ai calls still succeed, i.e. no client puts keys of its own into `arguments`.

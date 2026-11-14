@@ -2,10 +2,18 @@
 //! declared in: [`super::TgMcp::scoped_tools`] puts each `#[tool_router(router = …)]`
 //! block under one Scope, so a new tool gets its Scope from the block it is
 //! written in and is never listed or called without it.
+//!
+//! Every tool also takes only the parameters its input schema lists (#60): the
+//! schema says so (`additionalProperties: false`), and a call naming another
+//! one is `invalid_params` before the tool runs, with the closest known name.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use rmcp::{ErrorData, handler::server::router::tool::ToolRouter, model::Tool};
+use rmcp::{
+    ErrorData,
+    handler::server::router::tool::ToolRouter,
+    model::{JsonObject, Tool},
+};
 
 use crate::scope::{Scope, Scopes};
 
@@ -34,6 +42,10 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
             );
         }
         self.router.merge(router);
+        for route in self.router.map.values_mut() {
+            Arc::make_mut(&mut route.attr.input_schema)
+                .insert("additionalProperties".into(), false.into());
+        }
         self
     }
 
@@ -78,6 +90,37 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
         }
     }
 
+    /// Err when `arguments` has a key tool `name`'s input schema doesn't list:
+    /// a misspelt parameter would otherwise be dropped silently. An unknown
+    /// tool passes: the router answers it as any unknown tool.
+    pub fn check_arguments(
+        &self,
+        name: &str,
+        arguments: Option<&JsonObject>,
+    ) -> Result<(), ErrorData> {
+        let Some(route) = self.router.map.get(name) else {
+            return Ok(());
+        };
+        let known: Vec<&str> = route
+            .attr
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        match arguments
+            .into_iter()
+            .flat_map(|a| a.keys())
+            .find(|key| !known.contains(&key.as_str()))
+        {
+            None => Ok(()),
+            Some(unknown) => Err(ErrorData::invalid_params(
+                unknown_parameter(unknown, &known),
+                None,
+            )),
+        }
+    }
+
     /// The definition of tool `name`, to adjust what it lists (description,
     /// schemas) before serving. Its Scope stays as declared.
     pub fn tool_mut(&mut self, name: &str) -> Option<&mut Tool> {
@@ -89,6 +132,67 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
     pub fn router(&self) -> &ToolRouter<S> {
         &self.router
     }
+}
+
+/// Longest unknown parameter name an error repeats.
+const MAX_SHOWN_PARAMETER_CHARS: usize = 40;
+
+/// What a call with parameter `unknown` is told, given the `known` ones.
+fn unknown_parameter(unknown: &str, known: &[&str]) -> String {
+    let shown: String = if unknown.chars().count() > MAX_SHOWN_PARAMETER_CHARS {
+        let head: String = unknown.chars().take(MAX_SHOWN_PARAMETER_CHARS).collect();
+        format!("{head}…")
+    } else {
+        unknown.to_string()
+    };
+    match closest(unknown, known) {
+        Some(meant) => format!("unknown parameter `{shown}`; did you mean `{meant}`?"),
+        None if known.is_empty() => {
+            format!("unknown parameter `{shown}`; this tool takes no parameters")
+        }
+        None => format!(
+            "unknown parameter `{shown}`; this tool takes: {}",
+            known.join(", ")
+        ),
+    }
+}
+
+/// The known parameter `unknown` most likely means: the same letters and
+/// digits whatever the case and `_` (`pinnedOnly`, `PINNED_ONLY`), or a few
+/// edits away (`archive`, `chat` for `chat_id`).
+fn closest<'a>(unknown: &str, known: &[&'a str]) -> Option<&'a str> {
+    let letters = |s: &str| -> Vec<char> {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let unknown = letters(unknown);
+    known
+        .iter()
+        .map(|&name| {
+            let name_letters = letters(name);
+            let allowed = (unknown.len().max(name_letters.len()) / 3).max(1);
+            (edit_distance(&unknown, &name_letters), allowed, name)
+        })
+        .filter(|(distance, allowed, _)| distance <= allowed)
+        .min_by_key(|&(distance, _, name)| (distance, name))
+        .map(|(_, _, name)| name)
+}
+
+/// Levenshtein distance.
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substituted = diagonal + usize::from(ca != cb);
+            diagonal = row[j + 1];
+            row[j + 1] = substituted.min(row[j] + 1).min(row[j + 1] + 1);
+        }
+    }
+    row[b.len()]
 }
 
 impl<S: Send + Sync + 'static> Default for ScopedTools<S> {
@@ -333,5 +437,154 @@ mod tests {
         // Granted `organize` while no tool organizes: told only what it can do.
         let (organizer, _guard4) = serve(drafts().with(Scope::Organize)).await;
         assert_eq!(said(&organizer), crate::mcp::instructions(drafts()));
+    }
+
+    /// A tool's parameters as its published input schema lists them.
+    fn parameters(tool: &Tool) -> Vec<String> {
+        tool.input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn call(tool: &str, arguments: serde_json::Value) -> CallToolRequestParams {
+        CallToolRequestParams::new(tool.to_string())
+            .with_arguments(arguments.as_object().unwrap().clone())
+    }
+
+    async fn refusal(client: &Client, tool: &str, arguments: serde_json::Value) -> String {
+        match client.call_tool(call(tool, arguments)).await {
+            Err(rmcp::ServiceError::McpError(e))
+                if e.code == rmcp::model::ErrorCode::INVALID_PARAMS =>
+            {
+                e.message.to_string()
+            }
+            other => panic!("{tool}: expected invalid_params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_published_input_schema_forbids_other_parameters() {
+        for tool in tools().router().list_all() {
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_tool_refuses_an_unknown_parameter_and_names_it() {
+        let all: Scopes = Scope::ALL.into_iter().collect();
+        let (client, _guard) = serve(all).await;
+        let listed = client.list_all_tools().await.unwrap();
+        assert_eq!(listed.len(), tools().router().list_all().len());
+        for tool in &listed {
+            let known = parameters(tool);
+            let message = refusal(&client, &tool.name, serde_json::json!({ "foo": 1 })).await;
+            let takes = if known.is_empty() {
+                "this tool takes no parameters".to_string()
+            } else {
+                format!("this tool takes: {}", known.join(", "))
+            };
+            assert_eq!(
+                message,
+                format!("unknown parameter `foo`; {takes}"),
+                "{}",
+                tool.name
+            );
+
+            // A near miss of each parameter: written camelCase, or upper case.
+            for name in &known {
+                let camel = name
+                    .split('_')
+                    .enumerate()
+                    .map(|(i, part)| match i {
+                        0 => part.to_string(),
+                        _ => part[..1].to_uppercase() + &part[1..],
+                    })
+                    .collect::<String>();
+                let miss = if camel != *name {
+                    camel
+                } else {
+                    name.to_uppercase()
+                };
+                let message =
+                    refusal(&client, &tool.name, serde_json::json!({ miss.clone(): 1 })).await;
+                assert_eq!(
+                    message,
+                    format!("unknown parameter `{miss}`; did you mean `{name}`?"),
+                    "{}",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_misspellings_seen_in_use_get_the_right_suggestion() {
+        let all: Scopes = Scope::ALL.into_iter().collect();
+        let (client, _guard) = serve(all).await;
+        for (tool, miss, meant) in [
+            ("get_messages", "pinnedOnly", "pinned_only"),
+            ("list_chats", "archive", "archived"),
+            ("search_messages", "chat", "chat_id"),
+        ] {
+            let message = refusal(&client, tool, serde_json::json!({ miss: true })).await;
+            assert_eq!(
+                message,
+                format!("unknown parameter `{miss}`; did you mean `{meant}`?")
+            );
+        }
+        // An unknown key next to known ones is refused all the same.
+        let message = refusal(
+            &client,
+            "list_chats",
+            serde_json::json!({ "limit": 5, "archive": true }),
+        )
+        .await;
+        assert!(
+            message.starts_with("unknown parameter `archive`"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_parameters_still_work() {
+        let all: Scopes = Scope::ALL.into_iter().collect();
+        let (client, _guard) = serve(all).await;
+        let saved_messages = crate::tg::fake::fake_issued_id(crate::tg::chats::ChatId::User(42));
+        for (tool, arguments) in [
+            ("whoami", serde_json::json!({})),
+            (
+                "list_chats",
+                serde_json::json!({ "limit": 5, "archived": false }),
+            ),
+            ("get_drafts", serde_json::json!({})),
+            ("search_messages", serde_json::json!({ "query": "hi" })),
+            (
+                "save_draft",
+                serde_json::json!({ "chat_id": saved_messages, "text": "hi" }),
+            ),
+        ] {
+            let done = client.call_tool(call(tool, arguments)).await;
+            assert!(
+                done.as_ref().is_ok_and(|r| r.is_error != Some(true)),
+                "{tool}: {done:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_parameter_is_shown_shortened() {
+        let all: Scopes = Scope::ALL.into_iter().collect();
+        let (client, _guard) = serve(all).await;
+        let long = "x".repeat(10_000);
+        let message = refusal(&client, "whoami", serde_json::json!({ long: 1 })).await;
+        assert!(message.len() < 200, "{}", message.len());
+        assert!(message.starts_with("unknown parameter `xxx"), "{message}");
     }
 }

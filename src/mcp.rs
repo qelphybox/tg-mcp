@@ -2034,6 +2034,8 @@ impl ServerHandler for TgMcp {
             );
             return Err(err);
         }
+        self.tools
+            .check_arguments(&request.name, request.arguments.as_ref())?;
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(call).await
     }
