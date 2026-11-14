@@ -10,6 +10,9 @@
 // keys missing or malformed (falls back to English) and the page with JavaScript off.
 // --snapshot writes what the page showed (steps, demo frames, labels) as JSON, to diff two
 // versions of the page. Exits non-zero on any failed check.
+//
+// Needs Node and the `playwright` package with Chromium (not a dependency of the repo:
+// `npm i -g playwright && npx playwright install chromium` where it isn't installed).
 'use strict';
 const http = require('http');
 const fs = require('fs');
@@ -149,7 +152,8 @@ async function fallback(browser, url, origin) {
   const dict = {
     xx: {
       copy: 'KOPY',
-      apps: { chatgpt: { note: 'XX note', steps: ['only one step'] }, claude: 'not an object' },
+      apps: { chatgpt: { note: 'XX note', steps: ['xx 1', 'xx 2', 'xx 3', 'xx 4'] }, claude: 'not an object',
+        gemini: { steps: [1, 2, 3] } },
       cases: { sell: { msg: 'XX sell', chips: ['too', 'short'] } }
     }
   };
@@ -166,15 +170,20 @@ async function fallback(browser, url, origin) {
   const r1 = await page.evaluate(() => ({
     copy: document.querySelector('[data-copy]').innerText.trim(),
     note: document.querySelector('[data-text="appNote"]').textContent,
-    steps: document.querySelectorAll('#app-steps li').length,
-    first: document.querySelector('#app-steps li').innerText
+    steps: Array.from(document.querySelectorAll('#app-steps li')).map((li) => li.innerText.replace(/\s+/g, ' ').trim()),
+    stars: document.querySelector('[data-stars-count]').textContent,
+    starsLabel: document.querySelector('[data-repo-link]').getAttribute('aria-label')
   }));
   check(r1.copy === 'KOPY', `fallback: a key the dictionary has is used (copy = ${r1.copy})`);
   check(r1.note === 'XX note', `fallback: a nested key the dictionary has is used (note = ${r1.note})`);
-  check(r1.steps === 3 && /Developer mode/.test(r1.first), 'fallback: steps of the wrong length fall back to English');
+  check(r1.steps.join('|') === '1 xx 1|2 xx 2|3 xx 3|4 xx 4', `fallback: a language may have another number of steps (${r1.steps.join(' | ')})`);
+  check(r1.stars === '1.2k' && r1.starsLabel === 'GitHub, 1234 stars', `fallback: star count and label in English (${r1.stars}, "${r1.starsLabel}")`);
   await page.click('[data-app="1"]');
   const r2 = await page.evaluate(() => document.querySelector('#app-steps').innerText);
   check(/Add custom connector/.test(r2), 'fallback: an app given with the wrong shape falls back to English');
+  await page.click('[data-app="2"]');
+  const r2b = await page.evaluate(() => document.querySelector('#app-steps').innerText);
+  check(/Connected apps/.test(r2b), 'fallback: steps that are not text fall back to English');
   await page.clock.runFor(4000);
   const r3 = await page.evaluate(() => document.getElementById('phone').innerText);
   check(/XX sell/.test(r3) && /Weekend garage sale/.test(r3) && /On it\. Setting up your channel\./.test(r3),

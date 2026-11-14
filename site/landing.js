@@ -6,14 +6,19 @@
 //   <script>window.TGMCP_STRINGS = { ru: { copy: 'Копировать', ... } };</script>
 //   <script src="/landing.js"></script>
 // Any key it leaves out, or gives with the wrong shape, falls back to English (EN below).
+// Lists may have another length, except a case's `chips` (one per tool call). `stars` is
+// read as the page gives it, since languages have different plural forms.
 // Text outside the script (headline, definition, FAQ, demo replies) is markup on each page.
-
+(function () {
 // The English dictionary, and the fallback for every other language.
 var EN = {
   copy: 'Copy',
   copied: 'Copied',
-  // {n} is the star count; keys are Intl.PluralRules categories, `other` is the fallback.
+  // The star count's aria-label. {n} is the count; keys are Intl.PluralRules categories of
+  // the page's language, `other` is used for a category the page leaves out.
   stars: { one: 'GitHub, {n} star', other: 'GitHub, {n} stars' },
+  // The star count from 1000 on; {n} is the count in thousands, formatted for the language.
+  thousands: '{n}k',
   // {case} is the playing scenario's description.
   phoneLabel: 'Demo in the Claude app on a phone: {case}',
   apps: {
@@ -61,12 +66,13 @@ var EN = {
 };
 
 // `over` laid on `base`, key by key. Only keys of `base` count; a value of another type, or
-// an array of another length, is ignored, so a broken or partial dictionary still yields a
-// complete one.
+// a list that is empty or holds a value of another type, is ignored, so a broken or partial
+// dictionary still yields a complete one.
 function mergeStrings(base, over) {
   if (Array.isArray(base)) {
-    if (!Array.isArray(over) || over.length !== base.length) return base;
-    return base.map(function (b, i) { return mergeStrings(b, over[i]); });
+    var ok = Array.isArray(over) && over.length > 0 &&
+      over.every(function (o) { return typeof o === typeof base[0]; });
+    return ok ? over : base;
   }
   if (base && typeof base === 'object') {
     var out = {};
@@ -77,10 +83,10 @@ function mergeStrings(base, over) {
   return typeof over === typeof base ? over : base;
 }
 
-(function () {
   var lang = (document.documentElement.getAttribute('lang') || 'en').toLowerCase().split('-')[0];
   var dicts = window.TGMCP_STRINGS || {};
-  var S = mergeStrings(EN, dicts[lang]);
+  var own = Object.prototype.hasOwnProperty.call(dicts, lang) ? dicts[lang] : undefined;
+  var S = mergeStrings(EN, own);
   function fill(t, vars) {
     return t.replace(/\{(\w+)\}/g, function (m, k) { return k in vars ? vars[k] : m; });
   }
@@ -104,7 +110,11 @@ function mergeStrings(base, over) {
       chips: [{ name: 'find_chats', ms: 1100 }, { name: 'send_message', ms: 1300 },
         { name: 'get_messages', ms: 1900 }, { name: 'send_message', ms: 1100 }] }
   ];
-  function text(pc) { return S.cases[pc.key]; }
+  // A case's chip details pair one-to-one with its tool calls: another count is English.
+  CASES.forEach(function (pc) {
+    if (S.cases[pc.key].chips.length !== pc.chips.length) S.cases[pc.key].chips = EN.cases[pc.key].chips;
+  });
+  function wordsOf(pc) { return S.cases[pc.key]; }
   function phaseMs(pc) {
     var ms = [700, 900];
     pc.chips.forEach(function (c) { ms.push(c.ms); });
@@ -146,7 +156,7 @@ function mergeStrings(base, over) {
 
   function render() {
     var pc = CASES[state.ps];
-    var words = text(pc);
+    var words = wordsOf(pc);
     var ph = state.ph;
     var R = 2 + pc.chips.length;
     var T = R + 1;
@@ -217,7 +227,7 @@ function mergeStrings(base, over) {
     var pc = CASES[ps];
     state.ps = ps;
     state.ph = 2 + pc.chips.length;
-    state.chars = text(pc).msg.length;
+    state.chars = wordsOf(pc).msg.length;
   }
 
   function schedule() {
@@ -226,7 +236,7 @@ function mergeStrings(base, over) {
     if (!(auto && visible && !document.hidden)) return;
     var pc = CASES[state.ps];
     var ph = state.ph;
-    var len = text(pc).msg.length;
+    var len = wordsOf(pc).msg.length;
     if (ph === 0 && state.chars < len) {
       ti = setInterval(function () {
         state.chars += 1;
@@ -302,17 +312,22 @@ function mergeStrings(base, over) {
     // Plural forms vary by language (Russian has one/few/many), so the page's own `stars`
     // is read directly rather than merged onto English's one/other.
     function label(n) {
-      var own = dicts[lang] && dicts[lang].stars;
-      if (own && typeof own === 'object') {
-        var f = own[plural(lang, n)];
-        if (typeof f !== 'string') f = own.other;
+      var forms = own && own.stars;
+      if (forms && typeof forms === 'object') {
+        var f = forms[plural(lang, n)];
+        if (typeof f !== 'string') f = forms.other;
         if (typeof f === 'string') return fill(f, { n: n });
       }
       return fill(EN.stars[plural('en', n)] || EN.stars.other, { n: n });
     }
+    function thousands(n) {
+      var digits = n >= 10000 ? 0 : 1;
+      try { return new Intl.NumberFormat(lang, { maximumFractionDigits: digits }).format(n / 1000); } catch (e) {}
+      return (n / 1000).toFixed(digits).replace(/\.0$/, '');
+    }
     function show(n) {
       if (typeof n !== 'number' || n < 0) return;
-      out.textContent = n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k' : String(n);
+      out.textContent = n >= 1000 ? fill(S.thousands, { n: thousands(n) }) : String(n);
       box.hidden = false;
       if (link) link.setAttribute('aria-label', label(n));
     }
