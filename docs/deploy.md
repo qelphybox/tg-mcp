@@ -64,7 +64,7 @@ kamal rollback <sha>     # switch back to a previous image (kamal app containers
 
 A rollback can't cross a database migration: an image older than a migration the database already ran refuses to start (sqlx: "migration N was previously applied but is missing"). Check `migrations/` between the two commits; if one was added, fix forward instead.
 
-The image is distroless (no shell), so `kamal app exec` with a shell does not work, by design.
+The image is a static musl binary on `distroless/static` (no shell, no libc, no CA bundle: MTProto connects to IP addresses and nothing makes outbound TLS requests), so `kamal app exec` with a shell does not work, by design. It sets `TG_MCP_DB_PATH=/data/tg-mcp.db` and `MIMALLOC_ARENA_EAGER_COMMIT=0` (mimalloc's eager arena commit would hold about 9 MB more at idle). `scripts/container-smoke-test.sh <image>` runs any build the way a self-hoster would; CI runs it on every push.
 
 ## Landing page
 
