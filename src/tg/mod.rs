@@ -238,8 +238,8 @@ pub trait Telegram: Send + Sync + 'static {
     /// Writes, counted against its Chat's Send cap when it goes to Telegram).
     /// Where it goes is [`compose::place`]'s rule, as for a Draft. A
     /// `random_id` Telegram already has is [`send::already_sent`]: never sent
-    /// twice. The MCP layer checks the Send allow-list and confirmation
-    /// before calling this; nothing here does.
+    /// twice. The MCP layer checks the Send allow-list before calling this;
+    /// nothing here does.
     async fn send_message(&self, message: send::NewMessage) -> Result<send::SentMessage, TgError>;
 
     /// Set the Account's reaction on one message (`messages.sendReaction`,

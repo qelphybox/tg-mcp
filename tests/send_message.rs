@@ -1,8 +1,8 @@
-//! send_message through the whole server (#46): a Grant whose Consent ticked
-//! `send` sends into its Send allow-list, at once with Auto-send, else once
-//! the user confirms on the page in the Consent browser; the same text isn't
-//! sent twice within a minute; and the logs carry ids, never the text, the
-//! page's id, the cookie or a Token.
+//! send_message through the whole server (#46, ADR-0008): a Grant whose
+//! Consent ticked `send` sends into its Send allow-list at once; the same text
+//! isn't sent twice within a minute, whichever MCP session asks; there is no
+//! confirmation page any more; and the logs carry ids, never the text or a
+//! Token.
 
 mod common;
 
@@ -41,9 +41,9 @@ fn data() -> FakeData {
     FakeData::new(account(ME, "Me")).with_chats(vec![chat(ALICE, "Alice"), chat(BOB, "Bob")])
 }
 
-/// A Grant with `send` to Alice (and Auto-send if `auto_send`): its access
-/// Token, and the Confirmation cookie the Consent browser got (`name=value`).
-async fn grant(server: &TestServer, auto_send: bool) -> (String, String) {
+/// A Grant with `send` to Alice, through Consent: its access Token. Consent
+/// sets no cookie besides the login's.
+async fn grant(server: &TestServer) -> String {
     let client_id = server.register().await;
     let pkce = pkce();
     let (login_path, login_cookie) = server.start_authorize(&client_id, &pkce, "xyz").await;
@@ -57,27 +57,27 @@ async fn grant(server: &TestServer, auto_send: bool) -> (String, String) {
         .await;
     assert_eq!(loaded.status(), StatusCode::OK);
     let alice = fake_issued_id(ALICE);
-    let mut form = vec![("scope", "send"), ("chat", alice.as_str())];
-    if auto_send {
-        form.push(("auto_send", "on"));
-    }
-    form.push(("decision", "allow"));
     let res = server
-        .post_form(&consent_path, &form, Some(&login_cookie))
+        .post_form(
+            &consent_path,
+            &[
+                ("scope", "send"),
+                ("chat", alice.as_str()),
+                ("decision", "allow"),
+            ],
+            Some(&login_cookie),
+        )
         .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let cookie = res.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    for cookie in res.headers().get_all(header::SET_COOKIE) {
+        let cookie = cookie.to_str().unwrap();
+        assert!(!cookie.starts_with("tgm_confirm"), "{cookie}");
+    }
     let code = query(&location(&res), "code").expect("code in redirect");
     let (status, tokens) = json(server.exchange(&client_id, &code, &pkce.verifier).await).await;
     assert_eq!(status, StatusCode::OK, "{tokens}");
     assert_eq!(tokens["scope"], "read send");
-    (tokens["access_token"].as_str().unwrap().to_string(), cookie)
+    tokens["access_token"].as_str().unwrap().to_string()
 }
 
 type Client = RunningService<RoleClient, rmcp::model::ClientConfig>;
@@ -95,18 +95,20 @@ async fn send(client: &Client, chat: ChatId, text: &str) -> Result<Value, String
 }
 
 #[tokio::test]
-async fn with_auto_send_it_sends_once_only_into_the_allow_list_and_logs_ids_only() {
+async fn it_sends_at_once_once_only_into_the_allow_list_and_logs_ids_only() {
     let logs = captured_logs();
     let server = start_with(vec![data()]).await;
-    let (token, _) = grant(&server, true).await;
+    let token = grant(&server).await;
     let client = server.mcp(&token).await;
     // Something no log line can contain by chance.
-    let text = "**Auto** send e2e needle-7c1f9a";
+    let text = "**At once** e2e needle-7c1f9a";
 
     let sent = send(&client, ALICE, text).await.unwrap();
     assert_eq!(sent["status"], "sent", "{sent}");
     assert_eq!(sent["message_id"], FIRST_SENT_ID);
-    let err = send(&client, ALICE, text).await.unwrap_err();
+    // Another MCP session of the same Account: still a duplicate.
+    let other = server.mcp(&token).await;
+    let err = send(&other, ALICE, text).await.unwrap_err();
     assert!(
         err.contains(&format!("already sent: message {FIRST_SENT_ID}")),
         "{err}"
@@ -118,13 +120,10 @@ async fn with_auto_send_it_sends_once_only_into_the_allow_list_and_logs_ids_only
     let messages = server.connector.sent().of(ME);
     assert_eq!(messages.len(), 1, "sent once, and only to Alice");
     assert_eq!(messages[0].chat, ALICE);
-    assert_eq!(messages[0].text.text, "Auto send e2e needle-7c1f9a");
+    assert_eq!(messages[0].text.text, "At once e2e needle-7c1f9a");
 
     let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
-    assert!(
-        logs.contains("message sent without confirmation (auto-send)"),
-        "{logs}"
-    );
+    assert!(logs.contains("message sent"), "{logs}");
     assert!(
         logs.contains(&format!("message_id={FIRST_SENT_ID}")),
         "{logs}"
@@ -137,72 +136,24 @@ async fn with_auto_send_it_sends_once_only_into_the_allow_list_and_logs_ids_only
     assert!(!logs.contains(&token), "no Token in the logs");
     assert!(!logs.contains("tgm_"), "no Token or cookie in the logs");
     client.cancel().await.unwrap();
+    other.cancel().await.unwrap();
 }
 
 #[tokio::test]
-async fn without_auto_send_the_consent_browser_confirms_and_then_it_is_already_sent() {
-    let logs = captured_logs();
+async fn there_is_no_confirmation_page() {
     let server = start_with(vec![data()]).await;
-    let (token, cookie) = grant(&server, false).await;
-    // rmcp's default client declares no elicitation: it gets the link.
-    let client = server.mcp(&token).await;
-    let text = "Confirm e2e needle-d40b2e";
-
-    let pending = send(&client, ALICE, text).await.unwrap();
-    assert_eq!(pending["status"], "pending_confirmation", "{pending}");
-    let url = pending["confirm_url"].as_str().unwrap().to_string();
-    assert!(url.starts_with(&server.url("/confirm/")), "{url}");
-    assert!(
-        server.connector.sent().of(ME).is_empty(),
-        "not before the user confirms"
-    );
-
     let http = reqwest::Client::new();
-    let page = http
-        .get(&url)
-        .header(header::COOKIE, &cookie)
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(page.contains("needle-d40b2e"), "the page shows the text");
-    let start = page.find(r#"name="csrf" value=""#).expect("a form") + 19;
-    let csrf = page[start..].split('"').next().unwrap();
-    let decided = http
-        .post(&url)
-        .header(header::COOKIE, &cookie)
+    let page = server.url("/confirm/AAAAAAAAAAAAAAAAAAAAAA");
+    let got = http.get(&page).send().await.unwrap();
+    assert_eq!(got.status(), StatusCode::NOT_FOUND);
+    let posted = http
+        .post(&page)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(common::form(&[("csrf", csrf), ("decision", "send")]))
+        .body(common::form(&[("csrf", "x"), ("decision", "send")]))
         .send()
         .await
-        .unwrap()
-        .text()
-        .await
         .unwrap();
-    assert!(decided.contains("The message was sent"), "{decided}");
-    assert_eq!(server.connector.sent().of(ME).len(), 1);
-
-    let err = send(&client, ALICE, text).await.unwrap_err();
-    assert!(
-        err.contains(&format!("already sent: message {FIRST_SENT_ID}")),
-        "{err}"
-    );
-    assert_eq!(server.connector.sent().of(ME).len(), 1);
-
-    let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
-    assert!(logs.contains("pending send made"), "{logs}");
-    assert!(
-        logs.contains("pending send confirmed: message sent"),
-        "{logs}"
-    );
-    let id = url.rsplit_once('/').unwrap().1;
-    let cookie_value = cookie.split_once('=').unwrap().1;
-    for secret in ["needle-d40b2e", id, cookie_value, csrf, &token, "tgm_"] {
-        assert!(!logs.contains(secret), "{secret} in the logs");
-    }
-    client.cancel().await.unwrap();
+    assert_eq!(posted.status(), StatusCode::NOT_FOUND);
 }
 
 /// Everything the server logs while this test binary runs.

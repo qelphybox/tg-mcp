@@ -1,7 +1,6 @@
 //! Per-client-IP limits on the anonymous endpoints (`/register`, `/authorize`,
-//! `/token`, `/revoke`, `/media/{ticket}` for Media links, `/confirm/{id}`
-//! for pending sends, and the Consent screen's chat pickers, which reach
-//! Telegram before any Token exists): a
+//! `/token`, `/revoke`, `/media/{ticket}` for Media links, and the Consent
+//! screen's chat pickers, which reach Telegram before any Token exists): a
 //! token bucket per endpoint and client, answered with `429 Too Many
 //! Requests` + `Retry-After` when empty. Everything else (`/mcp`, `/healthz`,
 //! `.well-known/*`, the other Login flow pages) is not limited here.
@@ -57,9 +56,6 @@ pub struct OAuthLimits {
     /// `/login/{id}/consent/chats`: loading and searching the Consent
     /// screen's chats, each a call or two to Telegram.
     pub consent_chats: Rate,
-    /// `/confirm/{id}`: the confirmation page of pending sends and its
-    /// decisions (and guesses of their ids).
-    pub confirm: Rate,
     /// Login flows pending at once, server-wide. Each holds a Telegram connection.
     pub max_pending_logins: usize,
     /// Login flows pending at once from one client.
@@ -88,10 +84,6 @@ impl Default for OAuthLimits {
             },
             consent_chats: Rate {
                 per_minute: 20,
-                burst: 10,
-            },
-            confirm: Rate {
-                per_minute: 30,
                 burst: 10,
             },
             max_pending_logins: 50,
@@ -158,7 +150,6 @@ pub enum Endpoint {
     Revoke,
     Media,
     ConsentChats,
-    Confirm,
 }
 
 impl Endpoint {
@@ -171,8 +162,6 @@ impl Endpoint {
             // Never the ticket: it is a credential. Nor the login id.
             Self::Media => "/media",
             Self::ConsentChats => "/login/consent/chats",
-            // Never the id: it is a credential.
-            Self::Confirm => "/confirm",
         }
     }
 
@@ -183,7 +172,6 @@ impl Endpoint {
             Self::Token | Self::Revoke => limits.token,
             Self::Media => limits.media,
             Self::ConsentChats => limits.consent_chats,
-            Self::Confirm => limits.confirm,
         }
     }
 }
@@ -308,11 +296,6 @@ fn too_many_requests(endpoint: Endpoint, wait: Duration) -> Response {
             StatusCode::TOO_MANY_REQUESTS,
             "Too many requests",
             "Too many chat searches from your network. Wait a minute, then go back and try again.",
-        ),
-        Endpoint::Confirm => pages::error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many requests",
-            "Too many requests from your network. Wait a minute, then reload the page.",
         ),
         _ => (
             StatusCode::TOO_MANY_REQUESTS,

@@ -12,10 +12,9 @@
 //!   key of this process, so not even a short text can be guessed back from
 //!   it. Never the text, never logged; a restart forgets every send.
 //!
-//! A send is recorded when Telegram took it: at once with Auto-send, and
-//! when the user confirms a pending send on its page ([`crate::confirm`]),
-//! whether or not the tool call still waits for it. An Auto-send claims its
-//! key before it goes to Telegram, so two identical calls at once send one.
+//! A send claims its key before it goes to Telegram, so two identical calls
+//! at once send one, and is recorded when Telegram took it; a send Telegram
+//! refuses lets the key go. One guard per server, shared by its MCP sessions.
 
 use std::{
     collections::HashMap,
@@ -42,7 +41,7 @@ pub struct SendKey {
 
 #[derive(Debug, Clone, Copy)]
 enum Recent {
-    /// An Auto-send of it is with Telegram right now.
+    /// A send of it is with Telegram right now.
     Sending,
     /// Telegram took it as message `id` at `at`.
     Sent { id: i32, at: Instant },
@@ -117,6 +116,7 @@ impl RecentSends {
     }
 
     /// Err when this message was sent, or is being sent, within the window.
+    #[cfg(test)]
     pub fn check(&self, key: &SendKey) -> Result<(), Duplicate> {
         match self.entries().get(key) {
             None => Ok(()),
@@ -141,7 +141,7 @@ impl RecentSends {
     }
 
     /// Telegram took this message as message `id`, now.
-    pub fn sent(&self, key: &SendKey, id: i32) {
+    fn sent(&self, key: &SendKey, id: i32) {
         self.entries().insert(
             *key,
             Recent::Sent {
@@ -176,7 +176,7 @@ fn duplicate(key: &SendKey, recent: Recent) -> Duplicate {
     }
 }
 
-/// A key held while its Auto-send is with Telegram.
+/// A key held while its send is with Telegram.
 pub struct Claim {
     recent: Arc<RecentSends>,
     key: SendKey,

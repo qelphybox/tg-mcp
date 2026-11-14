@@ -71,7 +71,6 @@ pub struct Choices<'a> {
 pub struct Picked {
     pub folders: Vec<i32>,
     pub chats: Vec<ChatRef>,
-    pub auto_send: bool,
 }
 
 impl Picked {
@@ -281,7 +280,7 @@ impl Pickers {
                     .map(|id| id.chat()),
             );
         }
-        SendAllowList::new(chats, picked.auto_send).map_err(|err| match err {
+        SendAllowList::new(chats).map_err(|err| match err {
             AllowListError::Empty => Refused::Input(
                 "Choose at least one chat it may send to, or untick “Send messages”.".into(),
             ),
