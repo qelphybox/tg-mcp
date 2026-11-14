@@ -22,6 +22,7 @@ dependencies = [
  "tg-mcp",
  "tokio",
  "tokio-util",
+ "tracing-subscriber",
  "url",
  "zeroize",
 ]

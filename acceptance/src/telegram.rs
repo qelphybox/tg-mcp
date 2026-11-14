@@ -120,6 +120,27 @@ impl TgClient {
     }
 }
 
+impl TgClient {
+    /// The account's first and last name and username, as Telegram has them.
+    pub async fn names(&self) -> Result<Vec<String>> {
+        let users = self
+            .client
+            .invoke(&tl::functions::users::GetUsers {
+                id: vec![tl::enums::InputUser::UserSelf],
+            })
+            .await
+            .map_err(|e| telegram(e, &format!("the {}'s own account", self.role.name())))?;
+        Ok(match users.into_iter().next() {
+            Some(tl::enums::User::User(u)) => [u.first_name, u.last_name, u.username]
+                .into_iter()
+                .flatten()
+                .filter(|n| !n.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+}
+
 #[async_trait]
 impl Party for TgClient {
     async fn account_id(&self) -> Result<i64> {

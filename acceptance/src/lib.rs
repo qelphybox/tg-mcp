@@ -9,6 +9,7 @@ pub mod config;
 pub mod fake;
 pub mod fixtures;
 pub mod forms;
+pub mod invariants;
 pub mod lease;
 pub mod login;
 pub mod real;

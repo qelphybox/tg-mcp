@@ -107,7 +107,7 @@ async fn go(args: &[String]) -> anyhow::Result<ExitCode> {
         run::run(world.world.clone(), &chosen).await
     } else {
         let config = AcceptConfig::load()?;
-        let (world, _files) = real::start(&config, target.as_deref()).await?;
+        let world = real::start(&config, target.as_deref()).await?;
         run::run(world, &chosen).await
     };
     Ok(finish(&report))

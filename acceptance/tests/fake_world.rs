@@ -292,3 +292,86 @@ async fn a_missing_fixture_says_how_to_make_it() {
     };
     assert!(why.contains("cargo accept fixtures"), "{why}");
 }
+
+/// Writes a marked Draft, then plants its own text in the server's log.
+const LOG_LEAK: Scenario = Scenario {
+    id: "log-leak",
+    title: "a run text in the log",
+    run: |run| {
+        Box::pin(async move {
+            run.login(&["draft"]).await?;
+            let text = run.mark("a secret line nobody should log");
+            if let Some(observed) = &run.world.observed {
+                observed
+                    .log
+                    .append(format!("INFO draft saved text={text}\n").as_bytes());
+            }
+            Ok(())
+        })
+    },
+};
+
+#[tokio::test]
+async fn a_run_text_in_the_logs_fails_the_run_without_showing_it() {
+    let world = FakeWorld::start().await.unwrap();
+    let report = run::run(world.world.clone(), &[&LOG_LEAK]).await;
+    let Outcome::Fail(why) = report.outcome() else {
+        panic!("a leak in the logs passed: {report}");
+    };
+    assert!(why.contains("server logs: nothing the run wrote"), "{why}");
+    let shown = report.to_string();
+    assert!(
+        !shown.contains("nobody should log"),
+        "the report shows the text: {shown}"
+    );
+}
+
+/// Plants its marker in the database file.
+const DB_LEAK: Scenario = Scenario {
+    id: "db-leak",
+    title: "a run text in the database",
+    run: |run| {
+        Box::pin(async move {
+            let text = run.mark("x");
+            if let Some(observed) = &run.world.observed {
+                use std::io::Write;
+                let mut db = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&observed.db)?;
+                db.write_all(text.as_bytes())?;
+            }
+            Ok(())
+        })
+    },
+};
+
+#[tokio::test]
+async fn a_run_text_in_the_database_fails_the_run() {
+    let world = FakeWorld::start().await.unwrap();
+    let report = run::run(world.world.clone(), &[&DB_LEAK]).await;
+    let Outcome::Fail(why) = report.outcome() else {
+        panic!("a leak in the database passed: {report}");
+    };
+    assert!(why.contains("database: nothing the run wrote"), "{why}");
+}
+
+#[tokio::test]
+async fn a_clean_run_lists_its_invariants_as_passed() {
+    let world = FakeWorld::start().await.unwrap();
+    let report = run::run(world.world.clone(), &[&MARKS]).await;
+    assert_eq!(report.outcome(), Outcome::Pass, "{report}");
+    assert_eq!(report.checks.len(), 4, "{report}");
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|(_, c)| *c == acceptance::invariants::Check::Pass),
+        "{report}"
+    );
+    let log = world.world.observed.as_ref().unwrap().log.read().unwrap();
+    let log = String::from_utf8_lossy(&log);
+    assert!(
+        log.contains("draft saved"),
+        "the server's own log lines are captured, so the check reads something"
+    );
+}

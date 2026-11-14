@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     fixtures,
+    invariants::{LogSource, Observed},
     world::{Driver, Party, Peer, Server, World},
 };
 
@@ -235,6 +236,14 @@ impl FakeWorldBuilder {
 
     pub async fn start(self) -> Result<FakeWorld> {
         let accepted: Accepted = Arc::new(Mutex::new(HashMap::new()));
+        let account_names = [
+            Some(self.test_data.account.first_name.clone()),
+            self.test_data.account.last_name.clone(),
+            self.test_data.account.username.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let test_login = match self.password {
             Some(p) => FakeLogin::with_password(self.test_data, p),
             None => FakeLogin::new(self.test_data),
@@ -256,7 +265,7 @@ impl FakeWorldBuilder {
         });
         let login = Arc::new(GatedLogin { accepted });
         let connector = FakeConnector::default();
-        let (server, keep) = serve(login, connector.clone()).await?;
+        let (server, keep, observed) = serve(login, connector.clone()).await?;
         Ok(FakeWorld {
             world: Arc::new(World {
                 name: "fake",
@@ -273,6 +282,8 @@ impl FakeWorldBuilder {
                     wait: Duration::from_millis(300),
                     poll: Duration::from_millis(20),
                 },
+                observed: Some(observed),
+                account_names,
                 _keep: keep,
             }),
             connector,
@@ -320,8 +331,12 @@ const RELAXED_LIMITS: &[(&str, &str)] = &[
 
 type Keep = Vec<Box<dyn std::any::Any + Send + Sync>>;
 
-async fn serve(login: Arc<dyn Login>, connector: FakeConnector) -> Result<(Server, Keep)> {
+async fn serve(
+    login: Arc<dyn Login>,
+    connector: FakeConnector,
+) -> Result<(Server, Keep, Observed)> {
     let dir = tempfile::tempdir()?;
+    let log = capture_logs();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
     let config = Config::from_lookup(
@@ -354,10 +369,46 @@ async fn serve(login: Arc<dyn Login>, connector: FakeConnector) -> Result<(Serve
         .with_graceful_shutdown(stop.cancelled_owned())
         .await;
     });
+    let observed = Observed {
+        log: LogSource::Memory(log),
+        db: dir.path().join("tg-mcp.db"),
+    };
     Ok((
         Server { base },
         vec![Box::new(Shutdown(shutdown)), Box::new(dir)],
+        observed,
     ))
+}
+
+/// Every in-process server of this process logs into one buffer, as the
+/// server process does to its output. Runs only look for their own texts in
+/// it, so worlds side by side don't confuse each other.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("tg_mcp=debug,info"))
+            .with_ansi(false)
+            .with_writer(move || BufWriter(sink.clone()))
+            .try_init();
+        buf
+    })
+    .clone()
+}
+
+struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for BufWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The QR tokens accepted so far, each with the login of whoever accepted it.

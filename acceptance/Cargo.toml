@@ -24,6 +24,7 @@ tempfile = "3.27.0"
 tg-mcp = { path = ".." }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "time", "process"] }
 tokio-util = "0.7.20"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 zeroize = "1.9.1"
 grammers-client = { version = "=0.11.0", default-features = false }

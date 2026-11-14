@@ -21,7 +21,9 @@ use rmcp::{
 use serde_json::Value;
 
 use crate::{
-    blocked, lease,
+    blocked,
+    invariants::{self, Check},
+    lease,
     login::{self, Grant},
     world::{Who, World},
 };
@@ -100,18 +102,26 @@ pub struct Report {
     pub not_run: Vec<&'static str>,
     /// Why the run stopped before its first scenario, if it did.
     pub aborted: Option<Outcome>,
-    /// Checks of the run as a whole (#138's invariants), with their outcome.
-    pub checks: Vec<(String, Outcome)>,
+    /// Checks of the run as a whole (the logs and database invariants).
+    pub checks: Vec<(String, Check)>,
 }
 
 impl Report {
     /// Blocked if anything was blocked; else the first failure; else pass.
     pub fn outcome(&self) -> Outcome {
+        let checks: Vec<Outcome> = self
+            .checks
+            .iter()
+            .filter_map(|(name, c)| match c {
+                Check::Fail(why) => Some(Outcome::Fail(format!("{name}: {why}"))),
+                _ => None,
+            })
+            .collect();
         let all = self
             .aborted
             .iter()
             .chain(self.scenarios.iter().map(|s| &s.outcome))
-            .chain(self.checks.iter().map(|(_, o)| o));
+            .chain(checks.iter());
         let mut fail = None;
         for o in all {
             match o {
@@ -182,9 +192,9 @@ impl fmt::Display for Report {
         }
         for (check, outcome) in &self.checks {
             let result = match outcome {
-                Outcome::Pass => "✅".to_string(),
-                Outcome::Fail(why) => format!("❌ {}", one_line(why)),
-                Outcome::Blocked(why) => format!("skipped: {}", one_line(why)),
+                Check::Pass => "✅".to_string(),
+                Check::Fail(why) => format!("❌ {}", one_line(why)),
+                Check::Skipped(why) => format!("skipped: {}", one_line(why)),
             };
             writeln!(f, "| {check} | {result} | — |")?;
         }
@@ -234,6 +244,8 @@ pub struct Run {
     pub world: Arc<World>,
     /// Marks everything this run writes (see [`Run::mark`]).
     pub run_id: String,
+    /// Every text marked so far, for the invariants.
+    written: Arc<std::sync::Mutex<Vec<String>>>,
     scenario: &'static str,
     steps: Vec<String>,
     human: Vec<HumanCheck>,
@@ -272,7 +284,9 @@ impl Run {
     /// goes through this, so a crashed run's leftovers can't pass for the
     /// next run's.
     pub fn mark(&self, text: &str) -> String {
-        format!("{text} {}", marker(&self.run_id))
+        let marked = format!("{text} {}", marker(&self.run_id));
+        self.written.lock().unwrap().push(marked.clone());
+        marked
     }
 
     /// Of `texts`, those this run wrote.
@@ -483,6 +497,7 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
             return report;
         }
     };
+    let written = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut stopped = false;
     for scenario in scenarios {
         if stopped {
@@ -492,6 +507,7 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
         let mut run = Run {
             world: world.clone(),
             run_id: run_id.clone(),
+            written: written.clone(),
             scenario: scenario.id,
             steps: Vec::new(),
             human: Vec::new(),
@@ -512,6 +528,13 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
             teardown,
         });
     }
+    let texts = written.lock().unwrap().clone();
+    report.checks = invariants::check_all(
+        world.observed.as_ref(),
+        &marker(&run_id),
+        &texts,
+        &world.account_names,
+    );
     let mut notes = Vec::new();
     if let Err(e) = world.driver.end_server_sessions(started - 60).await {
         notes.push(format!(

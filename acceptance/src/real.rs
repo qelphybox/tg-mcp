@@ -14,17 +14,18 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::AcceptConfig,
+    invariants::{LogSource, Observed},
     telegram::{Role, TgClient},
     world::{Server, World},
 };
 
 /// The server under test's files, when the harness started it.
 #[derive(Debug, Clone)]
-pub struct ServerFiles {
+struct ServerFiles {
     /// Everything the server printed (stdout and stderr).
-    pub log: PathBuf,
+    log: PathBuf,
     /// Its SQLite database.
-    pub db: PathBuf,
+    db: PathBuf,
 }
 
 /// Functional runs raise these (ADR-0009); the limits scenario uses the defaults.
@@ -40,10 +41,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Starts the Real world. With `target`, the server is that URL; otherwise
 /// the harness builds and starts it on a free local port.
-pub async fn start(
-    config: &AcceptConfig,
-    target: Option<&str>,
-) -> Result<(Arc<World>, Option<ServerFiles>)> {
+pub async fn start(config: &AcceptConfig, target: Option<&str>) -> Result<Arc<World>> {
     let driver = Arc::new(TgClient::open(
         &config.app,
         &config.driver_session,
@@ -54,6 +52,7 @@ pub async fn start(
         &config.peer_session,
         Role::Peer,
     )?);
+    let account_names = driver.names().await?;
     let mut keep: Vec<Box<dyn std::any::Any + Send + Sync>> = Vec::new();
     let (server, files) = match target {
         Some(url) => (
@@ -83,9 +82,14 @@ pub async fn start(
         poll_every: Duration::from_millis(1500),
         login_timeout: Duration::from_secs(90),
         lease: crate::lease::Terms::REAL,
+        observed: files.map(|f| Observed {
+            log: LogSource::File(f.log),
+            db: f.db,
+        }),
+        account_names,
         _keep: keep,
     };
-    Ok((Arc::new(world), files))
+    Ok(Arc::new(world))
 }
 
 /// The server process the harness started; killed when dropped.

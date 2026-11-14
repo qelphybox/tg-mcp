@@ -85,6 +85,10 @@ pub struct World {
     pub login_timeout: Duration,
     /// How a run takes and keeps the Test account's lease.
     pub lease: crate::lease::Terms,
+    /// The server's logs and database, when the harness started the server.
+    pub observed: Option<crate::invariants::Observed>,
+    /// The Test account's names (first, last, username), kept out of the database.
+    pub account_names: Vec<String>,
     /// Whatever must live as long as the world (e.g. the server under test).
     pub(crate) _keep: Vec<Box<dyn Any + Send + Sync>>,
 }
