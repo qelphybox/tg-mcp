@@ -17,6 +17,7 @@ usage: cargo accept [<scenario>...]              on the Test account, with a loc
        cargo accept --fake [<scenario>...]       on the Fake world (no Telegram, no secrets)
        cargo accept --list                       the scenarios
        cargo accept sign-in driver|peer          first login of the Test account / the Peer
+       cargo accept fixtures                     create or repair the Test account's test chats
 
 Without scenarios: every scenario except `smoke`. Exit status: 0 pass,
 1 fail, 3 blocked (Telegram limited an account: not a bug in the code),
@@ -53,6 +54,32 @@ async fn go(args: &[String]) -> anyhow::Result<ExitCode> {
         };
         telegram::sign_in(role).await?;
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if args.first().map(String::as_str) == Some("fixtures") {
+        let config = AcceptConfig::load()?;
+        return Ok(match real::fixtures(&config).await {
+            Ok(done) if done.is_empty() => {
+                println!("Fixtures: all in place, nothing to do.");
+                ExitCode::SUCCESS
+            }
+            Ok(done) => {
+                for line in done {
+                    println!("- {line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => match acceptance::blocked::find(&e) {
+                Some(b) => {
+                    eprintln!("BLOCKED: {} (not a bug in the code)", b.reason);
+                    ExitCode::from(3)
+                }
+                None => {
+                    eprintln!("{e:#}");
+                    ExitCode::FAILURE
+                }
+            },
+        });
     }
 
     let mut fake = false;

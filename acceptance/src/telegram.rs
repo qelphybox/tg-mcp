@@ -58,7 +58,7 @@ impl Role {
 
 /// A logged-in Telegram client of the Test account or the Peer.
 pub struct TgClient {
-    client: Client,
+    pub(crate) client: Client,
     role: Role,
 }
 
@@ -86,7 +86,7 @@ fn connect(app: &App, store: SessionStore, role: Role) -> (Client, Arc<SessionSt
 
 /// A Telegram error as the run sees it: blocked when Telegram limits the
 /// account, else a plain failure.
-fn telegram(err: InvocationError, what: &str) -> anyhow::Error {
+pub(crate) fn telegram(err: InvocationError, what: &str) -> anyhow::Error {
     if let InvocationError::Rpc(rpc) = &err
         && let Some(b) = blocked::rpc(rpc.code, &rpc.name, rpc.value)
     {

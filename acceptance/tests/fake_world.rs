@@ -250,3 +250,45 @@ async fn a_run_marks_what_it_writes_and_sees_only_its_own() {
         "{drafts:?}"
     );
 }
+
+/// Resolves every fixture role through the server.
+const ROLES: Scenario = Scenario {
+    id: "roles",
+    title: "finds every fixture",
+    run: |run| {
+        Box::pin(async move {
+            let session = run.login(&[]).await?;
+            let found =
+                acceptance::fixtures::Fixtures::resolve(&session, run.world.peer_account).await?;
+            anyhow::ensure!(found.a.starts_with("user:7000002"), "{found:?}");
+            anyhow::ensure!(found.b.starts_with("chat:9001"), "{found:?}");
+            anyhow::ensure!(found.forum.starts_with("channel:9002"), "{found:?}");
+            anyhow::ensure!(found.releases == 10, "{found:?}");
+            anyhow::ensure!(found.g.starts_with("chat:9003"), "{found:?}");
+            anyhow::ensure!(found.work == 2, "{found:?}");
+            anyhow::ensure!(found.saved.starts_with("user:7000001"), "{found:?}");
+            Ok(())
+        })
+    },
+};
+
+#[tokio::test]
+async fn every_fixture_role_resolves_on_the_fake_world() {
+    let world = FakeWorld::start().await.unwrap();
+    let report = run::run(world.world.clone(), &[&ROLES]).await;
+    assert_eq!(report.outcome(), Outcome::Pass, "{report}");
+}
+
+#[tokio::test]
+async fn a_missing_fixture_says_how_to_make_it() {
+    let world = FakeWorld::builder()
+        .login_as(FakeData::new(acceptance::fake::test_account()))
+        .start()
+        .await
+        .unwrap();
+    let report = run::run(world.world.clone(), &[&ROLES]).await;
+    let Outcome::Fail(why) = report.outcome() else {
+        panic!("no fixtures, yet: {report}");
+    };
+    assert!(why.contains("cargo accept fixtures"), "{why}");
+}

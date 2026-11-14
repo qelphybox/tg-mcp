@@ -163,3 +163,30 @@ async fn start_server(config: &AcceptConfig) -> Result<StartedServer> {
         _dir: dir,
     })
 }
+
+/// `cargo accept fixtures`: creates and repairs the fixtures on the Test
+/// account, under the lease, after the same checks a run makes on the Driver
+/// and the Peer. Returns what it did.
+pub async fn fixtures(config: &AcceptConfig) -> Result<Vec<String>> {
+    let driver = Arc::new(TgClient::open(
+        &config.app,
+        &config.driver_session,
+        Role::Driver,
+    )?);
+    let peer = TgClient::open(&config.app, &config.peer_session, Role::Peer)?;
+    let (d, p) = (driver.me().await?, peer.me().await?);
+    if d != config.test_account || p != config.peer_account || d == p {
+        bail!(
+            "interlock: the Driver is account {d} and the Peer {p}, configured: Test account {}, Peer {}; nothing was written",
+            config.test_account,
+            config.peer_account
+        );
+    }
+    let run_id = crate::run::new_run_id();
+    let held = crate::lease::take(driver.clone(), &run_id, crate::lease::Terms::REAL).await?;
+    let done = crate::fixtures::ensure(&driver, &peer).await;
+    let released = held.release().await;
+    let done = done?;
+    released?;
+    Ok(done)
+}

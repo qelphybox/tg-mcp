@@ -21,13 +21,20 @@ use tg_mcp::{
     sessions::{TokenTtl, Vault},
     tg::{
         Account, FakeConnector, FakeLogin, FakePassword, LoggedIn, Login, LoginAttempt, LoginState,
-        TgError, fake::FakeData,
+        TgError,
+        chats::{ChatId, ChatKind, ChatSummary},
+        fake::FakeData,
+        fake::{FakeChatFolder, FakeTopic},
+        messages::RawHistoryMessage,
     },
 };
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-use crate::world::{Driver, Party, Peer, Server, World};
+use crate::{
+    fixtures,
+    world::{Driver, Party, Peer, Server, World},
+};
 
 /// The fake Test account's id.
 pub const TEST_ACCOUNT: i64 = 7_000_001;
@@ -71,10 +78,120 @@ pub struct FakeWorldBuilder {
     driver_claims: i64,
 }
 
+/// The fake fixtures' chat ids.
+pub const FAKE_B: ChatId = ChatId::Chat(9001);
+pub const FAKE_FORUM: ChatId = ChatId::Channel(9002);
+pub const FAKE_RELEASES: i32 = 10;
+pub const FAKE_G: ChatId = ChatId::Chat(9003);
+pub const FAKE_WORK: i32 = 2;
+
+fn summary(id: ChatId, title: &str, kind: ChatKind) -> ChatSummary {
+    ChatSummary {
+        id: id.to_string(),
+        title: title.into(),
+        kind,
+        username: None,
+        is_self: false,
+        unread_count: 0,
+        pinned: false,
+        muted: false,
+        marked_unread: false,
+        last_message: None,
+    }
+}
+
+fn message(id: i32, text: &str, topic: Option<i32>, from: Option<ChatId>) -> RawHistoryMessage {
+    RawHistoryMessage {
+        comments: None,
+        id,
+        date: 1_793_923_200 + id * 60,
+        from,
+        out: from.is_none(),
+        text: text.into(),
+        media: None,
+        reply_to: None,
+        reply_elsewhere: None,
+        forwarded: false,
+        forwarded_from: None,
+        edited: false,
+        reactions: Vec::new(),
+        pinned: false,
+        topic,
+    }
+}
+
+/// The Test account with the fixtures `cargo accept fixtures` makes on real
+/// Telegram: A (the Peer's chat), B, the forum with Releases, G with 👍 only,
+/// the Chat folder Work, and Saved Messages.
+pub fn test_account_with_fixtures() -> FakeData {
+    let peer = ChatId::User(PEER);
+    let saved = ChatId::User(TEST_ACCOUNT);
+    FakeData::new(test_account())
+        .with_chats(vec![
+            ChatSummary {
+                is_self: true,
+                ..summary(saved, "Saved Messages", ChatKind::Private)
+            },
+            ChatSummary {
+                username: Some("tgmcp_peer".into()),
+                ..summary(peer, "Peer", ChatKind::Private)
+            },
+            summary(FAKE_B, fixtures::B, ChatKind::Group),
+            summary(FAKE_FORUM, fixtures::FORUM, ChatKind::Supergroup),
+            summary(FAKE_G, fixtures::G, ChatKind::Group),
+        ])
+        .with_messages(
+            peer,
+            vec![message(1, "tgmcp-accept · fixture A", None, Some(peer))],
+        )
+        .with_messages(FAKE_B, vec![message(1, "hello B", None, None)])
+        .with_messages(
+            FAKE_FORUM,
+            vec![
+                message(2, "hello forum", None, None),
+                message(
+                    FAKE_RELEASES,
+                    "[service message]",
+                    Some(FAKE_RELEASES),
+                    None,
+                ),
+                message(
+                    11,
+                    "tgmcp-accept · release notes",
+                    Some(FAKE_RELEASES),
+                    None,
+                ),
+            ],
+        )
+        .with_topics(
+            FAKE_FORUM,
+            vec![
+                FakeTopic::new(FAKE_RELEASES, fixtures::RELEASES),
+                FakeTopic::new(1, "General"),
+            ],
+        )
+        .with_messages(
+            FAKE_G,
+            (1..=3)
+                .map(|n| message(n, &format!("tgmcp-accept · G message {n}"), None, None))
+                .collect(),
+        )
+        .with_allowed_reactions(FAKE_G, &[fixtures::G_REACTION])
+        .with_chat_folders(vec![FakeChatFolder {
+            id: FAKE_WORK,
+            title: fixtures::WORK.into(),
+            emoji: None,
+            rules: false,
+            pinned: Vec::new(),
+            included: vec![peer, FAKE_FORUM],
+            excluded: Vec::new(),
+        }])
+}
+
 impl Default for FakeWorldBuilder {
     fn default() -> Self {
         Self {
-            test_data: FakeData::new(test_account()),
+            test_data: test_account_with_fixtures(),
             password: Some(FakePassword {
                 password: CLOUD_PASSWORD.into(),
                 hint: Some("a staple".into()),
