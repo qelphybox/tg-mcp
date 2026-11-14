@@ -1,6 +1,6 @@
 # tg-mcp
 
-> tg-mcp is a free, open-source (MIT), unofficial remote MCP server for a personal Telegram account. Add `https://connector.tgmcp.dev/mcp` to Claude, ChatGPT, Gemini, Claude Code, Cursor or any MCP client that speaks streamable HTTP, sign in by scanning a QR code with Telegram, and the AI can read and search your chats. It writes only if you allow it at sign-in: Drafts you send yourself, or messages to chats you pick, each confirmed by you.
+> tg-mcp is a free, open-source (MIT), unofficial remote MCP server for a personal Telegram account. Add `https://connector.tgmcp.dev/mcp` to Claude, ChatGPT, Gemini, Claude Code, Cursor or any MCP client that speaks streamable HTTP, sign in by scanning a QR code with Telegram, and the AI can read and search your chats. It writes only if you allow it at sign-in: Drafts you send yourself, or messages to chats you pick, sent at once within the server's limits (your AI app decides whether to ask you first).
 
 Not affiliated with Telegram. Made by Kirill Bobykin (https://github.com/qelphybox), an independent developer.
 
