@@ -17,6 +17,11 @@ use tg_mcp::{
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+// musl's allocator is slow under tokio's worker threads, and the official image
+// is a static musl build (#101). Applies to the binary only, not to tests.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rmcp logs JSON-RPC payloads (= message content) at debug/trace. Cap it whatever RUST_LOG says.
