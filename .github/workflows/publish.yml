@@ -4,7 +4,8 @@ name: Publish
 # ghcr.io/qelphybox/tg-mcp:<full sha> and :edge (#131), one digest for both.
 # `latest` and the semver tags move only on releases (release.yml). The push
 # uses this job's own short-lived GITHUB_TOKEN; there is no long-lived registry
-# token anywhere. Forks skip the job and stay green.
+# token anywhere. Forks skip the job and stay green. Then `deploy` rolls that
+# very image out to production (deploy.yml, #105).
 
 on:
   push:
@@ -94,3 +95,12 @@ jobs:
         run: |
           echo "$IMAGE:$GITHUB_SHA and $IMAGE:edge = $DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
           docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA"
+
+  # Production runs exactly the image `edge` just pushed (#105). Read-only token.
+  deploy:
+    needs: edge
+    uses: ./.github/workflows/deploy.yml
+    permissions:
+      contents: read
+      packages: read
+    secrets: inherit

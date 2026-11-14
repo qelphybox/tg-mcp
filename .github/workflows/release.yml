@@ -9,6 +9,14 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+  # Point `latest` and `X.Y` at an already published X.Y.Z (a restore or a
+  # rollback), without a rebuild: the same digest, both architectures (#105).
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "An existing release, X.Y.Z (no v): latest and X.Y will point at its digest"
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -20,6 +28,7 @@ env:
 
 jobs:
   image:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -94,3 +103,45 @@ jobs:
           body: |
             Image: `${{ env.IMAGE }}:${{ steps.meta.outputs.version }}` for linux/amd64 and linux/arm64, the same digest as this release's `X.Y` tag and `latest`.
             Self-hosting: see the README. What changed: see CHANGELOG.md.
+
+  latest:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: The version is a published release
+        id: source
+        run: |
+          [[ "$VERSION" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z, got: $VERSION" >&2; exit 1; }
+          echo "minor=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')" || {
+            echo "::error::$IMAGE:$VERSION is not published" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # By digest: copies the existing index (both architectures, attestations)
+      # to the new tags; nothing is rebuilt.
+      - name: latest and X.Y → ${{ inputs.version }}
+        env:
+          MINOR: ${{ steps.source.outputs.minor }}
+          DIGEST: ${{ steps.source.outputs.digest }}
+        run: |
+          docker buildx imagetools create -t "$IMAGE:latest" -t "$IMAGE:$MINOR" "$IMAGE@$DIGEST"
+          for t in "$VERSION" "$MINOR" latest; do
+            got="$(docker buildx imagetools inspect "$IMAGE:$t" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            echo "$IMAGE:$t = $got" | tee -a "$GITHUB_STEP_SUMMARY"
+            test "$got" = "$DIGEST" || { echo "::error::$IMAGE:$t is $got, expected $DIGEST" >&2; exit 1; }
+          done
+          docker buildx imagetools inspect "$IMAGE:latest" | grep Platform | tee -a "$GITHUB_STEP_SUMMARY"

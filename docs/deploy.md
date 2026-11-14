@@ -4,11 +4,13 @@ Production runs at `https://connector.tgmcp.dev` on one VPS, deployed with [Kama
 
 ## How a rollout works
 
-1. GitHub Actions builds the image from `Dockerfile` and pushes it to `ghcr.io/qelphybox/tg-mcp:<git sha>`.
-2. Kamal SSHes into the server, pulls the image and starts the new container next to the old one.
+1. The Publish workflow's `edge` job builds the image from `Dockerfile` once, for amd64 and arm64, and pushes it as `ghcr.io/qelphybox/tg-mcp:<git sha>` and `:edge` (Releases below).
+2. Its `deploy` job (`.github/workflows/deploy.yml`) then runs `kamal deploy --skip-push --version <git sha>`: Kamal builds nothing and pushes nothing (`latest` included); it SSHes into the server, logs the server's Docker in to `ghcr.io` with the job's own read-only token, pulls that very image and starts the new container next to the old one. The job then checks that the server's image has the digest Publish pushed, and records both in the run's summary.
 3. kamal-proxy polls `/healthz` on the new container; once it answers, traffic switches over. The old container drains for up to `drain_timeout` (30 s), then gets SIGTERM and has `stop_timeout` (30 s) to exit before SIGKILL. On SIGTERM it closes MCP streams, waits for in-flight requests, then closes every Live client and re-seals each Telegram session that changed while live (bounded to 10 s; logged as `client pool flushed` with counts).
 
-Triggers: every push to `main`, or **Actions → Deploy → Run workflow** (pick `setup` for a fresh server, `deploy` otherwise). Manual runs only appear once the workflow is on `main`.
+Triggers: every push to `main` (the Publish run deploys once its `edge` job is green), or **Actions → Deploy → Run workflow** (pick `setup` for a fresh server, `deploy` otherwise; `version` empty deploys the head of the branch you pick, whose Publish run must be green). Manual runs only appear once the workflow is on `main`. One rollout at a time (`deploy-production`).
+
+Registry credentials: none to create. The package is public, but Kamal 2 always runs `docker login` on the server before it pulls, so the deploy job passes its own `GITHUB_TOKEN`, which has `packages: read` only and expires when the job ends. Nothing on the server, and nothing in the deploy job, can push to the registry.
 
 kamal-proxy terminates TLS with a Let's Encrypt certificate for the host. `text/event-stream` responses (MCP streams) pass through unbuffered; `response_timeout` only bounds the wait for response headers.
 
@@ -59,7 +61,7 @@ It collects the Telegram api_id/api_hash, makes sure your personal key opens `ro
 | `KAMAL_HOST`, `KAMAL_SSH_USER` | variable | Server IP and `deploy` |
 | `SSH_KNOWN_HOSTS` | variable | Pinned host key; CI refuses any other |
 
-The registry password is the workflow's own `GITHUB_TOKEN`; nothing to set. Re-running the wizard is safe: it keeps saved values and the hardening script is idempotent.
+The registry password is the deploy job's own read-only `GITHUB_TOKEN`; nothing to set. Re-running the wizard is safe: it keeps saved values and the hardening script is idempotent.
 
 ## Server baseline
 
@@ -77,12 +79,14 @@ Caveat: Docker writes its own iptables rules, so a port published with `-p` bypa
 
 ## Day-to-day
 
-From a local clone with the variables above exported (`set -a; . ./.env; set +a`) and `KAMAL_REGISTRY_PASSWORD` set to a GitHub token with `read:packages`:
+From a local clone with the variables above exported (`set -a; . ./.env; set +a`) and `KAMAL_REGISTRY_PASSWORD` set to a GitHub token with **only** `read:packages` (needed by commands that pull, such as `kamal deploy`; GitHub → Settings → Developer settings → Personal access tokens (classic) → scope `read:packages`, nothing else; never a token that can write):
 
 ```sh
 kamal app logs -f        # follow logs
-kamal rollback <sha>     # switch back to a previous image (kamal app containers lists them)
+kamal rollback <sha>     # switch back to an image still on the server (kamal app containers lists them)
 ```
+
+**Rollback.** Every `<git sha>` stays in GHCR, so any earlier commit can go back to production. Preferred: **Actions → Deploy → Run workflow** with `version` = that commit's full sha: it pulls the image from GHCR with the job's read-only token and checks the digest, like any deploy. From a laptop, `kamal rollback <sha>` (image still on the server; Kamal keeps the last few) or `kamal deploy --skip-push --version <sha>` work too, but there is no job token there: `KAMAL_REGISTRY_PASSWORD` must be your own classic token with `read:packages` only, never `write:packages`. Either way it is a deploy: it loses what any deploy loses (above). The next push to `main` deploys `main` again.
 
 A rollback can't cross a database migration: an image older than a migration the database already ran refuses to start (sqlx: "migration N was previously applied but is missing"). Check `migrations/` between the two commits; if one was added, fix forward instead.
 
@@ -160,6 +164,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 `.github/workflows/release.yml` checks the tag matches `Cargo.toml` and that the Built-in app secrets (`TG_MCP_BUILTIN_API_ID`, `TG_MCP_BUILTIN_API_HASH`, see the table above) are set, compiles them in through BuildKit secrets, builds `linux/amd64` and `linux/arm64` (the Dockerfile cross-compiles, no emulation) once, and pushes the result to `ghcr.io/qelphybox/tg-mcp` with the tags `0.1.0`, `0.1` and `latest`, one digest for all three. It then creates a GitHub Release naming the image. Run [the acceptance checks](acceptance.md) before tagging and put the memory numbers in the release notes.
 
-Every push to `main` also builds both architectures once and pushes `ghcr.io/qelphybox/tg-mcp:<git sha>` and `:edge` (`.github/workflows/publish.yml`), with the Built-in app when its secrets are set. `latest` and the version tags are meant to move only on releases; until production deploys this published image (#105), Kamal's own amd64 build for production still pushes `latest` and the same `<git sha>` tag, so whichever push finishes last owns `<git sha>`.
+Every push to `main` also builds both architectures once and pushes `ghcr.io/qelphybox/tg-mcp:<git sha>` and `:edge` (`.github/workflows/publish.yml`), with the Built-in app when its secrets are set. `latest` and the version tags move only on releases: production deploys this published `<git sha>` and Kamal never pushes.
+
+**Moving `latest` without a release** (a restore, or a rollback of a bad release): **Actions → Release → Run workflow** with `version` = an existing `X.Y.Z`. It points `latest` and `X.Y` at that version's digest with `docker buildx imagetools create` (no rebuild; both architectures), and checks all three tags carry the same digest.
 
 GHCR is the image's only home. Both workflows push with the job's own short-lived `GITHUB_TOKEN` (`packages: write`): there is no registry token to create, rotate or leak, and forks skip the publish job. The package is public, so pulls need no login (set once in GitHub → Packages → tg-mcp → Package settings; a new package starts private).

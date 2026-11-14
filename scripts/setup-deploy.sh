@@ -300,6 +300,7 @@ fi
 stage "First deploy"
 say "Docker is already on the server, so a plain 'kamal deploy' does it: boots kamal-proxy, gets the TLS certificate, starts the app."
 note "The Deploy workflow must be on main (GitHub only runs manual workflows from the default branch); a push to main deploys by itself."
+note "It deploys the image Publish pushed for main's head (ghcr.io/qelphybox/tg-mcp:<sha>): that Publish run must be green. No registry token to set: the job's own read-only one logs the server in."
 if confirm "Trigger the Deploy workflow on main now?"; then
   if gh workflow run deploy.yml --ref main -f command=deploy; then
     printf '  %s✓%s started; watching the run (Ctrl-C stops watching, not the deploy)\n' "$GREEN" "$RESET"

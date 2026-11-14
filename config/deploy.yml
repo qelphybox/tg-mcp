@@ -11,12 +11,20 @@ servers:
 ssh:
   user: <%= ENV.fetch("KAMAL_SSH_USER", "deploy") %>
 
+# Production runs the image .github/workflows/publish.yml pushed for the commit
+# (ghcr.io/qelphybox/tg-mcp:<sha>), deployed with `kamal deploy --skip-push
+# --version <sha>`: Kamal never builds or pushes (#105).
+# The package is public, but Kamal 2 always logs the server in before a pull:
+# CI's password is the deploy job's GITHUB_TOKEN with `packages: read` only;
+# locally, a token with `read:packages` only (docs/deploy.md, Day-to-day).
 registry:
   server: ghcr.io
   username: qelphybox
   password:
     - KAMAL_REGISTRY_PASSWORD
 
+# Never used: --skip-push builds nothing. Kamal 2.12 refuses a config without
+# `builder.arch` all the same; amd64 is the server's.
 builder:
   arch: amd64
 
