@@ -25,7 +25,7 @@ Rust (latest stable), tokio, axum, rmcp (MCP), grammers (Telegram, version pinne
 
 ## Agent skills
 
-Matt Pocock's skills are vendored in `.claude/skills/` (engineering + productivity, MIT). Start a change with `/grill-with-docs`, then `/to-spec` → `/to-tickets` → `/implement` (which drives `/tdd` and `/code-review`).
+Matt Pocock's skills are vendored in `.claude/skills/` (engineering + productivity, MIT). Start a change with `/grill-with-docs`, then `/to-spec` → `/to-tickets` → `/implement` (which drives `/tdd` and `/code-review`) → `/accept` (the feature on the Test account, ADR-0009).
 
 ### Issue tracker
 
