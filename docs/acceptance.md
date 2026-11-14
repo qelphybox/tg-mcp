@@ -1044,3 +1044,4 @@ Needs an account with at least 4 pinned chats in the main list (pin some in the 
 
 A cursor kept from before this deploy (e.g. a `next_cursor` of `list_chats` with `limit=1` saved earlier) still works: it continues with the unpinned chats from the top, as it did.
 
+Positions are counted per page: pinning, unpinning or reordering pinned chats in the app while you page can skip or repeat a pinned chat once. Don't touch the pins during the steps.

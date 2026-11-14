@@ -66,9 +66,9 @@ pub const RULES_NOT_SUPPORTED: &str = "this Chat folder is defined by rules, not
 
 /// Where the next page of a folder's listing starts: the folder's pinned
 /// Chats from position `pinned_from` (absent: none left), then its other
-/// Chats after `after` (absent: from the most recent). Its own shape, with
-/// keys no other cursor has, so a cursor of the other kind never passes for
-/// one.
+/// Chats after `after` (absent: from the most recent). Its own shape: `f`
+/// is required here and absent from the other cursor, which requires `d`,
+/// so a cursor of the other kind never passes for one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderCursor {
     #[serde(rename = "f")]

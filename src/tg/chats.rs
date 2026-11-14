@@ -630,13 +630,21 @@ fn assemble(
     let messages: HashMap<(ChatId, i32), &RawMessage> =
         messages.iter().map(|m| ((m.chat, m.id), m)).collect();
 
-    // Each pinned dialog of the listing with its position among them.
-    let mut pinned_at = 0..;
-    let mut seen = HashSet::new();
-    let mut shown: Vec<(&RawDialog, Option<usize>)> = dialogs
+    // Each dialog of the listing, a pinned one with its position among them.
+    // Positions are of this answer: a pin changed between two pages shifts them.
+    let mut pinned_count = 0;
+    let positioned: Vec<(&RawDialog, Option<usize>)> = dialogs
         .iter()
         .filter(|d| d.folder_id == listing.folder_id())
-        .map(|d| (d, d.pinned.then(|| pinned_at.next().expect("unbounded"))))
+        .map(|d| {
+            let at = d.pinned.then_some(pinned_count);
+            pinned_count += usize::from(d.pinned);
+            (d, at)
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    let mut shown: Vec<(&RawDialog, Option<usize>)> = positioned
+        .into_iter()
         .filter(|(d, _)| !(d.pinned && listing.exclude_pinned()))
         .filter(|(_, at)| at.is_none_or(|at| at >= pinned_from))
         .filter(|(d, _)| !listing.unread_only || d.unread_count > 0 || d.unread_mark)
@@ -651,12 +659,13 @@ fn assemble(
         .map(|(dialog, _)| summary(dialog, &peers, &messages))
         .collect();
 
-    // Cut among the pinned dialogs: the next page goes on with them.
+    // Cut among the pinned dialogs: the next page goes on with them, or after
+    // the last one with the unpinned dialogs from the top.
     if cut && let Some(&(_, Some(at))) = shown.last() {
         let next = Cursor {
             archived: listing.archived,
             unread_only: listing.unread_only,
-            pinned_from: Some(at + 1),
+            pinned_from: Some(at + 1).filter(|&from| from < pinned_count),
             ..Cursor::default()
         };
         return (chats, Some(next));
@@ -1528,25 +1537,27 @@ mod tests {
             dialog(29, false),
         ];
         let messages: Vec<RawMessage> = [5, 999, 3, 30, 29].map(message).into();
-        for limit in [2, 3] {
-            let page = assemble_page(&dialogs, &[], &messages, limit, true, MAIN_FIRST);
-            assert_eq!(page.chats.len(), limit);
-            assert!(page.chats.iter().all(|c| c.pinned));
-            assert_eq!(
-                cursor(&page),
-                Cursor {
-                    pinned_from: Some(limit),
-                    ..Cursor::default()
-                },
-                "limit {limit}"
-            );
-        }
+        let page = assemble_page(&dialogs, &[], &messages, 2, true, MAIN_FIRST);
+        assert_eq!(ids(&page), ["user:5", "user:999"]);
+        assert_eq!(
+            cursor(&page),
+            Cursor {
+                pinned_from: Some(2),
+                ..Cursor::default()
+            }
+        );
+
+        // Cut right after the last pinned one: the unpinned chats from the top,
+        // without Telegram's pinned dialogs again.
+        let page = assemble_page(&dialogs, &[], &messages, 3, true, MAIN_FIRST);
+        assert!(page.chats.iter().all(|c| c.pinned));
+        assert_eq!(cursor(&page), Cursor::default());
 
         // Telegram sends every pinned dialog again; those before `k` are left out.
         let (chats, next) = assemble(&dialogs, &[], &messages, 2, true, MAIN_FIRST, 1);
         let ids: Vec<&str> = chats.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["user:999", "user:3"]);
-        assert_eq!(next.and_then(|c| c.pinned_from), Some(3));
+        assert_eq!(next, Some(Cursor::default()));
     }
 
     /// One folder as `messages.getDialogs` serves it (as seen on production):
@@ -1856,6 +1867,24 @@ mod tests {
         assert_eq!(requests(&folder).len(), 5);
         assert!(!page.unread_scan_truncated);
         assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn a_page_inside_the_pinned_chats_is_one_telegram_call() {
+        for unread_only in [false, true] {
+            let folder = Folder {
+                pinned: vec![5, 999, 3, 998],
+                unread: [5, 999, 3, 998].into(),
+                ..main_list(300, &[])
+            };
+            let first = folder.list(1, None, unread_only);
+            requests(&folder);
+            let second = folder.list(1, first.next_cursor.as_deref(), unread_only);
+            assert_eq!(ids(&second), ["user:999"], "unread_only {unread_only}");
+            let requests = requests(&folder);
+            assert_eq!(requests.len(), 1, "unread_only {unread_only}");
+            assert!(requests[0].listing.first_page && requests[0].after.is_none());
+        }
     }
 
     #[test]
