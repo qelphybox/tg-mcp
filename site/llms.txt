@@ -1,0 +1,36 @@
+# tg-mcp
+
+> tg-mcp is a free, open-source (MIT), unofficial remote MCP server for a personal Telegram account. Add `https://connector.tgmcp.dev/mcp` to Claude, ChatGPT, Gemini, Claude Code, Cursor or any MCP client that speaks streamable HTTP, sign in by scanning a QR code with Telegram, and the AI can read and search your chats. It writes only if you allow it at sign-in: Drafts you send yourself, or messages to chats you pick, each confirmed by you.
+
+Not affiliated with Telegram. Made by Kirill Bobykin (https://github.com/qelphybox), an independent developer.
+
+## Connect
+
+- Public server URL: `https://connector.tgmcp.dev/mcp` (streamable HTTP, OAuth discovered automatically, no API key, no sign-up, no payment)
+- Claude (web, desktop, mobile; free plan too): Settings → Connectors → Add custom connector → paste the URL → Connect → scan the QR code with Telegram on your phone (Settings → Devices → Link Desktop Device)
+- ChatGPT (paid plans): Settings → Apps & Connectors → Advanced → turn on Developer mode → Create → name it Telegram, paste the URL → scan the QR code
+- Gemini (personal Google accounts, add it on the web): gemini.google.com → Settings → Connected apps → Add a custom app → paste the URL → approve → scan the QR code
+- Claude Code: `claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp`, then `/mcp` → telegram → Authenticate
+- Cursor and other MCP clients: add the URL as a streamable-HTTP server
+- Disconnect: Telegram → Settings → Devices → end the "Unofficial MCP Server" session
+
+## What the AI can do
+
+- Read: list chats (unread only, by Chat folder, archived), read messages and threads, search messages across chats, find chats and contacts by name, read chat and profile info, list group members, read Drafts
+- Media: look at photos and video thumbnails, transcribe voice messages and video notes with Telegram's own transcription, or download files through a short-lived link
+- Write, only when allowed at sign-in: `save_draft` (text in a chat's message field that you send yourself); `send_message`, `react` and `mark_read` in the chats you picked, each message confirmed by you unless you chose otherwise
+- Never: edit, delete or forward messages
+
+## Docs
+
+- [README](https://github.com/qelphybox/tg-mcp/blob/main/README.md): quick start, full tool reference, prompts, security model, self-hosting
+- [Tools](https://github.com/qelphybox/tg-mcp#tools): every tool with its inputs and outputs
+- [Security model](https://github.com/qelphybox/tg-mcp#security-model): the Telegram session is stored encrypted with a key that only the AI app's tokens carry; message content is never stored or logged
+- [Self-hosting](https://github.com/qelphybox/tg-mcp#self-hosting): one Docker image for amd64 and arm64 (`ghcr.io/qelphybox/tg-mcp`), your own app id from my.telegram.org, HTTPS on a public hostname
+- [Privacy policy](https://tgmcp.dev/privacy.html): what the public server stores and what it never stores
+
+## Optional
+
+- [Architecture decisions](https://github.com/qelphybox/tg-mcp/tree/main/docs/adr)
+- [Releases](https://github.com/qelphybox/tg-mcp/releases)
+- [Issues and support](https://github.com/qelphybox/tg-mcp/issues)
