@@ -586,7 +586,7 @@ python3 scripts/refresh-reuse-check.py   # expect every line [PASS] and exit sta
 Then, within 15 minutes, the server's side of it:
 
 ```sh
-logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
 logs | grep -E 'refresh token misused|revoked grant'
 # expect 4 lines: WARN "refresh token misused, grant revoked" with grant_id=… reason="refresh_reuse",
 #   then INFO "revoked grant's live client logged its telegram session out" with the same grant_id;
@@ -600,7 +600,7 @@ The Wrapped keys of used refresh Tokens leave the database within minutes. Use y
 
 ```sh
 mkdir -p /tmp/tgmcp-dump
-ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
+ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
 python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
@@ -622,11 +622,11 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 
    ```sh
    mkdir -p /tmp/tgmcp-dump
-   ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
+   ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump
    python3 - /tmp/tgmcp-dump/tg-mcp.db <<'PY'
    import sqlite3, sys
    db = sqlite3.connect(sys.argv[1])
-   print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 4
+   print(db.execute("SELECT max(version) FROM _sqlx_migrations").fetchone()[0])  # expect 4, or 5 once #44 (Send allow-list) is deployed
    print(db.execute("SELECT scopes, count(*) FROM grants GROUP BY scopes").fetchall())
    # expect [('read', N)]: every Grant from before is read-only (run this before steps 4-6, which add their own)
    PY
@@ -681,7 +681,7 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 8. **The server's side**, within 15 minutes of the runs:
 
    ```sh
-   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
    logs | grep -E 'authorization code issued|grant created'
    # expect a pair per login of steps 4-7 with client_id / grant_id and scopes=read, scopes=read, scopes=read draft, scopes=read
    logs | grep -c 'tgm_'   # expect 0: no Token is ever logged
@@ -696,8 +696,8 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 1. **Configuration.** Production runs on the defaults, 20 writes per account in any 10 minutes and 5 messages per chat in any minute:
 
    ```sh
-   ssh deploy@$KAMAL_HOST 'docker exec $(docker ps -qf label=service=tg-mcp) printenv TG_MCP_ACCOUNT_WRITES_PER_10_MIN TG_MCP_CHAT_SENDS_PER_MINUTE'
-   # expect no output (exit status 1): neither is set, so the defaults apply; if one is set, record its value
+   ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $(docker ps -qf label=service=tg-mcp)' | grep -E 'WRITES_PER|SENDS_PER'
+   # expect no output (exit status 1): neither is set, so the defaults apply; if one is set, record its value (the image has no printenv)
    ```
 
 2. **Reading is unaffected.** With the regular connector (a `read` Grant), ask Claude Code "list my latest Telegram chats, then show the last 20 messages of the first one and search my chats for 'hello'". `list_chats`, `get_messages` and `search_messages` answer as before, with no "retry in" error, and `tools/list` has no write tool (`save_draft` needs `draft`).
@@ -705,7 +705,7 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 3. **The server's side**, within 15 minutes of step 2:
 
    ```sh
-   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
    logs | grep -cE 'class=.?writes|over a write limit|PEER_FLOOD'   # expect 0: reading spends no writes (run it before step 4)
    ```
 
@@ -737,7 +737,7 @@ Needs Telegram open on a phone and on Telegram Desktop with the account, a priva
 2. **Markdown becomes formatting, on phone and desktop.** With `telegram-drafts`, ask:
 
    ~~~text
-   Use save_draft in my Saved Messages with exactly the text between the lines, keeping every character:
+   Call save_draft in my Saved Messages. Do not pass the format parameter at all (the default is markdown, which turns ** _ ` [..](..) and ``` into Telegram formatting) and do not escape anything. Use this text, from the line after --- to the line before ---:
    ---
    😀 **Release** _notes_: run `cargo test`, see [the PR](https://github.com/qelphybox/tg-mcp)
    ```rust
@@ -769,7 +769,7 @@ Needs Telegram open on a phone and on Telegram Desktop with the account, a priva
 8. **The server's side**, within 15 minutes of the steps:
 
    ```sh
-   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
    logs | grep 'draft saved' | tail -5
    # expect lines with grant_id, chat (e.g. chat=user:N, chat=channel:N), topic, reply_to, chars, entities and cleared: ids and sizes only
    logs | grep -cE 'Release|lorem|in releases|draft A|about this'   # expect 0: Draft text is never logged
@@ -830,7 +830,7 @@ Needs an account with at least one Chat folder that is a plain list of chats ("W
 7. **The server's side**, within 15 minutes of steps 2-6:
 
    ```sh
-   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
    logs | grep -E 'consent chat pickers loaded|consent chat search'
    # expect folders=N recent=100 per Choose chats, and found=N offered=N per search: counts only
    logs | grep -E 'authorization code issued|grant created' | grep 'read send'
@@ -923,7 +923,7 @@ Steps 1-4 need only #45. Steps 5-12 use `send_message` (#46, its own checks are 
 13. **The server's side**, within 15 minutes of the steps:
 
     ```sh
-    logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+    logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
     logs | grep -E 'pending send|confirmed write|sent without confirmation'
     # expect "pending send made" (grant_id, chat, chars, entities), "pending send confirmed: message sent" (grant_id, chat, message_id),
     # "pending send made a draft", "pending send cancelled", "pending send decision refused: not the consent browser",
@@ -975,7 +975,7 @@ Needs what §55 needs, its two connectors, `telegram-send` (step 3: A and the fo
 9. **The server's side**, within 15 minutes of the steps:
 
    ```sh
-   logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
    logs | grep -E 'sent without confirmation|not sent again|pending send'
    # expect "message sent without confirmation (auto-send)" (grant_id, chat, message_id),
    # "same text to the same chat within a minute: not sent again" (grant_id, chat, message_id of the earlier one),
@@ -1019,7 +1019,7 @@ Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its 
 10. **The server's side**, within 15 minutes of the steps:
 
     ```sh
-    logs() { ssh deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+    logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
     logs | grep -E 'reaction written|chat marked read'
     # expect "reaction written" with grant_id, chat, message_id and set=true/false,
     # and "chat marked read" with grant_id, chat, topic and up_to: ids only

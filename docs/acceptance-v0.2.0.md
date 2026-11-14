@@ -27,11 +27,12 @@ About 2 hours of hands-on time plus the hour of block G. 9 QR scans.
 ```bash
 bash
 set -a; . ./.env; set +a
-logs() { ssh deploy@$KAMAL_HOST "docker logs --since ${1:-15m} \$(docker ps -qf label=service=tg-mcp) 2>&1"; }
-dump() { rm -rf /tmp/tgmcp-dump && mkdir -p /tmp/tgmcp-dump && ssh deploy@$KAMAL_HOST 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump; }
+SSHD="ssh -i $HOME/.ssh/tg-mcp-deploy -o IdentitiesOnly=yes ${KAMAL_SSH_USER:-deploy}@$KAMAL_HOST"
+logs() { $SSHD "docker logs --since ${1:-15m} \$(docker ps -qf label=service=tg-mcp) 2>&1"; }
+dump() { rm -rf /tmp/tgmcp-dump && mkdir -p /tmp/tgmcp-dump && $SSHD 'docker run --rm -v tg-mcp-data:/data:ro busybox tar -C /data -cf - .' | tar -xf - -C /tmp/tgmcp-dump; }
 ```
 
-`logs` takes an optional window (`logs 40m`); the sections' greps work on it as written. `dump` replaces the `mkdir … | tar` lines of the sections; their Python snippets then read `/tmp/tgmcp-dump/tg-mcp.db`.
+The `deploy` user only takes the deploy key that `scripts/setup-deploy.sh` made (`~/.ssh/tg-mcp-deploy`), not your personal key; where a section writes `ssh … deploy@$KAMAL_HOST '…'`, `$SSHD '…'` is the same. `logs` takes an optional window (`logs 40m`): steps with several QR logins easily take longer than the sections' 15 minutes, so widen it rather than miss lines. `dump` replaces the `mkdir … | tar` lines of the sections; their Python snippets then read `/tmp/tgmcp-dump/tg-mcp.db`.
 
 ## A. Before any new login (no QR)
 

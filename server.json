@@ -3,7 +3,7 @@
   "name": "io.github.qelphybox/tg-mcp",
   "title": "Telegram (tg-mcp)",
   "description": "Your personal Telegram account for AI: read, search and sum up chats. QR login, no API key.",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "websiteUrl": "https://tgmcp.dev",
   "repository": {
     "url": "https://github.com/qelphybox/tg-mcp",
