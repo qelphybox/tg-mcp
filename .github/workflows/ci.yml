@@ -21,6 +21,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # release.yml syncs the README to Docker Hub, whose full description takes
+      # at most 25,000 bytes.
+      - name: README fits Docker Hub's description
+        run: |
+          size="$(wc -c < README.md)"
+          test "$size" -le 25000 || {
+            echo "::error::README.md is $size bytes; Docker Hub's full description takes at most 25000" >&2; exit 1; }
 
   # The image a self-hoster pulls, run the way they would (#101):
   # scripts/container-smoke-test.sh. No secrets, so forks run it too.

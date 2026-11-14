@@ -137,6 +137,23 @@ Production follows `main`; releases are for self-hosters. Bump `version` in `Car
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` checks the tag matches `Cargo.toml` and that the Built-in app secrets (`TG_MCP_BUILTIN_API_ID`, `TG_MCP_BUILTIN_API_HASH`, see the table above) are set, compiles them in through BuildKit secrets, builds `linux/amd64` and `linux/arm64` (the Dockerfile cross-compiles, no emulation), pushes `ghcr.io/qelphybox/tg-mcp:{0.1.0,0.1,latest}` and creates a GitHub Release with generated notes. Run [the acceptance checks](acceptance.md) before tagging and put the memory numbers in the release notes.
+`.github/workflows/release.yml` checks the tag matches `Cargo.toml` and that the Built-in app secrets (`TG_MCP_BUILTIN_API_ID`, `TG_MCP_BUILTIN_API_HASH`, see the table above) are set, compiles them in through BuildKit secrets, builds `linux/amd64` and `linux/arm64` (the Dockerfile cross-compiles, no emulation) once, and pushes the result with the tags `0.1.0`, `0.1` and `latest` to both registries, so both carry the same digest:
+
+- **Docker Hub, `qelphybox/tg-mcp`**: the image's home. The release also syncs the repository's full description from `README.md` (at most 25,000 bytes, CI checks; relative links become absolute). The short description is set by hand on Docker Hub: "Unofficial Telegram MCP server: read, search, sum up chats; draft and send where you allow."
+- **GHCR, `ghcr.io/qelphybox/tg-mcp`**: a mirror of release tags for installs that already pull from it, until the 0.3.x releases end (announced in the CHANGELOG).
+
+It then creates a GitHub Release naming both images. Run [the acceptance checks](acceptance.md) before tagging and put the memory numbers in the release notes.
+
+Every push to `main` also builds both architectures and pushes `qelphybox/tg-mcp:<git sha>` and `:edge` to Docker Hub (`.github/workflows/publish.yml`), with the Built-in app when its secrets are set. `latest` and the version tags move only on releases. Production doesn't deploy these yet: Kamal still builds its own image (above).
+
+Docker Hub setup, once, by the maintainer:
+
+| Name | Kind | What |
+| --- | --- | --- |
+| `DOCKERHUB_USERNAME` | variable | The Docker Hub account that owns `qelphybox/tg-mcp`. While it or `DOCKERHUB_TOKEN` is unset (forks), every Docker Hub step is skipped and releases go to GHCR only |
+| `DOCKERHUB_TOKEN` | secret | A Docker Hub personal access token with **Read & Write** access: pushes `<sha>`, `edge` and release tags. It exists only in GitHub Secrets and is used only by `publish.yml` and `release.yml`. Add it before (or together with) the variable |
+| `DOCKERHUB_DESCRIPTION_TOKEN` | secret, optional | A second token with **Read, Write, Delete** access, which Docker Hub's API requires to change a repository's description. Used only by the release's description step; without it the README isn't synced |
+
+Create the repository `qelphybox/tg-mcp` on Docker Hub (public) before the first push.
 
 The GHCR package is private until its visibility is set to public once (GitHub → Packages → tg-mcp → Package settings).
