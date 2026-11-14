@@ -495,6 +495,48 @@ mod tests {
 
     use super::*;
 
+    thread_local! {
+        static LOGS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Writes into the calling thread's [`LOGS`].
+    struct ThreadLogs;
+
+    impl std::io::Write for ThreadLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LOGS.with(|logs| logs.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Starts capturing this thread's log lines (see [`captured_logs`]).
+    ///
+    /// One global subscriber for the whole test binary, not a per-test
+    /// `set_default`: with a single scoped subscriber, tracing caches each
+    /// callsite's interest from whichever thread hits it first, so a test
+    /// without one running in parallel could switch the warning off for good.
+    fn capture_logs() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(|| ThreadLogs)
+                    .finish(),
+            )
+            .expect("no other global subscriber in the unit tests");
+        });
+        LOGS.with(|logs| logs.borrow_mut().clear());
+    }
+
+    /// What this thread logged since [`capture_logs`].
+    fn captured_logs() -> String {
+        LOGS.with(|logs| String::from_utf8(logs.borrow().clone()).unwrap())
+    }
+
     fn config(per_minute: u32, burst: u32) -> LimitsConfig {
         LimitsConfig {
             per_minute,
@@ -670,25 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_flood_wait_warning_names_the_method_telegram_throttled() {
-        #[derive(Clone, Default)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let sink = Sink::default();
-        let writer = sink.clone();
-        let _logs = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish(),
-        );
+        capture_logs();
         let limiter = AccountLimiter::new(config(600, 20));
         let calls = AtomicU32::new(0);
         let flooded = limiter
@@ -700,7 +724,7 @@ mod tests {
             flooded,
             Err(TgError::FloodWait { seconds: 300, .. })
         ));
-        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let logs = captured_logs();
         assert!(
             logs.contains("seconds=300")
                 && logs.contains("class=\"default\"")
@@ -959,25 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_flood_wait_warning_names_the_method_too() {
-        #[derive(Clone, Default)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let sink = Sink::default();
-        let writer = sink.clone();
-        let _logs = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish(),
-        );
+        capture_logs();
         let limiter = AccountLimiter::new(LimitsConfig::default());
         let calls = AtomicU32::new(0);
         let drafted = limiter
@@ -997,7 +1003,7 @@ mod tests {
             })
             .await;
         assert!(matches!(sent, Err(TgError::FloodWait { seconds: 40, .. })));
-        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let logs = captured_logs();
         assert!(
             logs.contains("seconds=30")
                 && logs.contains("method=\"messages.saveDraft\"")
