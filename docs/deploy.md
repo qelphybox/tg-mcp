@@ -14,12 +14,32 @@ kamal-proxy terminates TLS with a Let's Encrypt certificate for the host. `text/
 
 Client IPs: the app only sees kamal-proxy as its TCP peer. kamal-proxy (with `ssl: true` and `forward_headers` unset, so false) drops any `X-Forwarded-For` the client sent and sets it to the address it accepted the connection from; with `forward_headers: true` it would append that address instead. Either way the right-most entry is the real client, and `TG_MCP_TRUST_FORWARDED_FOR=1` makes the app read it for the per-IP limits on `/register`, `/authorize`, `/token`, `/revoke`, `/media/{ticket}` and on pending logins. Don't set kamal-proxy's `client_ip_header`: it would copy a client-controlled header into `X-Forwarded-For`.
 
-Media links (`get_media`, #36): `GET /media/{ticket}` carries its credential in the path, because the agent fetching it with curl has no token. The app never logs tickets, URLs or file bytes, but kamal-proxy's access log (`kamal proxy logs`) records request paths, so a ticket can end up there. This was accepted: a ticket works for 5 minutes and 3 downloads at most, for one file, and the proxy log stays on the server, where whoever can read it can read the app's memory too. Response buffering is off in `config/deploy.yml` (`proxy.buffering.responses: false`): by default kamal-proxy holds a response whole and writes anything over 1 MB to disk, which would put downloaded files on the server's disk. Downloads stream through it with their `Content-Length`.
+Media links (`get_media`, #36): `GET /media/{ticket}` carries its credential in the path, because the agent fetching it with curl has no token. The app never logs tickets, URLs or file bytes, but kamal-proxy's access log (`kamal proxy logs`) records request paths, so a ticket can end up there. This was accepted: a ticket works for 5 minutes and 3 downloads at most, for one file, and the proxy log stays on the server for 14 days at most (see Logs below), where whoever can read it can read the app's memory too. Response buffering is off in `config/deploy.yml` (`proxy.buffering.responses: false`): by default kamal-proxy holds a response whole and writes anything over 1 MB to disk, which would put downloaded files on the server's disk. Downloads stream through it with their `Content-Length`.
 
 ## What survives a deploy
 
 - **Survives:** everything in SQLite (Grants, Tokens, encrypted Telegram sessions) on the `tg-mcp-data` volume, mounted at `/data`.
 - **Lost:** in-memory state: open MCP sessions (clients re-initialize on their own), Live clients (reconnect lazily on the next call; Telegram session changes they held, such as a DC migration, are re-sealed on a graceful shutdown, but lost on SIGKILL or a crash), authorization codes and logins in progress (the user starts the browser flow again), Media links (their downloads 404; the agent calls `get_media` again), the duplicate guard of `send_message` (a text sent in the minute before the deploy can be sent again right after it), rate-limit counters (they start full again).
+
+## Logs: 14 days
+
+The app and kamal-proxy log to journald on the server (`logging` and `proxy.run.options` in `config/deploy.yml`, and Docker's default in `daemon.json`). `scripts/harden-server.sh` configures journald to delete entries older than 14 days (`MaxRetentionSec=14day`, one journal file per day so the cut is within a day of 14) and to use at most 1 GB. Neither ships logs anywhere else.
+
+What the app logs carry: ids, counts and sizes (Grant, Chat and message ids, rate-limit and stats counters), never message content, Tokens, Session keys, Telegram sessions or chat titles. kamal-proxy's access log adds request paths, which can include a Media link ticket (above).
+
+```sh
+kamal app logs -f                                   # from a clone, as before (docker logs reads journald)
+ssh deploy@$KAMAL_HOST journalctl -t tg-mcp -f      # on the server: the app, across deploys
+ssh deploy@$KAMAL_HOST journalctl -t kamal-proxy --since -1h
+```
+
+(`scripts/harden-server.sh` puts `deploy` in `systemd-journal`, so it can read these; it is in `docker` already, which is root-equivalent, so that grants nothing new.)
+
+## Backups: none, on purpose
+
+The `tg-mcp-data` volume on the server is the database's only copy, and nothing backs it up. Losing it means every user connects again (QR login and Consent); nothing else is lost, since the server stores no messages.
+
+A backup wouldn't spare them that. Refresh Tokens rotate on every refresh, and the database keeps only verifiers and Wrapped keys, never Tokens. Yesterday's copy has none of the Wrapped keys for today's Tokens, so restoring it still makes every client log in again. A copy is harmless (without Tokens it opens no Telegram session, ADR-0003) but useless, so there is none to keep safe.
 
 ## First deploy
 
@@ -46,11 +66,12 @@ The registry password is the workflow's own `GITHUB_TOKEN`; nothing to set. Re-r
 `scripts/harden-server.sh` (Debian/Ubuntu, run as root, idempotent) leaves the server like this:
 
 - **SSH:** public keys only (passwords and keyboard-interactive off), root allowed with a key only, `AllowUsers root deploy`, 3 attempts per connection. The config is a drop-in named `00-tg-mcp.conf` so it beats cloud-init's `50-cloud-init.conf` (sshd keeps the first value it reads), and it is checked with `sshd -t` before the reload. The script refuses to run if root has no key, so it can't lock you out.
-- **`deploy` user:** what Kamal and CI log in as. Member of `docker`, password locked, only the CI deploy key. Note that `docker` group membership is root-equivalent: the point is a separate, revocable key, not a sandbox. You keep administering as root with your personal key.
+- **`deploy` user:** what Kamal and CI log in as. Member of `docker` and `systemd-journal` (reads the logs), password locked, only the CI deploy key. Note that `docker` group membership is root-equivalent: the point is a separate, revocable key, not a sandbox. You keep administering as root with your personal key.
 - **Firewall (ufw):** incoming denied except 22 (rate-limited), 80 and 443.
 - **fail2ban:** sshd jail, 5 failures in 10 min → 1 h ban.
 - **Updates:** unattended-upgrades for the distro security pocket and Docker CE; reboots at 04:30 UTC when an update needs it. Containers come back on their own (`--restart unless-stopped`); in-memory state is lost as on a deploy.
-- **Docker CE** from download.docker.com, daemon with `live-restore` (containers survive a dockerd upgrade), `no-new-privileges`, and log rotation.
+- **Docker CE** from download.docker.com, daemon with `live-restore` (containers survive a dockerd upgrade), `no-new-privileges`, and journald as the log driver.
+- **journald:** entries older than 14 days are deleted, at most 1 GB (see Logs above).
 
 Caveat: Docker writes its own iptables rules, so a port published with `-p` bypasses ufw. Kamal publishes only kamal-proxy's 80/443 and keeps the app on the internal Docker network, so nothing else is exposed. Don't add `publish`/`-p` options without a firewall rule in mind.
 

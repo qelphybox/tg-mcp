@@ -95,6 +95,8 @@ If the proxy sets or appends `X-Forwarded-For` from the address it accepted the 
 
 Images are published for `linux/amd64` and `linux/arm64` on every release tag: a static binary on `distroless/static`, about 15 MB, running as non-root, with its database at `/data/tg-mcp.db` (mount a volume there). All settings are environment variables, documented in [`.env.example`](.env.example).
 
+Back up nothing, and keep logs short. The `/data` volume is the database's only copy, and losing it means every user connects again. A backup wouldn't prevent that: refresh Tokens rotate, so an old copy can't serve today's clients. And without Tokens the copy opens nothing. The server logs ids and sizes only; the hosted instance keeps them 14 days in journald ([docs/deploy.md](docs/deploy.md), Logs and Backups).
+
 This repository also deploys itself with [Kamal](https://kamal-deploy.org) to a single VPS (zero-downtime rollouts, automatic Let's Encrypt): see [docs/deploy.md](docs/deploy.md). `scripts/setup-deploy.sh` walks through the one-time setup, including server hardening.
 
 ## Development
