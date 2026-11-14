@@ -1204,3 +1204,26 @@ The precedence is covered by `cargo test --lib config::` (`TG_MCP_BIND` over `PO
 4. **A bad `PORT` stops it at once.** `docker run --rm -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=http $img` exits with `Error: PORT must be a port number (1-65535), not "http"`.
 
 5. **Production is unchanged.** `curl -s https://connector.tgmcp.dev/.well-known/oauth-authorization-server | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'` prints `https://connector.tgmcp.dev`, and the server's `listening` line says `public_url_source=TG_MCP_PUBLIC_URL` (`config/deploy.yml` sets both variables).
+
+## 69. Official images log in through the Built-in app, your own app wins, and neither value shows outside the binary
+
+Needs the repository secrets `TG_MCP_BUILTIN_API_ID` / `TG_MCP_BUILTIN_API_HASH` (a second Telegram app on a second phone number, never production's), a release image built with them (`ghcr.io/qelphybox/tg-mcp:<version>`), Docker, and an Account to log in with. The precedence is covered by `cargo test --lib config::` (env beats built-in; built-in when env is absent or empty; fake Telegram needs neither; the error names both ways out; the reported source).
+
+1. **The release guard.** Before adding the secrets (or in a fork), push a tag: the Release run fails at "Built-in Telegram app secrets are set" with "Repository secrets TG_MCP_BUILTIN_API_ID and TG_MCP_BUILTIN_API_HASH must be set …", and nothing is pushed. With the secrets, the same step passes.
+
+2. **No Telegram variables at all.** `docker run -d --name b69 -p 127.0.0.1:8080:8080 -v b69:/data ghcr.io/qelphybox/tg-mcp:<version>`; `docker logs b69` shows `using Telegram app api_id=<the built-in id> source=builtin` and no hash. `claude mcp add --transport http telegram-b69 http://localhost:8080/mcp`, Authenticate, scan the QR, Allow: `whoami` names the Account. In Telegram → Settings → Devices the new session is the Built-in app's (its title, not production's). Terminate it there, `claude mcp remove telegram-b69`.
+
+3. **Your own app wins.** The same with `-e TG_MCP_API_ID=<yours> -e TG_MCP_API_HASH=<yours>` (another container name and volume): `source=env api_id=<yours>`. With only one of the two set, or both empty: `source=builtin`.
+
+4. **An image without the secrets behaves as before.** `docker build -t tg-mcp:nosecret . && docker run --rm tg-mcp:nosecret` exits with `Error: no Telegram app: set TG_MCP_API_ID and TG_MCP_API_HASH (register one at https://my.telegram.org/apps), or run the official image, which has a built-in one (TG_MCP_FAKE_TELEGRAM=1 for development)`.
+
+5. **Neither value outside the binary.** With the built-in values in `$ID` and `$HASH`:
+
+   ```sh
+   img=ghcr.io/qelphybox/tg-mcp:<version>
+   docker history --no-trunc $img | grep -cE "$ID|$HASH"               # expect 0
+   docker buildx imagetools inspect $img --format '{{json .Provenance}}' | grep -cE "$ID|$HASH"   # expect 0
+   docker image inspect $img | grep -cE "$ID|$HASH"                    # expect 0
+   ```
+
+6. **Production still uses its own app.** On the server, `docker logs $(docker ps -qf label=service=tg-mcp) 2>&1 | grep 'using Telegram app'` shows `source=env` and production's api_id, not the built-in one.

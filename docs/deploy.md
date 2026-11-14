@@ -34,6 +34,7 @@ It collects the Telegram api_id/api_hash, makes sure your personal key opens `ro
 | Name | Kind | What |
 | --- | --- | --- |
 | `TG_MCP_API_ID`, `TG_MCP_API_HASH` | secret | Telegram app credentials (my.telegram.org) |
+| `TG_MCP_BUILTIN_API_ID`, `TG_MCP_BUILTIN_API_HASH` | secret | The Built-in app of release images ([ADR-0007](adr/0007-built-in-telegram-app-in-official-images.md)). Set by hand, not by the wizard: a **second** Telegram app, registered at my.telegram.org from a **second** phone number, never production's. The release workflow fails without them. |
 | `SSH_PRIVATE_KEY` | secret | Deploy key, `~/.ssh/tg-mcp-deploy` |
 | `KAMAL_HOST`, `KAMAL_SSH_USER` | variable | Server IP and `deploy` |
 | `SSH_KNOWN_HOSTS` | variable | Pinned host key; CI refuses any other |
@@ -136,6 +137,6 @@ Production follows `main`; releases are for self-hosters. Bump `version` in `Car
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` checks the tag matches `Cargo.toml`, builds `linux/amd64` and `linux/arm64` (the Dockerfile cross-compiles, no emulation), pushes `ghcr.io/qelphybox/tg-mcp:{0.1.0,0.1,latest}` and creates a GitHub Release with generated notes. Run [the acceptance checks](acceptance.md) before tagging and put the memory numbers in the release notes.
+`.github/workflows/release.yml` checks the tag matches `Cargo.toml` and that the Built-in app secrets (`TG_MCP_BUILTIN_API_ID`, `TG_MCP_BUILTIN_API_HASH`, see the table above) are set, compiles them in through BuildKit secrets, builds `linux/amd64` and `linux/arm64` (the Dockerfile cross-compiles, no emulation), pushes `ghcr.io/qelphybox/tg-mcp:{0.1.0,0.1,latest}` and creates a GitHub Release with generated notes. Run [the acceptance checks](acceptance.md) before tagging and put the memory numbers in the release notes.
 
 The GHCR package is private until its visibility is set to public once (GitHub → Packages → tg-mcp → Package settings).

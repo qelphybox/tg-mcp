@@ -54,7 +54,9 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         (false, Some(app)) => {
-            tracing::info!(api_id = app.api_id, "using Telegram app");
+            // ADR-0007: the source and the api_id, never the hash.
+            tracing::info!(api_id = app.credentials.api_id, source = %app.source, "using Telegram app");
+            let app = app.credentials;
             (
                 Arc::new(GrammersLogin::new(app.clone())),
                 GrammersConnector::new(

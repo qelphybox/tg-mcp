@@ -150,15 +150,18 @@ async fn serve(
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let config = Config::from_lookup(|key| match key {
-        "TG_MCP_PUBLIC_URL" => Some(base.clone()),
-        "TG_MCP_FAKE_TELEGRAM" => Some("1".into()),
-        _ => env
-            .iter()
-            .chain(RELAXED_LIMITS)
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.to_string()),
-    })
+    let config = Config::from_lookup(
+        |key| match key {
+            "TG_MCP_PUBLIC_URL" => Some(base.clone()),
+            "TG_MCP_FAKE_TELEGRAM" => Some("1".into()),
+            _ => env
+                .iter()
+                .chain(RELAXED_LIMITS)
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string()),
+        },
+        None,
+    )
     .unwrap();
     let pool = db::open(&dir.path().join("test.db")).await.unwrap();
     let mut vault = Vault::new(pool.clone(), TokenTtl::default());
