@@ -6,6 +6,10 @@
 - Removed with it: `/confirm/{id}` (now 404) and its rate limit (`TG_MCP_CONFIRM_PER_MINUTE` / `TG_MCP_CONFIRM_BURST` are ignored), pending sends, URL elicitation, the `tgm_confirm_…` cookie (no longer set or read; one left in a browser expires on its own) and the Consent screen's "Send to these chats without asking me" switch. The server's instructions and the tool descriptions no longer mention confirming. Send allow-lists sealed before still open; their Auto-send flag and cookie verifier are ignored.
 - **Landing page: text apart from behaviour.** The page's script moved to `site/landing.js`, shared by every language page; the text it shows (install steps and notes, the phone demo's messages and tool-call details, Copy / Copied, the star count's label) comes from a dictionary picked by `<html lang>`, and any key a language leaves out, or gives in the wrong shape, falls back to English. The English page looks and works as before. `tests/site/landing-check.cjs` checks the page with Playwright (widths, requests, the buttons, the demo, the fallback, no JavaScript).
 
+### Fixed
+
+- **`list_chats` no longer drops pinned chats beyond `limit`** (#68). With more pinned chats than `limit`, the next page goes on with the next pinned chat instead of starting the unpinned list, so every pinned chat appears once across the pages of one listing: main list, Archive and `unread_only` alike. A page that continues the pinned chats is still one `messages.getDialogs` call. Cursors issued before keep working as they did.
+
 ## 0.2.0
 
 ### New address
