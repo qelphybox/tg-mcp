@@ -12,6 +12,9 @@ on:
       command:
         type: string
         default: deploy
+      version:
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       command:
@@ -42,6 +45,10 @@ jobs:
     environment:
       name: production
       url: https://connector.tgmcp.dev
+    # -eo pipefail: a failed `imagetools inspect` must fail its step, not hide behind `tr`.
+    defaults:
+      run:
+        shell: bash
     env:
       IMAGE: ghcr.io/qelphybox/tg-mcp
       COMMAND: ${{ inputs.command || 'deploy' }}
@@ -62,6 +69,7 @@ jobs:
           [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full commit sha, got: $VERSION" >&2; exit 1; }
           digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')" || {
             echo "::error::$IMAGE:$VERSION is not published: wait for (or re-run) that commit's Publish run" >&2; exit 1; }
+          [[ "$digest" == sha256:* ]] || { echo "::error::no digest for $IMAGE:$VERSION (got '$digest')" >&2; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Deploying $IMAGE:$VERSION = $digest" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -92,6 +100,7 @@ jobs:
         env:
           DIGEST: ${{ steps.published.outputs.digest }}
         run: |
+          [[ "$DIGEST" == sha256:* ]] || { echo "::error::no published digest to compare with" >&2; exit 1; }
           out="$(kamal server exec "docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' $IMAGE:$VERSION")"
           printf '%s\n' "$out"
           grep -qF "$IMAGE@$DIGEST" <<<"$out" || { echo "::error::the server's $IMAGE:$VERSION is not $DIGEST" >&2; exit 1; }

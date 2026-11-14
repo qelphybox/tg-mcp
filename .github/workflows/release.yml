@@ -112,6 +112,10 @@ jobs:
       packages: write
     env:
       VERSION: ${{ inputs.version }}
+    # -eo pipefail: a failed `imagetools inspect` must fail its step, not hide behind `tr`.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: The version is a published release
         id: source
@@ -120,6 +124,7 @@ jobs:
           echo "minor=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')" || {
             echo "::error::$IMAGE:$VERSION is not published" >&2; exit 1; }
+          [[ "$digest" == sha256:* ]] || { echo "::error::no digest for $IMAGE:$VERSION (got '$digest')" >&2; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
 
