@@ -89,7 +89,6 @@ docker run -d --name tg-mcp --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -v tg-mcp-data:/data \
   -e TG_MCP_PUBLIC_URL=https://tg.example.com \
-  -e TG_MCP_DB_PATH=/data/tg-mcp.db \
   -e TG_MCP_API_ID=123456 \
   -e TG_MCP_API_HASH=your_api_hash \
   ghcr.io/qelphybox/tg-mcp:latest
@@ -97,7 +96,7 @@ docker run -d --name tg-mcp --restart unless-stopped \
 
 If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's.
 
-Images are published for `linux/amd64` and `linux/arm64` on every release tag. All settings are environment variables, documented in [`.env.example`](.env.example).
+Images are published for `linux/amd64` and `linux/arm64` on every release tag: a static binary on `distroless/static`, about 15 MB, running as non-root, with its database at `/data/tg-mcp.db` (mount a volume there). All settings are environment variables, documented in [`.env.example`](.env.example).
 
 This repository also deploys itself with [Kamal](https://kamal-deploy.org) to a single VPS (zero-downtime rollouts, automatic Let's Encrypt): see [docs/deploy.md](docs/deploy.md). `scripts/setup-deploy.sh` walks through the one-time setup, including server hardening.
 
