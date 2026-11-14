@@ -79,34 +79,33 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 
 ## Self-hosting
 
-With Docker Compose, from a clone of this repository ([`compose.yaml`](compose.yaml)):
+One command, no configuration:
 
 ```sh
-docker compose up -d                                              # http://localhost:8080/mcp, for Claude Code, Cursor and other local clients
-TG_MCP_DOMAIN=tg.example.com docker compose --profile https up -d   # https://tg.example.com/mcp through Caddy and Let's Encrypt
+docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data qelphybox/tg-mcp
+claude mcp add --transport http telegram http://localhost:8080/mcp
 ```
 
-The `https` profile is what claude.ai and Claude desktop need: they reach connectors from Anthropic's cloud, so the server needs a public HTTPS URL. Point the domain's DNS at the server and open ports 80 and 443. tg-mcp itself listens only on `127.0.0.1:8080`.
+Then `/mcp` → `telegram` → Authenticate, scan the QR code, Allow. From v0.3.0 the image logs in to Telegram through a built-in Telegram app, keeps its database on the `/data` volume and runs as non-root: a static binary of about 15 MB for `linux/amd64` and `linux/arm64`. Add `--restart unless-stopped` to keep it running across reboots.
 
-Or run the image behind your own TLS-terminating reverse proxy that forwards the `Host` header:
+**Localhost is for local clients only.** Claude Code, Cursor and other clients on the same machine can use `http://localhost:8080/mcp`. claude.ai and Claude desktop reach connectors from Anthropic's cloud, so they need a public HTTPS URL: compose's `https` profile on a VPS (below), or a hosting platform (Railway, Render, Fly.io and Koyeb have their public URL and port detected).
+
+**A VPS with a domain:** point the domain's DNS at the server, open ports 80 and 443, and use [`compose.yaml`](compose.yaml) from a clone of this repository:
 
 ```sh
-docker run -d --name tg-mcp --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v tg-mcp-data:/data \
-  -e TG_MCP_PUBLIC_URL=https://tg.example.com \
-  ghcr.io/qelphybox/tg-mcp:latest
+TG_MCP_DOMAIN=tg.example.com docker compose --profile https up -d   # https://tg.example.com/mcp, Caddy + Let's Encrypt
+docker compose up -d                                                # or without a domain: http://localhost:8080/mcp
 ```
 
-Release images from v0.3.0 on log in to Telegram through a built-in Telegram app ([ADR-0007](docs/adr/0007-built-in-telegram-app-in-official-images.md)). To use your own instead, register one at [my.telegram.org/apps](https://my.telegram.org/apps) (please keep "Unofficial" in its title) and add `-e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash`. An image you build yourself without the build secrets needs them.
+**Your own Telegram app (optional).** Register one at [my.telegram.org/apps](https://my.telegram.org/apps) (please keep "Unofficial" in its title) and pass `-e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash` (with compose: set them in the shell or in `.env`). That gives your logins their own quota and keeps them independent of the built-in app ([ADR-0007](docs/adr/0007-built-in-telegram-app-in-official-images.md)). The startup log says which app is in use. An image you build yourself has no built-in app and needs them.
 
-If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's.
+**Behind your own reverse proxy:** terminate TLS there, forward the `Host` header, and add `-e TG_MCP_PUBLIC_URL=https://tg.example.com`. If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's. Every setting is in [`.env.example`](.env.example).
 
-Images are published for `linux/amd64` and `linux/arm64` on every release tag: a static binary on `distroless/static`, about 15 MB, running as non-root, with its database at `/data/tg-mcp.db` (mount a volume there). All settings are environment variables, documented in [`.env.example`](.env.example).
+**Moving from GHCR:** `ghcr.io/qelphybox/tg-mcp` gets the same releases through 0.3.x only. Switch to `qelphybox/tg-mcp`, keeping the same `/data` volume.
 
-Back up nothing, and keep logs short. The `/data` volume is the database's only copy, and losing it means every user connects again. A backup wouldn't prevent that: refresh Tokens rotate, so an old copy can't serve today's clients. And without Tokens the copy opens nothing. The server logs ids and sizes only; the hosted instance keeps them 14 days in journald ([docs/deploy.md](docs/deploy.md), Logs and Backups).
+No backups needed: refresh Tokens rotate, so an old copy of `/data` couldn't serve today's clients anyway (losing it means users connect again), and without Tokens it opens nothing. Logs carry ids and sizes only ([docs/deploy.md](docs/deploy.md), Logs and Backups).
 
-This repository also deploys itself with [Kamal](https://kamal-deploy.org) to a single VPS (zero-downtime rollouts, automatic Let's Encrypt): see [docs/deploy.md](docs/deploy.md). `scripts/setup-deploy.sh` walks through the one-time setup, including server hardening.
+The hosted instance is deployed in public from `main` by GitHub Actions to one VPS with [Kamal](https://kamal-deploy.org) ([docs/deploy.md](docs/deploy.md)); `scripts/setup-deploy.sh` sets up a server like it, hardening included.
 
 ## Development
 

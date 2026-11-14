@@ -1308,3 +1308,28 @@ Needs Docker with Compose 2.23.1 or later and a clone; for steps 3–5 a VPS wit
 5. **Streams aren't buffered.** `docker compose exec caddy caddy adapt --config /etc/caddy/Caddyfile` shows `"flush_interval": -1` on the `reverse_proxy` to `tg-mcp:8080`. Then connect claude.ai to `https://<your domain>/mcp` (Settings → Connectors), log in, and ask for `get_media` `download` of a video of a few MB: `curl -sS -o /dev/null -w '%{time_starttransfer} %{time_total}\n' <the link>` shows the first byte well before the end (streamed, not held whole).
 
 6. **Your own Telegram app.** With `TG_MCP_API_ID=… TG_MCP_API_HASH=…` added to `.env`, `docker compose --profile https up -d` recreates tg-mcp and `docker compose logs tg-mcp | grep 'using Telegram app'` shows `source=env`; without them, `source=builtin` (official image) as in §69.
+
+## 72. Self-hosting from the docs: one line locally, HTTPS with compose, your own app as an option
+
+Needs Docker, Claude Code, a Telegram account, and for step 3 a VPS with a domain (§71). Run after v0.3.0 is on Docker Hub (#104, #103 set up), following the README's Self-hosting section word for word: no command may need editing beyond the domain and your own api_id/api_hash.
+
+1. **One line, no configuration.** On a machine that never ran tg-mcp:
+
+   ```sh
+   docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data qelphybox/tg-mcp
+   claude mcp add --transport http telegram http://localhost:8080/mcp
+   c=$(docker ps -qlf ancestor=qelphybox/tg-mcp); docker logs $c 2>&1 | grep -E 'using Telegram app|listening'
+   # expect source=builtin with the built-in api_id, and public_url=http://localhost:8080/ public_url_source=default (…)
+   ```
+
+   In Claude Code: `/mcp` → `telegram` → Authenticate, scan the QR, Allow, then "list my latest Telegram chats": the chats appear. Telegram → Settings → Devices shows the built-in app's session; terminate it there when done. `claude mcp remove telegram; docker rm -f $c`.
+
+2. **Localhost is not for claude.ai.** Adding `http://localhost:8080/mcp` as a connector in claude.ai fails to connect, as the README says it will.
+
+3. **HTTPS with compose.** On the VPS: `git clone https://github.com/qelphybox/tg-mcp && cd tg-mcp && TG_MCP_DOMAIN=<your domain> docker compose --profile https up -d`. Add `https://<your domain>/mcp` in claude.ai (Settings → Connectors), log in, Allow, ask for your latest chats: they appear. (§71 checks the details.)
+
+4. **Your own app.** With the container of step 1 removed, the step 1 `docker run` with `-e TG_MCP_API_ID=<yours> -e TG_MCP_API_HASH=<yours>` added: the log says `source=env api_id=<yours>`, and a new login shows your app's title in Telegram → Settings → Devices.
+
+5. **The landing page.** On `https://tgmcp.dev`, the "Don't trust. Verify." section shows the one-line `docker run` and `claude mcp add`, says localhost is enough for Claude Code and Cursor and that claude.ai needs HTTPS (compose), and nowhere asks for an app id from my.telegram.org (the FAQ included); at 320 px wide nothing scrolls sideways (`node tests/site/landing-check.cjs` passes). The Russian page (`/ru/`) says the same (`node tests/site/landing-check.cjs site /ru/` passes too).
+
+6. **No stale instruction.** `grep -rn -i "app id\|my.telegram" README.md site/ docs/deploy.md .env.example` finds the own-app option, other servers' setup (FAQ) and production's own secrets only, never "required".

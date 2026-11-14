@@ -143,7 +143,7 @@ summary:hover{color:#FFFFFF}
      "name": "Is it free? Do I need an API key or a bot?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "It's free: no sign-up, no payment and no API key. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy."
+      "text": "It's free: no sign-up, no payment and no API key. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's."
      }
     },
     {
@@ -430,16 +430,12 @@ GitHub
 </div>
 <ul style="margin: 56px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 0 48px">
 <li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Open source, MIT.</strong><span style="color: #B4A9C4">Free, forever. The code is yours to read, fork and run.</span><a href="https://github.com/qelphybox/tg-mcp" style="align-self: flex-start; padding: 8px 0">github.com/qelphybox/tg-mcp</a></li>
-<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">One command to self-host.</strong><span style="color: #B4A9C4">Ready images for amd64 and arm64, built from every release tag. Nothing to compile.</span></li>
-<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Deployed in public.</strong><span style="color: #B4A9C4">The public instance deploys from the public main branch through GitHub Actions, with open build logs. No one can prove what a server runs; self-hosting is the answer to that.</span><a href="https://github.com/qelphybox/tg-mcp/actions" style="align-self: flex-start; padding: 8px 0">See the deploys</a></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">One command to self-host.</strong><span style="color: #B4A9C4">A 15 MB image for amd64 and arm64 on Docker Hub, built from every release tag. No configuration and no app id: it logs in through a built-in Telegram app.</span></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Deployed in public.</strong><span style="color: #B4A9C4">The public instance deploys from the public main branch through GitHub Actions, with open build logs. It is built from the same Dockerfile as the image you run. No one can prove what a server runs; self-hosting is the answer to that.</span><a href="https://github.com/qelphybox/tg-mcp/actions" style="align-self: flex-start; padding: 8px 0">See the deploys</a></li>
 </ul>
-<pre style="margin: 32px 0 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 14px; padding: 20px 22px; font-size: 13.5px; line-height: 1.75; color: #F1ECF7; white-space: pre-wrap; word-break: break-word">docker run -d --name tg-mcp --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data \
-  -e TG_MCP_PUBLIC_URL=https://tg.example.com \
-  -e TG_MCP_DB_PATH=/data/tg-mcp.db \
-  -e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash \
-  ghcr.io/qelphybox/tg-mcp:latest</pre>
-<p style="margin: 14px 0 0; font-size: 14.5px; color: #8C809E">You need HTTPS on a public hostname and your own app id from <a href="https://my.telegram.org/apps">my.telegram.org</a>. <a href="https://github.com/qelphybox/tg-mcp#self-hosting">Full guide</a></p>
+<pre style="margin: 32px 0 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 14px; padding: 20px 22px; font-size: 13.5px; line-height: 1.75; color: #F1ECF7; white-space: pre-wrap; word-break: break-word">docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data qelphybox/tg-mcp
+claude mcp add --transport http telegram http://localhost:8080/mcp</pre>
+<p style="margin: 14px 0 0; font-size: 14.5px; color: #8C809E">Localhost is enough for Claude Code and Cursor. claude.ai and Claude desktop need HTTPS on a public hostname: the <code>https</code> profile of the repo's <code>compose.yaml</code> adds it on a VPS with a domain. <a href="https://github.com/qelphybox/tg-mcp#self-hosting">Full guide</a></p>
 </section>
 
 <section id="faq" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 104px; display: flex; flex-wrap: wrap; gap: 24px 64px">
@@ -455,7 +451,7 @@ GitHub
 </details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
 <summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Is it free? Do I need an API key or a bot?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
-<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">It's free: no sign-up, no payment and no API key. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy.</p>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">It's free: no sign-up, no payment and no API key. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's.</p>
 </details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
 <summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">How is it different from other Telegram MCP servers?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
