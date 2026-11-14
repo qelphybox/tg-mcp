@@ -102,6 +102,10 @@ pub struct ChatMessage {
     /// Only in a `thread_of` chain: its root, a message that replies to nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread_root: bool,
+    /// A channel post with comments on: how many it has (read them with
+    /// `comments_of`). Absent on any other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<u32>,
 }
 
 /// A message in some Chat, as the tools name it.
@@ -137,6 +141,10 @@ pub struct MessagePage {
     /// by Topic id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topics: Option<TopicTitles>,
+    /// Only for `comments_of`: the channel post these are the comments of.
+    /// The page's `chat_id` is then the channel's discussion group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments_of: Option<MessageLink>,
 }
 
 /// What kind of media a message carries.
@@ -434,6 +442,20 @@ pub struct RawHistoryMessage {
     /// ([`super::topics::topic_of`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<i32>,
+    /// A channel post with a discussion: how many comments it has
+    /// (`replies` with `comments`). `None` for any other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<u32>,
+}
+
+/// What reading the comments of `chat`'s post `post` is when the post has
+/// no discussion: comments off, or a channel without a discussion group.
+pub fn comments_off(chat: ChatId, post: i32) -> TgError {
+    TgError::InvalidInput(format!(
+        "comments are off for this post: message {post} of {chat} has no discussion \
+         (comments disabled, no linked discussion group, no such post, or {chat} is a group: \
+         comments are for channel posts)"
+    ))
 }
 
 /// A message by its Chat and id.
@@ -812,6 +834,7 @@ impl MessagePage {
             continues_in: None,
             broken_at: None,
             topics: None,
+            comments_of: None,
         }
     }
 
@@ -945,6 +968,7 @@ impl<'a> Issuer<'a> {
                 .then(|| topics::topic_of(m.topic)),
             target: false,
             thread_root: false,
+            comments: m.comments,
         }
     }
 }
@@ -1024,6 +1048,7 @@ mod tests {
 
     fn msg(id: i32, date: i32) -> RawHistoryMessage {
         RawHistoryMessage {
+            comments: None,
             id,
             date,
             from: None,

@@ -30,6 +30,7 @@ const VIDEO_NOTE_SIZE: u64 = 3 * PART_SIZE as u64 + 17;
 
 fn message(id: i32, media: Option<Media>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: 1_793_923_200 + id * 60,
         from: None,

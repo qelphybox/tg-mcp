@@ -34,7 +34,8 @@ use super::{
     },
     messages::{
         HistoryAnswer, HistoryQuery, HistoryRequest, MediaKind, MediaSummary, MessageAnswer,
-        MessageAt, MessagePage, MessageRequest, RawHistoryMessage, read_history,
+        MessageAt, MessageLink, MessagePage, MessageRequest, RawHistoryMessage, comments_off,
+        read_history,
     },
     reactions::{self, NewReaction, Reacted},
     search::{
@@ -135,6 +136,10 @@ pub struct FakeData {
     /// should be their length.
     #[serde(default)]
     pub file_contents: std::collections::HashMap<ChatId, Vec<(i32, Vec<u8>)>>,
+    /// Channel posts with comments: each post's copy in a discussion group
+    /// (#55). The group's history holds the comments, replying to `top`.
+    #[serde(default)]
+    pub discussions: Vec<FakeDiscussion>,
     /// The Account's Chat folders, in the user's order (#29).
     #[serde(default)]
     pub chat_folders: Vec<FakeChatFolder>,
@@ -487,6 +492,16 @@ pub enum FolderRpc {
     DialogFilters,
     /// `messages.getPeerDialogs` for this many Chats.
     PeerDialogs(usize),
+}
+
+/// A channel post's discussion: the message `top` in `group` that the
+/// post's comments reply to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeDiscussion {
+    pub channel: ChatId,
+    pub post: i32,
+    pub group: ChatId,
+    pub top: i32,
 }
 
 /// One Topic of a fake forum.
@@ -863,6 +878,7 @@ impl FakeData {
             topics: Default::default(),
             topics_in_answers: false,
             file_contents: Default::default(),
+            discussions: Vec::new(),
             transcriptions: Default::default(),
             transcribe: FakeTranscribeAccess::default(),
             chat_folders: Vec::new(),
@@ -888,6 +904,18 @@ impl FakeData {
 
     pub fn with_chat_folders(mut self, folders: Vec<FakeChatFolder>) -> Self {
         self.chat_folders = folders;
+        self
+    }
+
+    /// `channel`'s `post` has comments: the messages of `group` replying to
+    /// its `top` message (directly or through other comments).
+    pub fn with_discussion(mut self, channel: ChatId, post: i32, group: ChatId, top: i32) -> Self {
+        self.discussions.push(FakeDiscussion {
+            channel,
+            post,
+            group,
+            top,
+        });
         self
     }
 
@@ -1785,6 +1813,75 @@ pub fn fake_issued_id(chat: ChatId) -> String {
 }
 
 impl FakeTelegram {
+    /// A page of `history`, `id`'s messages (all of them, or a thread), as
+    /// getHistory and getMessages would serve it.
+    async fn history_page(
+        &self,
+        id: ChatRef,
+        history: &[RawHistoryMessage],
+        query: &HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        let chat = id.chat();
+        let peers = self.peers();
+        let mut page = read_history(
+            id,
+            query,
+            &|chat| self.known(chat),
+            |request| {
+                // The pinned messages are a search (method class Search).
+                if let Some(seconds) = self.data.search_flood_wait.filter(|_| request.pinned) {
+                    return std::future::ready(Err(TgError::FloodWait {
+                        seconds,
+                        class: MethodClass::Search,
+                    }));
+                }
+                let messages = get_history(history, &request, self.data.past_newest);
+                // The Chat, the senders of these messages and the original
+                // authors of forwarded ones, as Telegram describes them in a
+                // getHistory answer.
+                let min = self.data.min_past_newest && reaches_past_newest(history, &request);
+                let named = |id| {
+                    messages
+                        .iter()
+                        .any(|m| m.from == Some(id) || m.forwarded_from == Some(id))
+                };
+                let described: Vec<RawPeer> = peers
+                    .iter()
+                    .filter(|p| p.id == chat || named(p.id))
+                    .map(|p| RawPeer {
+                        access_hash: p.access_hash.filter(|_| !min),
+                        ..p.clone()
+                    })
+                    .collect();
+                self.remember(&described);
+                let forums = self.forums_described(&[chat], messages.iter().map(|m| (chat, m)));
+                std::future::ready(Ok(HistoryAnswer {
+                    returned: messages.len(),
+                    messages,
+                    peers: described,
+                    forums,
+                }))
+            },
+            |request| {
+                self.remember(&peers);
+                let messages = get_message(&self.data.messages, chat, &request);
+                // getMessages answers describe no Topics.
+                let forums = self.forums_described(&[chat], std::iter::empty());
+                std::future::ready(Ok(MessageAnswer {
+                    messages,
+                    peers: peers.clone(),
+                    forums,
+                }))
+            },
+        )
+        .await?;
+        topics::complete(&mut page, |ids| {
+            std::future::ready(self.topics_by_id(chat, &ids))
+        })
+        .await?;
+        Ok(page)
+    }
+
     /// Where a text to `at` with `reply_to` and `topic` goes, as Telegram
     /// takes a Draft or a sent message: [`compose::place`] with what
     /// Telegram knows of the Chat; a Chat the Account doesn't have, a reply
@@ -1884,6 +1981,59 @@ impl Telegram for FakeTelegram {
         .await
     }
 
+    async fn get_comments(
+        &self,
+        id: ChatRef,
+        post: i32,
+        query: HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        self.flood()?;
+        self.check_hash(id)?;
+        let chat = id.chat();
+        if !self.knows(chat) {
+            return Err(TgError::InvalidInput(format!(
+                "{chat} is not one of your chats; chat ids come from list_chats"
+            )));
+        }
+        let discussion = self
+            .data
+            .discussions
+            .iter()
+            .find(|d| d.channel == chat && d.post == post)
+            .ok_or_else(|| comments_off(chat, post))?;
+        // getReplies: every message of the group whose replies lead to `top`.
+        let group = self
+            .data
+            .messages
+            .get(&discussion.group)
+            .map_or(&[][..], Vec::as_slice);
+        let parent: std::collections::HashMap<i32, Option<i32>> =
+            group.iter().map(|m| (m.id, m.reply_to)).collect();
+        let replies_to_top = |m: &RawHistoryMessage| {
+            let mut at = m.reply_to;
+            for _ in 0..group.len() {
+                match at {
+                    Some(id) if id == discussion.top => return true,
+                    Some(id) => at = parent.get(&id).copied().flatten(),
+                    None => return false,
+                }
+            }
+            false
+        };
+        let thread: Vec<RawHistoryMessage> = group
+            .iter()
+            .filter(|m| replies_to_top(m))
+            .cloned()
+            .collect();
+        let group_ref = ChatRef::new(discussion.group, fake_access_hash(discussion.group));
+        let mut page = self.history_page(group_ref, &thread, &query).await?;
+        page.comments_of = Some(MessageLink {
+            chat_id: ChatRef::new(chat, fake_access_hash(chat)).to_string(),
+            message_id: post,
+        });
+        Ok(page)
+    }
+
     /// The same getHistory calls as the Live client, answered by [`get_history`].
     async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
         self.flood()?;
@@ -1898,64 +2048,7 @@ impl Telegram for FakeTelegram {
             self.check_topic(chat, topic)?;
         }
         let history = self.data.messages.get(&chat).map_or(&[][..], Vec::as_slice);
-        let peers = self.peers();
-        let mut page = read_history(
-            id,
-            &query,
-            &|chat| self.known(chat),
-            |request| {
-                // The pinned messages are a search (method class Search).
-                if let Some(seconds) = self.data.search_flood_wait.filter(|_| request.pinned) {
-                    return std::future::ready(Err(TgError::FloodWait {
-                        seconds,
-                        class: MethodClass::Search,
-                    }));
-                }
-                let messages = get_history(history, &request, self.data.past_newest);
-                // The Chat, the senders of these messages and the original
-                // authors of forwarded ones, as Telegram describes them in a
-                // getHistory answer.
-                let min = self.data.min_past_newest && reaches_past_newest(history, &request);
-                let named = |id| {
-                    messages
-                        .iter()
-                        .any(|m| m.from == Some(id) || m.forwarded_from == Some(id))
-                };
-                let described: Vec<RawPeer> = peers
-                    .iter()
-                    .filter(|p| p.id == chat || named(p.id))
-                    .map(|p| RawPeer {
-                        access_hash: p.access_hash.filter(|_| !min),
-                        ..p.clone()
-                    })
-                    .collect();
-                self.remember(&described);
-                let forums = self.forums_described(&[chat], messages.iter().map(|m| (chat, m)));
-                std::future::ready(Ok(HistoryAnswer {
-                    returned: messages.len(),
-                    messages,
-                    peers: described,
-                    forums,
-                }))
-            },
-            |request| {
-                self.remember(&peers);
-                let messages = get_message(&self.data.messages, chat, &request);
-                // getMessages answers describe no Topics.
-                let forums = self.forums_described(&[chat], std::iter::empty());
-                std::future::ready(Ok(MessageAnswer {
-                    messages,
-                    peers: peers.clone(),
-                    forums,
-                }))
-            },
-        )
-        .await?;
-        topics::complete(&mut page, |ids| {
-            std::future::ready(self.topics_by_id(chat, &ids))
-        })
-        .await?;
-        Ok(page)
+        self.history_page(id, history, &query).await
     }
 
     async fn get_chat_info(&self, id: ChatRef) -> Result<ChatInfo, TgError> {
@@ -3506,6 +3599,7 @@ mod tests {
         [3, 50, 1, 9, 40, 10, 2, 30, 20]
             .into_iter()
             .map(|id| RawHistoryMessage {
+                comments: None,
                 id,
                 date: 1000 + id,
                 from: None,

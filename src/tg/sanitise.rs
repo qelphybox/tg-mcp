@@ -385,6 +385,8 @@ impl Untrusted for MessagePage {
             continues_in: _,
             broken_at: _,
             topics,
+            // Ids this server issues.
+            comments_of: _,
         } = self;
         for title in topics.iter_mut().flat_map(|t| t.0.values_mut()) {
             clean(title);
@@ -409,6 +411,7 @@ impl Untrusted for MessagePage {
                 topic: _,
                 target: _,
                 thread_root: _,
+                comments: _,
             } = message;
             clean_text(text, sanitise, media.is_some());
             if let Some(media) = media {
@@ -706,6 +709,15 @@ impl Telegram for Sanitised {
         query: HistoryQuery,
     ) -> Result<MessagePage, TgError> {
         self.0.get_messages(chat, query).await.map(sanitised)
+    }
+
+    async fn get_comments(
+        &self,
+        chat: ChatRef,
+        post: i32,
+        query: HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        self.0.get_comments(chat, post, query).await.map(sanitised)
     }
 
     async fn get_chat_info(&self, chat: ChatRef) -> Result<ChatInfo, TgError> {
@@ -1129,6 +1141,7 @@ mod tests {
         let mut history = MessagePage::new(
             "user:1".into(),
             vec![ChatMessage {
+                comments: None,
                 id: 1,
                 date: "2026-11-06T00:00:00Z".into(),
                 sender: Some(Sender {
@@ -1208,6 +1221,7 @@ mod tests {
 
     fn message(text: &str) -> ChatMessage {
         ChatMessage {
+            comments: None,
             id: 1,
             date: "2026-11-06T00:00:00Z".into(),
             sender: Some(Sender {

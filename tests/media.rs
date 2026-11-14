@@ -62,6 +62,7 @@ fn preview(text: &str, kind: Option<MediaKind>) -> Option<MessagePreview> {
 
 fn message(id: i32, text: &str, media: Option<Media>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: DAY + id * 60,
         from: None,
