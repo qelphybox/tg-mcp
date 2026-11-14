@@ -4716,14 +4716,17 @@ mod resolve_tests {
             offset_access_hash: Some(-9),
             archived: false,
             unread_only: false,
+            pinned_from: None,
         };
         let archive_top = Cursor {
-            offset_date: 0,
-            offset_id: 0,
-            offset_peer: None,
-            offset_access_hash: None,
             archived: true,
-            unread_only: false,
+            ..Cursor::default()
+        };
+        // Further down the pinned chats: the first page again, one call.
+        let archive_pinned = Cursor {
+            archived: true,
+            pinned_from: Some(2),
+            ..Cursor::default()
         };
 
         assert!(live.list_chats(listing(30, None, false)).await.is_err());
@@ -4741,6 +4744,12 @@ mod resolve_tests {
                 .await
                 .is_err()
         );
+        let next = archive_pinned.encode();
+        assert!(
+            live.list_chats(listing(30, Some(&next), false))
+                .await
+                .is_err()
+        );
 
         let channel = tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
             channel_id: 5,
@@ -4753,6 +4762,7 @@ mod resolve_tests {
                 get_dialogs(false, 1, top()),
                 get_dialogs(true, 0, (1_700_000_000, 55, channel)),
                 get_dialogs(true, 1, top()),
+                get_dialogs(false, 1, top()),
             ]
         );
     }
