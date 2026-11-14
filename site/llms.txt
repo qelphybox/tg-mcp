@@ -4,6 +4,8 @@
 
 Not affiliated with Telegram. Made by Kirill Bobykin (https://github.com/qelphybox), an independent developer.
 
+In Russian: https://tgmcp.dev/ru/ (the same page, the same server).
+
 ## Connect
 
 - Public server URL: `https://connector.tgmcp.dev/mcp` (streamable HTTP, OAuth discovered automatically, no API key, no sign-up, no payment)
