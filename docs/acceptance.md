@@ -1029,6 +1029,23 @@ Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its 
 
 11. **Clean up.** Remove any reaction of yours left from these steps (`react` with `emoji: null`, or in the app), delete the §57 messages, and remove `telegram-react` (`claude mcp remove telegram-react`; it stays in the account's Active sessions until revoked there or with §56's clean-up).
 
+## 62. list_chats pages through more pinned chats than `limit`, each once
+
+Needs an account with at least 4 pinned chats in the main list (pin some in the app if needed: long-press → Pin), ideally 2 or more pinned in the Archive, and at least one pinned chat with unread messages or marked as unread. Write down from the app the pinned chats' titles, top to bottom, in each list. The paging itself is covered by fake-backed tests: `cargo test --lib tg::chats::` (every chat once, pinned first, in order, for every `limit` from 1 to 9, main list and Archive, with and without `unread_only`; old cursors decode) and `cargo test --lib tg::grammers::tests::listings_name_their_folder_and_later_pages_skip_pinned_chats` (a page inside the pinned chats is one `messages.getDialogs` like a first page). In Claude Code, with the server added as in §1, run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи, названия чатов выводи. 1) list_chats с limit=1, потом с cursor=<next_cursor предыдущей> и limit=1, пока не пройдёшь все чаты с pinned=true и ещё 2 страницы после них: для каждой страницы title, pinned. 2) То же с archived=true. 3) То же с unread_only=true и limit=1. 4) list_chats с limit=100: title чатов с pinned=true. Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: the first pages show the main list's pinned chats one per page, in the app's order, each once, then the most recent unpinned chat, then the next one. Before #68 the second page was already the first unpinned chat, and the other pinned chats never came.
+2. Step 2: the same for the Archive's pinned chats (with one or none pinned there: page 1 is that chat or the newest archived one, then the rest by date).
+3. Step 3: only chats with a badge, the pinned ones among them first and each once, then the unpinned ones; no `unread_scan_truncated` on the pinned pages.
+4. Step 4: the same pinned chats as step 1, all on this one page, in the same order.
+
+A cursor kept from before this deploy (e.g. a `next_cursor` of `list_chats` with `limit=1` saved earlier) still works: it continues with the unpinned chats from the top, as it did.
+
+Positions are counted per page: pinning, unpinning or reordering pinned chats in the app while you page can skip or repeat a pinned chat once. Don't touch the pins during the steps.
+
 ## 66. Once an hour one `stats` line with numbers only, and an external monitor on `/healthz`
 
 What the line holds and how the monitor is set up: [deploy.md](deploy.md#is-it-up-the-stats-line-and-the-healthz-monitor). The counting and the reset are also covered by tests: `cargo test --test stats` (with a paused clock, the line after an hour carries the expected counts, the next one starts from zero, and shutdown logs a last one; through `/mcp`, tool calls are counted by name, and the line names no chat, Account or Grant and no unknown tool) and `cargo test --lib stats`.
@@ -1060,4 +1077,3 @@ What the line holds and how the monitor is set up: [deploy.md](deploy.md#is-it-u
 4. **A deploy logs a last line.** Deploy (push to `main`, or `kamal deploy`); the old container's last `stats` line has `reason="shutdown"`: `kamal app logs --since 15m | sed 's/\x1b\[[0-9;]*m//g' | grep 'reason="shutdown"'` shows it, around the switch.
 
 5. **The monitor.** In UptimeRobot (or the service named on #64), the `/healthz` monitor shows "Up", with the interval and the alert e-mail as in deploy.md; the check of deploy.md step 6 sent a "Down" and an "Up" e-mail.
-
