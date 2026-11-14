@@ -3,13 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tg-mcp: your Telegram in ChatGPT, Claude and Gemini</title>
-<meta name="description" content="Connect your Telegram to ChatGPT, Claude or Gemini. Unofficial, open source, built by an independent developer.">
+<title>Telegram MCP server for Claude, ChatGPT and Gemini · tg-mcp</title>
+<meta name="description" content="Open-source Telegram MCP server. Connect your Telegram account to Claude, ChatGPT, Gemini or Cursor: read and search chats, write drafts. QR login, no API keys.">
+<link rel="canonical" href="https://tgmcp.dev/">
 <meta name="theme-color" content="#000000">
-<meta property="og:title" content="tg-mcp: your Telegram in ChatGPT, Claude and Gemini">
+<meta property="og:site_name" content="tg-mcp">
+<meta property="og:title" content="tg-mcp: Telegram MCP server for Claude, ChatGPT and Gemini">
 <meta property="og:description" content="Ask your AI what you missed, find what was said, book a table. Unofficial and open source.">
 <meta property="og:url" content="https://tgmcp.dev/">
 <meta property="og:type" content="website">
+<meta property="og:image" content="https://tgmcp.dev/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="tg-mcp: Telegram MCP server. Tell your AI what to do in Telegram.">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700&amp;family=Golos+Text:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
@@ -21,6 +28,7 @@ a{color:#C9B3FF;text-underline-offset:3px}
 a:hover{color:#E2D6FF}
 :focus-visible{outline:2px solid #C9B3FF;outline-offset:3px;border-radius:6px}
 code,pre,.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-variant-ligatures:none}
+p code{font-size:0.86em;color:#F1ECF7;overflow-wrap:anywhere}
 .view{animation:viewIn 480ms cubic-bezier(0.16,1,0.3,1) both}
 .stag>*{animation:lnIn 420ms cubic-bezier(0.16,1,0.3,1) both}
 .stag>*:nth-child(2){animation-delay:120ms}
@@ -56,6 +64,112 @@ summary:hover{color:#FFFFFF}
 .sheet{max-width:1288px;width:calc(100% - 24px);margin:96px auto 24px;border-radius:36px;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.01));-webkit-backdrop-filter:blur(6px) saturate(1.3);backdrop-filter:blur(6px) saturate(1.3);border:1px solid rgba(255,255,255,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 30px 80px -30px rgba(0,0,0,.7)}
 .halo{text-shadow:0 0 2px #000,0 1px 14px #000}
 </style>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "WebSite",
+   "@id": "https://tgmcp.dev/#website",
+   "url": "https://tgmcp.dev/",
+   "name": "tg-mcp",
+   "inLanguage": "en"
+  },
+  {
+   "@type": "SoftwareApplication",
+   "@id": "https://tgmcp.dev/#app",
+   "name": "tg-mcp",
+   "alternateName": [
+    "Telegram MCP server",
+    "tg-mcp Telegram MCP"
+   ],
+   "description": "Unofficial, open-source remote MCP (Model Context Protocol) server that connects a personal Telegram account to Claude, ChatGPT, Gemini, Cursor and other MCP clients.",
+   "url": "https://tgmcp.dev/",
+   "applicationCategory": "DeveloperApplication",
+   "operatingSystem": "Web, Linux, Docker",
+   "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+   },
+   "license": "https://opensource.org/licenses/MIT",
+   "isAccessibleForFree": true,
+   "sameAs": [
+    "https://github.com/qelphybox/tg-mcp"
+   ],
+   "author": {
+    "@type": "Person",
+    "@id": "https://github.com/qelphybox#person",
+    "name": "Kirill Bobykin",
+    "url": "https://github.com/qelphybox"
+   },
+   "image": "https://tgmcp.dev/og.jpg"
+  },
+  {
+   "@type": "FAQPage",
+   "@id": "https://tgmcp.dev/#faq",
+   "mainEntity": [
+    {
+     "@type": "Question",
+     "name": "What is a Telegram MCP server?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "MCP, the Model Context Protocol, is the open standard AI apps use to plug in outside tools. tg-mcp is an MCP server for your personal Telegram account: once it is connected, your AI can list your chats, read and search messages, look at photos, transcribe voice messages and, only if you allow it, write drafts or send messages to the chats you pick."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How do I connect Telegram to Claude, ChatGPT or Gemini?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Add https://connector.tgmcp.dev/mcp as a custom connector. In Claude: Settings → Connectors → Add custom connector. In ChatGPT (paid plans): Settings → Apps & Connectors → Advanced → Developer mode, then Create. In Gemini: Settings → Connected apps → Add a custom app. Then scan the QR code with Telegram on your phone. In Claude Code: claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp. Cursor and other MCP clients take the same URL as a streamable-HTTP server."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Do I need a Telegram API key or a bot?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "No. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Can Telegram block my account for this?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "It uses Telegram's official API through its own registered app, stays within Telegram's rate limits, and when Telegram asks it to wait, it waits instead of retrying around the limit. We can't speak for Telegram, so nobody can honestly promise that nothing will ever happen."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Who makes this?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "I do: Kirill Bobykin, an independent developer, @qelphybox on GitHub. tg-mcp is unofficial and not affiliated with Telegram, OpenAI, Anthropic or Google. All the code is public, and issues go straight to me."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "What does my AI provider see?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "The messages the AI reads to answer your question, the same as if you had pasted them into the chat yourself."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "I removed it from my AI app. Is it disconnected?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Not always. Some apps only forget their keys, and the Telegram session stays. To be sure, end it in Telegram → Settings → Devices → Unofficial MCP Server."
+     }
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 <div class="wall" aria-hidden="true"></div>
@@ -82,6 +196,7 @@ GitHub
 
 <section id="top" style="max-width: 1240px; margin: 0 auto; padding: 40px 24px 0; display: flex; flex-wrap: wrap; gap: 48px 72px; align-items: center">
 <div style="flex: 1 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 22px">
+<p class="halo" style="margin: 0 0 -8px; font-size: 15px; font-weight: 600; letter-spacing: 0.02em; color: #E4B2EA">Telegram MCP server · open source</p>
 <h1 style="margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(36px, 5vw, 66px); line-height: 1.04; letter-spacing: -0.03em; text-wrap: balance">Tell your AI what to do in Telegram.</h1>
 <ul aria-label="Things you can ask" style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; font-size: 17px">
 <li style="background: rgba(30,25,40,.6); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(241,236,247,.08); border-radius: 18px 18px 18px 6px; padding: 9px 16px; color: #F1ECF7">“What did I miss in my work chats?”</li>
@@ -311,6 +426,18 @@ GitHub
 <section id="faq" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 104px; display: flex; flex-wrap: wrap; gap: 24px 64px">
 <h2 style="flex: 1 1 280px; margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em">Questions.</h2>
 <div style="flex: 2.4 1 560px; min-width: 0; display: flex; flex-direction: column">
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">What is a Telegram MCP server?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">MCP, the <a href="https://modelcontextprotocol.io">Model Context Protocol</a>, is the open standard AI apps use to plug in outside tools. tg-mcp is an MCP server for your personal Telegram account: once it is connected, your AI can list your chats, read and search messages, look at photos, transcribe voice messages and, only if you allow it, write drafts or send messages to the chats you pick.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">How do I connect Telegram to Claude, ChatGPT or Gemini?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Add <code>https://connector.tgmcp.dev/mcp</code> as a custom connector. In Claude: Settings → Connectors → Add custom connector. In ChatGPT (paid plans): Settings → Apps &amp; Connectors → Advanced → Developer mode, then Create. In Gemini: Settings → Connected apps → Add a custom app. Then scan the QR code with Telegram on your phone. In Claude Code: <code>claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</code>. Cursor and other MCP clients take the same URL as a streamable-HTTP server.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Do I need a Telegram API key or a bot?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">No. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy.</p>
+</details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
 <summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Can Telegram block my account for this?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
 <p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">It uses Telegram's official API through its own registered app, stays within Telegram's rate limits, and when Telegram asks it to wait, it waits instead of retrying around the limit. We can't speak for Telegram, so nobody can honestly promise that nothing will ever happen.</p>
