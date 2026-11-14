@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://tgmcp.dev/</loc></url>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+  <url>
+    <loc>https://tgmcp.dev/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://tgmcp.dev/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://tgmcp.dev/ru/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://tgmcp.dev/"/>
+  </url>
+  <url>
+    <loc>https://tgmcp.dev/ru/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://tgmcp.dev/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://tgmcp.dev/ru/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://tgmcp.dev/"/>
+  </url>
   <url><loc>https://tgmcp.dev/privacy.html</loc></url>
 </urlset>

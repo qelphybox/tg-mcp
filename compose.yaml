@@ -1,0 +1,104 @@
+# tg-mcp with Docker Compose (#106). Every other setting: .env.example.
+#
+# Local clients (Claude Code, Cursor, …), no domain needed:
+#   docker compose up -d
+#   claude mcp add --transport http telegram http://localhost:8080/mcp
+#
+# A VPS with a domain whose DNS A/AAAA record points at it, for claude.ai and
+# Claude desktop (they reach connectors from Anthropic's cloud, over HTTPS):
+#   TG_MCP_DOMAIN=tg.example.com docker compose --profile https up -d
+#   → https://tg.example.com/mcp, with a Let's Encrypt certificate from Caddy.
+# Keep TG_MCP_DOMAIN set for later commands too (`echo TG_MCP_DOMAIN=… > .env`
+# next to this file): without it the server goes back to http://localhost:8080.
+#
+# Needs Docker Compose 2.23.1 or later (inline `configs`).
+
+services:
+  tg-mcp:
+    # TG_MCP_IMAGE picks another image or tag (e.g. qelphybox/tg-mcp:0.3.0, or
+    # one you built); default: the latest release.
+    image: ${TG_MCP_IMAGE:-qelphybox/tg-mcp:latest}
+    restart: unless-stopped
+    # Loopback only, in both modes: from outside the host, tg-mcp is reachable
+    # only through Caddy (https profile), whose 80 and 443 are the open ports.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # The Session vault (Grants, Tokens, sealed Telegram sessions): the only
+      # copy. Keep the volume across upgrades; see docs/deploy.md on backups.
+      - tg-mcp-data:/data
+    # Any other setting from .env.example (limits, RUST_LOG, …): put it in
+    # tg-mcp.env next to this file. Pick lines; don't copy .env.example whole,
+    # it turns on the fake Telegram used for development.
+    env_file:
+      - path: tg-mcp.env
+        required: false
+    environment:
+      # With a domain: the OAuth issuer and Host validation use it. Empty
+      # (no domain) counts as unset: http://localhost:8080.
+      - TG_MCP_PUBLIC_URL=${TG_MCP_DOMAIN:+https://${TG_MCP_DOMAIN}}
+      # With a domain, Caddy sets X-Forwarded-For from the address it accepted
+      # the connection from (it ignores the client's own), so the per-IP limits
+      # see real clients. A process on this host could still reach
+      # 127.0.0.1:8080 directly and pick its X-Forwarded-For: fine on a
+      # single-tenant VPS.
+      - TG_MCP_TRUST_FORWARDED_FOR=${TG_MCP_DOMAIN:+1}
+      # Optional: your own Telegram app instead of the image's built-in one
+      # (ADR-0007). Passed only when set (shell or .env).
+      - TG_MCP_API_ID
+      - TG_MCP_API_HASH
+      # Development only: TG_MCP_FAKE_TELEGRAM=1 serves a fake Telegram account.
+      - TG_MCP_FAKE_TELEGRAM
+
+  # The https profile needs TG_MCP_DOMAIN: without it, `up` fails here (exit
+  # 1, the reason in `docker compose logs domain-check`) and Caddy doesn't
+  # start; tg-mcp stays as without the profile, on loopback only.
+  domain-check:
+    profiles: [https]
+    image: caddy:2.10-alpine
+    environment:
+      TG_MCP_DOMAIN: ${TG_MCP_DOMAIN:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -n "$$TG_MCP_DOMAIN" ] || { echo "TG_MCP_DOMAIN is not set: run TG_MCP_DOMAIN=tg.example.com docker compose --profile https up -d (or put it in .env)" >&2; exit 1; }'
+
+  caddy:
+    profiles: [https]
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      domain-check:
+        condition: service_completed_successfully
+      tg-mcp:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      TG_MCP_DOMAIN: ${TG_MCP_DOMAIN:-}
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      # Certificates and the ACME account: keep them, or Let's Encrypt's rate
+      # limits may bite on the next start.
+      - caddy-data:/data
+      - caddy-config:/config
+
+configs:
+  caddyfile:
+    content: |
+      {$$TG_MCP_DOMAIN} {
+        reverse_proxy tg-mcp:8080 {
+          # Stream every response as it comes: MCP event streams and Media
+          # link downloads (up to 20 MB) are never held whole.
+          flush_interval -1
+        }
+      }
+
+volumes:
+  tg-mcp-data:
+  caddy-data:
+  caddy-config:

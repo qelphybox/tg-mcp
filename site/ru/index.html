@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP-сервер Telegram для Claude, ChatGPT и Gemini · tg-mcp</title>
+<meta name="description" content="MCP-сервер с открытым кодом: подключите Telegram к Claude, ChatGPT, Gemini или Cursor. Чтение и поиск по чатам, черновики. Вход по QR-коду, без API-ключей.">
+<link rel="canonical" href="https://tgmcp.dev/ru/">
+<link rel="alternate" hreflang="en" href="https://tgmcp.dev/">
+<link rel="alternate" hreflang="ru" href="https://tgmcp.dev/ru/">
+<link rel="alternate" hreflang="x-default" href="https://tgmcp.dev/">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<link rel="alternate" type="text/markdown" href="https://tgmcp.dev/llms.txt" title="tg-mcp для ИИ-агентов (llms.txt, на английском)">
+<meta name="theme-color" content="#000000">
+<meta property="og:site_name" content="tg-mcp">
+<meta property="og:title" content="tg-mcp: MCP-сервер Telegram для Claude, ChatGPT и Gemini">
+<meta property="og:description" content="Поручите ИИ повседневные дела в Telegram: разобрать непрочитанное, найти то самое сообщение, написать и отправить ответ там, где вы разрешили. Неофициальный проект с открытым кодом.">
+<meta property="og:url" content="https://tgmcp.dev/ru/">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:image" content="https://tgmcp.dev/ru/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="tg-mcp: MCP-сервер для Telegram. Скажите ИИ, что сделать в Telegram.">
+<meta name="twitter:card" content="summary_large_image">
+<script defer src="https://cloud.umami.is/script.js" data-website-id="552e4a6b-90d4-4f64-bf3e-ed0e49c563c6" data-domains="tgmcp.dev" data-do-not-track="true"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/fonts/unbounded-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/golos-text-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+@font-face{font-family:'Golos Text';font-style:normal;font-weight:400 600;font-display:swap;src:url(/fonts/golos-text-cyrillic.woff2) format('woff2');unicode-range:U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116}
+@font-face{font-family:'Golos Text';font-style:normal;font-weight:400 600;font-display:swap;src:url(/fonts/golos-text-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'Golos Text';font-style:normal;font-weight:400 600;font-display:swap;src:url(/fonts/golos-text-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400 500;font-display:swap;src:url(/fonts/jetbrains-mono-cyrillic.woff2) format('woff2');unicode-range:U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400 500;font-display:swap;src:url(/fonts/jetbrains-mono-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400 500;font-display:swap;src:url(/fonts/jetbrains-mono-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+@font-face{font-family:'Unbounded';font-style:normal;font-weight:500 700;font-display:swap;src:url(/fonts/unbounded-cyrillic.woff2) format('woff2');unicode-range:U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116}
+@font-face{font-family:'Unbounded';font-style:normal;font-weight:500 700;font-display:swap;src:url(/fonts/unbounded-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'Unbounded';font-style:normal;font-weight:500 700;font-display:swap;src:url(/fonts/unbounded-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+body{margin:0;background:#000}
+html{scrollbar-color:#3A3247 #000}
+::selection{background:#E4B2EA;color:#1F0F24}
+a{color:#C9B3FF;text-underline-offset:3px}
+a:hover{color:#E2D6FF}
+:focus-visible{outline:2px solid #C9B3FF;outline-offset:3px;border-radius:6px}
+code,pre,.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-variant-ligatures:none}
+p code{font-size:0.86em;color:#F1ECF7;overflow-wrap:anywhere}
+.view{animation:viewIn 480ms cubic-bezier(0.16,1,0.3,1) both}
+.stag>*{animation:lnIn 420ms cubic-bezier(0.16,1,0.3,1) both}
+.stag>*:nth-child(2){animation-delay:120ms}
+.stag>*:nth-child(3){animation-delay:240ms}
+.stag>*:nth-child(4){animation-delay:360ms}
+.stag>*:nth-child(5){animation-delay:480ms}
+.tick{animation:tick 380ms cubic-bezier(0.16,1,0.3,1) both}
+@keyframes viewIn{from{opacity:0;filter:blur(6px);transform:translateY(6px)}to{opacity:1;filter:blur(0);transform:none} }
+@keyframes tick{from{transform:scale(0.6);opacity:0}to{transform:none;opacity:1} }
+.spin{animation:spin 900ms linear infinite}
+summary::-webkit-details-marker{display:none}
+.chev{transition:transform 200ms ease-out}
+details[open] .chev{transform:rotate(180deg)}
+summary:hover{color:#FFFFFF}
+.bub{animation:bub 520ms cubic-bezier(0.16,1,0.3,1) both}
+.slide{animation:slide 560ms cubic-bezier(0.16,1,0.3,1) both}
+.caret{animation:caret 1s steps(1,end) infinite}
+@keyframes spin{to{transform:rotate(360deg)} }
+@keyframes bub{from{opacity:0;transform:translateY(14px) scale(0.97)}to{opacity:1;transform:none} }
+@keyframes slide{from{transform:translateX(100%)}to{transform:none} }
+@keyframes caret{50%{opacity:0} }
+@media (prefers-reduced-motion: reduce){
+.bub,.slide{animation:fadeOnly 200ms ease-out both}
+.spin,.caret{animation:none}
+.view,.stag>*,.tick{animation:fadeOnly 200ms ease-out both}
+@keyframes fadeOnly{from{opacity:0}to{opacity:1} }
+}
+[hidden]{display:none!important}
+.wall,.wall-in{pointer-events:none;opacity:.35;background:radial-gradient(circle at 80% 10%,#e4b2ea 0,rgba(228,178,234,0) 60%),radial-gradient(circle at 15% 30%,#8376c2 0,rgba(131,118,194,0) 60%),radial-gradient(circle at 25% 90%,#eab9d9 0,rgba(234,185,217,0) 60%),radial-gradient(circle at 85% 80%,#b493e6 0,rgba(180,147,230,0) 60%),#b493e6;-webkit-mask-image:url(/pattern.svg);mask-image:url(/pattern.svg);-webkit-mask-size:420px auto;mask-size:420px auto}
+.wall{position:fixed;inset:0;z-index:-1}
+.wall-in{position:absolute;inset:0;-webkit-mask-size:260px auto;mask-size:260px auto}
+.tgs>:not(.wall-in){position:relative}
+.sheet{max-width:1288px;width:calc(100% - 24px);margin:96px auto 24px;border-radius:36px;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.01));-webkit-backdrop-filter:blur(6px) saturate(1.3);backdrop-filter:blur(6px) saturate(1.3);border:1px solid rgba(255,255,255,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 30px 80px -30px rgba(0,0,0,.7)}
+.halo{text-shadow:0 0 2px #000,0 1px 14px #000}
+</style>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "WebPage",
+   "@id": "https://tgmcp.dev/ru/#webpage",
+   "url": "https://tgmcp.dev/ru/",
+   "name": "MCP-сервер Telegram для Claude, ChatGPT и Gemini · tg-mcp",
+   "inLanguage": "ru",
+   "isPartOf": {
+    "@id": "https://tgmcp.dev/#website"
+   },
+   "about": {
+    "@id": "https://tgmcp.dev/#app"
+   }
+  },
+  {
+   "@type": "SoftwareApplication",
+   "@id": "https://tgmcp.dev/#app",
+   "name": "tg-mcp",
+   "description": "Бесплатный MCP-сервер (Model Context Protocol) с открытым кодом для личного аккаунта Telegram. Работает с Claude, ChatGPT, Gemini, Claude Code, Cursor и другими MCP-клиентами; вход по QR-коду, без API-ключа.",
+   "url": "https://tgmcp.dev/",
+   "applicationCategory": "DeveloperApplication",
+   "operatingSystem": "Web, Docker (linux/amd64, linux/arm64)",
+   "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+   },
+   "license": "https://opensource.org/licenses/MIT",
+   "isAccessibleForFree": true,
+   "sameAs": [
+    "https://github.com/qelphybox/tg-mcp"
+   ],
+   "author": {
+    "@type": "Person",
+    "@id": "https://github.com/qelphybox#person",
+    "name": "Kirill Bobykin",
+    "url": "https://github.com/qelphybox"
+   },
+   "image": "https://tgmcp.dev/og.jpg"
+  },
+  {
+   "@type": "FAQPage",
+   "@id": "https://tgmcp.dev/ru/#faq",
+   "inLanguage": "ru",
+   "mainEntity": [
+    {
+     "@type": "Question",
+     "name": "Что такое MCP-сервер для Telegram?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "MCP (Model Context Protocol) — открытый стандарт, через который ИИ-приложения подключают внешние инструменты. tg-mcp — MCP-сервер для вашего личного аккаунта Telegram: после подключения ИИ может просматривать список чатов, читать и искать сообщения, смотреть фото, расшифровывать голосовые сообщения и, только если вы разрешите, писать черновики или отправлять сообщения в чаты, в которые разрешено отправлять."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Как подключить Телеграм к Claude, ChatGPT или Gemini?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Добавьте https://connector.tgmcp.dev/mcp как свой коннектор. В Claude: Настройки → Коннекторы → Добавить свой коннектор (Settings → Connectors → Add custom connector). В ChatGPT (платные тарифы): Настройки → Приложения и коннекторы → Дополнительно → Режим разработчика, затем «Создать» (Settings → Apps & Connectors → Advanced → Developer mode, Create). В Gemini: Настройки → Подключённые приложения → Добавить своё приложение (Settings → Connected apps → Add a custom app). Затем отсканируйте QR-код в Telegram на телефоне. В Claude Code: claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp. Cursor и другие MCP-клиенты принимают тот же адрес как streamable-HTTP-сервер."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Это бесплатно? Нужен API-ключ или бот?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Бесплатно: без регистрации, без оплаты и без API-ключа. Сервер входит в ваш собственный аккаунт по QR-коду, как Telegram Desktop, и работает с вашими настоящими чатами, а не с чатами бота. Свой app id с my.telegram.org нужен, только если вы запускаете собственную копию."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Чем он отличается от других MCP-серверов для Telegram?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Большинство MCP-серверов для Telegram работают на вашем компьютере: нужно поставить Python или Node, получить API id и hash на my.telegram.org и хранить файл сеанса на диске. tg-mcp — удалённый сервер, который добавляется по ссылке, поэтому он работает в Claude, ChatGPT и Gemini — и в браузере, и на телефоне. Ваш сеанс Telegram хранится в зашифрованном виде, а ключ есть только у вашего ИИ-приложения; собственную копию по-прежнему можно запустить в Docker."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Может ли Telegram заблокировать за это мой аккаунт?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Сервер работает через официальный API Telegram от имени своего зарегистрированного приложения, держится в пределах лимитов Telegram, а когда Telegram просит подождать, ждёт, а не обходит ограничение повторными запросами. Говорить за Telegram мы не можем, поэтому честно пообещать, что ничего никогда не случится, не может никто."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Кто это делает?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Я — Кирилл Бобыкин, независимый разработчик, @qelphybox на GitHub. tg-mcp — неофициальный проект, он не связан с Telegram, OpenAI, Anthropic или Google. Весь код открыт, а issues приходят прямо мне."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Что видит мой ИИ-провайдер?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Сообщения, которые ИИ читает, чтобы ответить на ваш вопрос, — так же, как если бы вы сами вставили их в чат."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Я удалил его из ИИ-приложения. Он отключён?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Не всегда. Некоторые приложения лишь забывают свои ключи, а сеанс Telegram остаётся. Для надёжности завершите его в Telegram → Настройки → Устройства → Unofficial MCP Server."
+     }
+    }
+   ]
+  }
+ ]
+}
+</script>
+</head>
+<body>
+<div class="wall" aria-hidden="true"></div>
+<div style="color: #F1ECF7; font-family: 'Golos Text', system-ui, sans-serif; font-size: 17px; line-height: 1.6">
+
+<header style="max-width: 1240px; margin: 0 auto; padding: 0 24px">
+<nav aria-label="Главное меню" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 24px; min-height: 76px">
+<a href="#top" style="display: inline-flex; align-items: center; gap: 10px; color: #F1ECF7; text-decoration: none; min-height: 44px">
+<svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><rect x="1.5" y="3.5" width="23" height="17" rx="6" stroke="#F1ECF7" stroke-width="2"></rect><path d="M7 20.5 6 24.5l5-4" stroke="#F1ECF7" stroke-width="2" stroke-linejoin="round"></path><circle cx="19" cy="7" r="4" fill="#E4B2EA" stroke="#000" stroke-width="2"></circle></svg>
+<span style="font-family: Unbounded, sans-serif; font-weight: 600; font-size: 18px; letter-spacing: -0.01em">tg-mcp</span>
+</a>
+<div class="halo" style="display: flex; flex-wrap: wrap; align-items: center; gap: 0 22px; font-size: 15px">
+<a href="#control" style="color: #D9D0E6; text-decoration: none; padding: 12px 0">Ваши данные</a>
+<a href="#verify" style="color: #D9D0E6; text-decoration: none; padding: 12px 0">Своя копия</a>
+<a href="#faq" style="color: #D9D0E6; text-decoration: none; padding: 12px 0">Вопросы</a>
+<span style="display: inline-flex; align-items: center; gap: 6px; color: #8C809E"><a href="/" hreflang="en" lang="en" aria-label="English version" style="color: #D9D0E6; text-decoration: none; padding: 12px 2px">EN</a>/<span aria-current="page" style="color: #F1ECF7; font-weight: 600">RU</span></span>
+<a href="https://github.com/qelphybox/tg-mcp" data-repo-link data-umami-event="GitHub" style="display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: 178px; gap: 8px; color: #F1ECF7; text-decoration: none; padding: 10px 16px; border: 1px solid rgba(241,236,247,.16); border-radius: 10px; background: rgba(30,25,40,.45); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);">
+<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"></path></svg>
+GitHub
+<span data-stars hidden style="display: inline-flex; align-items: center; gap: 5px; margin-left: 4px; padding-left: 10px; border-left: 1px solid rgba(241,236,247,.16); font-variant-numeric: tabular-nums"><svg width="14" height="14" viewBox="0 0 24 24" fill="#E4B2EA" aria-hidden="true"><path d="m12 2.5 2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.4l-5.9 3.1 1.2-6.5L2.5 9.4l6.6-.9z"></path></svg><span data-stars-count></span></span>
+</a>
+</div>
+</nav>
+</header>
+
+<main>
+<section id="top" style="max-width: 1240px; margin: 0 auto; padding: 40px 24px 0; display: flex; flex-wrap: wrap; gap: 48px 72px; align-items: center">
+<div style="flex: 1 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 22px">
+<p class="halo" style="margin: 0 0 -8px; font-size: 15px; font-weight: 600; letter-spacing: 0.02em; color: #E4B2EA">MCP-сервер для Telegram · открытый код</p>
+<h1 style="margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(36px, 5vw, 66px); line-height: 1.04; letter-spacing: -0.03em; text-wrap: balance">Скажите ИИ, что сделать в Telegram.</h1>
+<p class="halo" style="margin: 0; max-width: 56ch; font-size: 18px; line-height: 1.5; color: #D9D0E6">tg-mcp — бесплатный удалённый MCP-сервер с открытым кодом для вашего личного аккаунта Telegram. Добавьте одну ссылку в Claude, ChatGPT или Gemini, отсканируйте QR-код в Телеграме — и ИИ сможет читать, искать и пересказывать ваши чаты; писать он будет только там, где вы разрешите.</p>
+<div style="max-width: 560px; display: flex; flex-direction: column; gap: 14px">
+<div style="display: flex; flex-wrap: wrap; gap: 10px">
+<button type="button" data-app="0" data-umami-event="Add to app" data-umami-event-app="ChatGPT" aria-expanded="false" aria-controls="install-steps" style="-webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); display: inline-flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 22px; border-radius: 14px; border: 1px solid rgba(241,236,247,.14); background: rgba(30,25,40,.6); color: #F1ECF7; font: 600 16px 'Golos Text', sans-serif; cursor: pointer; transition: background 200ms ease-out, color 200ms ease-out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Добавить в ChatGPT</button>
+<button type="button" data-app="1" data-umami-event="Add to app" data-umami-event-app="Claude" aria-expanded="false" aria-controls="install-steps" style="-webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); display: inline-flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 22px; border-radius: 14px; border: 1px solid rgba(241,236,247,.14); background: rgba(30,25,40,.6); color: #F1ECF7; font: 600 16px 'Golos Text', sans-serif; cursor: pointer; transition: background 200ms ease-out, color 200ms ease-out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Добавить в Claude</button>
+<button type="button" data-app="2" data-umami-event="Add to app" data-umami-event-app="Gemini" aria-expanded="false" aria-controls="install-steps" style="-webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); display: inline-flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 22px; border-radius: 14px; border: 1px solid rgba(241,236,247,.14); background: rgba(30,25,40,.6); color: #F1ECF7; font: 600 16px 'Golos Text', sans-serif; cursor: pointer; transition: background 200ms ease-out, color 200ms ease-out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Добавить в Gemini</button>
+</div>
+<div data-if="appOpen" hidden style="display: contents">
+<div id="install-steps" class="view" style="background: rgba(24,19,32,.72); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px); border: 1px solid rgba(241,236,247,.08); border-radius: 16px; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 10px 30px -12px rgba(0,0,0,0.6)">
+<ol id="app-steps" style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px"></ol>
+<div style="display: flex; align-items: stretch; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.1); border-radius: 12px">
+<code style="flex: 1 1 auto; min-width: 0; padding: 12px 14px; font-size: 14px; color: #F1ECF7; white-space: nowrap; overflow-x: auto">https://connector.tgmcp.dev/mcp</code>
+<button type="button" data-copy data-umami-event="Copy URL" aria-label="Скопировать ссылку" style="flex: none; min-width: 88px; min-height: 46px; border: 0; border-radius: 0 12px 12px 0; background: #E4B2EA; color: #1F0F24; font: 600 14px 'Golos Text', sans-serif; cursor: pointer"><span data-text="copyLabel"></span></button>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 4px 20px; align-items: center; justify-content: space-between">
+<a href="https://chatgpt.com" data-app-url data-umami-event="Open app" data-umami-event-app="ChatGPT" target="_blank" rel="noopener" style="font-weight: 600; padding: 10px 0">Открыть <span data-text="appName"></span></a>
+<span style="font-size: 13.5px; color: #8C809E"><span data-text="appNote"></span></span>
+</div>
+</div>
+</div>
+<p class="halo" style="margin: 0; font-size: 13.5px; color: #B4A9C4">Неофициальный проект. Сделал <a href="https://github.com/qelphybox">Кирилл Бобыкин</a>, независимый разработчик; с Telegram не связан. Разработчикам: <a href="#dev">Claude Code, Cursor, своя копия</a>.</p>
+</div>
+</div>
+
+<div style="flex: 0 1 360px; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 22px; margin: 0 auto">
+<div id="phone" role="img" aria-label="Демо в приложении Claude на телефоне" style="width: 350px; max-width: 100%; height: 720px; box-sizing: border-box; padding: 11px; border-radius: 54px; background: #04070C; border: 1px solid #3A3247; box-shadow: 0 40px 80px -30px rgba(0,0,0,0.85), 0 12px 24px -12px rgba(0,0,0,0.6)">
+<div style="position: relative; width: 100%; height: 100%; border-radius: 44px; overflow: hidden; background: #1F1E1C">
+
+<div data-if="chat" hidden style="display: contents">
+<div style="position: absolute; inset: 0; display: flex; flex-direction: column; color: #ECEAE4; font-size: 14.5px; line-height: 1.5">
+<div style="flex: none; display: flex; align-items: center; justify-content: space-between; padding: 34px 18px 10px">
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ECEAE4" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"></path></svg>
+<span style="font-weight: 600; font-size: 15px">Claude</span>
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ECEAE4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+</div>
+<div style="flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 14px; padding: 0 16px 12px">
+
+<div data-if="user" hidden style="display: contents">
+<div class="bub" style="align-self: flex-end; max-width: 86%; display: flex; flex-direction: column; align-items: flex-end; gap: 6px">
+<div data-if="attach" hidden style="display: contents">
+<div style="display: flex; gap: 6px">
+<span style="width: 60px; height: 60px; border-radius: 12px; background: #2F6F6A; display: flex; align-items: center; justify-content: center"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="16" r="3.5"></circle><circle cx="18.5" cy="16" r="3.5"></circle><path d="M5.5 16 9 9h6.5l3 7M9 9l3 7M14 6h2.5"></path></svg></span>
+<span style="width: 60px; height: 60px; border-radius: 12px; background: #8A4B2E; display: flex; align-items: center; justify-content: center"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 11V7a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v4"></path><path d="M2 18v-5a2 2 0 1 1 4 0v2h12v-2a2 2 0 1 1 4 0v5ZM5 18v2M19 18v2"></path></svg></span>
+<span style="width: 60px; height: 60px; border-radius: 12px; background: #4B3F8A; display: flex; align-items: center; justify-content: center"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg></span>
+</div>
+</div>
+<div style="background: #393834; border-radius: 18px 18px 6px 18px; padding: 10px 14px"><span data-text="msg"></span></div>
+</div>
+</div>
+
+<div data-if="a1" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 8px">
+<span><span data-text="intro"></span></span>
+<div data-chips style="display: contents"></div>
+</div>
+</div>
+
+<div data-if="rSell" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 10px">
+<span>Готово. Канал <strong>Распродажа на выходных</strong> запущен: три поста, по одному на вещь, с фото и ценами. Вот ссылка:</span>
+<div style="display: flex; align-items: center; gap: 12px; background: #2A2926; border: 1px solid #3A3934; border-radius: 14px; padding: 10px 12px">
+<span style="flex: none; width: 36px; height: 36px; border-radius: 50%; background: #E4B2EA; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1F0F24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 14px">Распродажа на выходных</span><span class="mono" style="display: block; font-size: 12px; color: #C9B3FF">t.me/weekend_garage_sale</span></span>
+</div>
+</div>
+</div>
+
+<div data-if="rCatch" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 10px">
+<span>Шесть чатов, 94 новых сообщения. <strong>Ответа ждут два:</strong></span>
+<div class="stag" style="display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; gap: 10px; background: #2A2926; border: 1px solid #3A3934; border-radius: 12px; padding: 10px 12px"><span style="flex: none; width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: #E4B2EA"></span><span style="font-size: 13.5px"><strong>Анна, дизайн.</strong> Нужна презентация к пятнице: созвон с инвесторами перенесли на пораньше.<span class="mono" style="display: block; font-size: 11.5px; color: #C9B3FF; margin-top: 2px">t.me/c/1835/4812</span></span></div>
+<div style="display: flex; gap: 10px; background: #2A2926; border: 1px solid #3A3934; border-radius: 12px; padding: 10px 12px"><span style="flex: none; width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: #E4B2EA"></span><span style="font-size: 13.5px"><strong>Арендодатель.</strong> Просит подтвердить просмотр во вторник в 10:00.</span></div>
+</div>
+<span style="font-size: 13.5px; color: #A8A49A">Семья, Книжный клуб и ещё 2: ничего важного.</span>
+</div>
+</div>
+
+<div data-if="rTable" hidden style="display: contents">
+<div class="bub" style="display: flex; flex-direction: column; gap: 10px">
+<span>Забронировано. Osteria Lume подтвердила в Telegram:</span>
+<div style="display: flex; align-items: center; gap: 12px; background: #2A2926; border: 1px solid #3A3934; border-radius: 14px; padding: 10px 12px">
+<span style="flex: none; width: 44px; height: 48px; border-radius: 10px; background: #ECEAE4; color: #1F1E1C; display: flex; flex-direction: column; align-items: center; justify-content: center; line-height: 1.1"><span style="font-size: 10px; font-weight: 600; text-transform: uppercase; color: #B4472C">Пт</span><span style="font-size: 18px; font-weight: 700">13</span></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 14px">20:30 · Столик на 4, терраса</span><span style="display: block; font-size: 12.5px; color: #A8A49A">Osteria Lume</span></span>
+</div>
+</div>
+</div>
+
+</div>
+<div style="flex: none; padding: 8px 12px 26px">
+<div style="display: flex; align-items: flex-end; gap: 8px; background: #2A2926; border: 1px solid #3A3934; border-radius: 22px; padding: 8px 8px 8px 16px; min-height: 44px; box-sizing: border-box">
+<div style="flex: 1 1 auto; min-width: 0; padding: 4px 0; font-size: 14px; line-height: 1.45">
+<div data-if="typing" hidden style="display: contents"><span><span data-text="typed"></span></span><span class="caret" style="display: inline-block; width: 2px; height: 16px; margin-left: 1px; vertical-align: -3px; background: #E4B2EA"></span></div>
+<div data-if="idle" hidden style="display: contents"><span style="color: #8F8B82">Ответить Claude…</span></div>
+</div>
+<span data-send style="flex: none; width: 32px; height: 32px; border-radius: 50%; background: #4A4842; display: flex; align-items: center; justify-content: center; transition: background 200ms ease-out"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1F0F24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></span>
+</div>
+</div>
+</div>
+</div>
+
+<div data-if="tgSell" hidden style="display: contents">
+<div class="slide tgs" style="position: absolute; inset: 0; display: flex; flex-direction: column; background: #000; color: #F1ECF7; font-size: 14px; line-height: 1.45">
+<div class="wall-in" aria-hidden="true"></div>
+<div style="flex: none; display: flex; align-items: center; gap: 12px; padding: 34px 16px 12px; background: #141118">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#C9B3FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+<span style="flex: none; width: 38px; height: 38px; border-radius: 50%; background: #E4B2EA; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1F0F24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 15px">Распродажа на выходных</span><span style="display: block; font-size: 12.5px; color: #A99FBB">канал · 1 подписчик</span></span>
+</div>
+<div style="flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 10px; padding: 12px 12px 10px">
+<div data-if="it1" hidden style="display: contents">
+<div class="bub" style="width: 88%; background: #1E1A26; border-radius: 14px; overflow: hidden">
+<div style="height: 92px; background: #2F6F6A; display: flex; align-items: center; justify-content: center"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="16" r="3.5"></circle><circle cx="18.5" cy="16" r="3.5"></circle><path d="M5.5 16 9 9h6.5l3 7M9 9l3 7M14 6h2.5"></path></svg></div>
+<div style="padding: 8px 12px 6px"><strong>Городской велосипед, размер M · 14&nbsp;000&nbsp;₽</strong><br>Катался два лета, новая цепь. Самовывоз из центра.<span style="display: block; text-align: right; font-size: 11.5px; color: #9A8FAD">14:02</span></div>
+</div>
+</div>
+<div data-if="it2" hidden style="display: contents">
+<div class="bub" style="width: 88%; background: #1E1A26; border-radius: 14px; overflow: hidden">
+<div style="height: 92px; background: #8A4B2E; display: flex; align-items: center; justify-content: center"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 11V7a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v4"></path><path d="M2 18v-5a2 2 0 1 1 4 0v2h12v-2a2 2 0 1 1 4 0v5ZM5 18v2M19 18v2"></path></svg></div>
+<div style="padding: 8px 12px 6px"><strong>Бархатное кресло · 9&nbsp;000&nbsp;₽</strong><br>Зелёное, без царапин, животных дома нет.<span style="display: block; text-align: right; font-size: 11.5px; color: #9A8FAD">14:02</span></div>
+</div>
+</div>
+<div data-if="it3" hidden style="display: contents">
+<div class="bub" style="width: 88%; background: #1E1A26; border-radius: 14px; overflow: hidden">
+<div style="height: 92px; background: #4B3F8A; display: flex; align-items: center; justify-content: center"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#F2EDE4" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg></div>
+<div style="padding: 8px 12px 6px"><strong>Монитор 27″, 1440p · 11&nbsp;000&nbsp;₽</strong><br>Коробка и кабели в комплекте.<span style="display: block; text-align: right; font-size: 11.5px; color: #9A8FAD">14:03</span></div>
+</div>
+</div>
+</div>
+<div style="flex: none; padding: 10px 16px 26px; background: #141118; text-align: center; font-weight: 600; color: #C9B3FF">Поделиться каналом</div>
+</div>
+</div>
+
+<div data-if="tgTable" hidden style="display: contents">
+<div class="slide tgs" style="position: absolute; inset: 0; display: flex; flex-direction: column; background: #000; color: #F1ECF7; font-size: 14px; line-height: 1.45">
+<div class="wall-in" aria-hidden="true"></div>
+<div style="flex: none; display: flex; align-items: center; gap: 12px; padding: 34px 16px 12px; background: #141118">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#C9B3FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+<span style="flex: none; width: 38px; height: 38px; border-radius: 50%; background: #3B5B8C; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#F1ECF7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 2v7a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2V2M7 2v20M21 15V2a5 5 0 0 0-5 5v6a2 2 0 0 0 2 2h3Zm0 0v7"></path></svg></span>
+<span style="min-width: 0"><span style="display: block; font-weight: 600; font-size: 15px">Osteria Lume</span><span style="display: block; font-size: 12.5px; color: #A99FBB">в сети</span></span>
+</div>
+<div style="flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 8px; padding: 12px 12px 14px">
+<div data-if="it1" hidden style="display: contents">
+<div class="bub" style="align-self: flex-end; max-width: 80%; background: #6E5BB8; border-radius: 16px 16px 4px 16px; padding: 8px 12px">Здравствуйте! Есть столик на четверых в пятницу около 20:00?<span style="display: block; text-align: right; font-size: 11px; color: #E0D7F5">14:10 ✓✓</span></div>
+</div>
+<div data-if="it2" hidden style="display: contents">
+<div class="bub" style="align-self: flex-start; max-width: 80%; background: #1E1A26; border-radius: 16px 16px 16px 4px; padding: 8px 12px">Здравствуйте! На 20:00 всё занято, но есть 20:30 на террасе. Забронировать?<span style="display: block; text-align: right; font-size: 11px; color: #9A8FAD">14:12</span></div>
+</div>
+<div data-if="it3" hidden style="display: contents">
+<div class="bub" style="align-self: flex-end; max-width: 80%; background: #6E5BB8; border-radius: 16px 16px 4px 16px; padding: 8px 12px">20:30 на террасе подходит, спасибо!<span style="display: block; text-align: right; font-size: 11px; color: #E0D7F5">14:12 ✓✓</span></div>
+</div>
+<div data-if="it4" hidden style="display: contents">
+<div class="bub" style="align-self: flex-start; max-width: 80%; background: #1E1A26; border-radius: 16px 16px 16px 4px; padding: 8px 12px">Забронировали: пятница, 20:30, терраса, 4 гостя. Ждём вас!<span style="display: block; text-align: right; font-size: 11px; color: #9A8FAD">14:13</span></div>
+</div>
+</div>
+<div style="flex: none; display: flex; align-items: center; gap: 10px; padding: 10px 14px 26px; background: #141118; color: #9A8FAD">Сообщение</div>
+</div>
+</div>
+
+</div>
+</div>
+<div data-if="cap0" hidden style="display: contents"><p class="view" style="margin: 0; font-size: 16px; font-weight: 500; color: #D9D0E6; text-align: center">Продать вещи</p></div>
+<div data-if="cap1" hidden style="display: contents"><p class="view" style="margin: 0; font-size: 16px; font-weight: 500; color: #D9D0E6; text-align: center">Разобрать непрочитанное</p></div>
+<div data-if="cap2" hidden style="display: contents"><p class="view" style="margin: 0; font-size: 16px; font-weight: 500; color: #D9D0E6; text-align: center">Забронировать столик</p></div>
+</div>
+</section>
+
+<div class="sheet">
+<section id="control" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 0">
+<h2 style="margin: 0 0 16px; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em; text-wrap: balance">Всё под вашим контролем.</h2>
+<p style="margin: 0 0 48px; max-width: 58ch; color: #B4A9C4; font-size: 18px">Не «это безопасно», а что именно tg-mcp не может сделать с вашим аккаунтом.</p>
+<div role="table" aria-label="Частые опасения и что происходит на самом деле" style="display: flex; flex-direction: column">
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 0 40px; padding: 0 0 14px; font-size: 13.5px; color: #8C809E">
+<span role="columnheader" style="flex: 1 1 260px">Вас беспокоит</span>
+<span role="columnheader" style="flex: 1.6 1 340px">Что происходит на самом деле</span>
+<span role="columnheader" style="flex: 1.2 1 280px">Почему это так</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">«Он что-нибудь отправит от моего имени».</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">Сразу после подключения он только читает. Писать он сможет, только если вы разрешите это при входе, и только в чаты, в которые разрешено отправлять (их вы выбираете сами), не больше установленного лимита. Спрашивать ли вас перед каждой отправкой, решает ваше ИИ-приложение. Или разрешите только черновики — их вы отправите сами.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">Разрешения вы выбираете на экране входа. Инструменты, которые вы не разрешили, ИИ даже не видит, а чаты и лимиты сервер проверяет сам, что бы ни просил ИИ.</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">«Разработчик будет читать мои чаты».</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">Ваши сообщения нигде не хранятся. Ваш сеанс Telegram зашифрован ключом, которого у разработчика нет.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">Ключ есть только в токенах входа, которые хранит ваше ИИ-приложение. Сервер хранит сеанс зашифрованным и сам открыть его не может.</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">«У меня украдут пароль или аккаунт».</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">Пароль вы вводите на странице входа самого tg-mcp, и ИИ его не видит. В украденной базе данных нет ничего, что можно прочитать.</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">Вход по QR-коду и ввод облачного пароля происходят вне ИИ-приложения. Сеанс в базе данных зашифрован.</span>
+</div>
+<div role="row" style="display: flex; flex-wrap: wrap; gap: 10px 40px; padding: 28px 0; border-top: 1px solid rgba(241,236,247,.1); border-bottom: 1px solid rgba(241,236,247,.1)">
+<span role="cell" style="flex: 1 1 260px; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 19px; line-height: 1.3; letter-spacing: -0.01em">«Я не смогу его отключить».</span>
+<span role="cell" style="flex: 1.6 1 340px; color: #F1ECF7">Одно касание: Telegram → Настройки → Устройства → завершите сеанс «Unofficial MCP Server».</span>
+<span role="cell" style="flex: 1.2 1 280px; font-size: 15px; color: #B4A9C4">Сервер по-настоящему выходит из аккаунта. При следующем запросе ваш ИИ получит ошибку.</span>
+</div>
+</div>
+<p style="margin: 24px 0 0"><a href="/privacy.html" hreflang="en" style="display: inline-block; padding: 10px 0">Политика конфиденциальности (на английском)</a></p>
+</section>
+
+<section id="verify" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 0">
+<h2 style="margin: 0 0 28px; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em">Не доверяйте. Проверяйте.</h2>
+<div style="display: flex; flex-wrap: wrap; gap: 24px 64px; align-items: flex-start">
+<p style="flex: 1.4 1 480px; margin: 0; font-size: 20px; line-height: 1.55; color: #F1ECF7; max-width: 60ch">Шифрование защищает то, что хранится. Пока ИИ читает чат, сообщения проходят через память сервера, так что тот, кто управляет сервером, теоретически может их увидеть. А всё, о чём вы спрашиваете, уходит вашему ИИ-провайдеру: OpenAI, Anthropic или Google.</p>
+<p style="flex: 1 1 320px; margin: 0; font-family: Unbounded, sans-serif; font-weight: 500; font-size: 22px; line-height: 1.3; letter-spacing: -0.01em; color: #E4B2EA">Не хотите доверять даже мне? Запустите свою копию.</p>
+</div>
+<ul style="margin: 56px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 0 48px">
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Открытый код, MIT.</strong><span style="color: #B4A9C4">Бесплатно и навсегда. Код можно читать, форкать и запускать.</span><a href="https://github.com/qelphybox/tg-mcp" style="align-self: flex-start; padding: 8px 0">github.com/qelphybox/tg-mcp</a></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Своя копия одной командой.</strong><span style="color: #B4A9C4">Готовые образы для amd64 и arm64 собираются из каждого релизного тега. Ничего не нужно компилировать.</span></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Деплой на виду.</strong><span style="color: #B4A9C4">Публичный сервер разворачивается из публичной ветки main через GitHub Actions, логи сборки открыты. Доказать, что именно запущено на сервере, не может никто; ответ на это — своя копия.</span><a href="https://github.com/qelphybox/tg-mcp/actions" style="align-self: flex-start; padding: 8px 0">Смотреть деплои</a></li>
+</ul>
+<pre style="margin: 32px 0 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 14px; padding: 20px 22px; font-size: 13.5px; line-height: 1.75; color: #F1ECF7; white-space: pre-wrap; word-break: break-word">docker run -d --name tg-mcp --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data \
+  -e TG_MCP_PUBLIC_URL=https://tg.example.com \
+  -e TG_MCP_DB_PATH=/data/tg-mcp.db \
+  -e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash \
+  ghcr.io/qelphybox/tg-mcp:latest</pre>
+<p style="margin: 14px 0 0; font-size: 14.5px; color: #8C809E">Нужен HTTPS на публичном домене и свой app id с <a href="https://my.telegram.org/apps">my.telegram.org</a>. <a href="https://github.com/qelphybox/tg-mcp#self-hosting" hreflang="en">Полное руководство (на английском)</a></p>
+</section>
+
+<section id="faq" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 104px; display: flex; flex-wrap: wrap; gap: 24px 64px">
+<h2 style="flex: 1 1 280px; margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(28px, 3.6vw, 48px); line-height: 1.08; letter-spacing: -0.025em">Вопросы.</h2>
+<div style="flex: 2.4 1 560px; min-width: 0; display: flex; flex-direction: column">
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Что такое MCP-сервер для Telegram?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">MCP (<a href="https://modelcontextprotocol.io">Model Context Protocol</a>) — открытый стандарт, через который ИИ-приложения подключают внешние инструменты. tg-mcp — MCP-сервер для вашего личного аккаунта Telegram: после подключения ИИ может просматривать список чатов, читать и искать сообщения, смотреть фото, расшифровывать голосовые сообщения и, только если вы разрешите, писать черновики или отправлять сообщения в чаты, в которые разрешено отправлять.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Как подключить Телеграм к Claude, ChatGPT или Gemini?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Добавьте <code>https://connector.tgmcp.dev/mcp</code> как свой коннектор. В Claude: Настройки → Коннекторы → Добавить свой коннектор (Settings → Connectors → Add custom connector). В ChatGPT (платные тарифы): Настройки → Приложения и коннекторы → Дополнительно → Режим разработчика, затем «Создать» (Settings → Apps &amp; Connectors → Advanced → Developer mode, Create). В Gemini: Настройки → Подключённые приложения → Добавить своё приложение (Settings → Connected apps → Add a custom app). Затем отсканируйте QR-код в Telegram на телефоне. В Claude Code: <code>claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</code>. Cursor и другие MCP-клиенты принимают тот же адрес как streamable-HTTP-сервер.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Это бесплатно? Нужен API-ключ или бот?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Бесплатно: без регистрации, без оплаты и без API-ключа. Сервер входит в ваш собственный аккаунт по QR-коду, как Telegram Desktop, и работает с вашими настоящими чатами, а не с чатами бота. Свой app id с my.telegram.org нужен, только если вы запускаете собственную копию.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Чем он отличается от других MCP-серверов для Telegram?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Большинство MCP-серверов для Telegram работают на вашем компьютере: нужно поставить Python или Node, получить API id и hash на my.telegram.org и хранить файл сеанса на диске. tg-mcp — удалённый сервер, который добавляется по ссылке, поэтому он работает в Claude, ChatGPT и Gemini — и в браузере, и на телефоне. Ваш сеанс Telegram хранится в зашифрованном виде, а ключ есть только у вашего ИИ-приложения; собственную копию по-прежнему можно запустить в Docker.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Может ли Telegram заблокировать за это мой аккаунт?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Сервер работает через официальный API Telegram от имени своего зарегистрированного приложения, держится в пределах лимитов Telegram, а когда Telegram просит подождать, ждёт, а не обходит ограничение повторными запросами. Говорить за Telegram мы не можем, поэтому честно пообещать, что ничего никогда не случится, не может никто.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Кто это делает?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Я — <a href="https://github.com/qelphybox">Кирилл Бобыкин</a>, независимый разработчик, <a href="https://github.com/qelphybox">@qelphybox</a> на GitHub. tg-mcp — неофициальный проект, он не связан с Telegram, OpenAI, Anthropic или Google. Весь код открыт, а issues приходят прямо мне.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Что видит мой ИИ-провайдер?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Сообщения, которые ИИ читает, чтобы ответить на ваш вопрос, — так же, как если бы вы сами вставили их в чат.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1); border-bottom: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Я удалил его из ИИ-приложения. Он отключён?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Не всегда. Некоторые приложения лишь забывают свои ключи, а сеанс Telegram остаётся. Для надёжности завершите его в Telegram → Настройки → Устройства → Unofficial MCP Server.</p>
+</details>
+</div>
+</section>
+<footer id="dev" style="margin-top: 24px; border-top: 1px solid rgba(241,236,247,.1)">
+<div style="max-width: 1240px; margin: 0 auto; padding: 48px 24px 64px; display: flex; flex-wrap: wrap; gap: 40px 64px">
+<div style="flex: 1 1 300px; display: flex; flex-direction: column; gap: 10px">
+<span style="font-family: Unbounded, sans-serif; font-weight: 600; font-size: 18px">tg-mcp</span>
+<p style="margin: 0; max-width: 42ch; font-size: 14.5px; color: #B4A9C4">Неофициальный проект. Сделал <a href="https://github.com/qelphybox">Кирилл Бобыкин</a>, независимый разработчик; с Telegram не связан. Лицензия MIT.</p>
+</div>
+<div style="flex: 2 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 10px">
+<span style="font-weight: 600; font-size: 15px">Разработчикам</span>
+<pre style="margin: 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; color: #D9D0E6; white-space: pre-wrap; word-break: break-all"><code class="language-bash">claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</code></pre>
+<p style="margin: 0; font-size: 14.5px; color: #B4A9C4">Любой клиент с поддержкой streamable HTTP сам находит OAuth. Написано на Rust: tokio, axum, rmcp, grammers, SQLite.</p>
+<div style="display: flex; flex-wrap: wrap; gap: 0 24px; font-size: 14.5px">
+<a href="https://github.com/qelphybox/tg-mcp#tools" style="padding: 10px 0">Инструменты и промпты</a>
+<a href="https://github.com/qelphybox/tg-mcp/tree/main/docs/adr" style="padding: 10px 0">Архитектурные решения</a>
+<a href="https://github.com/qelphybox/tg-mcp#security-model" style="padding: 10px 0">Модель безопасности</a>
+<a href="/llms.txt" hreflang="en" style="padding: 10px 0">llms.txt</a>
+</div>
+</div>
+<div style="flex: 1 1 160px; display: flex; flex-direction: column; font-size: 14.5px">
+<span style="font-weight: 600; font-size: 15px; margin-bottom: 4px">Проект</span>
+<a href="https://github.com/qelphybox/tg-mcp" style="padding: 8px 0">GitHub</a>
+<a href="https://github.com/qelphybox/tg-mcp/releases" style="padding: 8px 0">Релизы</a>
+<a href="https://github.com/qelphybox/tg-mcp/issues" style="padding: 8px 0">Поддержка</a>
+<a href="/privacy.html" hreflang="en" style="padding: 8px 0">Политика конфиденциальности (на английском)</a>
+</div>
+</div>
+</footer>
+</div>
+</main>
+
+</div>
+<script src="/ru/strings.js"></script>
+<script src="/landing.js"></script>
+</body>
+</html>

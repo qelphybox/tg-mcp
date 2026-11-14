@@ -79,7 +79,16 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 
 ## Self-hosting
 
-You need a server with HTTPS on a public hostname (OAuth requires it). Run the image behind a TLS-terminating reverse proxy that forwards the `Host` header:
+With Docker Compose, from a clone of this repository ([`compose.yaml`](compose.yaml)):
+
+```sh
+docker compose up -d                                              # http://localhost:8080/mcp, for Claude Code, Cursor and other local clients
+TG_MCP_DOMAIN=tg.example.com docker compose --profile https up -d   # https://tg.example.com/mcp through Caddy and Let's Encrypt
+```
+
+The `https` profile is what claude.ai and Claude desktop need: they reach connectors from Anthropic's cloud, so the server needs a public HTTPS URL. Point the domain's DNS at the server and open ports 80 and 443. tg-mcp itself listens only on `127.0.0.1:8080`.
+
+Or run the image behind your own TLS-terminating reverse proxy that forwards the `Host` header:
 
 ```sh
 docker run -d --name tg-mcp --restart unless-stopped \
