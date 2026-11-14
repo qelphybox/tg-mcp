@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`list_chats` no longer drops pinned chats beyond `limit`** (#68). With more pinned chats than `limit`, the next page goes on with the next pinned chat instead of starting the unpinned list, so every pinned chat appears once across the pages of one listing: main list, Archive and `unread_only` alike. A page that continues the pinned chats is still one `messages.getDialogs` call. Cursors issued before keep working as they did.
+
 ## 0.2.0
 
 ### New address

@@ -853,6 +853,7 @@ mod tests {
             offset_access_hash: None,
             archived: false,
             unread_only: false,
+            pinned_from: None,
         }
         .encode();
         let other = FolderCursor {
@@ -902,6 +903,7 @@ mod tests {
             offset_access_hash: None,
             archived: false,
             unread_only: true,
+            pinned_from: None,
         };
         assert_eq!(FolderCursor::decode(&plain.encode()), None);
     }

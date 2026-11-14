@@ -1028,3 +1028,19 @@ Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its 
     ```
 
 11. **Clean up.** Remove any reaction of yours left from these steps (`react` with `emoji: null`, or in the app), delete the §57 messages, and remove `telegram-react` (`claude mcp remove telegram-react`; it stays in the account's Active sessions until revoked there or with §56's clean-up).
+
+## 62. list_chats pages through more pinned chats than `limit`, each once
+
+Needs an account with at least 4 pinned chats in the main list (pin some in the app if needed: long-press → Pin), ideally 2 or more pinned in the Archive, and at least one pinned chat with unread messages or marked as unread. Write down from the app the pinned chats' titles, top to bottom, in each list. The paging itself is covered by fake-backed tests: `cargo test --lib tg::chats::` (every chat once, pinned first, in order, for every `limit` from 1 to 9, main list and Archive, with and without `unread_only`; old cursors decode) and `cargo test --lib tg::grammers::tests::listings_name_their_folder_and_later_pages_skip_pinned_chats` (a page inside the pinned chats is one `messages.getDialogs` like a first page). In Claude Code, with the server added as in §1, run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи, названия чатов выводи. 1) list_chats с limit=1, потом с cursor=<next_cursor предыдущей> и limit=1, пока не пройдёшь все чаты с pinned=true и ещё 2 страницы после них: для каждой страницы title, pinned. 2) То же с archived=true. 3) То же с unread_only=true и limit=1. 4) list_chats с limit=100: title чатов с pinned=true. Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: the first pages show the main list's pinned chats one per page, in the app's order, each once, then the most recent unpinned chat, then the next one. Before #68 the second page was already the first unpinned chat, and the other pinned chats never came.
+2. Step 2: the same for the Archive's pinned chats (with one or none pinned there: page 1 is that chat or the newest archived one, then the rest by date).
+3. Step 3: only chats with a badge, the pinned ones among them first and each once, then the unpinned ones; no `unread_scan_truncated` on the pinned pages.
+4. Step 4: the same pinned chats as step 1, all on this one page, in the same order.
+
+A cursor kept from before this deploy (e.g. a `next_cursor` of `list_chats` with `limit=1` saved earlier) still works: it continues with the unpinned chats from the top, as it did.
+
