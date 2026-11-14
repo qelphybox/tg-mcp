@@ -262,8 +262,9 @@ supported, and an emoji that is no standard reaction is an error that lists them
 admins allow only some reactions, or none, refuses the others with an error. Only the chats the \
 user allowed when connecting this app work; any other is an error. Setting the reaction that \
 is already there changes nothing and is no error. Counts against the account's writes budget \
-(not the chat's limit of messages). get_messages shows a message's reactions as counts. Returns `status` (`set` or `removed`), the `chat_id`, \
-`message_id` and the `emoji` as Telegram names it. An error that says to retry in N s, or \
+(not the chat's limit of messages). get_messages shows a message's reactions as counts. \
+Returns `status` (`set` or `removed`), the `chat_id`, `message_id` and the `emoji` as Telegram \
+names it. An error that says to retry in N s, or \
 PEER_FLOOD, means nothing was written: never retry it on your own; tell the user.",
         annotations(
             title = "React to a message",

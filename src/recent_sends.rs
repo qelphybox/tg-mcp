@@ -116,6 +116,7 @@ impl RecentSends {
     }
 
     /// Err when this message was sent, or is being sent, within the window.
+    #[cfg(test)]
     pub fn check(&self, key: &SendKey) -> Result<(), Duplicate> {
         match self.entries().get(key) {
             None => Ok(()),
@@ -140,7 +141,7 @@ impl RecentSends {
     }
 
     /// Telegram took this message as message `id`, now.
-    pub fn sent(&self, key: &SendKey, id: i32) {
+    fn sent(&self, key: &SendKey, id: i32) {
         self.entries().insert(
             *key,
             Recent::Sent {

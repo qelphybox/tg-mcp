@@ -18,7 +18,7 @@ Not affiliated with Telegram. Made by Kirill Bobykin (https://github.com/qelphyb
 
 - Read: list chats (unread only, by Chat folder, archived), read messages and threads, search messages across chats, find chats and contacts by name, read chat and profile info, list group members, read Drafts
 - Media: look at photos and video thumbnails, transcribe voice messages and video notes with Telegram's own transcription, or download files through a short-lived link
-- Write, only when allowed at sign-in: `save_draft` (text in a chat's message field that you send yourself); `send_message`, `react` and `mark_read` in the chats you picked, each message confirmed by you unless you chose otherwise
+- Write, only when allowed at sign-in: `save_draft` (text in a chat's message field that you send yourself); `send_message`, `react` and `mark_read` in the chats you picked, sent at once (your AI app decides whether to ask you first; the server enforces the chats and the limits)
 - Never: edit, delete or forward messages
 
 ## Docs

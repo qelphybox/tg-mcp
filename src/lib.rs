@@ -63,8 +63,11 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
         move || {
-            Ok(TgMcp::new(links.clone(), experimental_documents)
-                .with_recent_sends(recent_sends.clone()))
+            Ok(TgMcp::new(
+                links.clone(),
+                recent_sends.clone(),
+                experimental_documents,
+            ))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()

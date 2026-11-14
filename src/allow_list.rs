@@ -30,8 +30,12 @@ pub const MAX_CHATS: usize = 1000;
 /// 2 (#45) also with the Confirmation cookie's 32-byte verifier after the
 /// count when its flag is set.
 const VERSION: u8 = 3;
-const V1_AUTO_SEND: u8 = 1;
-const V2_CONFIRM_COOKIE: u8 = 2;
+const VERSION_1: u8 = 1;
+const VERSION_2: u8 = 2;
+/// Versions 1 and 2: the Auto-send flag.
+const FLAG_AUTO_SEND: u8 = 1;
+/// Version 2: a Confirmation cookie verifier follows the count.
+const FLAG_CONFIRM_COOKIE: u8 = 2;
 const HEADER_LEN: usize = 6;
 const V2_VERIFIER_LEN: usize = 32;
 const ENTRY_LEN: usize = 9;
@@ -111,8 +115,8 @@ impl SendAllowList {
         let (&[version, flags], rest) = bytes.split_first_chunk::<2>()?;
         let known_flags = match version {
             VERSION => 0,
-            2 => V1_AUTO_SEND | V2_CONFIRM_COOKIE,
-            1 => V1_AUTO_SEND,
+            VERSION_2 => FLAG_AUTO_SEND | FLAG_CONFIRM_COOKIE,
+            VERSION_1 => FLAG_AUTO_SEND,
             _ => return None,
         };
         if flags & !known_flags != 0 || !bytes.len().is_multiple_of(PAD_TO) {
@@ -120,7 +124,7 @@ impl SendAllowList {
         }
         let (count, mut rest) = rest.split_first_chunk::<4>()?;
         let count = usize::try_from(u32::from_le_bytes(*count)).ok()?;
-        if flags & V2_CONFIRM_COOKIE != 0 {
+        if flags & FLAG_CONFIRM_COOKIE != 0 {
             // A cookie no page reads any more.
             rest = rest.get(V2_VERIFIER_LEN..)?;
         }

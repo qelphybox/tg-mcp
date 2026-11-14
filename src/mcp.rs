@@ -268,8 +268,8 @@ pub struct TgMcp {
     prompt_router: PromptRouter<Self>,
     /// Where get_media's Media links are kept.
     links: Arc<MediaLinks>,
-    /// The duplicate guard of sends. One per server: MCP sessions share it
-    /// ([`Self::with_recent_sends`]), as the guard is per Account.
+    /// The duplicate guard of sends. One per server: MCP sessions share it,
+    /// as the guard is per Account.
     recent_sends: Arc<RecentSends>,
     /// EXPERIMENTAL (#58 prototype): get_media takes mode `document`.
     experimental_documents: bool,
@@ -279,7 +279,13 @@ impl TgMcp {
     /// With `experimental_documents` off (the default), get_media neither
     /// takes mode `document` nor shows it: its schemas and description are
     /// those of a server without it.
-    pub fn new(links: Arc<MediaLinks>, experimental_documents: bool) -> Self {
+    /// `recent_sends` is the server's one duplicate guard, shared by every
+    /// MCP session: the guard is per Account.
+    pub fn new(
+        links: Arc<MediaLinks>,
+        recent_sends: Arc<RecentSends>,
+        experimental_documents: bool,
+    ) -> Self {
         let mut tools = Self::scoped_tools();
         if let Some(get_media) = tools.tool_mut("get_media") {
             if experimental_documents {
@@ -288,7 +294,10 @@ impl TgMcp {
                 hide_document_mode(get_media);
             }
         }
-        Self::with_tools(links, tools, experimental_documents)
+        Self {
+            recent_sends,
+            ..Self::with_tools(links, tools, experimental_documents)
+        }
     }
 
     /// Every tool, under the Scope a Grant needs to see and call it. A tool's
@@ -315,13 +324,6 @@ impl TgMcp {
             recent_sends: Arc::default(),
             experimental_documents,
         }
-    }
-
-    /// Sends are checked against `recent_sends`, the server's one duplicate
-    /// guard, rather than this MCP session's own.
-    pub fn with_recent_sends(mut self, recent_sends: Arc<RecentSends>) -> Self {
-        self.recent_sends = recent_sends;
-        self
     }
 }
 
