@@ -11,8 +11,7 @@ on:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   IMAGE: ghcr.io/qelphybox/tg-mcp
@@ -22,6 +21,9 @@ env:
 jobs:
   image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 

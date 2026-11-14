@@ -64,7 +64,9 @@ jobs:
           tags: |
             type=sha,format=long,prefix=
             type=edge,branch=main
+          # `service` is the label Kamal checks before it runs an image (#105).
           labels: |
+            service=tg-mcp
             org.opencontainers.image.title=tg-mcp
             org.opencontainers.image.description=${{ env.DESCRIPTION }}
             org.opencontainers.image.licenses=MIT
