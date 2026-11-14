@@ -1227,3 +1227,34 @@ Needs the repository secrets `TG_MCP_BUILTIN_API_ID` / `TG_MCP_BUILTIN_API_HASH`
    ```
 
 6. **Production still uses its own app.** On the server, `docker logs $(docker ps -qf label=service=tg-mcp) 2>&1 | grep 'using Telegram app'` shows `source=env` and production's api_id, not the built-in one.
+
+## 70. Docker Hub is the image's home: `main` publishes `<sha>` and `edge`, a release publishes the same digest to Docker Hub and GHCR
+
+Needs the maintainer's Docker Hub setup (`docs/deploy.md`, Releases: the public repository `qelphybox/tg-mcp` with its short description, the `DOCKERHUB_USERNAME` variable, the `DOCKERHUB_TOKEN` secret and `DOCKERHUB_DESCRIPTION_TOKEN`), Docker with `buildx`, and `jq`.
+
+1. **Forks and unset variables skip cleanly.** Before the setup (or in a fork), a push to `main` shows the Publish run's `edge` job as skipped and CI green; with the variable but no `DOCKERHUB_TOKEN`, the job is green with a warning and pushes nothing; a tag goes to GHCR only (the Docker Hub login and description steps show as skipped, with a warning).
+
+2. **A push to `main` publishes `<sha>` and `edge` for both architectures.** After the setup, push any commit to `main` (note its full sha `S`). When the Publish run is green:
+
+   ```sh
+   docker buildx imagetools inspect qelphybox/tg-mcp:$S | grep Platform    # expect linux/amd64 and linux/arm64 (plus unknown/unknown: the attestations)
+   docker buildx imagetools inspect qelphybox/tg-mcp:edge --format '{{json .Manifest.Digest}}'
+   docker buildx imagetools inspect qelphybox/tg-mcp:$S   --format '{{json .Manifest.Digest}}'   # expect the same digest
+   docker buildx imagetools inspect qelphybox/tg-mcp:latest   # expect the last release (or "not found" before the first one), not S
+   ```
+
+   The Deploy run of the same push is green and still deploys through Kamal as before.
+
+3. **A release publishes the same digest to both registries.** After tagging `vX.Y.Z`:
+
+   ```sh
+   for t in X.Y.Z X.Y latest; do
+     for r in qelphybox/tg-mcp ghcr.io/qelphybox/tg-mcp; do
+       printf '%s:%s ' $r $t; docker buildx imagetools inspect $r:$t --format '{{json .Manifest.Digest}}'
+     done
+   done   # expect one digest on all six lines
+   ```
+
+4. **Labels and descriptions.** `docker buildx imagetools inspect qelphybox/tg-mcp:X.Y.Z --format '{{json .Image}}' | jq '."linux/amd64".config.Labels'` shows `org.opencontainers.image.description` = "Unofficial Telegram MCP server: read, search, sum up chats; draft and send where you allow." (no "read-only"). On `https://hub.docker.com/r/qelphybox/tg-mcp` the short description is the same sentence (set by hand) and the overview is the README of the tagged commit, its links pointing to GitHub. The GitHub Release body names `qelphybox/tg-mcp:X.Y.Z` and the GHCR mirror.
+
+5. **The write token stays in CI.** The Docker Hub token is only in GitHub Secrets (Settings → Secrets → `DOCKERHUB_TOKEN`); `grep -rln 'DOCKERHUB_.*TOKEN' .github/` lists only `publish.yml` and `release.yml`, and `config/deploy.yml` doesn't mention Docker Hub (production's switch to a read-only token is #105).

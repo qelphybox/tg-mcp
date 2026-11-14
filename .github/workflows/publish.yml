@@ -1,0 +1,91 @@
+name: Publish
+
+# Every push to main: build linux/amd64 and linux/arm64 and push
+# qelphybox/tg-mcp:<sha> and :edge to Docker Hub (#104). `latest` and the
+# semver tags move only on releases (release.yml). Skipped where the
+# DOCKERHUB_USERNAME variable is unset (forks, or before the maintainer's setup);
+# the Docker Hub write token (DOCKERHUB_TOKEN) exists only in GitHub Secrets.
+# Production still deploys through Kamal (deploy.yml), unchanged.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-edge
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_IMAGE: qelphybox/tg-mcp
+  # Same as release.yml's.
+  DESCRIPTION: "Unofficial Telegram MCP server: read, search, sum up chats; draft and send where you allow."
+
+jobs:
+  edge:
+    if: vars.DOCKERHUB_USERNAME != ''
+    runs-on: ubuntu-latest
+    steps:
+      # The variable alone (say, set before the secret) must not turn main red.
+      - id: token
+        env:
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::warning::DOCKERHUB_USERNAME is set but the DOCKERHUB_TOKEN secret is not: nothing published"; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.ok == 'true'
+
+      # ADR-0007: official images carry the Built-in app when its secrets exist.
+      - id: builtin
+        if: steps.token.outputs.ok == 'true'
+        env:
+          BUILTIN_API_ID: ${{ secrets.TG_MCP_BUILTIN_API_ID }}
+          BUILTIN_API_HASH: ${{ secrets.TG_MCP_BUILTIN_API_HASH }}
+        run: |
+          if [ -n "$BUILTIN_API_ID" ] && [ -n "$BUILTIN_API_HASH" ]; then
+            echo "mode=required" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::TG_MCP_BUILTIN_API_ID / TG_MCP_BUILTIN_API_HASH are not set: this edge image has no Built-in app"
+            echo "mode=optional" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.token.outputs.ok == 'true'
+
+      - uses: docker/login-action@v3
+        if: steps.token.outputs.ok == 'true'
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        if: steps.token.outputs.ok == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.DOCKERHUB_IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=edge,branch=main
+          labels: |
+            org.opencontainers.image.title=tg-mcp
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+            org.opencontainers.image.licenses=MIT
+
+      - uses: docker/build-push-action@v6
+        if: steps.token.outputs.ok == 'true'
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          secrets: |
+            tg_builtin_api_id=${{ secrets.TG_MCP_BUILTIN_API_ID }}
+            tg_builtin_api_hash=${{ secrets.TG_MCP_BUILTIN_API_HASH }}
+          build-args: TG_MCP_BUILTIN_APP=${{ steps.builtin.outputs.mode }}
+          cache-from: type=gha,scope=publish
+          cache-to: type=gha,mode=max,scope=publish
