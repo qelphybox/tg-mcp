@@ -29,8 +29,11 @@ COPY . .
 # build without them, and keeps layers cached with and without the secrets
 # apart (secrets are not part of the cache key).
 ARG TG_MCP_BUILTIN_APP=optional
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# One cache per target architecture: a multi-platform build runs both of these
+# steps at once on the builder's platform, and two cargos unpacking into one
+# shared registry cache race ("failed to unpack package ... File exists").
+RUN --mount=type=cache,id=cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-$TARGETARCH,target=/src/target \
     --mount=type=secret,id=tg_builtin_api_id,env=TG_MCP_BUILTIN_API_ID \
     --mount=type=secret,id=tg_builtin_api_hash,env=TG_MCP_BUILTIN_API_HASH \
     set -eu; triple="$(cat /triple)"; \

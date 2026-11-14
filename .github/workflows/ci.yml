@@ -38,6 +38,21 @@ jobs:
           cache-to: type=gha,mode=max
       - run: scripts/container-smoke-test.sh tg-mcp:ci
 
+  # Both platforms in one build, as publish.yml and release.yml run it: the two
+  # cross-compiles share one builder, which a single-platform job never shows.
+  docker-multiarch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha,scope=multiarch
+          cache-to: type=gha,mode=max,scope=multiarch
+
   # arm64 is cross-compiled on the amd64 runner (no emulation), as publish.yml
   # and release.yml build it; this job builds that image and hands it on.
   docker-arm64:
