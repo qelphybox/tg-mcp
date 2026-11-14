@@ -140,3 +140,25 @@ _Avoid_: result, match
 
 **MCP session**:
 The streamable-HTTP session identified by `Mcp-Session-Id`. Unrelated to the Telegram session.
+
+## Acceptance
+
+**Test account**:
+An Account set aside for acceptance runs, holding nothing of value, which the harness may change in any way. Every write of a run must land in it, never in a real user's Account.
+_Avoid_: test user, sandbox account
+
+**Driver**:
+The harness's own logged-in Telegram app on the Test account, standing in for the user's phone: it accepts QR logins and reads what really happened in Telegram. Not a Telegram session in this glossary's sense: no Grant, Session key or Token owns it.
+_Avoid_: test session, bot, phone (unqualified)
+
+**Peer**:
+A second Telegram account, controlled by the harness, that plays the other side of a Chat: it writes to the Test account, owns or joins its test Chats, votes, comments and reacts.
+_Avoid_: friend, second user, counterpart
+
+**Acceptance app**:
+The Telegram app registered on the Test account's phone number that acceptance runs log in through, apart from production's app and the Built-in app, so that Telegram limiting it can't affect real users' logins.
+_Avoid_: test credentials, dev app
+
+**Human check**:
+An acceptance step only a person can judge, such as how something looks on a phone or how a real MCP client behaves: the harness prepares the state, then asks one concrete question with its expected answer.
+_Avoid_: manual test, UAT, visual check
