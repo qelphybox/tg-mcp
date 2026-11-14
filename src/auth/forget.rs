@@ -174,6 +174,8 @@ pub async fn decide(
 /// Delete every Grant of `account_id`, as revocation does: Media links first,
 /// then the Grant with its Tokens and sealed session, then its Live client,
 /// logged out where the Client pool holds one. Returns how many went.
+// The Err is the ready-to-send page; it is built once, on the failure path only.
+#[allow(clippy::result_large_err)]
 async fn delete_grants(auth: &AuthState, account_id: i64) -> Result<usize, Response> {
     let grants = auth
         .vault
