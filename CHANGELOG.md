@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **An hourly `stats` log line.** Once an hour, and once on a graceful shutdown, the server logs one `info` line `stats` (target `tg_mcp::stats`) with numbers only: Grants, Live clients, pending Login flows and Media links now; over the hour, tool calls by tool name, tool errors by kind, Telegram's `FLOOD_WAIT`s per method class with the longest wait, our own limits' refusals, Logins completed and revocations. No ids, no titles; an unknown tool is counted as `unknown_tool`, not by its name. The counters live in memory and a restart loses them. `docs/deploy.md` says how to read it and how to set up a free external monitor on `/healthz` that e-mails when the server is down.
 - **Landing page: text apart from behaviour.** The page's script moved to `site/landing.js`, shared by every language page; the text it shows (install steps and notes, the phone demo's messages and tool-call details, Copy / Copied, the star count's label) comes from a dictionary picked by `<html lang>`, and any key a language leaves out, or gives in the wrong shape, falls back to English. The English page looks and works as before. `tests/site/landing-check.cjs` checks the page with Playwright (widths, requests, the buttons, the demo, the fallback, no JavaScript).
 
 ## 0.2.0
