@@ -1189,7 +1189,7 @@ Needs Docker on your machine (amd64, or arm64 for step 2) and a clone. The image
 
    It runs the image with `TG_MCP_FAKE_TELEGRAM=1` and a volume at `/data`, nothing else.
 
-2. **Static, both architectures, no emulation.** After the next release tag: `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest` lists `linux/amd64` and `linux/arm64`. On an arm64 machine (Apple silicon, Ampere, a Raspberry Pi 4/5) step 1 passes with that tag too. The release run's log shows no `qemu` / `binfmt` step.
+2. **Static, both architectures, no emulation.** Right after a release tag (until #105, a production deploy moves `latest` to its amd64-only image): `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest` lists `linux/amd64` and `linux/arm64`. On an arm64 machine (Apple silicon, Ampere, a Raspberry Pi 4/5) step 1 passes with that tag too. The release run's log shows no `qemu` / `binfmt` step.
 
    ```sh
    c=$(docker create ghcr.io/qelphybox/tg-mcp:<sha>); docker cp $c:/usr/local/bin/tg-mcp /tmp/tg-mcp; docker rm $c
@@ -1259,7 +1259,7 @@ Needs the repository secrets `TG_MCP_BUILTIN_API_ID` / `TG_MCP_BUILTIN_API_HASH`
 
 Needs Docker with `buildx` and `jq`. No login: the package `ghcr.io/qelphybox/tg-mcp` is public. The arm64 checks also run in CI on every push and PR (`docker-arm64` cross-builds the image as the releases do, `docker-arm64-smoke` runs `scripts/container-smoke-test.sh` on it on a native `ubuntu-24.04-arm` runner).
 
-1. **A push to `main` publishes `<sha>` and `edge`, one digest, both architectures.** Push any commit to `main` (note its full sha `S`). When the Publish run's `edge` job is green (its summary names the digest):
+1. **A push to `main` publishes `<sha>` and `edge`, one digest, both architectures.** Push any commit to `main` (note its full sha `S`). When the Publish run's `edge` job is green (its summary names the digest). Until production deploys the published image (#105), Kamal's deploy of the same push also pushes an amd64-only `<sha>` and `latest`, and whichever finishes last owns `<sha>`: run this after #105.
 
    ```sh
    I=ghcr.io/qelphybox/tg-mcp
@@ -1284,7 +1284,7 @@ Needs Docker with `buildx` and `jq`. No login: the package `ghcr.io/qelphybox/tg
 
 5. **No write token outside CI.** `git grep -niE 'docker ?hub|docker\.io' -- ':!CHANGELOG.md'` finds only two lines of `scripts/harden-server.sh` (the name of Debian's own Docker package, not a registry). Both `publish.yml` and `release.yml` log in to `ghcr.io` with `secrets.GITHUB_TOKEN` and no other registry credential; Settings → Secrets holds no registry token.
 
-6. **Forks skip cleanly.** In a fork, a push to its `main` shows the Publish run's `edge` job as skipped (`if: github.repository == 'qelphybox/tg-mcp'`) and CI green, the arm64 smoke job included.
+6. **Forks skip cleanly.** In a public fork, a push to its `main` shows the Publish run's `edge` job as skipped (`if: github.repository == 'qelphybox/tg-mcp'`) and CI green, the arm64 smoke job included.
 
 ## 71. `compose.yaml`: local by default, HTTPS through Caddy with one variable, tg-mcp reachable from outside only through Caddy
 
