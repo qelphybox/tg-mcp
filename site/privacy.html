@@ -12,6 +12,7 @@
 <meta property="og:url" content="https://tgmcp.dev/privacy.html">
 <meta property="og:image" content="https://tgmcp.dev/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
+<script defer src="https://cloud.umami.is/script.js" data-website-id="552e4a6b-90d4-4f64-bf3e-ed0e49c563c6" data-domains="tgmcp.dev" data-do-not-track="true"></script>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="/fonts/unbounded-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/golos-text-latin.woff2" as="font" type="font/woff2" crossorigin>
@@ -56,7 +57,7 @@ nav a{display:inline-block;padding:10px 0;color:#D9D0E6;text-decoration:none}
 <nav class="halo"><a href="./">← tg-mcp</a></nav>
 <main>
 <h1>Privacy policy</h1>
-<p class="muted">Last updated November 12, 2026</p>
+<p class="muted">Last updated November 14, 2026</p>
 
 <p>tg-mcp connects your Telegram account to an AI app such as ChatGPT, Claude or Gemini. This page says what the public instance at <code>connector.tgmcp.dev</code> and this website do with your data. It is run by <a href="https://github.com/qelphybox">Kirill Bobykin</a>, an independent developer. tg-mcp is not affiliated with Telegram, OpenAI, Anthropic or Google.</p>
 <p>If you run your own copy of tg-mcp, you are the operator of that copy and this policy does not cover it.</p>
@@ -79,7 +80,10 @@ nav a{display:inline-block;padding:10px 0;color:#D9D0E6;text-decoration:none}
 </ul>
 
 <h2>Cookies</h2>
-<p>This website sets no cookies and runs no analytics. The server's sign-in page sets <code>tgm_login</code>, which ties the sign-in to your browser and expires after 10 minutes. If you allow sending, the browser you signed in with also gets <code>tgm_confirm_…</code>, which lets only that browser confirm a message; it lasts as long as your sign-in, and the server keeps only a value that checks it.</p>
+<p>This website sets no cookies. It keeps the GitHub star count in your browser's local storage for an hour, so it doesn't ask GitHub again on every visit. The server's sign-in page sets <code>tgm_login</code>, which ties the sign-in to your browser and expires after 10 minutes. If you allow sending, the browser you signed in with also gets <code>tgm_confirm_…</code>, which lets only that browser confirm a message; it lasts as long as your sign-in, and the server keeps only a value that checks it.</p>
+
+<h2>Website analytics</h2>
+<p>This website counts visits and clicks with <a href="https://umami.is">Umami</a> (Umami Cloud), without cookies and without storing anything in your browser, so it can't recognise you on a later visit by anything it left there. For each page view Umami receives the page address and title, the site you came from, your browser, operating system, device type, screen size and language, and your IP address, from which it derives your country; it doesn't store the IP address. For a click on <em>Add to …</em>, <em>Open …</em>, <em>Copy</em> or the GitHub link, it receives which one and, for the first two, which AI app. If your browser sends Do Not Track, nothing is counted. The server's sign-in, consent and confirmation pages run no analytics.</p>
 
 <h2>Logs</h2>
 <p>The server logs ids and sizes, never message content, tokens or sessions. It logs your IP address when it refuses a sign-in attempt because of rate limits. The reverse proxy in front of it records requests, including the IP address. Logs are rotated by size, and old entries are overwritten.</p>
@@ -89,7 +93,8 @@ nav a{display:inline-block;padding:10px 0;color:#D9D0E6;text-decoration:none}
 <li><strong>Telegram</strong>, which the server talks to on your behalf through the official Telegram API.</li>
 <li><strong>Your AI provider</strong> (OpenAI, Anthropic, Google or another) receives what the AI reads to answer you, the same as if you had pasted it into the chat. Their own privacy policy applies to it.</li>
 <li><strong>The hosting provider</strong> of the server, <span class="todo">[HOSTING PROVIDER]</span>, which runs the machine but has no key to your session.</li>
-<li><strong>GitHub</strong> hosts this website and, for the star count next to its GitHub link, answers one request to its public API; <strong>Google Fonts</strong> serves its fonts. Both receive your IP address when you open it.</li>
+<li><strong>GitHub</strong> hosts this website and, for the star count next to its GitHub link, answers one request to its public API. It receives your IP address when you open the website. The fonts are served from this website itself.</li>
+<li><strong>Umami</strong> receives the page views and clicks described under <em>Website analytics</em>.</li>
 </ul>
 <p>Nothing is sold, shared for advertising or used to train AI models.</p>
 
