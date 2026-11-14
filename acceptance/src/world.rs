@@ -74,6 +74,14 @@ pub trait Driver: Party {
     /// Types a Draft into `chat` as another app would (plain text).
     async fn type_draft(&self, chat: &str, text: &str) -> Result<()>;
 
+    /// Deletes message `id` the Test account sent in `chat` (A or a basic
+    /// group: private-chat ids), for everyone.
+    async fn delete_message(&self, chat: &str, id: i64) -> Result<()>;
+
+    /// How many "Unofficial MCP Server" sessions created since `since` (Unix
+    /// seconds) the Test account still has.
+    async fn server_sessions_since(&self, since: i64) -> Result<usize>;
+
     /// The text of the Draft in the Test account's Saved Messages, if any.
     async fn saved_draft(&self) -> Result<Option<String>>;
 
@@ -94,6 +102,10 @@ pub trait Driver: Party {
 pub trait Peer: Party {
     /// Writes `text` to the Test account in their private chat (fixture A).
     async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()>;
+
+    /// Whether the Test account's latest messages to the Peer (in A) include
+    /// one reading exactly `text`.
+    async fn received_from_test_account(&self, test_account: i64, text: &str) -> Result<bool>;
 }
 
 /// Who logs in through the Login flow.

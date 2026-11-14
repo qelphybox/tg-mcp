@@ -280,6 +280,49 @@ impl Driver for TgClient {
         }
     }
 
+    async fn delete_message(&self, chat: &str, id: i64) -> Result<()> {
+        let id = i32::try_from(id).context("a message id out of range")?;
+        match input_peer(chat)? {
+            tl::enums::InputPeer::Channel(c) => {
+                self.client
+                    .invoke(&tl::functions::channels::DeleteMessages {
+                        channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                            channel_id: c.channel_id,
+                            access_hash: c.access_hash,
+                        }),
+                        id: vec![id],
+                    })
+                    .await
+                    .map_err(|e| telegram(e, "channels.deleteMessages"))?;
+            }
+            _ => {
+                self.client
+                    .invoke(&tl::functions::messages::DeleteMessages {
+                        revoke: true,
+                        id: vec![id],
+                    })
+                    .await
+                    .map_err(|e| telegram(e, "messages.deleteMessages"))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn server_sessions_since(&self, since: i64) -> Result<usize> {
+        let tl::enums::account::Authorizations::Authorizations(all) = self
+            .client
+            .invoke(&tl::functions::account::GetAuthorizations {})
+            .await
+            .map_err(|e| telegram(e, "account.getAuthorizations"))?;
+        Ok(all
+            .authorizations
+            .into_iter()
+            .filter(|tl::enums::Authorization::Authorization(a)| {
+                !a.current && a.device_model == SERVER_DEVICE && i64::from(a.date_created) >= since
+            })
+            .count())
+    }
+
     async fn type_draft(&self, chat: &str, text: &str) -> Result<()> {
         self.client
             .invoke(&tl::functions::messages::SaveDraft {
@@ -368,11 +411,10 @@ impl Driver for TgClient {
     }
 }
 
-#[async_trait]
-impl Peer for TgClient {
-    async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()> {
-        // The Peer has a dialog with the Test account (fixture A): its user,
-        // with the access hash, is in the Peer's dialogs.
+impl TgClient {
+    /// The Test account as the Peer addresses it: their chat (fixture A) puts
+    /// its user, with the access hash, among the Peer's dialogs.
+    async fn test_account_peer(&self, test_account: i64) -> Result<tl::enums::InputPeer> {
         let answer = self
             .client
             .invoke(&tl::functions::messages::GetDialogs {
@@ -398,6 +440,44 @@ impl Peer for TgClient {
                 _ => None,
             })
             .context("the Peer has no chat with the Test account: run `cargo accept fixtures`")?;
+        Ok(tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: test_account,
+            access_hash,
+        }))
+    }
+}
+
+#[async_trait]
+impl Peer for TgClient {
+    async fn received_from_test_account(&self, test_account: i64, text: &str) -> Result<bool> {
+        let history = self
+            .client
+            .invoke(&tl::functions::messages::GetHistory {
+                peer: self.test_account_peer(test_account).await?,
+                offset_id: 0,
+                offset_date: 0,
+                add_offset: 0,
+                limit: 20,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getHistory"))?;
+        let messages = match history {
+            tl::enums::messages::Messages::Messages(m) => m.messages,
+            tl::enums::messages::Messages::Slice(m) => m.messages,
+            tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
+            tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+        };
+        Ok(messages.iter().any(|m| match m {
+            tl::enums::Message::Message(m) => !m.out && m.message == text,
+            _ => false,
+        }))
+    }
+
+    async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()> {
+        let peer = self.test_account_peer(test_account).await?;
         self.client
             .invoke(&tl::functions::messages::SendMessage {
                 no_webpage: true,
@@ -408,10 +488,7 @@ impl Peer for TgClient {
                 update_stickersets_order: false,
                 invert_media: false,
                 allow_paid_floodskip: false,
-                peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
-                    user_id: test_account,
-                    access_hash,
-                }),
+                peer,
                 reply_to: None,
                 message: text.to_string(),
                 random_id: {

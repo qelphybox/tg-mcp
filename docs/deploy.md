@@ -163,7 +163,11 @@ In CI, `.github/workflows/acceptance.yml` runs it on dispatch (scenario ids as i
 | `TG_ACCEPT_CLOUD_PASSWORD` | The Test account's Cloud password. |
 | `TG_ACCEPT_DRIVER_SESSION`, `TG_ACCEPT_PEER_SESSION` | The Driver's and the Peer's logins (base64 snapshots): full access to those two accounts. |
 
-A fork's PR gets none of them. Runs queue one at a time. Logins come from GitHub's datacenter IPs; if Telegram restricts the Test account, runs report BLOCKED. The fix then is a self-hosted runner or test DCs, not a change to the code.
+A fork's PR gets none of them.
+
+**After every deploy**, `deploy.yml`'s job `acceptance-smoke` runs `cargo accept --target https://connector.tgmcp.dev smoke`. It logs the Test account in through the QR, the Cloud password and Consent (`draft` and `send`, with A as the Send allow-list), checks that `list_chats` answers, that a Draft in A reaches Telegram and that a message there reaches the Peer, then revokes the Grant and checks that its Telegram session is gone. It runs once the repository variable `ACCEPTANCE_SMOKE` is `on`, which `scripts/accept-setup.sh` sets. A red smoke is the alert. **Nothing rolls back on its own**: roll back by hand (`kamal rollback`, Day-to-day above), after reading the report (a BLOCKED smoke means Telegram limited the Test account; the deploy may be fine). Each deploy leaves the Test account as an Account in production's database: one login and one revoke, with its sent message and Draft removed again.
+
+Runs queue one at a time. Logins come from GitHub's datacenter IPs; if Telegram restricts the Test account, runs report BLOCKED. The fix then is a self-hosted runner or test DCs, not a change to the code.
 
 ## Releases
 

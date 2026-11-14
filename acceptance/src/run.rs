@@ -320,7 +320,18 @@ impl Run {
 
     /// [`Run::login`] for `who`.
     pub async fn login_as(&mut self, who: Who, scopes: &[&str]) -> Result<Session> {
-        let grant = login::login(&self.world, who, scopes).await?;
+        self.login_sending(who, scopes, &[]).await
+    }
+
+    /// [`Run::login_as`] with a Send allow-list of the Chats whose ids start
+    /// with `send_to` (e.g. `user:<the Peer>` for A).
+    pub async fn login_sending(
+        &mut self,
+        who: Who,
+        scopes: &[&str],
+        send_to: &[&str],
+    ) -> Result<Session> {
+        let grant = login::login_sending(&self.world, who, scopes, send_to).await?;
         self.grants.push(grant.clone());
         let by = match who {
             Who::TestAccount => "the Driver",
@@ -347,6 +358,14 @@ impl Run {
             Who::Peer => "whoami is the Peer",
         });
         Ok(session)
+    }
+
+    /// Revokes every Grant the scenario made so far, as the user's
+    /// disconnecting would; fails if `/revoke` refuses one.
+    pub async fn revoke_all(&mut self) -> Result<()> {
+        let notes = self.teardown().await;
+        anyhow::ensure!(notes.is_empty(), "{}", notes.join("; "));
+        Ok(())
     }
 
     /// Revokes every Grant the scenario made; returns what didn't work.

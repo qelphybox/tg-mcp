@@ -557,6 +557,17 @@ impl Driver for FakeParty {
         }))
     }
 
+    async fn delete_message(&self, _chat: &str, _id: i64) -> Result<()> {
+        // The fake Telegram keeps what was sent as its record; nothing to undo.
+        Ok(())
+    }
+
+    async fn server_sessions_since(&self, _since: i64) -> Result<usize> {
+        // A revoked Grant's fake session is logged out (FakeConnector records
+        // it); no other session of the server exists in the fake.
+        Ok(0)
+    }
+
     async fn type_draft(&self, chat: &str, text: &str) -> Result<()> {
         let chat = parse_chat(chat)?;
         self.connector
@@ -592,6 +603,16 @@ impl Peer for FakeParty {
     /// A is the one the fixtures seed.
     async fn say_to_test_account(&self, _test_account: i64, _text: &str) -> Result<()> {
         Ok(())
+    }
+
+    async fn received_from_test_account(&self, test_account: i64, text: &str) -> Result<bool> {
+        let peer = ChatId::User(self.account);
+        Ok(self
+            .connector
+            .sent()
+            .of(test_account)
+            .iter()
+            .any(|m| m.chat == peer && m.text.text == text))
     }
 }
 

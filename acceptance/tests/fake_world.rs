@@ -412,3 +412,17 @@ async fn s53_reports_its_human_checks_as_pr_checkboxes() {
         "only G's and A's Drafts stay, for the Human checks: {left:?}"
     );
 }
+
+#[tokio::test]
+async fn smoke_names_a_broken_send() {
+    let world = FakeWorld::start().await.unwrap();
+    world
+        .connector
+        .sent()
+        .refuse_next(tg_mcp::tg::TgError::Upstream("broken on purpose".into()));
+    let report = run::run(world.world.clone(), &[scenarios::find("smoke").unwrap()]).await;
+    let Outcome::Fail(why) = report.outcome() else {
+        panic!("a broken send passed the smoke: {report}");
+    };
+    assert!(why.contains("send_message"), "{why}");
+}

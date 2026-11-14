@@ -62,15 +62,7 @@ impl Form {
         boxes: &str,
         tick: &[&str],
     ) -> Result<Vec<(String, String)>> {
-        let offered = self.checkboxes(boxes);
-        for value in tick {
-            if !offered.iter().any(|(v, _)| v == value) {
-                bail!(
-                    "the form offers no {boxes} box with value {value:?} (it offers {:?})",
-                    offered.iter().map(|(v, _)| v).collect::<Vec<_>>()
-                );
-            }
-        }
+        let mut pairs = self.fields(&[(boxes, tick)])?;
         if !self.controls.iter().any(|c| {
             c.kind == "submit"
                 && c.name.as_deref() == Some(button.0)
@@ -78,6 +70,25 @@ impl Form {
         }) {
             bail!("the form has no {}={} button", button.0, button.1);
         }
+        pairs.push((button.0.to_string(), button.1.to_string()));
+        Ok(pairs)
+    }
+
+    /// The form's fields with exactly `tick`'s values ticked in each named
+    /// group of boxes, and no button: what a `formaction` button posts.
+    pub fn fields(&self, groups: &[(&str, &[&str])]) -> Result<Vec<(String, String)>> {
+        for (boxes, tick) in groups {
+            let offered = self.checkboxes(boxes);
+            for value in *tick {
+                if !offered.iter().any(|(v, _)| v == value) {
+                    bail!(
+                        "the form offers no {boxes} box with value {value:?} (it offers {:?})",
+                        offered.iter().map(|(v, _)| v).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        let group = |name: &str| groups.iter().find(|(g, _)| *g == name).map(|(_, t)| *t);
         let mut pairs = Vec::new();
         for c in &self.controls {
             let Some(name) = &c.name else { continue };
@@ -89,10 +100,9 @@ impl Form {
                 "submit" | "button" | "reset" | "image" => {}
                 "checkbox" | "radio" => {
                     let value = value.unwrap_or_else(|| "on".into());
-                    let on = if name == boxes {
-                        tick.contains(&value.as_str())
-                    } else {
-                        c.checked
+                    let on = match group(name) {
+                        Some(tick) => tick.contains(&value.as_str()),
+                        None => c.checked,
                     };
                     if on {
                         pairs.push((name.clone(), value));
@@ -101,7 +111,6 @@ impl Form {
                 _ => pairs.push((name.clone(), value.unwrap_or_default())),
             }
         }
-        pairs.push((button.0.to_string(), button.1.to_string()));
         Ok(pairs)
     }
 }

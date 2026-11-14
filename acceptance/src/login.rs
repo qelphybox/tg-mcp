@@ -43,10 +43,25 @@ impl std::fmt::Debug for Grant {
 /// ticked on Consent: `who`'s own login accepts the QR, and the Test account
 /// types its Cloud password when asked.
 pub async fn login(world: &World, who: Who, scopes: &[&str]) -> Result<Grant> {
+    login_sending(world, who, scopes, &[]).await
+}
+
+/// [`login`] with a Send allow-list: `send_to` names its Chats by the start
+/// of their id (`user:123`), picked from the Consent screen's recent Chats.
+pub async fn login_sending(
+    world: &World,
+    who: Who,
+    scopes: &[&str],
+    send_to: &[&str],
+) -> Result<Grant> {
     let mut flow = LoginFlow::start(world, scopes).await?;
     flow.wait_logged_in(world, who).await?;
     let html = flow.consent_page().await?;
-    let code = flow.allow(&html, scopes).await?;
+    let code = if send_to.is_empty() {
+        flow.allow(&html, scopes).await?
+    } else {
+        flow.allow_sending(&html, scopes, send_to).await?
+    };
     flow.token(&code).await
 }
 
@@ -226,9 +241,76 @@ impl LoginFlow {
     /// Ticks exactly `scopes` on the Consent form, presses Allow and returns
     /// the authorization code.
     pub async fn allow(&self, consent_html: &str, scopes: &[&str]) -> Result<String> {
+        let form = Form::find(consent_html, self.consent()?)?;
+        let pairs = form.submit(("decision", "allow"), "scope", scopes)?;
+        self.post_consent(pairs).await
+    }
+
+    /// Ticks `scopes` (with `send`), loads the Send allow-list's pickers,
+    /// ticks the Chats whose ids start with `send_to`, and presses Allow.
+    pub async fn allow_sending(
+        &self,
+        consent_html: &str,
+        scopes: &[&str],
+        send_to: &[&str],
+    ) -> Result<String> {
+        ensure!(
+            scopes.contains(&"send"),
+            "a Send allow-list needs the send Scope"
+        );
         let path = self.consent()?;
         let form = Form::find(consent_html, path)?;
-        let pairs = form.submit(("decision", "allow"), "scope", scopes)?;
+        let pick = form
+            .controls
+            .iter()
+            .find_map(|c| c.formaction.clone())
+            .context("the Consent form has no button that loads the chats")?;
+        let fields = form.fields(&[("scope", scopes)])?;
+        let fields: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let res = self
+            .http
+            .post(format!("{}{pick}", self.base))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, &self.cookie)
+            .body(form_body(&fields))
+            .send()
+            .await
+            .context("loading Consent's chats")?;
+        let status = res.status();
+        let html = res.text().await?;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(Blocked::new(format!("the server says: {}", page_alert(&html))).into());
+        }
+        ensure!(
+            status == StatusCode::OK,
+            "loading Consent's chats: {status}"
+        );
+        let form = Form::find(&html, path)?;
+        let offered = form.checkboxes("chat");
+        let mut chats = Vec::new();
+        for want in send_to {
+            let found = offered
+                .iter()
+                .map(|(v, _)| v.as_str())
+                .find(|v| *v == *want || v.starts_with(&format!("{want}~")))
+                .with_context(|| {
+                    format!(
+                        "Consent offers no chat {want} to send to (it offers {:?})",
+                        offered.iter().map(|(v, _)| v).collect::<Vec<_>>()
+                    )
+                })?;
+            chats.push(found);
+        }
+        let mut pairs = form.fields(&[("scope", scopes), ("chat", &chats)])?;
+        pairs.push(("decision".into(), "allow".into()));
+        self.post_consent(pairs).await
+    }
+
+    async fn post_consent(&self, pairs: Vec<(String, String)>) -> Result<String> {
+        let path = self.consent()?;
         let pairs: Vec<(&str, &str)> = pairs
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
