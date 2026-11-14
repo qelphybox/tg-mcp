@@ -71,7 +71,9 @@ pub enum Platform {
     Render,
     /// <https://docs.fly.io/machines/runtime-environment>: `FLY_APP_NAME`; an app
     /// "is automatically given a `fly.dev` subdomain, based on the app's name"
-    /// (<https://docs.fly.io/networking/custom-domain/>).
+    /// (<https://docs.fly.io/networking/custom-domain/>). It is set on every
+    /// Machine, public or not: an app without a public `fly.dev` address sets
+    /// `TG_MCP_PUBLIC_URL`.
     Fly,
     /// <https://www.koyeb.com/docs/build-and-deploy/environment-variables>:
     /// `KOYEB_PUBLIC_DOMAIN`, the "default public Service URL" as a bare domain.
@@ -109,6 +111,69 @@ impl Platform {
     }
 }
 
+/// `TG_MCP_BIND`, else `0.0.0.0:$PORT` (the hosting platform's), else `0.0.0.0:8080`.
+fn resolve_bind(get: &impl Fn(&str) -> Option<String>) -> anyhow::Result<SocketAddr> {
+    if let Some(bind) = get("TG_MCP_BIND") {
+        return bind.parse().context("TG_MCP_BIND must be host:port");
+    }
+    let port = match get("PORT") {
+        None => 8080,
+        Some(port) => port
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|&p| p != 0)
+            .with_context(|| format!("PORT must be a port number (1-65535), not {port:?}"))?,
+    };
+    Ok(SocketAddr::from(([0, 0, 0, 0], port)))
+}
+
+/// `TG_MCP_PUBLIC_URL`, else the first hosting platform detected (in
+/// [`Platform::ALL`] order) as `https://`, else `http://localhost:8080`.
+fn resolve_public_url(
+    get: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<(Uri, PublicUrlSource)> {
+    if let Some(url) = get("TG_MCP_PUBLIC_URL") {
+        let url: Uri = url.parse().context("TG_MCP_PUBLIC_URL must be a URL")?;
+        if url.scheme().is_none() || url.authority().is_none() {
+            bail!("TG_MCP_PUBLIC_URL must be absolute, e.g. https://tg-mcp.example.com");
+        }
+        return Ok((url, PublicUrlSource::Explicit));
+    }
+    for platform in Platform::ALL {
+        let Some(value) = get(platform.variable()) else {
+            continue;
+        };
+        // A bare DNS name: no scheme, port, path or userinfo.
+        let is_domain = value.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+        if !is_domain {
+            bail!(
+                "{} must be a domain name, not {value:?}",
+                platform.variable()
+            );
+        }
+        let url = format!("https://{}", platform.host(&value))
+            .parse()
+            .with_context(|| {
+                format!(
+                    "{} must be a domain name, not {value:?}",
+                    platform.variable()
+                )
+            })?;
+        return Ok((url, PublicUrlSource::Platform(platform)));
+    }
+    Ok((
+        Uri::from_static("http://localhost:8080"),
+        PublicUrlSource::Default,
+    ))
+}
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_lookup(|key| std::env::var(key).ok())
@@ -116,57 +181,14 @@ impl Config {
 
     /// Same as [`Config::from_env`], with an injectable variable source for tests.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
-        // Set but empty is unset, for the variables a platform or a compose file fills in.
-        let get_set = |key: &str| get(key).filter(|v| !v.trim().is_empty());
-
-        let bind = match (get("TG_MCP_BIND"), get_set("PORT")) {
-            (Some(bind), _) => bind.parse().context("TG_MCP_BIND must be host:port")?,
-            (None, Some(port)) => {
-                let port: u16 =
-                    port.trim()
-                        .parse()
-                        .ok()
-                        .filter(|&p| p != 0)
-                        .with_context(|| {
-                            format!("PORT must be a port number (1-65535), not {port:?}")
-                        })?;
-                SocketAddr::from(([0, 0, 0, 0], port))
-            }
-            (None, None) => SocketAddr::from(([0, 0, 0, 0], 8080)),
+        // Set but empty (or blank) is unset: platforms and compose files fill these in.
+        let get_nonempty = |key: &str| {
+            get(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
         };
-
-        let detected = Platform::ALL
-            .into_iter()
-            .find_map(|platform| get_set(platform.variable()).map(|value| (platform, value)));
-        let (public_url, public_url_source): (Uri, _) = match (get("TG_MCP_PUBLIC_URL"), detected) {
-            (Some(url), _) => (
-                url.parse().context("TG_MCP_PUBLIC_URL must be a URL")?,
-                PublicUrlSource::Explicit,
-            ),
-            (None, Some((platform, value))) => {
-                let host = platform.host(value.trim());
-                let url: Uri = format!("https://{host}")
-                    .parse()
-                    .ok()
-                    .filter(|url: &Uri| {
-                        url.path() == "/" && host.parse::<http::uri::Authority>().is_ok()
-                    })
-                    .with_context(|| {
-                        format!(
-                            "{} must be a domain name, not {value:?}",
-                            platform.variable()
-                        )
-                    })?;
-                (url, PublicUrlSource::Platform(platform))
-            }
-            (None, None) => (
-                Uri::from_static("http://localhost:8080"),
-                PublicUrlSource::Default,
-            ),
-        };
-        if public_url.scheme().is_none() || public_url.authority().is_none() {
-            bail!("TG_MCP_PUBLIC_URL must be absolute, e.g. https://tg-mcp.example.com");
-        }
+        let bind = resolve_bind(&get_nonempty)?;
+        let (public_url, public_url_source) = resolve_public_url(&get_nonempty)?;
 
         let fake_telegram = matches!(get("TG_MCP_FAKE_TELEGRAM").as_deref(), Some("1" | "true"));
         let db_path = get("TG_MCP_DB_PATH")
@@ -484,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_port_that_is_not_a_port_number_is_rejected() {
-        for bad in ["http", "0", "65536", "-1", "80 80"] {
+        for bad in ["http", "0", "65536", "-1", "+9000", "80 80"] {
             let err = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), ("PORT", bad)]))
                 .unwrap_err();
             assert!(format!("{err:#}").contains("PORT"), "PORT={bad}: {err:#}");
@@ -565,14 +587,59 @@ mod tests {
 
     #[test]
     fn a_platform_domain_that_is_not_a_host_is_rejected() {
-        let err = Config::from_lookup(env(&[
+        for bad in [
+            "https://x.up.railway.app/path",
+            "x.up.railway.app:8443",
+            "user@x.up.railway.app",
+            "[::1]",
+            "x..up.railway.app",
+        ] {
+            let err = Config::from_lookup(env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("RAILWAY_PUBLIC_DOMAIN", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("RAILWAY_PUBLIC_DOMAIN"),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_several_platforms_the_first_in_documented_order_wins() {
+        let config = Config::from_lookup(env(&[
             ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("RAILWAY_PUBLIC_DOMAIN", "https://x.up.railway.app/path"),
+            ("KOYEB_PUBLIC_DOMAIN", "t-me.koyeb.app"),
+            ("FLY_APP_NAME", "t"),
+            ("RENDER_EXTERNAL_HOSTNAME", "t.onrender.com"),
+            ("RAILWAY_PUBLIC_DOMAIN", "t.up.railway.app"),
         ]))
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("RAILWAY_PUBLIC_DOMAIN"),
-            "{err:#}"
+        .unwrap();
+        assert_eq!(config.base_url(), "https://t.up.railway.app");
+        let config = Config::from_lookup(env(&[
+            ("TG_MCP_FAKE_TELEGRAM", "1"),
+            ("KOYEB_PUBLIC_DOMAIN", "t-me.koyeb.app"),
+            ("FLY_APP_NAME", "t"),
+        ]))
+        .unwrap();
+        assert_eq!(config.base_url(), "https://t.fly.dev");
+    }
+
+    #[test]
+    fn empty_bind_and_public_url_are_unset() {
+        let config = Config::from_lookup(env(&[
+            ("TG_MCP_FAKE_TELEGRAM", "1"),
+            ("TG_MCP_BIND", ""),
+            ("TG_MCP_PUBLIC_URL", " "),
+            ("PORT", "9000"),
+            ("FLY_APP_NAME", "t"),
+        ]))
+        .unwrap();
+        assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
+        assert_eq!(
+            config.public_url_source,
+            PublicUrlSource::Platform(Platform::Fly)
         );
     }
 }

@@ -6,8 +6,9 @@
 #
 # Checks: the image is under the size budget (uncompressed), /healthz answers,
 # the OAuth issuer is the localhost default, the server runs as non-root, and
-# the database lands on the /data volume. Then, as on a hosting platform, with
-# PORT=9000 and Railway's public domain: /healthz on 9000 and the detected issuer. Needs docker, curl and python3; no
+# the database lands on the /data volume. Then, as on a hosting platform,
+# with PORT=9000 and Railway's public domain: /healthz on 9000 and the
+# detected issuer. Needs docker, curl and python3; no
 # Telegram credentials (forks run it too). CI: .github/workflows/ci.yml.
 set -euo pipefail
 
