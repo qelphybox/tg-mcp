@@ -122,6 +122,7 @@ async function behaviour(browser, url, origin) {
   await page.clock.runFor(1700);
   snap.copy.push(await label());
 
+  snap.lang = await page.evaluate(() => document.documentElement.lang);
   snap.stars = await page.evaluate(() => ({
     shown: !document.querySelector('[data-stars]').hidden,
     count: document.querySelector('[data-stars-count]').textContent,
@@ -192,6 +193,43 @@ async function fallback(browser, url, origin) {
   await page.close();
 }
 
+// What search engines and agents read: JSON-LD that parses with every FAQ entry word
+// for word on the page, a canonical URL of its own and reciprocal hreflang links.
+async function seo(browser, url) {
+  const ctx = await browser.newContext({ javaScriptEnabled: false });
+  const page = await ctx.newPage();
+  await page.route('**/*', (r) => (r.request().url().startsWith(new URL(url).origin) ? r.continue() : r.abort()));
+  await page.goto(url);
+  const r = await page.evaluate(() => {
+    const norm = (t) => t.replace(/\s+/g, ' ').trim();
+    const text = norm(document.body.textContent);
+    let parsed = true;
+    const faq = [];
+    for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const data = JSON.parse(el.textContent);
+        for (const node of data['@graph'] || [data]) {
+          if (node['@type'] === 'FAQPage') {
+            for (const q of node.mainEntity) faq.push([q.name, q.acceptedAnswer.text]);
+          }
+        }
+      } catch (e) { parsed = false; }
+    }
+    const missing = faq.filter(([q, a]) => !text.includes(norm(q)) || !text.includes(norm(a))).map(([q]) => q);
+    const alt = {};
+    for (const l of document.querySelectorAll('link[rel="alternate"][hreflang]')) alt[l.hreflang] = new URL(l.href).pathname;
+    const canonical = document.querySelector('link[rel="canonical"]');
+    return { parsed, faq: faq.length, missing, alt, canonical: canonical && new URL(canonical.href).pathname, lang: document.documentElement.lang };
+  });
+  const path = new URL(url).pathname;
+  check(r.parsed && r.faq >= 5, `seo: JSON-LD parses, ${r.faq} FAQ entries`);
+  check(r.missing.length === 0, `seo: every FAQ entry is on the page word for word ${r.missing.length ? JSON.stringify(r.missing) : ''}`);
+  check(r.canonical === path, `seo: canonical is the page itself (${r.canonical})`);
+  check(r.alt.en === '/' && r.alt.ru === '/ru/' && r.alt['x-default'] === '/' && r.alt[r.lang] === path,
+    `seo: hreflang en, ru, x-default, self included (${JSON.stringify(r.alt)})`);
+  await ctx.close();
+}
+
 async function noScript(browser, url) {
   const ctx = await browser.newContext({ javaScriptEnabled: false });
   const page = await ctx.newPage();
@@ -199,7 +237,7 @@ async function noScript(browser, url) {
   await page.goto(url);
   const r = await page.evaluate(() => ({
     h1: (document.querySelector('h1') || {}).textContent || '',
-    def: Array.from(document.querySelectorAll('#top p')).some((p) => /MCP server/.test(p.textContent) && p.textContent.length > 120),
+    def: Array.from(document.querySelectorAll("#top p")).some((p) => (document.documentElement.lang === 'en' ? /MCP server/ : /MCP/).test(p.textContent) && p.textContent.length > 120),
     faq: document.querySelectorAll('#faq details').length,
     faqText: (document.querySelector('#faq details p') || {}).textContent || ''
   }));
@@ -222,12 +260,17 @@ async function noScript(browser, url) {
     check(snap.closed, 'pressing the open button again closes the steps');
     check(snap.copy[1] !== snap.copy[0] && snap.copy[2] === snap.copy[0], `Copy → ${snap.copy[1]} → back (${snap.copy.join(' → ')})`);
     check(snap.clipboard === 'https://connector.tgmcp.dev/mcp', 'the link is copied');
-    check(snap.stars.shown && snap.stars.count === '1.2k' && /1234/.test(snap.stars.label), `star count shows (${snap.stars.count}, "${snap.stars.label}")`);
+    check(snap.stars.shown && (snap.lang === 'en' ? snap.stars.count === '1.2k' : /^1[.,]2/.test(snap.stars.count)) && /1234/.test(snap.stars.label), `star count shows (${snap.stars.count}, "${snap.stars.label}")`);
+    if (snap.lang !== 'en') {
+      const english = snap.apps.flatMap((a) => a.steps).filter((t) => !/[а-яё]/i.test(t));
+      check(english.length === 0, `${snap.lang}: every install step comes from the page's dictionary ${english.length ? JSON.stringify(english) : ''}`);
+    }
     const caps = new Set(snap.frames.map((f) => f.split('\n').pop()));
     check(caps.size === 3, `the demo plays three scenarios (${[...caps].join(', ')})`);
     if (snapOut) fs.writeFileSync(snapOut, JSON.stringify(snap, null, 1));
     await fallback(browser, url, origin);
     await noScript(browser, url);
+    await seo(browser, url);
   } finally {
     await browser.close();
     server.close();
