@@ -3010,6 +3010,10 @@ impl Connector for GrammersConnector {
         self.log_out_session(&snapshot).await.map(|()| true)
     }
 
+    fn live_clients(&self) -> usize {
+        self.pool.len()
+    }
+
     async fn shutdown(&self) {
         let _resealing = self.resealing.lock().await;
         let live_clients = self.pool.len();

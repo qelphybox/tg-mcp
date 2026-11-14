@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod recent_sends;
 pub mod scope;
 pub mod sessions;
+pub mod stats;
 pub mod tg;
 
 use std::sync::Arc;
@@ -60,6 +61,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     // One duplicate guard for every MCP session: it is per Account.
     let recent_sends = Arc::new(RecentSends::default());
     auth::spawn_flow_sweeper(&auth);
+    spawn_stats(&auth);
 
     let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
@@ -102,4 +104,28 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         // Media links are for curl in an agent's shell, never for a page:
         // merged after the CORS layer, so no browser may read them cross-origin.
         .merge(links::router(auth))
+}
+
+/// The hourly `stats` line ([`stats`]), with what exists right now read from `auth`.
+/// Its last line comes from [`stats::finish`], once the server has drained.
+fn spawn_stats(auth: &Arc<AuthState>) {
+    let auth = auth.clone();
+    stats::spawn(move || {
+        let auth = auth.clone();
+        async move {
+            let grants = match auth.vault.count_grants().await {
+                Ok(n) => Some(n),
+                Err(err) => {
+                    tracing::warn!(error = %err, "counting grants for stats failed");
+                    None
+                }
+            };
+            stats::Gauges {
+                grants,
+                live_clients: auth.connector.live_clients(),
+                login_flows: auth.pending_logins(),
+                media_links: auth.links.len(),
+            }
+        }
+    });
 }
