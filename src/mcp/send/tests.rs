@@ -1,6 +1,8 @@
-//! react and mark_read (#47) through `/mcp` with rmcp's own client, on the
-//! fake Telegram: only into the Send allow-list, never confirmed, a standard
-//! emoji only, a Topic only in a forum.
+//! The `send` Scope's tools through `/mcp` with rmcp's own client, on the
+//! fake Telegram: send_message (#46) sends at once (ADR-0008), never the same
+//! text twice within a minute, with save_draft's text and forum rules; react
+//! and mark_read (#47) a standard emoji only, a Topic only in a forum. All
+//! only into the Send allow-list.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -22,13 +24,14 @@ use super::TgMcp;
 use crate::{
     allow_list::SendAllowList,
     auth::Caller,
+    limits::WriteLimit,
     links::MediaLinks,
     scope::{Scope, Scopes},
     sessions::{TokenTtl, Vault},
     tg::{
-        Account, Connector, FakeConnector,
+        Account, Connector, FakeConnector, TgError,
         chats::{ChatId, ChatKind, ChatSummary},
-        fake::{FakeData, FakeTopic, fake_issued_id},
+        fake::{FIRST_SENT_ID, FakeData, FakeTopic, fake_issued_id},
         mark_read::MarkedRead,
         messages::RawHistoryMessage,
     },
@@ -132,7 +135,7 @@ async fn server(scopes: Scopes) -> Server {
     let connector = FakeConnector::default();
     let send_allow_list = scopes
         .contains(Scope::Send)
-        .then(|| Arc::new(SendAllowList::new([ALICE, FORUM, STRICT, QUIET], false).unwrap()));
+        .then(|| Arc::new(SendAllowList::new([ALICE, FORUM, STRICT, QUIET]).unwrap()));
     let caller = Caller {
         grant_id: grant.grant_id.clone(),
         account_id: grant.account_id,
@@ -243,6 +246,241 @@ fn invalid_params(result: Result<Value, (i32, String)>) -> String {
         }
         Ok(value) => panic!("expected invalid params, got {value}"),
     }
+}
+
+async fn send_message(server: &Server, arguments: Value) -> Result<Value, (i32, String)> {
+    call(server, "send_message", arguments).await
+}
+
+async fn send_text(server: &Server, chat: ChatId, text: &str) -> Result<Value, (i32, String)> {
+    send_message(
+        server,
+        json!({ "chat_id": fake_issued_id(chat), "text": text }),
+    )
+    .await
+}
+
+/// The error's message, whatever kind of error it is.
+fn refused(result: Result<Value, (i32, String)>) -> String {
+    match result {
+        Err((_, msg)) => msg,
+        Ok(value) => panic!("expected an error, got {value}"),
+    }
+}
+
+#[tokio::test]
+async fn a_message_is_sent_at_once_and_only_into_the_allow_list() {
+    let server = sending().await;
+    let sent = send_text(&server, ALICE, "**hi** Alice").await.unwrap();
+    assert_eq!(sent["status"], "sent", "{sent}");
+    assert_eq!(sent["message_id"], FIRST_SENT_ID);
+    assert_eq!(sent["chat_id"], fake_issued_id(ALICE));
+    assert!(sent["date"].as_str().unwrap().ends_with('Z'), "{sent}");
+    for gone in ["confirm_url", "expires_at"] {
+        assert!(sent.get(gone).is_none(), "{gone}: {sent}");
+    }
+    let messages = server.connector.sent().of(ME);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].chat, ALICE);
+    assert_eq!(messages[0].text.text, "hi Alice");
+    assert_eq!(messages[0].text.entities.len(), 1, "the bold");
+
+    let msg = invalid_params(send_text(&server, BOB, "hi Bob").await);
+    assert!(
+        msg.contains("user:102 is not one of the chats this connection may send to"),
+        "{msg}"
+    );
+    assert_eq!(server.connector.sent().of(ME).len(), 1);
+}
+
+#[tokio::test]
+async fn the_same_text_to_the_same_chat_within_a_minute_is_already_sent() {
+    let server = sending().await;
+    let first = send_text(&server, ALICE, "see you").await.unwrap();
+    assert_eq!(first["status"], "sent");
+    let msg = refused(send_text(&server, ALICE, "see you").await);
+    assert!(
+        msg.contains(&format!("already sent: message {FIRST_SENT_ID}")),
+        "{msg}"
+    );
+    // The same as the chat shows it: Markdown that formats nothing is plain.
+    let plain = json!({ "chat_id": fake_issued_id(ALICE), "text": "see you", "format": "plain" });
+    assert!(refused(send_message(&server, plain).await).contains("already sent"));
+
+    // Another chat, or another text, is another message.
+    let in_general = json!({ "chat_id": fake_issued_id(FORUM), "text": "see you", "topic": 1 });
+    assert_eq!(
+        send_message(&server, in_general).await.unwrap()["status"],
+        "sent"
+    );
+    assert_eq!(
+        send_text(&server, ALICE, "see you!").await.unwrap()["status"],
+        "sent"
+    );
+    assert_eq!(server.connector.sent().of(ME).len(), 3);
+}
+
+#[tokio::test]
+async fn a_refused_send_says_when_to_retry_and_holds_nothing_back() {
+    let server = sending().await;
+    for (refusal, says) in [
+        (
+            TgError::WritesLimited {
+                seconds: 42,
+                limit: WriteLimit::Chat,
+            },
+            "Too many messages to this chat right now; retry in 42 s",
+        ),
+        (
+            TgError::SlowMode { seconds: 17 },
+            "slow mode: each member may send one message per set interval; retry in 17 s",
+        ),
+        (TgError::PeerFlood, "PEER_FLOOD"),
+    ] {
+        server.connector.sent().refuse_next(refusal);
+        let msg = refused(send_text(&server, ALICE, "once more").await);
+        assert!(msg.contains(says), "{says}: {msg}");
+        assert!(server.connector.sent().of(ME).is_empty());
+    }
+    // Nothing was sent, so nothing is a duplicate.
+    assert_eq!(
+        send_text(&server, ALICE, "once more").await.unwrap()["status"],
+        "sent"
+    );
+}
+
+#[tokio::test]
+async fn text_and_forum_rules_are_save_drafts() {
+    let server = sending().await;
+    let forum = fake_issued_id(FORUM);
+    let alice = fake_issued_id(ALICE);
+
+    let msg = refused(send_message(&server, json!({ "chat_id": forum, "text": "a" })).await);
+    assert!(
+        msg.contains("is a forum") && msg.contains("General is 1"),
+        "{msg}"
+    );
+    let msg = refused(
+        send_message(
+            &server,
+            json!({ "chat_id": alice, "text": "b", "topic": 1 }),
+        )
+        .await,
+    );
+    assert!(msg.contains("not a forum"), "{msg}");
+    let msg = refused(
+        send_message(
+            &server,
+            json!({ "chat_id": forum, "text": "c", "reply_to": 12, "topic": 1 }),
+        )
+        .await,
+    );
+    assert!(msg.contains("in Topic 10, not in topic 1"), "{msg}");
+    let msg = refused(
+        send_message(
+            &server,
+            json!({ "chat_id": alice, "text": "d", "reply_to": 0 }),
+        )
+        .await,
+    );
+    assert!(msg.contains("reply_to must be a positive id"), "{msg}");
+    let msg = refused(
+        send_message(
+            &server,
+            json!({ "chat_id": alice, "text": "x".repeat(4097) }),
+        )
+        .await,
+    );
+    assert!(msg.contains("4097") && msg.contains("not split"), "{msg}");
+    for blank in ["", "  \n"] {
+        let msg = refused(send_message(&server, json!({ "chat_id": alice, "text": blank })).await);
+        assert!(msg.contains("a message needs some text"), "{msg}");
+    }
+    assert!(server.connector.sent().of(ME).is_empty());
+
+    // In a Topic, a reply that finds its Topic, and plain text as given.
+    let in_topic = send_message(
+        &server,
+        json!({ "chat_id": forum, "text": "e", "topic": 10 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (in_topic["status"].as_str(), in_topic["topic"].as_i64()),
+        (Some("sent"), Some(10))
+    );
+    let reply = send_message(
+        &server,
+        json!({ "chat_id": forum, "text": "f", "reply_to": 12 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["topic"], 10, "{reply}");
+    assert_eq!(reply["reply_to"], 12, "{reply}");
+    let plain = send_message(
+        &server,
+        json!({ "chat_id": alice, "text": "**as is**", "format": "plain" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plain["status"], "sent");
+    let sent = server.connector.sent().of(ME);
+    assert_eq!(sent.len(), 3);
+    assert_eq!((sent[0].topic, sent[0].reply_to), (Some(10), None));
+    assert_eq!((sent[1].topic, sent[1].reply_to), (Some(10), Some(12)));
+    assert_eq!(sent[2].text.text, "**as is**");
+    assert!(sent[2].text.entities.is_empty());
+}
+
+#[tokio::test]
+async fn send_message_is_listed_as_a_bounded_destructive_open_world_write() {
+    let server = sending().await;
+    let tools = server.client.list_all_tools().await.unwrap();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "send_message")
+        .expect("listed for a send Grant");
+    let hints = tool.annotations.as_ref().unwrap();
+    assert_eq!(hints.read_only_hint, Some(false));
+    assert_eq!(hints.idempotent_hint, Some(false));
+    // So that clients ask the user by default (ADR-0008); nothing here
+    // relies on it.
+    assert_eq!(hints.destructive_hint, Some(true), "it can't be unsent");
+    assert_eq!(hints.open_world_hint, Some(true), "others read it");
+    let description = tool.description.as_deref().unwrap();
+    for words in [
+        "Send a message as the user",
+        "sent at once",
+        "already sent: message N",
+        "never retry it on your own",
+    ] {
+        assert!(description.contains(words), "{words}: {description}");
+    }
+    for gone in ["confirm", "pending", "Draft"] {
+        assert!(!description.contains(gone), "{gone}: {description}");
+    }
+    let input = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+    assert_eq!(input["properties"]["text"]["maxLength"], 16_384);
+    assert_eq!(input["properties"]["text"]["minLength"], 1);
+    assert!(input["properties"]["chat_id"]["maxLength"].is_u64());
+    assert_eq!(input["required"], json!(["chat_id", "text"]));
+    let output = serde_json::to_value(tool.output_schema.as_ref().unwrap().as_ref()).unwrap();
+    let statuses: Vec<&Value> = output["$defs"]["SendStatus"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|status| &status["const"])
+        .collect();
+    assert_eq!(statuses, [&json!("sent")], "{output}");
+    assert_eq!(
+        output["required"],
+        json!(["status", "chat_id", "message_id", "date"]),
+        "{output}"
+    );
+    assert!(
+        output["properties"].get("confirm_url").is_none(),
+        "{output}"
+    );
 }
 
 #[tokio::test]
@@ -436,7 +674,7 @@ async fn without_send_neither_is_listed_nor_callable() {
 }
 
 #[tokio::test]
-async fn both_are_listed_as_bounded_idempotent_writes() {
+async fn both_are_listed_as_bounded_idempotent_writes_others_see() {
     let server = sending().await;
     let tools = server.client.list_all_tools().await.unwrap();
     for name in ["react", "mark_read"] {
@@ -445,7 +683,7 @@ async fn both_are_listed_as_bounded_idempotent_writes() {
         assert_eq!(hints.read_only_hint, Some(false), "{name}");
         assert_eq!(hints.destructive_hint, Some(false), "{name}");
         assert_eq!(hints.idempotent_hint, Some(true), "{name}");
-        assert_eq!(hints.open_world_hint, Some(false), "{name}");
+        assert_eq!(hints.open_world_hint, Some(true), "{name}");
         assert!(tool.output_schema.is_some(), "{name}");
     }
     let react = tools.iter().find(|t| t.name == "react").unwrap();

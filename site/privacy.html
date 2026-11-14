@@ -68,22 +68,22 @@ nav a{display:inline-block;padding:10px 0;color:#D9D0E6;text-decoration:none}
 <li>Your chat list, contacts and profile details.</li>
 <li>Your Telegram cloud password.</li>
 </ul>
-<p>When your AI asks for something, the server fetches it from Telegram, passes it to your AI app and keeps it only in memory while answering. A download link for a file lives in memory for 5 minutes and 3 downloads, and the file streams from Telegram without touching the disk. A message waiting for your confirmation before it is sent lives in memory for up to 10 minutes.</p>
+<p>When your AI asks for something, the server fetches it from Telegram, passes it to your AI app and keeps it only in memory while answering. A download link for a file lives in memory for 5 minutes and 3 downloads, and the file streams from Telegram without touching the disk. A message your AI sends goes to Telegram at once; to refuse sending the same text to the same chat twice within a minute, the server keeps a scrambled fingerprint of it (never the text) in memory for that minute.</p>
 
 <h2>What is stored</h2>
 <ul>
 <li><strong>Your Telegram user id</strong>, a number Telegram assigns to your account.</li>
 <li><strong>Your Telegram session, encrypted.</strong> It holds only the authorization keys and the home data center, no messages. The key that decrypts it is not stored: it lives only in the sign-in tokens your AI app holds, so the server can't open the session without one of them.</li>
 <li><strong>Sign-in tokens, in a form that can't be used on its own.</strong> For each token the server keeps a public id, a value that checks it, an encrypted copy of the session key and the expiry time.</li>
-<li><strong>The permissions you chose</strong> when you signed in (read, drafts, sending). If you allowed sending, the list of chats you allowed and whether each message needs your confirmation, encrypted the same way as the session.</li>
+<li><strong>The permissions you chose</strong> when you signed in (read, drafts, sending). If you allowed sending, the list of chats you allowed, encrypted the same way as the session.</li>
 <li><strong>The AI apps you connected:</strong> the name each app registered under and the addresses it asked to be sent back to after sign-in.</li>
 </ul>
 
 <h2>Cookies</h2>
-<p>This website sets no cookies. It keeps the GitHub star count in your browser's local storage for an hour, so it doesn't ask GitHub again on every visit. The server's sign-in page sets <code>tgm_login</code>, which ties the sign-in to your browser and expires after 10 minutes. If you allow sending, the browser you signed in with also gets <code>tgm_confirm_…</code>, which lets only that browser confirm a message; it lasts as long as your sign-in, and the server keeps only a value that checks it.</p>
+<p>This website sets no cookies. It keeps the GitHub star count in your browser's local storage for an hour, so it doesn't ask GitHub again on every visit. The server's sign-in page sets <code>tgm_login</code>, which ties the sign-in to your browser and expires after 10 minutes. Versions before 0.3.0 also set <code>tgm_confirm_…</code> when you allowed sending; the server no longer sets or reads it, and it expires on its own.</p>
 
 <h2>Website analytics</h2>
-<p>This website counts visits and clicks with <a href="https://umami.is">Umami</a> (Umami Cloud), without cookies and without storing anything in your browser, so it can't recognise you on a later visit by anything it left there. For each page view Umami receives the page address and title, the site you came from, your browser, operating system, device type, screen size and language, and your IP address, from which it derives your country; it doesn't store the IP address. For a click on <em>Add to …</em>, <em>Open …</em>, <em>Copy</em> or the GitHub link, it receives which one and, for the first two, which AI app. If your browser sends Do Not Track, nothing is counted. The server's sign-in, consent and confirmation pages run no analytics.</p>
+<p>This website counts visits and clicks with <a href="https://umami.is">Umami</a> (Umami Cloud), without cookies and without storing anything in your browser, so it can't recognise you on a later visit by anything it left there. For each page view Umami receives the page address and title, the site you came from, your browser, operating system, device type, screen size and language, and your IP address, from which it derives your country; it doesn't store the IP address. For a click on <em>Add to …</em>, <em>Open …</em>, <em>Copy</em> or the GitHub link, it receives which one and, for the first two, which AI app. If your browser sends Do Not Track, nothing is counted. The server's sign-in and consent pages run no analytics.</p>
 
 <h2>Logs</h2>
 <p>The server logs ids and sizes, never message content, tokens or sessions. It logs your IP address when it refuses a sign-in attempt because of rate limits. The reverse proxy in front of it records requests, including the IP address. Logs are rotated by size, and old entries are overwritten.</p>

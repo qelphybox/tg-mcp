@@ -17,7 +17,7 @@ The serialized grammers/MTProto state (auth key, DC, peer data) that lets the se
 _Avoid_: session (unqualified), login
 
 **Session key**:
-The random per-Grant symmetric key that encrypts the Telegram session (and, with `send`, the Send allow-list with the Confirmation cookie's verifier). Never stored in plaintext; recoverable only from a Token.
+The random per-Grant symmetric key that encrypts the Telegram session (and, with `send`, the Send allow-list). Never stored in plaintext; recoverable only from a Token.
 _Avoid_: master key, secret
 
 **Token**:
@@ -54,35 +54,19 @@ A kind of access a Grant has: `read` (always), `draft`, `send`, `organize`. Aske
 _Avoid_: permission, role, right
 
 **Send allow-list**:
-The Chats a Grant with the `send` Scope may send to, react in or mark as read, chosen on the Consent screen from the Account's existing dialogs: Chat folders that are explicit lists (read into their Chats there and then), the 100 most recent Chats, and its own Chats found by name. Never empty; sealed with the Session key together with Auto-send, so only a Token opens it. Nothing outside it can be written to, and changing it means a new Grant.
+The Chats a Grant with the `send` Scope may send to, react in or mark as read, chosen on the Consent screen from the Account's existing dialogs: Chat folders that are explicit lists (read into their Chats there and then), the 100 most recent Chats, and its own Chats found by name. Never empty; sealed with the Session key, so only a Token opens it. Nothing outside it can be written to, and changing it means a new Grant. Writes into it go out at once: whether a human approves each one is the MCP client's business (ADR-0008).
 _Avoid_: whitelist, allowed chats
-
-**Auto-send**:
-A Grant's choice, made on the Consent screen and off unless ticked, to send to its Send allow-list without the user confirming each message. Stored sealed with the list. Reactions and marking as read never ask either way.
-_Avoid_: auto-confirm, trusted mode
-
-**Pending send**:
-A message a tool wants to send that waits for the user's confirmation: the Chat, the text and its formatting, `reply_to`, the Topic and the `random_id` it will go out with, plus a reference to the Grant's Live client. In memory only, for 10 minutes; decided once (sent, cancelled or made a Draft); a restart drops it.
-_Avoid_: queued message, draft (a Draft is Telegram's), outbox
-
-**Confirmation page**:
-`/confirm/<id>`, where the user decides a Pending send: it shows the Chat (and Topic), the text as it will look, the message replied to and who asks. Send and Cancel need the Confirmation cookie; any browser can make it a Draft. The id is 256 random bits; the server never logs it.
-_Avoid_: approval page, consent (Consent is the screen before a Grant exists)
-
-**Confirmation cookie**:
-The cookie the Consent screen sets in its browser when it grants `send`: random, HttpOnly, SameSite=Strict, sent only to `/confirm`, living as long as a refresh Token and renewed whenever the page is opened with it. The Grant keeps only its verifier, sealed with its Send allow-list. The one thing that lets a Pending send be sent, so the model's own shell, which may have the page's URL, can't.
-_Avoid_: session cookie, login cookie (that is the Login flow's `tgm_login`)
 
 **Writes budget**:
 How many writes (Drafts, sent messages, reactions, marking as read) an Account may make in any 10 minutes, 20 by default, on top of the request budget every call to Telegram shares. A write over it fails at once with the wait; it never waits or queues.
 _Avoid_: write quota, rate limit (unqualified)
 
 **Send cap**:
-How many messages the Account may send to one Chat in any minute, 5 by default. Only sent messages count, not reactions, marking as read or Drafts. Counted when the message goes to Telegram, so a Pending send doesn't count until the user confirms it, and can still be refused then; over the cap it fails at once with the wait and is never queued.
+How many messages the Account may send to one Chat in any minute, 5 by default. Only sent messages count, not reactions, marking as read or Drafts. Counted when the message goes to Telegram; over the cap it fails at once with the wait and is never queued.
 _Avoid_: per-chat limit, throttle
 
 **Duplicate guard**:
-`send_message`'s refusal to send the same text (as the Chat shows it: text and formatting) to the same Chat again within 60 seconds of a send by the same Account, whichever Grant asks and whether it went out by Auto-send or from the Confirmation page; it answers "already sent: message N". Keeps only a keyed hash of the text, in memory. Unrelated to `random_id`, which stops one message from going out twice.
+`send_message`'s refusal to send the same text (as the Chat shows it: text and formatting) to the same Chat again within 60 seconds of a send by the same Account, whichever Grant or MCP session asks; it answers "already sent: message N". Keeps only a keyed hash of the text, in memory. Unrelated to `random_id`, which stops one message from going out twice.
 _Avoid_: dedup, idempotency
 
 **Draft**:
