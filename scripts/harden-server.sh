@@ -59,6 +59,25 @@ log "Upgrading the system and installing base packages"
 "${APT[@]}" install ca-certificates curl gnupg openssh-server ufw fail2ban python3-systemd \
   unattended-upgrades apt-listchanges
 
+# ── Logs: journald, 14 days ───────────────────────────────────────────────
+# Containers log to journald (daemon.json below, and config/deploy.yml for the
+# app and kamal-proxy). Entries older than 14 days are deleted; one journal file
+# per day, so the cut is within a day of 14. SystemMaxUse caps the disk.
+log "journald: logs kept 14 days"
+journald_changed=0
+write_file /etc/systemd/journald.conf.d/00-tg-mcp.conf 0644 <<'EOF' && journald_changed=1
+# Managed by tg-mcp scripts/harden-server.sh
+[Journal]
+Storage=persistent
+MaxRetentionSec=14day
+MaxFileSec=1day
+SystemMaxUse=1G
+EOF
+if (( journald_changed )); then
+  systemctl restart systemd-journald
+  journalctl --vacuum-time=14d >/dev/null 2>&1 || true
+fi
+
 # ── Docker CE from Docker's repo ──────────────────────────────────────────
 log "Docker"
 if dpkg -s docker.io >/dev/null 2>&1; then
@@ -81,8 +100,7 @@ write_file /etc/docker/daemon.json 0644 <<'EOF' && docker_changed=1
 {
   "live-restore": true,
   "no-new-privileges": true,
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "20m", "max-file": "5" }
+  "log-driver": "journald"
 }
 EOF
 systemctl enable --now docker
@@ -92,9 +110,12 @@ if (( docker_changed )); then
 fi
 
 # ── Deploy user ───────────────────────────────────────────────────────────
-log "User '$DEPLOY_USER' (Kamal connects as this user)"
+log "User '$DEPLOY_USER' (Kamal connects as this user; reads the journal)"
 id "$DEPLOY_USER" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$DEPLOY_USER"
 usermod -aG docker "$DEPLOY_USER"
+# Reads the app's and kamal-proxy's logs (journalctl -t tg-mcp); grants nothing
+# beyond what docker group membership already does.
+usermod -aG systemd-journal "$DEPLOY_USER"
 passwd -l "$DEPLOY_USER" >/dev/null   # key-only; no password to guess
 DEPLOY_HOME=$(getent passwd "$DEPLOY_USER" | cut -d: -f6)
 install -d -m 0700 -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$DEPLOY_HOME/.ssh"

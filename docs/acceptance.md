@@ -1049,6 +1049,33 @@ ADR-0008. Needs `telegram-send` of §56, and, for step 4, a send connector made 
 
 9. **Clean up.** Connect the main account again where you want it (Claude Code: `/mcp` → `telegram` → Authenticate), and end any leftover "Unofficial MCP Server" sessions in Settings → Devices.
 
+## 61. Logs are kept 14 days in journald, readable after a deploy; there are no database backups, on purpose
+
+Maintainer, on the production server, as root (with the repo checked out there, or the script copied over), then from a clone with `.env` loaded. The journald settings were also checked in a Debian 12 container with systemd: two runs of the journald section, the second writes nothing, `systemd-analyze cat-config systemd/journald.conf` shows the four settings.
+
+1. **Apply.** `scripts/harden-server.sh <deploy public key>` twice: the first run prints `wrote /etc/systemd/journald.conf.d/00-tg-mcp.conf` and `wrote /etc/docker/daemon.json`, the second writes nothing. Then:
+
+   ```sh
+   systemd-analyze cat-config systemd/journald.conf | grep -E '^(Storage|MaxRetentionSec|MaxFileSec|SystemMaxUse)='
+   # expect Storage=persistent, MaxRetentionSec=14day, MaxFileSec=1day, SystemMaxUse=1G
+   docker info --format '{{.LoggingDriver}}'   # expect journald
+   ```
+
+2. **The app logs to journald, and `kamal app logs` still works.** Deploy (push to `main` or Actions → Deploy), then `kamal proxy reboot` once from a clone (it asks to confirm; kamal-proxy restarts, a few seconds without service). On the server, as `deploy` (after step 1 it is in `systemd-journal`; log in again):
+
+   ```sh
+   docker inspect -f '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "tag"}}' $(docker ps -qf label=service=tg-mcp)   # expect "journald tg-mcp"
+   docker inspect -f '{{.HostConfig.LogConfig.Type}}' kamal-proxy                                                                       # expect journald
+   journalctl -t tg-mcp --since -10min --no-pager | grep -E 'listening|database ready'   # the app's startup lines
+   journalctl -t kamal-proxy --since -10min --no-pager | tail -3                         # proxy request lines
+   ```
+
+   From the clone, `kamal app logs -n 20` shows the same app lines.
+
+3. **14 days.** `journalctl --list-boots` and `journalctl --since -20d --until -15d -t tg-mcp | head` show nothing older than 14 days (the first time, right after step 1, `journalctl --vacuum-time=14d` already trimmed it). `journalctl --disk-usage` stays under 1 GB.
+
+4. **The docs say why there are no backups.** `docs/deploy.md` has "Logs: 14 days" and "Backups: none, on purpose" (refresh Tokens rotate, so a copy lacks today's Wrapped keys; a copy without Tokens opens nothing, ADR-0003), and the README's self-hosting section says both in short. Note on the ticket (#65) that step 1 ran on production, with the date.
+
 ## 62. list_chats pages through more pinned chats than `limit`, each once
 
 Needs an account with at least 4 pinned chats in the main list (pin some in the app if needed: long-press → Pin), ideally 2 or more pinned in the Archive, and at least one pinned chat with unread messages or marked as unread. Write down from the app the pinned chats' titles, top to bottom, in each list. The paging itself is covered by fake-backed tests: `cargo test --lib tg::chats::` (every chat once, pinned first, in order, for every `limit` from 1 to 9, main list and Archive, with and without `unread_only`; old cursors decode) and `cargo test --lib tg::grammers::tests::listings_name_their_folder_and_later_pages_skip_pinned_chats` (a page inside the pinned chats is one `messages.getDialogs` like a first page). In Claude Code, with the server added as in §1, run:
