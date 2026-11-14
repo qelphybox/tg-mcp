@@ -24,7 +24,7 @@ cleanup() {
     echo "--- container log ---" >&2
     docker logs "$name" >&2 2>&1 || true
   fi
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f "$name" ${created:+"$created"} >/dev/null 2>&1 || true
   docker volume rm -f "$volume" >/dev/null 2>&1 || true
 }
 trap 'status=$?; cleanup' EXIT
@@ -34,6 +34,7 @@ trap 'status=$?; cleanup' EXIT
 created="$(docker create "$image")"
 size_bytes="$(docker export "$created" | wc -c)"
 docker rm "$created" >/dev/null
+created=
 size_mb="$(python3 -c "print(f'{$size_bytes / 1048576:.1f}')")"
 [ "$size_bytes" -le $((budget_mb * 1048576)) ] \
   || fail "image is ${size_mb} MB uncompressed, over the ${budget_mb} MB budget"
@@ -60,9 +61,10 @@ issuer="$(curl -fsS "$base/.well-known/oauth-authorization-server" \
 [ "$issuer" = "http://localhost:8080" ] || fail "issuer is $issuer, expected http://localhost:8080"
 pass "issuer is $issuer"
 
-pid="$(docker inspect -f '{{.State.Pid}}' "$name")"
-uid="$(awk '/^Uid:/ { print $2 }' "/proc/$pid/status")"
-[ "$uid" != 0 ] || fail "the server runs as root"
+# The uid inside the container, as the daemon's ps sees it (also on Docker Desktop).
+uid="$(docker top "$name" -o pid,uid | awk 'NR == 2 { print $2 }')"
+[ -n "$uid" ] || fail "could not read the server's uid"
+[ "$uid" != 0 ] && [ "$uid" != root ] || fail "the server runs as root"
 pass "the server runs as uid $uid"
 
 docker cp "$name:/data/tg-mcp.db" - >/dev/null 2>&1 || fail "no database at /data/tg-mcp.db"
