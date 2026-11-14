@@ -37,7 +37,6 @@ use self::{
 };
 use crate::{
     allow_list::{SendAllowList, WriteRefused, may_write},
-    confirm::PendingSends,
     links::MediaLinks,
     scope::{Scope, Scopes},
     sessions::{GrantId, Vault, VaultError},
@@ -64,8 +63,6 @@ pub struct AuthState {
     pub connector: Arc<dyn Connector>,
     /// Media links: revoking a Grant ends them, and `/media/{ticket}` serves them.
     pub links: Arc<MediaLinks>,
-    /// Pending sends: revoking a Grant ends them, and `/confirm/{id}` decides them.
-    pub confirmations: Arc<PendingSends>,
     flows: Flows,
     rate_limiter: RateLimiter,
 }
@@ -82,7 +79,6 @@ impl AuthState {
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
-            confirmations: Arc::new(PendingSends::new(&base_url)),
             base_url,
             vault,
             clients,
@@ -122,7 +118,7 @@ impl AuthState {
     }
 }
 
-/// Sweep expired Login flows, Media links and pending sends every minute, for
+/// Sweep expired Login flows and Media links every minute, for
 /// as long as the server lives.
 pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
     let auth = Arc::downgrade(auth);
@@ -138,10 +134,6 @@ pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
             let links = auth.links.sweep();
             if links > 0 {
                 tracing::info!(links, "expired media links dropped");
-            }
-            let sends = auth.confirmations.sweep();
-            if sends > 0 {
-                tracing::info!(sends, "expired pending sends dropped");
             }
         }
     });
@@ -261,7 +253,6 @@ pub async fn require_bearer(
             // the Grant goes too, and the client has to log in again.
             tracing::warn!(grant_id = %grant_id, error = %err, "grant has a dead telegram session, deleting it");
             auth.links.revoke_grant(&grant_id);
-            auth.confirmations.revoke_grant(&grant_id);
             if let Err(err) = auth.vault.delete_grant(&grant_id).await {
                 tracing::error!(grant_id = %grant_id, error = %err, "deleting dead grant failed");
             }
@@ -401,8 +392,9 @@ async fn register(State(auth): State<Arc<AuthState>>, body: Json<RegisterRequest
     }
 }
 
-/// The pages' wallpaper pattern and fonts: never change within a release.
-fn static_asset(content_type: &'static str, body: &'static [u8]) -> Response {
+/// A file embedded in the binary (the pages' wallpaper pattern and fonts, the
+/// server's icon): never changes within a release, so cached for a day.
+pub(crate) fn static_asset(content_type: &'static str, body: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),

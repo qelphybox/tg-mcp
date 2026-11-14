@@ -325,9 +325,9 @@ impl AccountLimiter {
 
     /// Run one request that sends a message to `chat` (`messages.sendMessage`):
     /// a write ([`MethodClass::Writes`]) that also counts against `chat`'s Send
-    /// cap. Charged here, at the call to Telegram, so a send waiting for the
-    /// user's confirmation counts only once it is really sent. Never waits,
-    /// never retried: over any limit it fails at once with the wait.
+    /// cap. Charged here, at the call to Telegram, so only what really goes
+    /// out counts. Never waits, never retried: over any limit it fails at once
+    /// with the wait.
     pub async fn run_send<T, F, Fut>(&self, chat: ChatId, request: F) -> Result<T, TgError>
     where
         F: FnOnce() -> Fut,

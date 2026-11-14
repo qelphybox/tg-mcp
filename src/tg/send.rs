@@ -5,9 +5,8 @@
 //! checked ([`super::compose::prepare`]), placed by
 //! [`super::compose::place`] like a Draft, and carrying the `random_id`
 //! Telegram deduplicates sends by. Whoever makes a message keeps that id for
-//! as long as it may be sent again (a pending send keeps one for its whole
-//! life), so a retry or a double click can't send it twice: Telegram refuses
-//! the repeat with `RANDOM_ID_DUPLICATE` ([`already_sent`]).
+//! as long as it may be sent again, so a retry can't send it twice: Telegram
+//! refuses the repeat with `RANDOM_ID_DUPLICATE` ([`already_sent`]).
 
 use super::{TgError, chats::ChatId, chats::ChatRef, markdown::FormattedText};
 

@@ -361,7 +361,6 @@ impl Vault {
             grant_id = %grant_id,
             scopes = %scopes,
             send_chats = send_allow_list.map_or(0, SendAllowList::len),
-            auto_send = send_allow_list.is_some_and(SendAllowList::auto_send),
             "grant created"
         );
         crate::stats::global().login();
@@ -511,18 +510,6 @@ impl Vault {
             .await?;
         tx.commit().await?;
         Ok(issued)
-    }
-
-    /// The OAuth client a Grant was issued to, while the Grant exists. Needs
-    /// no Token and opens nothing: for the confirmation page, which carries
-    /// no Token and shows who asks.
-    pub async fn grant_client(&self, grant_id: &GrantId) -> Result<Option<String>, VaultError> {
-        Ok(
-            sqlx::query_scalar("SELECT client_id FROM grants WHERE id = ?")
-                .bind(grant_id.as_str())
-                .fetch_optional(&self.pool)
-                .await?,
-        )
     }
 
     /// Whether a Grant still exists (it isn't revoked or purged). Needs no
@@ -843,14 +830,11 @@ mod tests {
 
     /// Chats of a Send allow-list, with ids unlikely to turn up by chance.
     fn chosen_chats() -> SendAllowList {
-        SendAllowList::new(
-            [
-                ChatId::User(4_711_000_042),
-                ChatId::Chat(4_711_000_043),
-                ChatId::Channel(1_987_654_321_987),
-            ],
-            true,
-        )
+        SendAllowList::new([
+            ChatId::User(4_711_000_042),
+            ChatId::Chat(4_711_000_043),
+            ChatId::Channel(1_987_654_321_987),
+        ])
         .unwrap()
     }
 
@@ -960,7 +944,7 @@ mod tests {
 
     /// A Send allow-list opens only as its own Grant's list: not swapped into
     /// the Telegram session's place, nor into another Grant (of the same
-    /// Account, or with the same key), and the auto-send flag can't be flipped.
+    /// Account, or with the same key), and can't be altered.
     #[tokio::test]
     async fn a_send_allow_list_opens_only_where_it_was_sealed() {
         let dir = tempfile::tempdir().unwrap();

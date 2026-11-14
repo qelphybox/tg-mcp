@@ -376,7 +376,7 @@ async fn a_send_grant_keeps_its_allow_list_through_refresh_and_restart() {
     let sending: Scopes = [Scope::Send].into_iter().collect();
     let alice = ChatId::User(7);
     let team = ChatId::Channel(9);
-    let list = SendAllowList::new([alice, team], false).unwrap();
+    let list = SendAllowList::new([alice, team]).unwrap();
     let (sender, drafter) = {
         let vault = Vault::open_path(&path, TokenTtl::default()).await.unwrap();
         let sender = vault
@@ -414,7 +414,6 @@ async fn a_send_grant_keeps_its_allow_list_through_refresh_and_restart() {
         let mut chats: Vec<String> = opened.chats().map(|c| c.to_string()).collect();
         chats.sort();
         assert_eq!(chats, ["channel:9", "user:7"]);
-        assert!(!opened.auto_send(), "off unless ticked");
         assert_eq!(grant.may_write_to(alice), Ok(()));
         assert_eq!(grant.may_write_to(team), Ok(()));
         assert_eq!(
@@ -434,7 +433,7 @@ async fn debug_output_never_contains_secrets() {
     let issued = vault.create_grant("client", 42, SESSION).await.unwrap();
     let grant = vault.open(issued.access.expose()).await.unwrap();
 
-    let list = SendAllowList::new([ChatId::User(4_711_000_042)], true).unwrap();
+    let list = SendAllowList::new([ChatId::User(4_711_000_042)]).unwrap();
     let sending: Scopes = [Scope::Send].into_iter().collect();
     let sender = vault
         .create_grant_with_send("client", 42, SESSION, sending, Some(&list))

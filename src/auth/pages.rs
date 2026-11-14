@@ -77,6 +77,8 @@ fn render(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32" type="image/png">
 <title>{title} · Telegram MCP (unofficial)</title>
 <style>
 {STYLE}</style>
@@ -300,7 +302,7 @@ fn consent_body(view: &ConsentView<'_>) -> String {
   <div class="send-off">
     <span class="ico big">{plane}</span>
     <h2>Sending is off</h2>
-    <p class="muted">It won't send messages, react or mark anything as read. Turn on <b>Send messages</b> to pick the chats it may write to; you can still confirm every message.</p>
+    <p class="muted">It won't send messages, react or mark anything as read. Turn on <b>Send messages</b> to pick the chats it may write to.</p>
     <label for="scope-send" class="button">Turn on sending</label>
   </div>
 </div>
@@ -365,8 +367,7 @@ fn send_section(login_id: &str, send: &SendView<'_>, hidden: &str) -> String {
         r#"<section class="send"{hidden}>
     <h2>Chats it may send to</h2>
     {error}<p class="muted">Only these chats. To change them later, connect again.</p>
-    <label class="chat"><input type="checkbox" name="auto_send" value="on"{auto_send}> <span>Send to these chats <b>without asking me</b> each time</span></label>
-    <p class="muted">Unticked, each message waits until you confirm it in this browser.</p>
+    <p class="muted">Its messages there are sent <b>at once</b>, as you. Whether you are asked first is up to the app.</p>
     <fieldset class="pick"><legend>Chat folders</legend>
       {folders}
     </fieldset>
@@ -378,11 +379,6 @@ fn send_section(login_id: &str, send: &SendView<'_>, hidden: &str) -> String {
       {notice}<div class="chats">{found}</div>
     </fieldset>
   </section>"#,
-        auto_send = if send.picked.auto_send {
-            " checked"
-        } else {
-            ""
-        },
         max_query = MAX_QUERY_CHARS,
         query = esc(send.query),
     )
@@ -488,6 +484,24 @@ pub const LOGIN_JS: &str = r#""use strict";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_page_links_the_servers_icon_under_the_same_csp() {
+        let response = error(StatusCode::BAD_REQUEST, "Oops", "Something.");
+        assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], CSP);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        for link in [
+            r#"<link rel="icon" href="/icon.svg" type="image/svg+xml">"#,
+            r#"<link rel="icon" href="/favicon.ico" sizes="32x32" type="image/png">"#,
+        ] {
+            assert!(html.contains(link), "{link}: {html}");
+        }
+        // Same-origin images were already allowed: nothing loosened.
+        assert!(CSP.contains("img-src 'self' data:;"));
+    }
 
     fn view<'a>(client_name: &'a str, target: &'a str, loopback: bool) -> ConsentView<'a> {
         ConsentView {
@@ -824,7 +838,6 @@ mod tests {
                 picked: Picked {
                     folders: vec![3],
                     chats: vec!["channel:9~AAAAAAAAAAk".parse().unwrap()],
-                    auto_send: false,
                 },
                 query: "Te\"am",
                 notice: Some("Found 1 of your chats."),
@@ -832,9 +845,12 @@ mod tests {
             },
             ..view("Claude", "claude.ai", false)
         });
+        assert!(!html.contains("auto_send"), "nothing to opt out of: {html}");
         assert!(
-            html.contains(r#"<input type="checkbox" name="auto_send" value="on"> "#),
-            "auto-send is off unless ticked: {html}"
+            html.contains(
+                "sent <b>at once</b>, as you. Whether you are asked first is up to the app."
+            ),
+            "{html}"
         );
         assert!(
             html.contains(r#"name="folder" value="3" checked>"#),
@@ -872,19 +888,11 @@ mod tests {
                     recent: &recent,
                     found: &[],
                 }),
-                picked: Picked {
-                    auto_send: true,
-                    ..Picked::default()
-                },
                 error: Some("Choose at least one chat"),
                 ..SendView::default()
             },
             ..view("Claude", "claude.ai", false)
         });
-        assert!(
-            ticked.contains(r#"name="auto_send" value="on" checked>"#),
-            "{ticked}"
-        );
         assert!(
             ticked.contains("No chat folders that are a list of chats."),
             "{ticked}"

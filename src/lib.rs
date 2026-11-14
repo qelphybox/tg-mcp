@@ -1,11 +1,12 @@
 //! tg-mcp: a remote MCP server for a personal Telegram account: reading, and
-//! the writes a Grant's Scopes allow (Drafts, and sends the user confirms).
+//! the writes a Grant's Scopes allow (Drafts, and sends into its Send
+//! allow-list).
 
 pub mod allow_list;
 pub mod auth;
 pub mod config;
-pub mod confirm;
 pub mod db;
+pub mod icon;
 pub mod limits;
 pub mod links;
 pub mod mcp;
@@ -29,6 +30,7 @@ use crate::{
     config::Config,
     links::MediaLinks,
     mcp::TgMcp,
+    recent_sends::RecentSends,
     sessions::Vault,
     tg::{Connector, Login},
 };
@@ -56,15 +58,19 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         links.clone(),
         config.oauth_limits,
     ));
-    let confirmations = auth.confirmations.clone();
+    // One duplicate guard for every MCP session: it is per Account.
+    let recent_sends = Arc::new(RecentSends::default());
     auth::spawn_flow_sweeper(&auth);
     spawn_stats(&auth);
 
     let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
         move || {
-            Ok(TgMcp::new(links.clone(), experimental_documents)
-                .with_confirmations(confirmations.clone()))
+            Ok(TgMcp::new(
+                links.clone(),
+                recent_sends.clone(),
+                experimental_documents,
+            ))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
@@ -93,12 +99,11 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .merge(mcp)
         .merge(auth::router(auth.clone()))
+        .merge(icon::router())
         .layer(cors)
         // Media links are for curl in an agent's shell, never for a page:
         // merged after the CORS layer, so no browser may read them cross-origin.
-        .merge(links::router(auth.clone()))
-        // Nor may a page read or post the confirmation page cross-origin.
-        .merge(confirm::router(auth))
+        .merge(links::router(auth))
 }
 
 /// The hourly `stats` line ([`stats`]), with what exists right now read from `auth`.

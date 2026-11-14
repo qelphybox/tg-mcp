@@ -57,15 +57,6 @@ input[type=checkbox] { width: 18px; height: 18px; margin: 0; accent-color: var(-
 @keyframes qr-wave { 0%, 100% { opacity: .12; transform: scale(.45); } 35% { opacity: 1; transform: scale(1); } 70% { opacity: .12; transform: scale(.45); } }
 @keyframes qr-pulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
 
-/* The send confirmation: the message as Telegram will show it. */
-dl.facts { margin: 0 0 14px; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; padding: 12px 14px; border-radius: 16px; background: var(--soft); border: 1px solid rgba(255,255,255,.08); }
-dl.facts dt { color: var(--muted); font-size: 14px; }
-dl.facts dd { margin: 0; overflow-wrap: anywhere; unicode-bidi: isolate; }
-.reply { margin: 0 0 8px; padding: 8px 12px; border-radius: 14px 14px 14px 4px; background: var(--tint); font-size: 14px; color: #D9D0E6; overflow-wrap: anywhere; unicode-bidi: isolate; }
-.message { white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: isolate; margin: 0 0 14px; padding: 12px 14px; border-radius: 16px 16px 4px 16px; background: #6E5BB8; color: #fff; max-height: 50vh; overflow: auto; }
-.message code { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: rgba(0,0,0,.22); padding: 1px 5px; border-radius: 6px; }
-.message .url { color: #E0D7F5; font-size: 14px; }
-
 /* The Consent screen. */
 fieldset.scopes { border: 0; padding: 0; margin: 4px 0 16px; min-width: 0; }
 fieldset.scopes legend { padding: 0; margin: 0 0 10px; }
@@ -79,12 +70,12 @@ label.scope input:disabled { display: none; }
 label.scope:has(input:checked) .ico { background: rgba(228,178,234,.16); border-color: var(--tint-line); }
 .ico.big { width: 60px; height: 60px; border-radius: 20px; color: var(--muted); }
 
-/* Write scopes and auto-send are switches. */
-label.scope input.write, input[name=auto_send] { -webkit-appearance: none; appearance: none; flex: none; position: relative; width: 44px; height: 26px; margin: 3px 0 0; border-radius: 13px;
+/* Write scopes are switches. */
+label.scope input.write { -webkit-appearance: none; appearance: none; flex: none; position: relative; width: 44px; height: 26px; margin: 3px 0 0; border-radius: 13px;
   background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18); cursor: pointer; transition: background .2s ease-out; }
-label.scope input.write::before, input[name=auto_send]::before { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: var(--fg); transition: transform .22s cubic-bezier(.16,1,.3,1); }
-label.scope input.write:checked, input[name=auto_send]:checked { background: var(--accent); border-color: var(--accent); }
-label.scope input.write:checked::before, input[name=auto_send]:checked::before { transform: translateX(18px); background: var(--on-accent); }
+label.scope input.write::before { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: var(--fg); transition: transform .22s cubic-bezier(.16,1,.3,1); }
+label.scope input.write:checked { background: var(--accent); border-color: var(--accent); }
+label.scope input.write:checked::before { transform: translateX(18px); background: var(--on-accent); }
 
 /* What it can't do, how to disconnect, when to deny: each with its icon. */
 p.read-only, p.writes, p.sends { color: var(--fg); font-weight: 500; font-size: 15px; padding-left: 28px; background: no-repeat 0 2px / 18px
@@ -122,9 +113,6 @@ label.chat:hover { background: rgba(255,255,255,.05); }
 label.chat:has(input:checked) { background: var(--tint); }
 label.chat > span { flex: 1; min-width: 0; }
 label.chat span .muted { display: inline-block; margin-left: 6px; padding: 0 8px; border-radius: 999px; background: rgba(255,255,255,.08); font-size: 12px; color: #D9D0E6; }
-label.chat:has(input[name=auto_send]) { margin: 12px 0 4px; padding: 14px 16px; border-radius: 16px; background: var(--soft); border: 1px solid rgba(255,255,255,.08); }
-label.chat:has(input[name=auto_send]:checked) { background: var(--tint); border-color: var(--tint-line); }
-label.chat input[name=auto_send] { order: 2; margin: 0; }
 .search { display: flex; gap: 8px; margin: 0 0 8px; }
 .search button, .row button.pick { flex: none; }
 
@@ -153,5 +141,5 @@ main.wide footer { margin: 0; padding: 14px 34px 18px; border-top: 0; }
 @media (prefers-reduced-motion: reduce) {
   .qr-load circle, .qr-load .fp { animation: none; opacity: .45; }
   .qr img { animation: none; -webkit-mask-image: none; mask-image: none; }
-  label.scope, label.scope input.write::before, input[name=auto_send]::before { transition: none; }
+  label.scope, label.scope input.write::before { transition: none; }
 }

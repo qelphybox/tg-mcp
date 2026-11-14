@@ -2,14 +2,15 @@
 //! block they are in:
 //!
 //! - `send_message` (#46) checks and formats its input as `save_draft` does,
-//!   and [`TgMcp::deliver`] sends it: only into the Grant's Send allow-list,
-//!   confirmed by the user unless the Grant has Auto-send;
-//! - `react` and `mark_read` (#47) write only into the Send allow-list too,
-//!   and are never confirmed (ADR-0005): one reaction, or a read mark, is
-//!   low-impact and undone as easily.
+//!   and sends it at once (ADR-0008): only into the Grant's Send allow-list,
+//!   and never the same text to the same Chat twice within a minute of a
+//!   send ([`crate::recent_sends`]);
+//! - `react` and `mark_read` (#47) write only into the Send allow-list too.
 //!
-//! Each spends the Account's Writes budget; only a sent message counts
-//! against the Chat's Send cap. Logs carry ids only.
+//! Whether a human approves each call is the MCP client's business: the
+//! annotations ask clients to, and nothing here relies on it. Each spends the
+//! Account's Writes budget; only a sent message counts against the Chat's
+//! Send cap. Logs carry ids only.
 
 use rmcp::{
     ErrorData,
@@ -17,18 +18,17 @@ use rmcp::{
         tool::Extension,
         wrapper::{Json, Parameters},
     },
-    schemars,
-    service::{RequestContext, RoleServer},
-    tool, tool_router,
+    schemars, tool, tool_router,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{TgMcp, caller, confirm::SendResult, telegram, tool_error};
+use super::{TgMcp, caller, telegram, tool_error};
 use crate::{
     auth::Caller,
+    recent_sends::{Duplicate, SendKey},
     tg::{
         Telegram, TgError,
-        chats::{CHAT_REF_MAX_LEN, CHAT_REF_PATTERN, ChatRef},
+        chats::{CHAT_REF_MAX_LEN, CHAT_REF_PATTERN, ChatRef, rfc3339},
         compose::{self, MAX_INPUT_CHARS},
         mark_read::MarkRead,
         markdown::TextFormat,
@@ -56,6 +56,33 @@ pub struct SendMessageParams {
     pub topic: Option<i32>,
     /// `markdown` (default) or `plain`.
     pub format: Option<TextFormat>,
+}
+
+/// What became of a message send_message sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SendStatus {
+    /// Telegram took it: it is in the chat.
+    Sent,
+}
+
+/// send_message's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct SendResult {
+    pub status: SendStatus,
+    /// The chat, as given.
+    #[schemars(length(max = CHAT_REF_MAX_LEN))]
+    pub chat_id: String,
+    /// The new message's id in the chat.
+    pub message_id: i32,
+    /// When Telegram dated it (UTC).
+    #[schemars(length(max = 40))]
+    pub date: String,
+    /// In a forum: the Topic it went to (General is 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -150,13 +177,8 @@ impl TgMcp {
         title = "Send message",
         description = "Send a message as the user: `text` into one chat (`chat_id` as list_chats \
 or find_chats gave it, passed verbatim), where everyone in it reads it as written by the user. \
-Only the chats the user allowed when connecting this app work; any other is an error. Unless the \
-user chose to let this app send without asking, the user confirms each message on a page that \
-shows it: a client that can open a URL for the user waits for their decision; otherwise the call \
-returns `status: \"pending_confirmation\"` with `confirm_url` (valid until `expires_at`, 10 \
-minutes): give the user that link, to open in the browser where they connected this app (on \
-another device the page can only make it a Draft), and afterwards check get_messages (sent) or \
-get_drafts (made a Draft); don't send it again meanwhile. `format` is `markdown` (default): \
+It is sent at once, and can't be edited or deleted afterwards. Only the chats the user allowed \
+when connecting this app work; any other is an error. `format` is `markdown` (default): \
 **bold**, *italic* or _italic_, `inline code`, ``` code blocks (```lang on the first line names \
 the language), [text](https://…) links (http, https, tg and mailto); a backslash before a \
 punctuation character writes it as is; anything else, and a marker without its partner, stays \
@@ -164,26 +186,23 @@ as typed. `format: \"plain\"` sends the text exactly as given. 1 to 4096 charact
 formatted: longer is an error, never split. `reply_to`: the id of a message in the same chat to \
 reply to (no partial quotes). In a forum (get_chat_info lists its `topics`) give `topic` \
 (General is 1), or `reply_to` a message, whose Topic it then goes to; neither is an error, and \
-so is `topic` on a chat that is no forum. Text only: no media, no forwarding. Returns `status`: \
-`sent` (with `message_id` and `date`), `cancelled` or `expired` (nothing was sent), `drafted` \
-(the user made it a Draft in the chat's message field) or `pending_confirmation`, with the \
-`chat_id`, and the `topic` and `reply_to` it went to. The same text to the same chat within 60 s \
-of sending it is not sent again: an error says \"already sent: message N\". Each message counts \
-against the account's writes budget and the chat's limit of 5 messages a minute. An error that \
-says to retry in N s, or PEER_FLOOD, means nothing was sent: never retry it on your own; tell \
-the user.",
+so is `topic` on a chat that is no forum. Text only: no media, no forwarding. Returns `status: \
+\"sent\"` with the `message_id`, its `date`, the `chat_id`, and the `topic` and `reply_to` it \
+went to. The same text to the same chat within 60 s of sending it is not sent again: an error \
+says \"already sent: message N\". Each message counts against the account's writes budget and \
+the chat's limit of 5 messages a minute. An error that says to retry in N s, or PEER_FLOOD, \
+means nothing was sent: never retry it on your own; tell the user.",
         annotations(
             title = "Send message",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn send_message(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        context: RequestContext<RoleServer>,
         Parameters(params): Parameters<SendMessageParams>,
     ) -> Result<Json<SendResult>, ErrorData> {
         let invalid = |msg: String| ErrorData::invalid_params(msg, None);
@@ -198,10 +217,38 @@ the user.",
         }
         let text = compose::prepare_message(&params.text, params.format.unwrap_or_default())
             .map_err(tool_error)?;
+        let caller = writer(&parts, chat)?;
         let message = NewMessage::new(chat, text, params.reply_to, params.topic);
-        self.deliver(&context, caller(&parts)?, message)
+        let key = self
+            .recent_sends
+            .key(caller.account_id, chat.chat(), &message.text);
+        // Claimed before it goes to Telegram, so two identical calls at once
+        // send one; a send Telegram refuses releases the claim.
+        let claim = self
+            .recent_sends
+            .claim(key)
+            .map_err(|duplicate| refuse_duplicate(caller, &key, duplicate))?;
+        let sent = caller
+            .telegram
+            .send_message(message)
             .await
-            .map(Json)
+            .map_err(tool_error)?;
+        claim.sent(sent.id);
+        // Ids only: never the text.
+        tracing::info!(
+            grant_id = %caller.grant_id,
+            chat = %sent.chat,
+            message_id = sent.id,
+            "message sent"
+        );
+        Ok(Json(SendResult {
+            status: SendStatus::Sent,
+            chat_id: chat.to_string(),
+            message_id: sent.id,
+            date: rfc3339(sent.date),
+            topic: sent.topic,
+            reply_to: sent.reply_to,
+        }))
     }
 
     #[tool(
@@ -213,18 +260,18 @@ replacing the account's previous reaction on that message; `emoji: null` removes
 in the chat sees it as the user's. Custom emoji and paid (Telegram Stars) reactions are not \
 supported, and an emoji that is no standard reaction is an error that lists them; a chat whose \
 admins allow only some reactions, or none, refuses the others with an error. Only the chats the \
-user allowed when connecting this app work; any other is an error. The user is not asked to \
-confirm. Setting the reaction that is already there changes nothing and is no error. Counts \
-against the account's writes budget (not the chat's limit of messages). get_messages shows a \
-message's reactions as counts. Returns `status` (`set` or `removed`), the `chat_id`, \
-`message_id` and the `emoji` as Telegram names it. An error that says to retry in N s, or \
+user allowed when connecting this app work; any other is an error. Setting the reaction that \
+is already there changes nothing and is no error. Counts against the account's writes budget \
+(not the chat's limit of messages). get_messages shows a message's reactions as counts. \
+Returns `status` (`set` or `removed`), the `chat_id`, `message_id` and the `emoji` as Telegram \
+names it. An error that says to retry in N s, or \
 PEER_FLOOD, means nothing was written: never retry it on your own; tell the user.",
         annotations(
             title = "React to a message",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn react(
@@ -284,7 +331,7 @@ private chat the other person sees their messages as read. In a forum (get_chat_
 `topics`) `topic` marks only that Topic read (General is 1), up to its latest message or \
 `up_to`; without `topic` the whole chat. `topic` on a chat that is no forum, or a Topic it \
 doesn't have, is an error. Only the chats the user allowed when connecting this app work; any \
-other is an error. The user is not asked to confirm. Marking read again changes nothing. Counts \
+other is an error. Marking read again changes nothing. Counts \
 against the account's writes budget. Returns the `chat_id`, and the `topic` and `up_to` it \
 marked read (no `up_to`: up to the latest message). An error that says to retry in N s means \
 nothing was marked: never retry it on your own; tell the user.",
@@ -293,7 +340,7 @@ nothing was marked: never retry it on your own; tell the user.",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn mark_read(
@@ -333,6 +380,21 @@ nothing was marked: never retry it on your own; tell the user.",
             up_to: marked.up_to,
         }))
     }
+}
+
+/// What a send of a message already sent says. Ids only in the log.
+fn refuse_duplicate(caller: &Caller, key: &SendKey, duplicate: Duplicate) -> ErrorData {
+    let message_id = match duplicate {
+        Duplicate::Sent { id, .. } => Some(id),
+        Duplicate::Sending { .. } => None,
+    };
+    tracing::info!(
+        grant_id = %caller.grant_id,
+        chat = %key.chat(),
+        message_id,
+        "same text to the same chat within a minute: not sent again"
+    );
+    ErrorData::invalid_params(duplicate.to_string(), None)
 }
 
 /// The caller, if it may write to `chat`: only into its Send allow-list.

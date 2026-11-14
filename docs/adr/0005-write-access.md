@@ -1,5 +1,7 @@
 # Write access: Scopes, Send allow-list, human confirmation
 
+> The human confirmation (confirmation page, Confirmation cookie, URL elicitation, the Auto-send opt-out and pending sends) is superseded by ADR-0008: sends go out at once. The Scopes, Send allow-list, writes budget, per-Chat Send cap and "never forward" stand.
+
 v0.2.0 lets the AI act on the Account, and every message it reads is attacker-controlled input: one crafted message in any group can try to make the model send or leak as the user. So writing is split into Scopes the user picks on the Consent screen (`read` always, `draft`, `send`, `organize`; changing them means a new Grant), tools outside the granted Scopes are not even listed, and `send` only works inside a Send allow-list of existing dialogs chosen at Consent and stored sealed under the Session key. Each send is confirmed by the human on our own confirmation page, which only works in the browser that gave Consent (a cookie the model's shell doesn't have) and is offered through URL elicitation where the client supports it; elsewhere the page can turn the message into a Draft, which the user sends from Telegram. Drafts are the first write feature because the human always presses send.
 
 ## Considered Options
