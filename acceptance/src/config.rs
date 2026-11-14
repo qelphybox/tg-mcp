@@ -47,14 +47,26 @@ fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// `KEY=VALUE` lines; `#` starts a comment line.
+/// `KEY=VALUE` lines, the value bare or in single quotes with `'\''` for a
+/// quote (as `scripts/accept-setup.sh` writes them); `#` starts a comment line.
 fn parse(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .map(|(k, v)| (k.trim().to_string(), unquote(v.trim())))
         .collect()
+}
+
+fn unquote(v: &str) -> String {
+    match v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        Some(inner) => inner.replace("'\\''", "'"),
+        None => v.to_string(),
+    }
+}
+
+fn quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
 }
 
 fn read_file() -> Result<BTreeMap<String, String>> {
@@ -96,7 +108,7 @@ pub fn set_in_file(key: &str, value: &str) -> Result<PathBuf> {
          # Secrets: keep this file to yourself (mode 600), never commit it.\n",
     ));
     for (k, v) in &values {
-        text.push_str(&format!("{k}={v}\n"));
+        text.push_str(&format!("{k}={}\n", quote(v)));
     }
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -213,6 +225,18 @@ mod tests {
         assert_eq!(values.get("B").map(String::as_str), Some("two"));
         assert_eq!(values.get("C").map(String::as_str), Some("x=y"));
         assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn reads_single_quoted_values_as_the_wizard_writes_them() {
+        let values = parse("P='it'\\''s a pass word '\nQ='x=y'\n");
+        assert_eq!(
+            values.get("P").map(String::as_str),
+            Some("it's a pass word ")
+        );
+        assert_eq!(values.get("Q").map(String::as_str), Some("x=y"));
+        let round = parse(&format!("P={}", quote("a'b c")));
+        assert_eq!(round.get("P").map(String::as_str), Some("a'b c"));
     }
 
     #[test]
