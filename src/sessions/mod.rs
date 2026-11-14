@@ -363,6 +363,7 @@ impl Vault {
             send_chats = send_allow_list.map_or(0, SendAllowList::len),
             "grant created"
         );
+        crate::stats::global().login();
         Ok(issued)
     }
 
@@ -550,6 +551,14 @@ impl Vault {
         Ok(())
     }
 
+    /// How many Grants there are: a number for the `stats` line, nothing opened.
+    pub async fn count_grants(&self) -> Result<u64, VaultError> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM grants")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     /// Delete the Wrapped key of every refresh Token consumed longer than
     /// [`REFRESH_GRACE`] ago; its id, Grant, verifier and expiry stay, to recognise a
     /// reuse. Verification already refuses such a Token; this removes the key from
@@ -659,6 +668,7 @@ impl Vault {
             reason = reason.as_str(),
             "refresh token misused, grant revoked"
         );
+        crate::stats::global().revocation();
         VaultError::GrantRevoked { grant_id, reason }
     }
 

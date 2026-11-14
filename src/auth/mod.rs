@@ -94,6 +94,11 @@ impl AuthState {
         }
     }
 
+    /// How many Login flows are pending: a number for the `stats` line.
+    pub fn pending_logins(&self) -> usize {
+        self.flows.pending()
+    }
+
     /// Served over https: cookies are `Secure`.
     pub(crate) fn is_https(&self) -> bool {
         self.base_url.starts_with("https://")

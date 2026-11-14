@@ -221,6 +221,12 @@ impl Flows {
         id
     }
 
+    /// How many Login flows are pending, those still starting included.
+    pub fn pending(&self) -> usize {
+        let logins = self.logins.lock().expect("flows lock");
+        logins.pending.len() + logins.starting.values().sum::<usize>()
+    }
+
     pub fn login(&self, id: &str) -> Option<Arc<PendingLogin>> {
         let logins = self.logins.lock().expect("flows lock");
         logins

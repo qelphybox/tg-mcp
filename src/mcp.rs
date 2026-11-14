@@ -2021,7 +2021,14 @@ impl ServerHandler for TgMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let caller = request_caller(&context)?;
+        let stats = crate::stats::global();
+        // Counted by name only once the name is one of ours: never the caller's string.
+        let known = self.tool_router.has_route(&request.name);
+        if known {
+            stats.tool_call(&request.name);
+        }
         if let Err(err) = self.tools.check(&request.name, caller.scopes) {
+            stats.tool_error(crate::stats::ToolError::Scope);
             tracing::warn!(
                 grant_id = %caller.grant_id,
                 tool = %request.name,
@@ -2043,7 +2050,21 @@ impl ServerHandler for TgMcp {
             return Err(err);
         }
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(call).await
+        let result = self.tool_router.call(call).await;
+        if let Err(err) = &result {
+            stats.tool_error(if !known {
+                crate::stats::ToolError::UnknownTool
+            } else {
+                match err.code {
+                    rmcp::model::ErrorCode::INVALID_PARAMS => {
+                        crate::stats::ToolError::InvalidParams
+                    }
+                    rmcp::model::ErrorCode::INTERNAL_ERROR => crate::stats::ToolError::Internal,
+                    _ => crate::stats::ToolError::Other,
+                }
+            });
+        }
+        result
     }
 }
 
