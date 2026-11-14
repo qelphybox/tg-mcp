@@ -364,6 +364,7 @@ impl Vault {
             auto_send = send_allow_list.is_some_and(SendAllowList::auto_send),
             "grant created"
         );
+        crate::stats::global().login();
         Ok(issued)
     }
 
@@ -536,12 +537,23 @@ impl Vault {
 
     /// Delete a Grant with its sealed Telegram session and all its Tokens.
     pub async fn delete_grant(&self, grant_id: &GrantId) -> Result<(), VaultError> {
-        sqlx::query("DELETE FROM grants WHERE id = ?")
+        let deleted = sqlx::query("DELETE FROM grants WHERE id = ?")
             .bind(grant_id.as_str())
             .execute(&self.pool)
             .await?;
         tracing::info!(grant_id = %grant_id, "grant deleted");
+        if deleted.rows_affected() > 0 {
+            crate::stats::global().revocation();
+        }
         Ok(())
+    }
+
+    /// How many Grants there are: a number for the `stats` line, nothing opened.
+    pub async fn count_grants(&self) -> Result<u64, VaultError> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM grants")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n.max(0).unsigned_abs())
     }
 
     /// Delete the Wrapped key of every refresh Token consumed longer than

@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod recent_sends;
 pub mod scope;
 pub mod sessions;
+pub mod stats;
 pub mod tg;
 
 use std::sync::Arc;
@@ -57,6 +58,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     ));
     let confirmations = auth.confirmations.clone();
     auth::spawn_flow_sweeper(&auth);
+    spawn_stats(&auth, shutdown.clone());
 
     let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
@@ -97,4 +99,30 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         .merge(links::router(auth.clone()))
         // Nor may a page read or post the confirmation page cross-origin.
         .merge(confirm::router(auth))
+}
+
+/// The hourly `stats` line ([`stats`]), with what exists right now read from `auth`.
+fn spawn_stats(auth: &Arc<AuthState>, shutdown: CancellationToken) {
+    let auth = auth.clone();
+    stats::spawn(
+        move || {
+            let auth = auth.clone();
+            async move {
+                let grants = match auth.vault.count_grants().await {
+                    Ok(n) => Some(n),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "counting grants for stats failed");
+                        None
+                    }
+                };
+                stats::Gauges {
+                    grants,
+                    live_clients: auth.connector.live_clients(),
+                    login_flows: auth.pending_logins(),
+                    media_links: auth.links.len(),
+                }
+            }
+        },
+        shutdown,
+    );
 }

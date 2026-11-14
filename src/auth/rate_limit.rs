@@ -292,7 +292,10 @@ pub async fn limit(
             request.extensions_mut().insert(client);
             next.run(request).await
         }
-        Err(wait) => too_many_requests(endpoint, wait),
+        Err(wait) => {
+            crate::stats::global().refused(crate::stats::Refusal::OAuth);
+            too_many_requests(endpoint, wait)
+        }
     }
 }
 

@@ -66,6 +66,49 @@ A rollback can't cross a database migration: an image older than a migration the
 
 The image is distroless (no shell), so `kamal app exec` with a shell does not work, by design.
 
+## Is it up? The `stats` line and the `/healthz` monitor
+
+There is no metrics stack. Once an hour, and once on a graceful shutdown, the server logs one `info` line `stats` (target `tg_mcp::stats`) with numbers only:
+
+```text
+INFO tg_mcp::stats: stats reason="hourly" grants=12 live_clients=3 login_flows=0 media_links=1 tool_calls=get_messages:41 list_chats:9 tool_errors=invalid_params:2 flood_waits=search:1/12s refused=oauth:3 logins=1 revocations=0
+```
+
+| Field | What it counts |
+| --- | --- |
+| `reason` | `hourly`, or `shutdown` for the line logged as the process stops |
+| `grants` | Grants in the database now (left out if the database couldn't be read) |
+| `live_clients` | Live clients in the Client pool now |
+| `login_flows` | pending Login flows now |
+| `media_links` | live Media links now |
+| `tool_calls` | over the hour: tool calls by tool name |
+| `tool_errors` | over the hour: failed tool calls by kind: `scope` (outside the Grant's Scopes), `invalid_params`, `internal` (Telegram, our limits or the server), `unknown_tool`, `other` |
+| `flood_waits` | over the hour: Telegram's `FLOOD_WAIT`s per method class (`default`, `search`, `files`, `transcribe`, `writes`) as `count/longest wait` |
+| `refused` | over the hour: requests our own limits refused: `account` (request budget), `writes` (Writes budget), `chat_sends` (a Chat's Send cap), `oauth` (`429` from an OAuth endpoint) |
+| `logins` | over the hour: Login flows that ended in a new Grant |
+| `revocations` | over the hour: Grants revoked, by their client or for a reused refresh Token |
+
+`-` means none. The counters live in memory: they reset with each line, and a restart (every deploy) loses them, so the first line after a deploy covers less than an hour. The line names no user, Account, Grant, chat or message and carries no titles: only our tool names, error kinds, method classes and limits.
+
+```sh
+kamal app logs --since 24h | grep 'tg_mcp::stats'    # the last day, one line an hour
+kamal app logs -f | grep 'tg_mcp::stats'             # wait for the next one
+```
+
+### The external monitor (maintainer, once)
+
+`GET https://connector.tgmcp.dev/healthz` answers `200 ok` while the process serves HTTP. It doesn't ask Telegram anything, so it says the server is up, not that every Account can reach Telegram (the `stats` line's `tool_errors` and `flood_waits` say that). A free [UptimeRobot](https://uptimerobot.com) monitor e-mails when it stops answering:
+
+1. Sign up at uptimerobot.com (free plan) with the e-mail address that should get the alerts, and confirm it.
+2. **New monitor** → type **HTTP(s)**.
+3. **URL**: `https://connector.tgmcp.dev/healthz`. **Friendly name**: `tg-mcp connector`. **Interval**: 5 minutes (the free plan's shortest).
+4. **Advanced**: keyword monitoring is not needed; leave the method `GET` and the timeout at its default. Turn on SSL certificate expiry alerts if the plan offers them (kamal-proxy renews the certificate; an expiring one means renewal broke).
+5. **Alert contacts**: tick the e-mail contact from step 1. **Create monitor**.
+6. Check it fires: stop the app for a little over one interval (`kamal app stop`, wait about 6 minutes, `kamal app boot`), expect a "Down" e-mail and then an "Up" one. Or, without downtime, pause and resume the monitor and check that it shows "Up" with a response time.
+7. Write on #64 which service and which address get the alerts.
+
+A deploy restarts the container in seconds behind kamal-proxy and stays under one interval, so it doesn't page.
+
 ## Landing page
 
 `https://tgmcp.dev` is GitHub Pages, published from `site/` by `.github/workflows/pages.yml` on every push to `main` that touches it. There is no build step: what is in `site/` is what is served. The custom domain lives in **Settings → Pages**, not in a `CNAME` file (Pages ignores it when deploying from Actions).

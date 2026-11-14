@@ -1028,3 +1028,35 @@ Needs the Claude Code connector `telegram-send` of §56 (A and the forum in its 
     ```
 
 11. **Clean up.** Remove any reaction of yours left from these steps (`react` with `emoji: null`, or in the app), delete the §57 messages, and remove `telegram-react` (`claude mcp remove telegram-react`; it stays in the account's Active sessions until revoked there or with §56's clean-up).
+
+## 66. Once an hour one `stats` line with numbers only, and an external monitor on `/healthz`
+
+What the line holds and how the monitor is set up: [deploy.md](deploy.md#is-it-up-the-stats-line-and-the-healthz-monitor). The counting and the reset are also covered by tests: `cargo test --test stats` (with a paused clock, the line after an hour carries the expected counts, the next one starts from zero, and shutdown logs a last one; through `/mcp`, tool calls are counted by name, and the line names no chat, Account or Grant and no unknown tool) and `cargo test --lib stats`.
+
+1. **One line an hour.** At least an hour and a quarter after a deploy:
+
+   ```sh
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 3h $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep 'tg_mcp::stats'
+   # expect one line an hour since the deploy, each with reason="hourly", grants=, live_clients=,
+   # login_flows=, media_links=, tool_calls=, tool_errors=, flood_waits=, refused=, logins= and revocations=
+   ```
+
+2. **The counts match what was done.** Right after an hourly line, with the `telegram` connector in Claude Code: "list my 5 latest chats", twice, then "call get_messages on <a chat> with limit 3". After the next line:
+
+   ```sh
+   logs | grep 'tg_mcp::stats' | tail -1   # expect list_chats:2 and get_messages:1 at least in tool_calls (other users count too)
+   ```
+
+3. **Numbers only.** In the lines of step 1:
+
+   ```sh
+   logs | grep 'tg_mcp::stats' | grep -cE 'user:|chat:|channel:|grant_id|account|title|@'   # expect 0
+   ```
+
+   And none of the chat titles or names you saw in step 2 appears: `logs | grep 'tg_mcp::stats' | grep -ci '<a chat title from step 2>'` gives 0.
+
+4. **A deploy logs a last line.** Deploy (push to `main`, or `kamal deploy`); in the old container's logs, its last `stats` line has `reason="shutdown"` (`kamal app logs` shows both containers' lines around the switch).
+
+5. **The monitor.** In UptimeRobot (or the service named on #64), the `/healthz` monitor shows "Up", with the interval and the alert e-mail as in deploy.md; the check of deploy.md step 6 sent a "Down" and an "Up" e-mail.
+
