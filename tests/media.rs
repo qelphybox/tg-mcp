@@ -393,6 +393,7 @@ fn quiz() -> Media {
             options: vec![
                 option("Paris\u{E0041}", 7, false, true),
                 option("Lyon\nor Nice", 2, true, false),
+                option("\u{2066}\u{200B}", 0, false, false),
             ],
             options_truncated: true,
             total_voters: Some(9),
@@ -424,6 +425,7 @@ async fn a_poll_shows_its_question_options_results_and_state_sanitised() {
             "options": [
                 { "text": "Paris", "votes": 7, "correct": true },
                 { "text": "Lyon or Nice", "votes": 2, "chosen": true },
+                { "text": "[no visible text]", "votes": 0 },
             ],
             "options_truncated": true,
             "total_voters": 9,

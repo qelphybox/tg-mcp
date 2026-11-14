@@ -279,8 +279,9 @@ fn clean_media(media: &mut Media) {
     }
 }
 
-/// A poll's question and options are written by its author: content. Its
-/// flags and counts are Telegram's.
+/// A poll's question and options are written by its author: content, and
+/// one with nothing visible left reads [`NO_VISIBLE_TEXT`]. Its flags and
+/// counts are Telegram's.
 fn clean_poll(poll: &mut Poll) {
     let Poll {
         question,
@@ -292,7 +293,13 @@ fn clean_poll(poll: &mut Poll) {
         quiz: _,
         anonymous: _,
     } = poll;
-    clean(question);
+    let visible = |field: &mut String| {
+        clean(field);
+        if field.trim().is_empty() {
+            *field = NO_VISIBLE_TEXT.into();
+        }
+    };
+    visible(question);
     for PollOption {
         text,
         votes: _,
@@ -300,7 +307,7 @@ fn clean_poll(poll: &mut Poll) {
         correct: _,
     } in options
     {
-        clean(text);
+        visible(text);
     }
 }
 

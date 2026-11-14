@@ -15,10 +15,7 @@
 use grammers_client::tl;
 
 use super::{
-    messages::{
-        MAX_POLL_OPTION_CHARS, MAX_POLL_OPTIONS, MAX_POLL_QUESTION_CHARS, Media, MediaKind, Poll,
-        PollOption,
-    },
+    messages::{Media, MediaKind, Poll, PollOption},
     view::{Picture, PictureSize, SizeForm},
 };
 
@@ -50,8 +47,9 @@ pub fn describe(media: Option<&tl::enums::MessageMedia>) -> Option<Media> {
     }
 }
 
-/// A poll, from the message alone (#62): its question and options, cut to
-/// size, and the results as far as Telegram shows them to this Account.
+/// A poll, from the message alone (#62): its question and every option, and
+/// the results as far as Telegram shows them to this Account. Cut to size
+/// once sanitised, with the page (`bound_history`).
 fn poll_of(media: &tl::types::MessageMediaPoll) -> Media {
     let tl::enums::Poll::Poll(poll) = &media.poll;
     let tl::enums::PollResults::Results(results) = &media.results;
@@ -73,15 +71,12 @@ fn poll_of(media: &tl::types::MessageMediaPoll) -> Media {
         .collect();
     let options = answers
         .iter()
-        .take(MAX_POLL_OPTIONS)
         .map(|answer| {
             let tl::enums::TextWithEntities::Entities(text) = &answer.text;
             let result = shown.iter().find(|v| v.option == answer.option);
             PollOption {
-                text: cut(&text.text, MAX_POLL_OPTION_CHARS),
-                votes: result
-                    .and_then(|v| v.voters)
-                    .and_then(|n| u32::try_from(n).ok()),
+                text: text.text.clone(),
+                votes: result.and_then(|v| v.voters).and_then(count),
                 // Results the same for everyone (`min`) carry no one's vote.
                 chosen: result.is_some_and(|v| v.chosen && !results.min),
                 correct: poll.quiz && result.is_some_and(|v| v.correct),
@@ -90,10 +85,10 @@ fn poll_of(media: &tl::types::MessageMediaPoll) -> Media {
         .collect();
     Media {
         poll: Some(Poll {
-            question: cut(&question.text, MAX_POLL_QUESTION_CHARS),
+            question: question.text.clone(),
             options,
-            options_truncated: answers.len() > MAX_POLL_OPTIONS,
-            total_voters: results.total_voters.and_then(|n| u32::try_from(n).ok()),
+            options_truncated: false,
+            total_voters: results.total_voters.and_then(count),
             closed: poll.closed,
             multiple_choice: poll.multiple_choice,
             quiz: poll.quiz,
@@ -103,15 +98,9 @@ fn poll_of(media: &tl::types::MessageMediaPoll) -> Media {
     }
 }
 
-/// At most `max` characters of `text`, the cut marked with `…`. Content is
-/// sanitised later, which only takes characters away.
-fn cut(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut cut: String = text.chars().take(max - 1).collect();
-    cut.push('…');
-    cut
+/// A count Telegram sends as `i32`; a negative one is none.
+fn count(n: i32) -> Option<u32> {
+    u32::try_from(n).ok()
 }
 
 /// A photo, with its largest size. A self-destructing photo that is gone
@@ -1465,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn long_questions_and_options_and_many_options_are_cut() {
+    fn every_option_and_the_whole_text_are_read_for_the_page_to_cut() {
         let long_option = "o".repeat(150);
         let many: Vec<&str> = std::iter::repeat_n(long_option.as_str(), 14).collect();
         let poll = poll_media(&many, None, None, |poll, _| {
@@ -1473,14 +1462,27 @@ mod tests {
         })
         .poll
         .unwrap();
-        assert_eq!(poll.question.chars().count(), MAX_POLL_QUESTION_CHARS);
-        assert!(poll.question.ends_with('…'));
-        assert_eq!(poll.options.len(), MAX_POLL_OPTIONS);
-        assert!(poll.options_truncated);
-        for option in &poll.options {
-            assert_eq!(option.text.chars().count(), MAX_POLL_OPTION_CHARS);
-            assert!(option.text.ends_with('…'));
-        }
+        assert_eq!(poll.question.chars().count(), 400);
+        assert_eq!(poll.options.len(), 14);
+        assert!(!poll.options_truncated);
+    }
+
+    #[test]
+    fn an_option_without_a_count_in_shown_results_has_no_votes() {
+        let results = vec![
+            voters(0, None, true, false),
+            voters(1, Some(3), false, false),
+        ];
+        let poll = poll_media(&["a", "b"], Some(results), Some(4), |_, _| {})
+            .poll
+            .unwrap();
+        assert_eq!(
+            poll.options,
+            [
+                option("a", None, true, false),
+                option("b", Some(3), false, false)
+            ]
+        );
     }
 
     #[test]

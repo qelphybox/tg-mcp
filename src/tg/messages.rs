@@ -192,11 +192,11 @@ pub struct Media {
     pub poll: Option<Poll>,
 }
 
-/// Longest poll question shown, in characters (Telegram allows 255).
+/// Longest poll question shown, in characters.
 pub const MAX_POLL_QUESTION_CHARS: usize = 300;
-/// Longest poll option shown, in characters (Telegram allows 100).
+/// Longest poll option shown, in characters.
 pub const MAX_POLL_OPTION_CHARS: usize = 100;
-/// At most this many options of a poll are shown (Telegram allows 12).
+/// At most this many options of a poll are shown.
 pub const MAX_POLL_OPTIONS: usize = 12;
 
 /// A poll as the message carries it (#62): what it asks and, when Telegram
@@ -212,8 +212,8 @@ pub struct Poll {
     /// The poll has more options than `options` shows.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub options_truncated: bool,
-    /// How many people voted, when Telegram shows the results to this Account
-    /// (often only once it voted, or the poll is closed).
+    /// How many people voted, as Telegram tells this Account (usually also
+    /// before it voted, while the per-option `votes` stay hidden).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_voters: Option<u32>,
     /// No more votes are taken.
@@ -232,7 +232,8 @@ pub struct PollOption {
     /// Votes for this option, when Telegram shows the results to this Account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub votes: Option<u32>,
-    /// The Account voted for this option.
+    /// The Account voted for this option. Absent also when Telegram doesn't
+    /// say (results the same for everyone, without the Account's vote).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chosen: bool,
     /// Quizzes only, once revealed: the correct answer.

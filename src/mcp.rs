@@ -48,7 +48,10 @@ use crate::{
             self, MAX_MEMBER_CURSOR_LEN, MAX_MEMBER_QUERY_CHARS, MAX_MEMBERS_PER_PAGE, MemberPage,
             MembersQuery,
         },
-        messages::{self, ChatMessage, HistoryQuery, MediaKind, MessagePage},
+        messages::{
+            self, ChatMessage, HistoryQuery, MAX_POLL_OPTION_CHARS, MAX_POLL_OPTIONS,
+            MAX_POLL_QUESTION_CHARS, MediaKind, MessagePage, Poll,
+        },
         sanitise::Sanitised,
         search::{self, ChatType, MediaFilter, SearchFrom, SearchPage, SearchQuery, SearchScope},
         topics::MAX_LISTED_TOPICS,
@@ -824,11 +827,11 @@ as [service message]; rich posts' tables, lists and collapsible sections as plai
 cells joined by ` | `; cut to 1000 characters), `media` when the message carries any: `kind` \
 (photo, video, video_note, voice, audio, document, sticker, gif, location, contact, poll, \
 other) and, when Telegram sends them, `duration_s`, `size_bytes`, `mime_type`, `file_name` \
-(cut to 128 characters), `width`, `height`; a poll also has `question`, `options` (each \
-`text`, and `votes` when Telegram shows this account the results, `chosen` for its own vote, \
-`correct` on a quiz's revealed answer; at most 12, `options_truncated` if more), \
-`total_voters`, `closed`, `multiple_choice`, `quiz`, `anonymous`, never who voted (a link \
-preview is not media: the link is in the text), the id it replies to, forwarded/edited flags, `reactions` when it has any (each standard \
+(cut to 128 characters), `width`, `height` (a link preview is not media: the link is in the \
+text); a poll also has `question`, `options` (each `text`, `votes` when Telegram shows this \
+account the results, `chosen` on its own vote, `correct` on a quiz's revealed answer; at most \
+12, `options_truncated` if more), `total_voters`, `closed`, `multiple_choice`, `quiz` and \
+`anonymous`, never who voted; the id it replies to, forwarded/edited flags, `reactions` when it has any (each standard \
 emoji with its count, all custom emoji summed under `custom`, paid Telegram Stars reactions \
 under `paid`; not who reacted), `link`: a t.me URL that opens the message in Telegram (in \
 channels and supergroups only; a `t.me/c/…` link opens only for their members) and `pinned: \
@@ -1837,6 +1840,9 @@ fn bound_history(mut page: MessagePage, reach: Reach) -> MessagePage {
             {
                 *name = shorten(name, MAX_TITLE_CHARS);
             }
+            if let Some(poll) = &mut media.poll {
+                bound_poll(poll);
+            }
         }
     }
     for title in page.topics.iter_mut().flat_map(|t| t.0.values_mut()) {
@@ -1917,6 +1923,19 @@ fn bound_history(mut page: MessagePage, reach: Reach) -> MessagePage {
         page.next_after_id = page.messages.first().map(|m| m.id);
     }
     page
+}
+
+/// A poll as a page shows it: at most [`MAX_POLL_OPTIONS`] options, each
+/// and the question cut on one line.
+fn bound_poll(poll: &mut Poll) {
+    poll.question = shorten(&poll.question, MAX_POLL_QUESTION_CHARS);
+    if poll.options.len() > MAX_POLL_OPTIONS {
+        poll.options.truncate(MAX_POLL_OPTIONS);
+        poll.options_truncated = true;
+    }
+    for option in &mut poll.options {
+        option.text = shorten(&option.text, MAX_POLL_OPTION_CHARS);
+    }
 }
 
 /// What one message takes of the page budget: its text, its media's names,
@@ -2343,6 +2362,53 @@ mod tests {
             "{}",
             json.chars().count()
         );
+    }
+
+    #[test]
+    fn a_page_cuts_a_polls_question_options_and_their_number() {
+        let poll = Poll {
+            question: format!("{}\n{}", "q".repeat(200), "q".repeat(200)),
+            options: (0..14)
+                .map(|_| PollOption {
+                    text: "o".repeat(150),
+                    votes: None,
+                    chosen: false,
+                    correct: false,
+                })
+                .collect(),
+            options_truncated: false,
+            total_voters: None,
+            closed: false,
+            multiple_choice: false,
+            quiz: false,
+            anonymous: true,
+        };
+        let page = MessagePage::new(
+            "channel:1".into(),
+            vec![ChatMessage {
+                media: Some(Media {
+                    poll: Some(poll),
+                    ..Media::from(MediaKind::Poll)
+                }),
+                ..window(1, 1, 0).messages.remove(0)
+            }],
+        );
+        let page = bound_history(page, Reach::Older);
+        let poll = page.messages[0]
+            .media
+            .as_ref()
+            .unwrap()
+            .poll
+            .as_ref()
+            .unwrap();
+        assert_eq!(poll.question.chars().count(), MAX_POLL_QUESTION_CHARS);
+        assert!(poll.question.ends_with('…') && !poll.question.contains('\n'));
+        assert_eq!(poll.options.len(), MAX_POLL_OPTIONS);
+        assert!(poll.options_truncated);
+        for option in &poll.options {
+            assert_eq!(option.text.chars().count(), MAX_POLL_OPTION_CHARS);
+            assert!(option.text.ends_with('…'));
+        }
     }
 
     #[test]
