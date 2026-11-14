@@ -23,7 +23,6 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 mod arguments;
-mod confirm;
 mod drafts;
 mod prompts;
 mod scoped;
@@ -32,7 +31,6 @@ mod send;
 use self::scoped::ScopedTools;
 use crate::{
     auth::Caller,
-    confirm::PendingSends,
     limits::{MethodClass, WriteLimit},
     links::{MAX_DOWNLOAD_BYTES, MediaDownload, MediaLinks},
     recent_sends::RecentSends,
@@ -163,8 +161,7 @@ pub fn instructions(scopes: Scopes) -> String {
         if scopes.contains(Scope::Send) {
             can.push(
                 "send messages, react to messages and mark chats as read in the chats the user \
-                 allowed (each message confirmed by the user, unless they chose to let this app \
-                 send without asking; reactions and marking as read never are)",
+                 allowed",
             );
         }
         if scopes.contains(Scope::Organize) {
@@ -226,17 +223,15 @@ mod instructions_tests {
     }
 
     #[test]
-    fn a_send_grant_is_told_where_it_may_send_react_and_mark_read_and_what_is_confirmed() {
+    fn a_send_grant_is_told_where_it_may_send_react_and_mark_read() {
         let sending: Scopes = [Scope::Send].into_iter().collect();
         assert_eq!(
             instructions(sending),
             format!(
                 "Unofficial Telegram MCP server (uses the Telegram API). Access to the connected \
                  Telegram account: you can read chats, messages and media, and send messages, \
-                 react to messages and mark chats as read in the chats the user allowed (each \
-                 message confirmed by the user, unless they chose to let this app send without \
-                 asking; reactions and marking as read never are); you cannot edit or delete \
-                 messages. {UNTRUSTED}"
+                 react to messages and mark chats as read in the chats the user allowed; you \
+                 cannot edit or delete messages. {UNTRUSTED}"
             )
         );
     }
@@ -274,11 +269,8 @@ pub struct TgMcp {
     prompt_router: PromptRouter<Self>,
     /// Where get_media's Media links are kept.
     links: Arc<MediaLinks>,
-    /// Where sends wait for the user's confirmation; `None` on a server
-    /// without the confirmation page, where nothing can be confirmed.
-    confirmations: Option<Arc<PendingSends>>,
-    /// The duplicate guard of sends: the confirmation page's, which records
-    /// confirmed sends, once there is one.
+    /// The duplicate guard of sends. One per server: MCP sessions share it,
+    /// as the guard is per Account.
     recent_sends: Arc<RecentSends>,
     /// EXPERIMENTAL (#58 prototype): get_media takes mode `document`.
     experimental_documents: bool,
@@ -288,7 +280,13 @@ impl TgMcp {
     /// With `experimental_documents` off (the default), get_media neither
     /// takes mode `document` nor shows it: its schemas and description are
     /// those of a server without it.
-    pub fn new(links: Arc<MediaLinks>, experimental_documents: bool) -> Self {
+    /// `recent_sends` is the server's one duplicate guard, shared by every
+    /// MCP session: the guard is per Account.
+    pub fn new(
+        links: Arc<MediaLinks>,
+        recent_sends: Arc<RecentSends>,
+        experimental_documents: bool,
+    ) -> Self {
         let mut tools = Self::scoped_tools();
         if let Some(get_media) = tools.tool_mut("get_media") {
             if experimental_documents {
@@ -297,7 +295,10 @@ impl TgMcp {
                 hide_document_mode(get_media);
             }
         }
-        Self::with_tools(links, tools, experimental_documents)
+        Self {
+            recent_sends,
+            ..Self::with_tools(links, tools, experimental_documents)
+        }
     }
 
     /// Every tool, under the Scope a Grant needs to see and call it. A tool's
@@ -321,18 +322,9 @@ impl TgMcp {
             tools: Arc::new(tools),
             prompt_router: Self::prompt_router(),
             links,
-            confirmations: None,
             recent_sends: Arc::default(),
             experimental_documents,
         }
-    }
-
-    /// Sends that need the user's confirmation wait in `confirmations`,
-    /// decided on its `/confirm` page.
-    pub fn with_confirmations(mut self, confirmations: Arc<PendingSends>) -> Self {
-        self.recent_sends = confirmations.recent_sends().clone();
-        self.confirmations = Some(confirmations);
-        self
     }
 }
 

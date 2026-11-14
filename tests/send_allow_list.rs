@@ -193,18 +193,15 @@ fn id(chat: ChatId) -> String {
     fake_issued_id(chat)
 }
 
-/// The Chats and auto-send flag of the Grant behind `tokens`, opened with its Token.
-async fn opened(server: &TestServer, tokens: &Value) -> (BTreeSet<String>, bool) {
+/// The Chats of the Grant behind `tokens`, opened with its Token.
+async fn opened(server: &TestServer, tokens: &Value) -> BTreeSet<String> {
     let grant = server
         .vault
         .open(tokens["access_token"].as_str().unwrap())
         .await
         .unwrap();
     let list = grant.send_allow_list.expect("a send Grant has a list");
-    (
-        list.chats().map(|c| c.to_string()).collect(),
-        list.auto_send(),
-    )
+    list.chats().map(|c| c.to_string()).collect()
 }
 
 fn set(chats: &[ChatId]) -> BTreeSet<String> {
@@ -255,8 +252,8 @@ async fn two_chats_chosen_are_exactly_what_the_grant_opens_with() {
         "the box stays as posted: {html}"
     );
     assert!(
-        html.contains(r#"name="auto_send" value="on">"#),
-        "auto-send starts off"
+        !html.contains("auto_send"),
+        "every message goes at once: nothing to opt out of"
     );
 
     let tokens = flow
@@ -271,10 +268,7 @@ async fn two_chats_chosen_are_exactly_what_the_grant_opens_with() {
         )
         .await;
     assert_eq!(tokens["scope"], "read send");
-    assert_eq!(
-        opened(&server, &tokens).await,
-        (set(&[friend(1), friend(2)]), false)
-    );
+    assert_eq!(opened(&server, &tokens).await, set(&[friend(1), friend(2)]));
     let grant = server
         .vault
         .open(tokens["access_token"].as_str().unwrap())
@@ -325,12 +319,9 @@ async fn send_with_nothing_chosen_is_refused_and_the_login_goes_on() {
 
     // The same login still finishes, with a chat this time.
     let tokens = flow
-        .allow(
-            &server,
-            &[SEND, ("chat", &id(friend(5))), ("auto_send", "on"), ALLOW],
-        )
+        .allow(&server, &[SEND, ("chat", &id(friend(5))), ALLOW])
         .await;
-    assert_eq!(opened(&server, &tokens).await, (set(&[friend(5)]), true));
+    assert_eq!(opened(&server, &tokens).await, set(&[friend(5)]));
 }
 
 #[tokio::test]
@@ -342,10 +333,7 @@ async fn a_folder_brings_its_chats_with_a_dialog_as_they_are_now() {
         .allow(&server, &[SEND, ("folder", "3"), ("folder", "4"), ALLOW])
         .await;
     // Not the chat it left, and nothing for the folder of rules.
-    assert_eq!(
-        opened(&server, &tokens).await,
-        (set(&[WORK_A, WORK_B]), false)
-    );
+    assert_eq!(opened(&server, &tokens).await, set(&[WORK_A, WORK_B]));
 }
 
 #[tokio::test]
@@ -404,10 +392,7 @@ async fn search_offers_only_the_accounts_own_chats_with_a_dialog() {
             ],
         )
         .await;
-    assert_eq!(
-        opened(&server, &tokens).await,
-        (set(&[CAROLYN, WORK_B]), false)
-    );
+    assert_eq!(opened(&server, &tokens).await, set(&[CAROLYN, WORK_B]));
 
     let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
     assert!(logs.contains("consent chat search"), "{logs}");
@@ -540,7 +525,7 @@ async fn telegram_failing_shows_why_and_grants_nothing() {
     let tokens = flow
         .allow(&server, &[SEND, ("chat", &id(friend(1))), ALLOW])
         .await;
-    assert_eq!(opened(&server, &tokens).await, (set(&[friend(1)]), false));
+    assert_eq!(opened(&server, &tokens).await, set(&[friend(1)]));
 }
 
 /// Each failed try to load the chats opens a connection: a few per login.
@@ -591,7 +576,7 @@ async fn a_refresh_keeps_the_allow_list() {
     .await;
     assert_eq!(status, StatusCode::OK, "{rotated}");
     assert_eq!(rotated["scope"], "read send");
-    assert_eq!(opened(&server, &rotated).await, (set(&[friend(9)]), false));
+    assert_eq!(opened(&server, &rotated).await, set(&[friend(9)]));
 }
 
 /// Everything the server logs while this test binary runs.
@@ -664,7 +649,7 @@ async fn a_send_grant_lists_the_send_tools_and_is_told_where_it_may_write() {
     assert!(
         said.contains(
             "send messages, react to messages and mark chats as read in the chats the user \
-             allowed (each message confirmed by the user"
+             allowed; you cannot edit or delete messages."
         ),
         "{said}"
     );

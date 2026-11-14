@@ -397,7 +397,11 @@ async fn rendered_recipes_stay_under_400_words() {
 #[tokio::test]
 async fn rendering_a_prompt_needs_no_telegram() {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let server = TgMcp::new(Arc::new(MediaLinks::new("http://127.0.0.1")), false);
+    let server = TgMcp::new(
+        Arc::new(MediaLinks::new("http://127.0.0.1")),
+        Arc::default(),
+        false,
+    );
     tokio::spawn(async move {
         let running = server.serve(server_io).await.unwrap();
         let _ = running.waiting().await;

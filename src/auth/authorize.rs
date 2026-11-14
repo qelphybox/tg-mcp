@@ -30,7 +30,6 @@ use super::{
 };
 use crate::{
     allow_list::{MAX_CHATS, SendAllowList},
-    confirm::cookie,
     scope::{Scope, Scopes},
     tg::{LoggedIn, LoginState, TgError},
 };
@@ -471,15 +470,15 @@ fn offered(scopes: impl IntoIterator<Item = Scope>) -> Scopes {
 
 /// The Consent form: `decision` (`allow` or `deny`), one `scope` per checked
 /// box, as the browser posts them (`scope=draft&decision=allow`), and the Send
-/// allow-list part: `auto_send`, one `folder` and one `chat` per ticked box,
-/// and `q`, the name to search for.
+/// allow-list part: one `folder` and one `chat` per ticked box, and `q`, the
+/// name to search for. Anything else is ignored, such as the `auto_send` box
+/// of a screen loaded before 0.3.0 (ADR-0008).
 #[derive(Debug, Default)]
 pub struct ConsentForm {
     decision: String,
     scopes: Vec<String>,
     folders: Vec<String>,
     chats: Vec<String>,
-    auto_send: bool,
     query: String,
 }
 
@@ -493,7 +492,6 @@ impl ConsentForm {
                     "scope" => form.scopes.push(value),
                     "folder" => form.folders.push(value),
                     "chat" => form.chats.push(value),
-                    "auto_send" => form.auto_send = value == "on",
                     "q" if form.query.is_empty() => form.query = value,
                     _ => {}
                 }
@@ -522,7 +520,6 @@ impl ConsentForm {
                 .filter_map(|id| id.parse().ok())
                 .take(MAX_CHATS)
                 .collect(),
-            auto_send: self.auto_send,
         }
     }
 }
@@ -640,34 +637,16 @@ pub async fn consent_submit(
             let client_id = request.client_id.clone();
             // Counts only: which Chats is as private as their names.
             let send_chats = send_allow_list.as_ref().map_or(0, SendAllowList::len);
-            let auto_send = send_allow_list
-                .as_ref()
-                .is_some_and(SendAllowList::auto_send);
-            // With `send`, this browser gets the Confirmation cookie: the
-            // only place its pending sends can be sent from (#45).
-            let cookie = send_allow_list
-                .is_some()
-                .then(|| cookie::issue(auth.vault.ttl().refresh, auth.is_https()));
-            let send_allow_list = send_allow_list.map(|list| match &cookie {
-                Some(cookie) => list.with_confirm_cookie(cookie.verifier),
-                None => list,
-            });
             let code = auth
                 .flows
                 .issue_code(request, logged_in, scopes, send_allow_list);
-            tracing::info!(client_id = %client_id, scopes = %scopes, send_chats, auto_send, "authorization code issued");
-            let mut response = redirect_with(
+            tracing::info!(client_id = %client_id, scopes = %scopes, send_chats, "authorization code issued");
+            redirect_with(
                 &redirect_uri,
                 &[("code", &code)],
                 state.as_deref(),
                 &auth.base_url,
-            );
-            if let Some(cookie) = cookie {
-                response
-                    .headers_mut()
-                    .append(header::SET_COOKIE, cookie.set_cookie);
-            }
-            response
+            )
         }
         ("allow", Progress::InProgress(_)) => pages::error(
             StatusCode::BAD_REQUEST,
@@ -916,14 +895,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["user:7~AAAAAAAAAAE", "chat:8"]
         );
-        assert!(picked.auto_send);
         assert_eq!(form.query, "Ann");
 
-        let form = posted(&[("auto_send", "yes"), ("decision", "allow")]);
-        assert!(
-            !form.picked().auto_send,
-            "only the box's own value ticks it"
-        );
+        // A screen loaded before 0.3.0 posts its Auto-send box: ignored.
+        let form = posted(&[("auto_send", "on"), ("decision", "allow")]);
         assert_eq!(form.picked(), Picked::default());
     }
 }
