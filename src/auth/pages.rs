@@ -77,6 +77,8 @@ fn render(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32" type="image/png">
 <title>{title} · Telegram MCP (unofficial)</title>
 <style>
 {STYLE}</style>
@@ -482,6 +484,24 @@ pub const LOGIN_JS: &str = r#""use strict";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_page_links_the_servers_icon_under_the_same_csp() {
+        let response = error(StatusCode::BAD_REQUEST, "Oops", "Something.");
+        assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], CSP);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        for link in [
+            r#"<link rel="icon" href="/icon.svg" type="image/svg+xml">"#,
+            r#"<link rel="icon" href="/favicon.ico" sizes="32x32" type="image/png">"#,
+        ] {
+            assert!(html.contains(link), "{link}: {html}");
+        }
+        // Same-origin images were already allowed: nothing loosened.
+        assert!(CSP.contains("img-src 'self' data:;"));
+    }
 
     fn view<'a>(client_name: &'a str, target: &'a str, loopback: bool) -> ConsentView<'a> {
         ConsentView {
