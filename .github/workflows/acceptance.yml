@@ -1,0 +1,71 @@
+# Acceptance on the Test account (ADR-0009): cargo accept against real
+# Telegram, with the server started on the runner through the Acceptance app.
+# Cloud agent sessions can't reach Telegram, so they run it here.
+#
+# Runs only when asked: a dispatch (scenario ids as input) or a PR labelled
+# `accept`. Each run logs the Test account in, so never on every push.
+name: acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Scenario ids, space-separated (empty: every one but smoke)"
+        required: false
+        default: ""
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+jobs:
+  accept:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'accept')
+    runs-on: ubuntu-latest
+    # The Test account's and the Peer's logins live only in this environment;
+    # a fork's PR gets none of them.
+    environment: acceptance
+    concurrency:
+      group: acceptance
+      cancel-in-progress: false
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: never
+      TG_ACCEPT_API_ID: ${{ secrets.TG_ACCEPT_API_ID }}
+      TG_ACCEPT_API_HASH: ${{ secrets.TG_ACCEPT_API_HASH }}
+      TG_ACCEPT_ACCOUNT_ID: ${{ secrets.TG_ACCEPT_ACCOUNT_ID }}
+      TG_ACCEPT_PEER_ID: ${{ secrets.TG_ACCEPT_PEER_ID }}
+      TG_ACCEPT_CLOUD_PASSWORD: ${{ secrets.TG_ACCEPT_CLOUD_PASSWORD }}
+      TG_ACCEPT_DRIVER_SESSION: ${{ secrets.TG_ACCEPT_DRIVER_SESSION }}
+      TG_ACCEPT_PEER_SESSION: ${{ secrets.TG_ACCEPT_PEER_SESSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built before the run, so the server starts at once when cargo accept asks.
+      - run: cargo build --locked --package tg-mcp --package acceptance
+      - name: cargo accept
+        env:
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          case "$SCENARIOS" in *[!a-z0-9\ -]*)
+            echo "::error::scenario ids are lower-case letters, digits and dashes"; exit 2;; esac
+          set +e
+          # shellcheck disable=SC2086 # the ids are meant to split
+          cargo accept $SCENARIOS > report.md
+          status=$?
+          set -e
+          {
+            if [ "$status" = 3 ]; then
+              echo "# BLOCKED: Telegram limited the Test account. Not a failure of the code: don't change code, run again after the wait."
+              echo
+            fi
+            cat report.md
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-report
+          path: summary.md
+          if-no-files-found: ignore
