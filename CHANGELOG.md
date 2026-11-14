@@ -12,6 +12,7 @@
 
 ### New
 
+- **Comments under channel posts** (#55). A channel post with comments on has `comments`: how many (from the message itself, no extra call). get_messages `comments_of` = a post's id reads its comments from the channel's discussion group, newest first, paged with `limit` and `before_id` like a history and with the same message shape (media, reactions, links, sanitised): `messages.getDiscussionMessage`, then `messages.getReplies`, through the account's limiter. The answer's `chat_id` is the discussion group, so `around_id` and `thread_of` continue there, and `comments_of` names the post. A post with comments off is an error that says so; a post nobody commented on, an empty page. `comments_of` doesn't combine with `around_id`, `after_id`, `thread_of`, `pinned_only`, `since`, `until` or `topic`, and is for channels only.
 - **Polls in `media`** (#62). A message with a poll describes it in its `media`: `question`, `options` (each `text`, `votes` when Telegram shows this account the results, `chosen` for its own vote, `correct` on a quiz's revealed answer), `options_truncated`, `total_voters`, `closed`, `multiple_choice`, `quiz`, `anonymous`. Everything comes from the message itself: no extra Telegram call, and who voted for what is never fetched. Question and options are sanitised like message text and cut (question 300, option 100 characters, at most 12 options). In get_messages and wherever a message's full `media` is shown; list_chats previews and search hits keep only `kind`.
 
 ### Changed

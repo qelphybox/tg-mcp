@@ -42,6 +42,7 @@ fn chat(id: ChatId, title: &str, kind: ChatKind, username: Option<&str>) -> Chat
 /// Message `id`, `id` minutes into DAY, with "release" in its text.
 fn message(id: i32) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: DAY + id * 60,
         from: None,

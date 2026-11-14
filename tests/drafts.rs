@@ -43,6 +43,7 @@ fn chat(id: ChatId, title: &str, kind: ChatKind) -> ChatSummary {
 
 fn message(id: i32, topic: Option<i32>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: DAY + id,
         from: None,

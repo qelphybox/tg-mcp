@@ -45,6 +45,7 @@ fn chat(id: ChatId, title: &str, kind: ChatKind) -> ChatSummary {
 /// Message `id`, `id` minutes into DAY, in `topic` (`None`: General).
 fn message(id: i32, text: &str, topic: Option<i32>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: DAY + id * 60,
         from: None,

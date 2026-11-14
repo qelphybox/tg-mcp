@@ -38,6 +38,7 @@ fn alice_chat() -> ChatSummary {
 /// Message `id` sent `id` hours into DAY; even ids are ours.
 fn message(id: i32, text: &str) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: DAY + id * 3600,
         from: None,
