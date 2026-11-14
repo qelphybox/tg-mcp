@@ -88,7 +88,7 @@ fn render(
 <header class="brand">{MARK}tg-mcp</header>
 <main{main_class}>
 {body}
-<footer>Unofficial Telegram MCP server. Uses the Telegram API; not affiliated with Telegram.</footer>
+<footer>Unofficial Telegram MCP server. Uses the Telegram API; not affiliated with Telegram. <a href="/forget">Delete my data</a></footer>
 </main>
 </body>
 </html>"#,
@@ -167,6 +167,100 @@ pub fn password(
 </form>"#,
             id = esc(login_id),
         ),
+    )
+}
+
+/// `/forget`: what it does, and the button that starts its QR login.
+pub fn forget_intro() -> Response {
+    page(
+        StatusCode::OK,
+        "Delete my data",
+        r#"<h1>Delete my data</h1>
+<p>This deletes every connection this server holds for your Telegram account: each app's access, its tokens and its encrypted Telegram session. You don't need the apps or their tokens.</p>
+<p>First log in with Telegram, so the server knows the account is yours. You will see how many connections there are before anything is deleted.</p>
+<form method="post" action="/forget">
+  <div class="row"><button type="submit" class="primary">Log in with Telegram</button></div>
+</form>
+<p class="muted">The login made for this check is ended right after.</p>"#,
+    )
+}
+
+/// `/forget` after the login: `count` connections of `account_name`, for `apps`.
+pub fn forget_review(
+    login_id: &str,
+    account_name: &str,
+    count: usize,
+    apps: &[String],
+) -> Response {
+    let account = esc(&sanitise(account_name));
+    let form = |buttons: &str| {
+        format!(
+            r#"<form method="post" action="/login/{id}/forget">
+  <div class="row">{buttons}</div>
+</form>"#,
+            id = esc(login_id),
+        )
+    };
+    let body = if count == 0 {
+        format!(
+            r#"<h1>Nothing to delete</h1>
+<p>This server holds no connections for <b>{account}</b>.</p>
+{form}"#,
+            form = form(
+                r#"<button type="submit" name="decision" value="cancel" class="primary">Done</button>"#
+            ),
+        )
+    } else {
+        let connections = if count == 1 {
+            "1 connection".to_string()
+        } else {
+            format!("{count} connections")
+        };
+        let apps = apps
+            .iter()
+            .map(|name| format!("“{}”", esc(&sanitise(name))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"<h1>Delete all?</h1>
+<p>This server holds <b>{connections}</b> for <b>{account}</b>.</p>
+<p class="muted">Apps: {apps} (the names they gave themselves, not verified).</p>
+<p>Deleting ends each app's access at once; to use one again, connect it again.</p>
+{form}"#,
+            form = form(
+                r#"<button type="submit" name="decision" value="cancel">Cancel</button>
+    <button type="submit" name="decision" value="delete" class="primary">Delete</button>"#
+            ),
+        )
+    };
+    page(StatusCode::OK, "Delete my data", &body)
+}
+
+/// `/forget` done: `deleted` connections are gone.
+pub fn forget_deleted(deleted: usize) -> Response {
+    let connections = if deleted == 1 {
+        "1 connection".to_string()
+    } else {
+        format!("{deleted} connections")
+    };
+    page(
+        StatusCode::OK,
+        "Deleted",
+        &format!(
+            r#"<h1>Deleted</h1>
+<p>Deleted {connections}.</p>
+<p>Old “Unofficial MCP Server” sessions may still be listed in Telegram → Settings → Devices: end them there. Nobody can use them, not even us: their keys were only in your apps' tokens.</p>"#
+        ),
+    )
+}
+
+/// `/forget` cancelled.
+pub fn forget_cancelled() -> Response {
+    page(
+        StatusCode::OK,
+        "Nothing deleted",
+        r#"<h1>Nothing deleted</h1>
+<p>Nothing was deleted. The login made for this check has been ended.</p>"#,
     )
 }
 

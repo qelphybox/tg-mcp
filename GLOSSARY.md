@@ -34,7 +34,7 @@ _Avoid_: leeway, reuse interval
 ## Onboarding
 
 **Login flow**:
-The browser part of OAuth authorization: QR login, optional 2FA password, then Consent. Ends with an authorization code.
+The browser part of OAuth authorization: QR login, optional 2FA password, then Consent. Ends with an authorization code. `/forget` runs the same QR login and password steps to prove who owns the Account, then deletes its Grants instead; that login never ends in a code.
 _Avoid_: signup, auth (unqualified)
 
 **QR login**:

@@ -3010,6 +3010,10 @@ impl Connector for GrammersConnector {
         self.log_out_session(&snapshot).await.map(|()| true)
     }
 
+    async fn log_out_login(&self, logged_in: LoggedIn) -> Result<(), TgError> {
+        self.log_out_session(&logged_in.telegram_session).await
+    }
+
     fn live_clients(&self) -> usize {
         self.pool.len()
     }

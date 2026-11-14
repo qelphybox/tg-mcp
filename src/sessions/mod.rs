@@ -512,6 +512,25 @@ impl Vault {
         Ok(issued)
     }
 
+    /// The Grants of an Account, each with the OAuth client it was issued to,
+    /// oldest first. Needs no Token and opens nothing: for `/forget` (#63),
+    /// which deletes them once the user proved they own the Account.
+    pub async fn grants_of_account(
+        &self,
+        account_id: i64,
+    ) -> Result<Vec<(GrantId, String)>, VaultError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, client_id FROM grants WHERE account_id = ? ORDER BY created_at, id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, client)| (GrantId(id), client))
+            .collect())
+    }
+
     /// Whether a Grant still exists (it isn't revoked or purged). Needs no
     /// Token, and opens nothing: for Media links, which carry no Token.
     pub async fn grant_exists(&self, grant_id: &GrantId) -> Result<bool, VaultError> {
