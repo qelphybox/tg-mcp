@@ -1,7 +1,6 @@
 //! Per-client-IP limits on the anonymous endpoints (`/register`, `/authorize`,
 //! `/token`, `/revoke`, `/media/{ticket}` for Media links, `/forget`, and the
-//! Consent screen's chat pickers, which reach Telegram before any Token
-//! exists): a
+//! Consent screen's chat pickers, which reach Telegram before any Token exists): a
 //! token bucket per endpoint and client, answered with `429 Too Many
 //! Requests` + `Retry-After` when empty. Everything else (`/mcp`, `/healthz`,
 //! `.well-known/*`, the other Login flow pages) is not limited here.

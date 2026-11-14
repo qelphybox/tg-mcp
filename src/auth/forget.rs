@@ -7,7 +7,8 @@
 //! bucket). Once logged in, the login page sends it on to `/login/{id}/forget`:
 //! how many connections the Account has and which apps they are for, and
 //! Delete / Cancel. Nothing is deleted before the click. Either way the
-//! session made for this check is logged out at the end.
+//! session made for this check is logged out at the end, and so is one left
+//! logged in when its login expires (the minute's sweep).
 //!
 //! ADR-0003 holds: deleting needs no Token because it destroys, never
 //! decrypts. A Grant's Telegram session is logged out only where the Client
@@ -28,7 +29,7 @@ use serde::Deserialize;
 use super::{
     AuthState,
     authorize::{expired, not_an_authorization, owned_login, to_login_page},
-    flows::{Progress, Purpose},
+    flows::{PendingLogin, Progress, Purpose},
     pages,
     rate_limit::ClientIp,
 };
@@ -90,7 +91,7 @@ pub async fn review(
         Ok(grants) => grants,
         Err(err) => {
             tracing::error!(error = %err, "listing grants for forget failed");
-            return server_error();
+            return unavailable_now();
         }
     };
     let mut apps: Vec<String> = Vec::new();
@@ -100,7 +101,7 @@ pub async fn review(
             Ok(None) => "an app no longer registered".into(),
             Err(err) => {
                 tracing::error!(error = %err, "loading oauth client for forget failed");
-                return server_error();
+                return unavailable_now();
             }
         };
         if !apps.contains(&name) {
@@ -142,26 +143,19 @@ pub async fn decide(
             );
         }
     };
+    {
+        let progress = login.progress.lock().await;
+        if !matches!(&*progress, Progress::LoggedIn(_)) {
+            return Redirect::to(&format!("/login/{id}")).into_response();
+        }
+    }
     drop(login);
+    // Once: a second submit finds the login gone, or its session taken.
     let Some(login) = auth.flows.take_login(&id) else {
         return expired();
     };
-    let Ok(login) = Arc::try_unwrap(login) else {
-        return pages::error(
-            StatusCode::CONFLICT,
-            "Already submitted",
-            "This was already done.",
-        );
-    };
-    let logged_in = match login.progress.into_inner() {
-        Progress::LoggedIn(logged_in) => logged_in,
-        Progress::InProgress(_) => {
-            return pages::error(
-                StatusCode::BAD_REQUEST,
-                "Not logged in",
-                "Finish the Telegram login first.",
-            );
-        }
+    let Some(logged_in) = login.progress.lock().await.take_logged_in() else {
+        return expired();
     };
     let account_id = logged_in.account.id;
     let response = if delete {
@@ -213,12 +207,37 @@ async fn delete_grants(auth: &AuthState, account_id: i64) -> Result<usize, Respo
     Ok(grants.len())
 }
 
+/// A `/forget` login dropped by the sweep while logged in: end its session,
+/// which nobody will use. Any other login is left as it is.
+pub async fn log_out_abandoned(auth: &AuthState, login: &PendingLogin) {
+    if !matches!(login.purpose, Purpose::Forget) {
+        return;
+    }
+    let Some(logged_in) = login.progress.lock().await.take_logged_in() else {
+        return;
+    };
+    tracing::info!(
+        account_id = logged_in.account.id,
+        "forget: abandoned check logged out"
+    );
+    log_out_check(auth, logged_in).await;
+}
+
 /// End the session made for this check; best effort, it is useless anyway.
 async fn log_out_check(auth: &AuthState, logged_in: LoggedIn) {
     let account_id = logged_in.account.id;
     if let Err(err) = auth.connector.log_out_login(logged_in).await {
         tracing::warn!(account_id, error = %err, "forget: logging the check's session out failed");
     }
+}
+
+/// Reading failed before anything was deleted.
+fn unavailable_now() -> Response {
+    pages::error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Server error",
+        "Nothing was deleted. Try again later.",
+    )
 }
 
 fn server_error() -> Response {

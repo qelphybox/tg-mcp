@@ -124,8 +124,11 @@ pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
             every.tick().await;
             let Some(auth) = auth.upgrade() else { return };
             let swept = auth.flows.sweep();
-            if swept > 0 {
-                tracing::info!(swept, "abandoned logins dropped");
+            if !swept.is_empty() {
+                tracing::info!(swept = swept.len(), "abandoned logins dropped");
+            }
+            for login in swept {
+                forget::log_out_abandoned(&auth, &login).await;
             }
             let links = auth.links.sweep();
             if links > 0 {

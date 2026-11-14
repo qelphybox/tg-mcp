@@ -40,9 +40,28 @@ pub enum Purpose {
     Forget,
 }
 
+// `InProgress` reads as the login's state; renaming it helps no reader.
+#[allow(clippy::enum_variant_names)]
 pub enum Progress {
     InProgress(Box<dyn LoginAttempt>),
     LoggedIn(LoggedIn),
+    /// Its session was handed on ([`Progress::take_logged_in`]): `/forget`
+    /// used it and logged it out.
+    Finished,
+}
+
+impl Progress {
+    /// The logged-in session, leaving [`Progress::Finished`]; `None` (and
+    /// nothing changed) when the login isn't finished.
+    pub fn take_logged_in(&mut self) -> Option<LoggedIn> {
+        match std::mem::replace(self, Progress::Finished) {
+            Progress::LoggedIn(logged_in) => Some(logged_in),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
 }
 
 pub struct PendingLogin {
@@ -243,15 +262,21 @@ impl Flows {
         code
     }
 
-    /// Drop expired logins and codes. An abandoned login holds an open Telegram
-    /// connection until it is dropped, so this runs periodically.
-    pub fn sweep(&self) -> usize {
+    /// Drop expired logins and codes, returning the logins dropped (for
+    /// `/forget`'s to be logged out). An abandoned login holds an open
+    /// Telegram connection until it is dropped, so this runs periodically.
+    pub fn sweep(&self) -> Vec<Arc<PendingLogin>> {
         let mut logins = self.logins.lock().expect("flows lock");
-        let before = logins.pending.len();
-        logins
+        let expired: Vec<String> = logins
             .pending
-            .retain(|_, l| l.created.elapsed() < LOGIN_TTL);
-        let swept = before - logins.pending.len();
+            .iter()
+            .filter(|(_, l)| l.created.elapsed() >= LOGIN_TTL)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let swept = expired
+            .iter()
+            .filter_map(|id| logins.pending.remove(id))
+            .collect();
         drop(logins);
         self.codes
             .lock()
