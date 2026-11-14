@@ -78,6 +78,7 @@ fn data() -> FakeData {
         .with_messages(
             ALICE,
             vec![RawHistoryMessage {
+                comments: None,
                 id: 1,
                 date: 1_793_923_200,
                 from: None,

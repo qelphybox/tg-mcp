@@ -51,6 +51,7 @@ fn chat(id: ChatId, title: String, kind: ChatKind, username: Option<&str>) -> Ch
 
 fn message(id: i32, text: String) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: 1_793_923_200 + id,
         from: None,

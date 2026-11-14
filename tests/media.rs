@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tg_mcp::tg::{
     chats::{ChatId, ChatKind, ChatSummary, MessagePreview},
     fake::{FakeData, fake_issued_id},
-    messages::{Media, MediaKind, MediaSummary, RawHistoryMessage},
+    messages::{Media, MediaKind, MediaSummary, Poll, PollOption, RawHistoryMessage},
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
@@ -62,6 +62,7 @@ fn preview(text: &str, kind: Option<MediaKind>) -> Option<MessagePreview> {
 
 fn message(id: i32, text: &str, media: Option<Media>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: DAY + id * 60,
         from: None,
@@ -375,5 +376,92 @@ async fn the_output_schemas_declare_media() {
         "height",
     ] {
         assert!(schema.contains(field), "{field}");
+    }
+}
+
+/// A poll whose question and options hide characters: a quiz the Account
+/// answered, results shown, more options than are listed.
+fn quiz() -> Media {
+    let option = |text: &str, votes: u32, chosen: bool, correct: bool| PollOption {
+        text: text.into(),
+        votes: Some(votes),
+        chosen,
+        correct,
+    };
+    Media {
+        poll: Some(Poll {
+            question: "Capital of\u{202E} France?\u{200B}".into(),
+            options: vec![
+                option("Paris\u{E0041}", 7, false, true),
+                option("Lyon\nor Nice", 2, true, false),
+                option("\u{2066}\u{200B}", 0, false, false),
+            ],
+            options_truncated: true,
+            total_voters: Some(9),
+            closed: true,
+            multiple_choice: false,
+            quiz: true,
+            anonymous: true,
+        }),
+        ..Media::from(MediaKind::Poll)
+    }
+}
+
+#[tokio::test]
+async fn a_poll_shows_its_question_options_results_and_state_sanitised() {
+    let data = FakeData::new(account(42, "Me"))
+        .with_chats(vec![chat(ALICE, "Alice", ChatKind::Private, None)])
+        .with_messages(ALICE, vec![message(1, "", Some(quiz()))]);
+    let server = start_with(vec![data]).await;
+    let (_, tokens) = server.login().await;
+    let client = server.mcp(tokens["access_token"].as_str().unwrap()).await;
+
+    let messages = messages(&client).await;
+    assert_eq!(messages[&1]["text"], "");
+    assert_eq!(
+        messages[&1]["media"],
+        json!({
+            "kind": "poll",
+            "question": "Capital of France?",
+            "options": [
+                { "text": "Paris", "votes": 7, "correct": true },
+                { "text": "Lyon or Nice", "votes": 2, "chosen": true },
+                { "text": "[no visible text]", "votes": 0 },
+            ],
+            "options_truncated": true,
+            "total_voters": 9,
+            "closed": true,
+            "multiple_choice": false,
+            "quiz": true,
+            "anonymous": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn only_get_messages_declares_a_polls_details() {
+    let (_server, client) = client().await;
+    let tools = client.list_all_tools().await.unwrap();
+    let schema = |name: &str| {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        serde_json::to_string(tool.output_schema.as_ref().unwrap()).unwrap()
+    };
+    let get_messages = schema("get_messages");
+    for field in [
+        "question",
+        "options",
+        "options_truncated",
+        "total_voters",
+        "multiple_choice",
+        "anonymous",
+        "chosen",
+        "correct",
+    ] {
+        assert!(get_messages.contains(field), "{field}");
+    }
+    assert!(get_messages.contains("\"maxItems\":12"), "{get_messages}");
+    assert!(get_messages.contains("\"maxLength\":300"), "{get_messages}");
+    for name in ["search_messages", "list_chats"] {
+        assert!(!schema(name).contains("question"), "{name}");
     }
 }

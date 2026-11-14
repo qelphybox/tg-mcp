@@ -28,6 +28,16 @@ jobs:
           test "$listed" = "$crate" || {
             echo "server.json version $listed does not match Cargo.toml version $crate" >&2; exit 1; }
 
+      # ADR-0007: an official image never ships without the Built-in app.
+      - name: Built-in Telegram app secrets are set
+        env:
+          BUILTIN_API_ID: ${{ secrets.TG_MCP_BUILTIN_API_ID }}
+          BUILTIN_API_HASH: ${{ secrets.TG_MCP_BUILTIN_API_HASH }}
+        run: |
+          test -n "$BUILTIN_API_ID" && test -n "$BUILTIN_API_HASH" || {
+            echo "::error::Repository secrets TG_MCP_BUILTIN_API_ID and TG_MCP_BUILTIN_API_HASH must be set: the Built-in Telegram app of official images (ADR-0007, docs/deploy.md). Add them, then re-run this workflow." >&2
+            exit 1; }
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -58,6 +68,14 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Secrets, not build args: they stay out of `docker history` and provenance.
+          secrets: |
+            tg_builtin_api_id=${{ secrets.TG_MCP_BUILTIN_API_ID }}
+            tg_builtin_api_hash=${{ secrets.TG_MCP_BUILTIN_API_HASH }}
+          build-args: TG_MCP_BUILTIN_APP=required
+          # Secrets aren't part of the cache key: rebuild the build stage so
+          # rotated Built-in app secrets always reach the release.
+          no-cache-filters: build
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

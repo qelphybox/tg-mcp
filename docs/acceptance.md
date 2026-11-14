@@ -1002,6 +1002,53 @@ ADR-0008. Needs `telegram-send` of §56, and, for step 4, a send connector made 
 
    This is information for the Connectors directory (#57), not a pass/fail check: whether a custom connector shows `serverInfo.icons` is up to each client.
 
+## 60. `/forget` deletes every connection of an Account without a Token, and only after the user presses Delete
+
+#63. Needs two clients connected to your main account (e.g. the regular `telegram` connector in Claude Code and a claude.ai connector, or §51's `scripts/scope-check.py - read` left running twice), a second account connected once (a second phone, or a friend's account through §51's script), and a desktop browser. The boundaries are also covered by fake-backed tests: `cargo test --test forget` (Delete removes exactly that Account's Grants and another's survive, their Tokens get 401; Cancel deletes nothing; both log the check's session out; the cookie binds every step; a `/forget` login never yields a code and an OAuth login never reaches the forget page; the per-IP limit; the Consent screen links it).
+
+1. **Before.** In Claude Code with `telegram`: "Call whoami" works. In claude.ai, ask anything of the connector: it works. The second account's connector works too.
+
+2. **The page explains first.** Open `https://connector.tgmcp.dev/forget`: "Delete my data", what it deletes, and a **Log in with Telegram** button. Nothing has started yet: `logs | grep -c 'forget'` (step 7's `logs`) is 0.
+
+3. **Log in, see what would go.** Press the button: the usual QR page (in the developer tools, the POST to `/forget` answers 303 to `/login/<id>` and sets `tgm_login`). Scan it with the **main** account's phone (and type the cloud password if it has one). The page that follows says "Delete all?", "This server holds **N connections** for **<your name>**", with N the number of connections of that account (2 or more), and the apps by name in quotes, "(the names they gave themselves, not verified)", with **Cancel** and **Delete**. Nothing is deleted yet: whoami in Claude Code still works.
+
+4. **Cancel deletes nothing.** Press **Cancel**: "Nothing deleted". Claude Code's whoami still works. In Telegram → Settings → Devices, the session this check made ("Unofficial MCP Server", just now) disappears within seconds; the connectors' own sessions stay.
+
+5. **Delete deletes exactly that account's connections.** Repeat steps 3 and press **Delete**: "Deleted N connections", plus the note about old sessions in Settings → Devices. Then:
+   - Claude Code: the next `telegram` tool call fails with 401, and `/mcp` shows it needs authentication again. claude.ai's connector does the same.
+   - The second account's connector still works.
+   - Telegram → Settings → Devices on the main phone: the check's session is gone. The connectors' sessions are gone too if their Live clients were in memory (used within the last few minutes); otherwise they are still listed and can be ended there.
+   - The back button and **Delete** again: "Login expired" (410), nothing more happens.
+
+6. **Bound to its browser and rate-limited.**
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST -d decision=delete https://connector.tgmcp.dev/login/AAAAAAAAAAAAAAAAAAAAAA/forget   # expect 403: no login cookie
+   for i in $(seq 1 8); do curl -s -o /dev/null -w '%{http_code} ' -X POST https://connector.tgmcp.dev/forget; done; echo
+   # expect 303 three times (at most 3 logins in progress per client IP), then 503 until the burst of 5
+   # (/authorize's rate, 10 a minute, its own bucket) is spent, then 429
+   ```
+
+   Each 303 above started a Telegram login that nobody scans: they expire after 10 minutes. Wait a minute before using `/authorize` or `/forget` again from the same network.
+
+7. **The server's side**, within 15 minutes of the steps:
+
+   ```sh
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -E 'forget'
+   # expect "forget: cancelled, nothing deleted" (account_id) for step 4,
+   # and "forget: grants deleted" (account_id, grants=N, logged_out=M) for step 5: ids and counts only
+   logs | grep -c 'tgm_'   # expect 0: neither the login cookie nor a Token
+   ```
+
+8. **The links.** The footer of every sign-in page (QR, cloud password, Consent) has **Delete my data** → `/forget`; so do the README ("Disconnecting") and `https://tgmcp.dev/privacy.html` ("Disconnecting and deletion"):
+
+   ```sh
+   curl -s https://tgmcp.dev/privacy.html | grep -c 'connector.tgmcp.dev/forget'   # expect 1 (after the Pages deploy)
+   ```
+
+9. **Clean up.** Connect the main account again where you want it (Claude Code: `/mcp` → `telegram` → Authenticate), and end any leftover "Unofficial MCP Server" sessions in Settings → Devices.
+
 ## 62. list_chats pages through more pinned chats than `limit`, each once
 
 Needs an account with at least 4 pinned chats in the main list (pin some in the app if needed: long-press → Pin), ideally 2 or more pinned in the Archive, and at least one pinned chat with unread messages or marked as unread. Write down from the app the pinned chats' titles, top to bottom, in each list. The paging itself is covered by fake-backed tests: `cargo test --lib tg::chats::` (every chat once, pinned first, in order, for every `limit` from 1 to 9, main list and Archive, with and without `unread_only`; old cursors decode) and `cargo test --lib tg::grammers::tests::listings_name_their_folder_and_later_pages_skip_pinned_chats` (a page inside the pinned chats is one `messages.getDialogs` like a first page). In Claude Code, with the server added as in §1, run:
@@ -1034,6 +1081,39 @@ Needs nothing beyond §1. The mechanism is covered by fake-backed tests over eve
 5. Step 5: three chats, no error. If Claude corrects the spelling on its own in steps 1–3 (it may, since the schema now forbids other keys), the call succeeds: note it, and that is fine too.
 
 Then in claude.ai, in a chat with the connector (Settings → Connectors, `https://connector.tgmcp.dev/mcp`), ask "list my 3 most recent Telegram chats" and "what did I miss on Telegram?": both answer without an `unknown parameter` error. Record on #60 that Claude Code and claude.ai calls still succeed, i.e. no client puts keys of its own into `arguments`.
+
+## 64. A poll in `media` shows its question, options, state and the results the account may see
+
+Needs, in chats of the account (replace the `<…>`; create them yourself in a group or a channel of yours if needed: attach → Poll): an open poll `<P1>` the account has not voted in, ideally one whose results are hidden until you vote; a multiple-choice poll `<P2>` the account voted in for two options; a closed quiz `<Q>` with its correct answer revealed; if possible a poll with hidden characters or a very long question. Write down from the app the question, the options, the vote counts and percentages shown, and your own vote, for each. The extraction is covered by tests: `cargo test --lib tg::media::` (open poll with and without visible results, closed poll, quiz with a revealed answer, multiple choice with the account's choices, results the same for everyone carrying no own vote, an option without a count), `cargo test --test media` (sanitised through `/mcp`, a blank option, the output schemas) and `cargo test --lib mcp::tests::a_polls` / `mcp::tests::a_page_cuts_a_polls` (the caps and the page budget). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи. 1) get_messages для чата с <P1>, around_id=<id сообщения с P1>, limit=1: выведи media (JSON как есть). 2) То же для <P2>. 3) То же для <Q>. 4) search_messages с chat_id=<чат P1> и query=<слово из вопроса P1>: выведи media хита. Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: `kind: "poll"`, `question` and the options' `text` as in the app (hidden characters gone, no line breaks), `closed: false`, the right `multiple_choice` / `quiz` / `anonymous`; `total_voters` as the app's "N votes"; no `votes` and no `chosen` while the app hides the results from you (otherwise the counts the app shows).
+2. Step 2: `votes` on every option and `total_voters` matching the app, `chosen: true` on exactly your two options, `multiple_choice: true`.
+3. Step 3: `closed: true`, `quiz: true`, `correct: true` on the right answer only, `chosen: true` on yours.
+4. Step 4: the hit's `media` is `{ "kind": "poll" }` only. A hit's text is the matched text: a poll's question is not message text, so if the search finds nothing, that is expected; record it.
+
+No log line carries a question or an option: `kamal app logs | grep -F '<a word of the question of P1>'` finds nothing.
+
+## 65. A channel post says how many comments it has, and `comments_of` reads them from the discussion group
+
+Needs, among the account's chats (replace the `<…>`): a channel `<C>` with comments on (it has a linked discussion group: Channel info → Discussion) and a recent post `<P>` with at least 5 comments, one of them a reply to another comment; a post `<Q>` of a channel with comments off (or of a channel without a discussion group); if possible a post `<E>` with comments on that nobody commented on. Write down from the app `<P>`'s comment count and its newest three comments' authors. The behaviour is covered by fake-backed tests: `cargo test --test comments` (the count on posts; reading and paging comments; the answer's `chat_id` is the discussion group; comments off; an empty discussion; the parameters it refuses) and `cargo test --lib tg::grammers::topic_tests` (the first call is `messages.getDiscussionMessage` through the limiter; the discussion is the post's copy in another chat; `MSG_ID_INVALID` is comments off). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи и не пересказывай. 1) get_messages для <C> с limit=10: для каждого сообщения id и comments. 2) get_messages для <C> с comments_of=<id P> и limit=3: выведи chat_id, comments_of, next_before_id и для каждого сообщения id, sender.name, reply_to. 3) Ещё страница: comments_of=<id P>, limit=3, before_id=<next_before_id>. 4) get_messages с chat_id=<chat_id из шага 2> и around_id=<id самого нового комментария>, limit=5: выведи id. 5) get_messages для канала <Q> с comments_of=<id Q>. 6) Если есть <E>: comments_of=<id E>. 7) Ошибки, выведи тексты: comments_of=<id P> вместе с around_id=<id P>; с since="2026-01-01"; comments_of=<id P> для chat_id личного чата. Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: `<P>` has `comments` equal to the app's count; posts of a channel without comments have no `comments`.
+2. Step 2: `chat_id` is the discussion group's id (a `channel:` id other than `<C>`'s), `comments_of` = `{ "chat_id": "<C's id>", "message_id": <P> }`, the newest three comments, newest first, with their authors as in the app; the reply to a comment has `reply_to` = that comment's id; `next_before_id` is set.
+3. Step 3: the next three older comments, no repeats, no gap.
+4. Step 4: a window in the discussion group around that comment: the conversation continues there.
+5. Step 5: an error "comments are off for this post: …".
+6. Step 6: an empty `messages` list without `next_before_id`.
+7. Step 7: `comments_of can't be combined with around_id`, `comments_of can't be combined with since`, `comments_of is for channel posts: user:… is no channel …`.
+
+Telegram calls, each through the account's limiter: one `messages.getDiscussionMessage` and one `messages.getReplies` per page. If a `FLOOD_WAIT` comes, `kamal app logs | grep FLOOD_WAIT` names its `method`: record it. `kamal app logs | grep -F '<a word of a comment>'` finds nothing.
 
 ## 66. Once an hour one `stats` line with numbers only, and an external monitor on `/healthz`
 
@@ -1098,3 +1178,52 @@ Needs Docker on your machine (amd64, or arm64 for step 2) and a clone. The image
    | after #101 (musl + mimalloc) | | | |
 
    Expect the "after" row within a few MB of the "before" row. For reference, locally with fake Telegram on 2 CPUs (`--cpuset-cpus=0,1`): glibc image 2.2 MB at idle and 2.9 MB after 20,000 requests to `/healthz`, the OAuth metadata and `/register`; musl + mimalloc 2.1 MB and 2.9 MB. Without the image's `MIMALLOC_ARENA_EAGER_COMMIT=0` mimalloc held 11 MB and 13.7 MB: if the "after" row is about 9 MB above the "before" row, check that variable (`docker inspect -f '{{.Config.Env}}' <container>`).
+
+## 68. On a hosting platform the server listens on its `PORT` and names its public domain as the issuer; an explicit URL still wins
+
+The precedence is covered by `cargo test --lib config::` (`TG_MCP_BIND` over `PORT` over 8080, a bad `PORT` refused, `TG_MCP_PUBLIC_URL` over each platform's variable over localhost, the allowed hosts and the reported source), and the CI `docker` job runs the image with `PORT=9000` and `RAILWAY_PUBLIC_DOMAIN` (`scripts/container-smoke-test.sh`, the last two PASS lines). Needs Docker and an image built from this commit or later (production's `ghcr.io/qelphybox/tg-mcp:<sha>`).
+
+1. **Each platform's variable, with the platform's `PORT`.** For each pair, run, check, and remove:
+
+   ```sh
+   img=ghcr.io/qelphybox/tg-mcp:<sha>
+   for v in RAILWAY_PUBLIC_DOMAIN=t.up.railway.app RENDER_EXTERNAL_HOSTNAME=t.onrender.com FLY_APP_NAME=t KOYEB_PUBLIC_DOMAIN=t-me.koyeb.app; do
+     docker run -d --name p68 -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=9000 -e "$v" -p 127.0.0.1:9000:9000 "$img" >/dev/null; sleep 2
+     curl -fsS http://127.0.0.1:9000/.well-known/oauth-authorization-server | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'
+     docker logs p68 2>&1 | grep listening; docker rm -f p68 >/dev/null
+   done
+   # expect the issuers https://t.up.railway.app, https://t.onrender.com, https://t.fly.dev and https://t-me.koyeb.app,
+   # each with a "listening" line: bind=0.0.0.0:9000 public_url=https://…/ public_url_source=Railway (RAILWAY_PUBLIC_DOMAIN)
+   # (then Render (RENDER_EXTERNAL_HOSTNAME), Fly.io (FLY_APP_NAME), Koyeb (KOYEB_PUBLIC_DOMAIN))
+   ```
+
+2. **An explicit URL wins, `TG_MCP_BIND` wins, nothing changes the proxy trust.** `docker run -d --name p68 -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=9000 -e TG_MCP_BIND=0.0.0.0:8080 -e TG_MCP_PUBLIC_URL=https://tg.example.com -e RAILWAY_PUBLIC_DOMAIN=t.up.railway.app -p 127.0.0.1:8080:8080 $img`: the issuer is `https://tg.example.com`, the log says `bind=0.0.0.0:8080 … public_url_source=TG_MCP_PUBLIC_URL`. Send `curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'X-Forwarded-For: 203.0.113.9' -H 'Content-Type: application/json' -d '{"redirect_uris":["http://localhost:9/cb"]}' http://127.0.0.1:8080/register` six times: the sixth is `429` whatever address the header claims, so the limit counts the real peer (`TG_MCP_TRUST_FORWARDED_FOR` stayed off). `docker rm -f p68`.
+
+3. **Nothing set.** `docker run --rm -e TG_MCP_FAKE_TELEGRAM=1 $img` logs `bind=0.0.0.0:8080 public_url=http://localhost:8080/ public_url_source=default (TG_MCP_PUBLIC_URL unset, no hosting platform detected)` (Ctrl-C to stop).
+
+4. **A bad `PORT` stops it at once.** `docker run --rm -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=http $img` exits with `Error: PORT must be a port number (1-65535), not "http"`.
+
+5. **Production is unchanged.** `curl -s https://connector.tgmcp.dev/.well-known/oauth-authorization-server | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'` prints `https://connector.tgmcp.dev`, and the server's `listening` line says `public_url_source=TG_MCP_PUBLIC_URL` (`config/deploy.yml` sets both variables).
+
+## 69. Official images log in through the Built-in app, your own app wins, and neither value shows outside the binary
+
+Needs the repository secrets `TG_MCP_BUILTIN_API_ID` / `TG_MCP_BUILTIN_API_HASH` (a second Telegram app on a second phone number, never production's), a release image built with them (`ghcr.io/qelphybox/tg-mcp:<version>`), Docker, and an Account to log in with. The precedence is covered by `cargo test --lib config::` (env beats built-in; built-in when env is absent or empty; fake Telegram needs neither; the error names both ways out; the reported source).
+
+1. **The release guard.** Before adding the secrets (or in a fork), push a tag: the Release run fails at "Built-in Telegram app secrets are set" with "Repository secrets TG_MCP_BUILTIN_API_ID and TG_MCP_BUILTIN_API_HASH must be set …", and nothing is pushed. With the secrets, the same step passes.
+
+2. **No Telegram variables at all.** `docker run -d --name b69 -p 127.0.0.1:8080:8080 -v b69:/data ghcr.io/qelphybox/tg-mcp:<version>`; `docker logs b69` shows `using Telegram app api_id=<the built-in id> source=builtin` and no hash. `claude mcp add --transport http telegram-b69 http://localhost:8080/mcp`, Authenticate, scan the QR, Allow: `whoami` names the Account. In Telegram → Settings → Devices the new session is the Built-in app's (its title, not production's). Terminate it there, `claude mcp remove telegram-b69`.
+
+3. **Your own app wins.** The same with `-e TG_MCP_API_ID=<yours> -e TG_MCP_API_HASH=<yours>` (another container name and volume): `source=env api_id=<yours>`. With only one of the two set, or both empty: `source=builtin`.
+
+4. **An image without the secrets behaves as before.** `docker build -t tg-mcp:nosecret . && docker run --rm tg-mcp:nosecret` exits with `Error: no Telegram app: set TG_MCP_API_ID and TG_MCP_API_HASH (register one at https://my.telegram.org/apps), or run the official image, which has a built-in one (TG_MCP_FAKE_TELEGRAM=1 for development)`.
+
+5. **Neither value outside the binary.** With the built-in values in `$ID` and `$HASH`:
+
+   ```sh
+   img=ghcr.io/qelphybox/tg-mcp:<version>
+   docker history --no-trunc $img | grep -cE "$ID|$HASH"               # expect 0
+   docker buildx imagetools inspect $img --format '{{json .Provenance}}' | grep -cE "$ID|$HASH"   # expect 0
+   docker image inspect $img | grep -cE "$ID|$HASH"                    # expect 0
+   ```
+
+6. **Production still uses its own app.** On the server, `docker logs $(docker ps -qf label=service=tg-mcp) 2>&1 | grep 'using Telegram app'` shows `source=env` and production's api_id, not the built-in one.

@@ -568,6 +568,7 @@ mod tests {
 
     fn msg(id: i32, date: i32, text: &str) -> RawHistoryMessage {
         RawHistoryMessage {
+            comments: None,
             id,
             date,
             from: None,

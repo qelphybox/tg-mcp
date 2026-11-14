@@ -54,7 +54,9 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         (false, Some(app)) => {
-            tracing::info!(api_id = app.api_id, "using Telegram app");
+            // ADR-0007: the source and the api_id, never the hash.
+            tracing::info!(api_id = app.credentials.api_id, source = %app.source, "using Telegram app");
+            let app = app.credentials;
             (
                 Arc::new(GrammersLogin::new(app.clone())),
                 GrammersConnector::new(
@@ -79,7 +81,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
-    tracing::info!(bind = %config.bind, public_url = %config.public_url, "listening");
+    tracing::info!(
+        bind = %config.bind,
+        public_url = %config.public_url,
+        public_url_source = %config.public_url_source,
+        "listening"
+    );
 
     axum::serve(
         listener,

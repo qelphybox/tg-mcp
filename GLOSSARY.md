@@ -34,7 +34,7 @@ _Avoid_: leeway, reuse interval
 ## Onboarding
 
 **Login flow**:
-The browser part of OAuth authorization: QR login, optional 2FA password, then Consent. Ends with an authorization code.
+The browser part of OAuth authorization: QR login, optional 2FA password, then Consent. Ends with an authorization code. `/forget` runs the same QR login and password steps to prove who owns the Account, then deletes its Grants instead; that login never ends in a code.
 _Avoid_: signup, auth (unqualified)
 
 **QR login**:
@@ -43,6 +43,14 @@ Telegram login by scanning a `tg://login` QR code (`auth.exportLoginToken` / `up
 **Cloud password**:
 The Account's Telegram two-step verification password. Asked for on the login page after QR login when the Account has one, checked once via SRP (`account.getPassword` + `auth.checkPassword`), never stored or logged.
 _Avoid_: 2FA code, PIN
+
+**Telegram app**:
+The api_id/api_hash pair, registered at my.telegram.org, that the server's Login flows and Telegram sessions go through. From `TG_MCP_API_ID` / `TG_MCP_API_HASH`, else the Built-in app.
+_Avoid_: API key, client id, credentials (unqualified)
+
+**Built-in app**:
+The Telegram app compiled into official images from CI secrets (ADR-0007): a separate app, on its own phone number, from the one production uses. Extractable from the binary, so it is not a secret.
+_Avoid_: default app, shared credentials
 
 **Consent**:
 The screen where the user chooses the Grant's Scopes (and, with `send`, its Send allow-list) before a Grant is created.
@@ -101,6 +109,10 @@ _Avoid_: folder (unqualified), filter, tab
 **Topic**:
 A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic; the tools name it by its id, which is the id of the message that created it, and General, every forum's first Topic, is 1.
 _Avoid_: thread (a thread is a chain of replies), subchat
+
+**Comment**:
+A message under a channel post. It lives in the channel's discussion group (the supergroup linked to the channel) and replies, directly or through another comment, to the group's copy of the post. The tools count a post's comments (`comments`) and read them with get_messages `comments_of`.
+_Avoid_: reply (any message can be replied to), thread
 
 **Rich message**:
 A message whose content is page blocks (paragraphs, lists, tables, collapsible sections, photos: Telegram's Instant View blocks, `message.rich_message`) rather than, or besides, its plain text. The tools read it as plain lines after the plain text.

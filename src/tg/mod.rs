@@ -133,6 +133,19 @@ pub trait Telegram: Send + Sync + 'static {
         query: messages::HistoryQuery,
     ) -> Result<messages::MessagePage, TgError>;
 
+    /// The comments of channel `chat`'s post `post`: the replies to its copy
+    /// in the channel's discussion group (`messages.getDiscussionMessage`), paged
+    /// newest first like a history with `query`'s `limit` and `before_id`
+    /// (`messages.getReplies`). The page is the group's, with `comments_of`
+    /// naming the post. A post without a discussion is
+    /// [`TgError::InvalidInput`].
+    async fn get_comments(
+        &self,
+        chat: chats::ChatRef,
+        post: i32,
+        query: messages::HistoryQuery,
+    ) -> Result<messages::MessagePage, TgError>;
+
     /// Details of one Chat: title, type, @username, description, member count;
     /// for a user, the profile Telegram shows the Account
     /// ([`chats::user_info`]), without `common_chats`.
@@ -292,6 +305,11 @@ pub trait Connector: Send + Sync + 'static {
     /// evicted, the Live client is gone even if logging out fails.
     async fn evict_and_log_out(&self, grant_id: &GrantId) -> Result<bool, TgError>;
 
+    /// End a Telegram session the Login flow just made that no Grant holds
+    /// (`auth.logOut`), such as the one `/forget` logs in with to check who
+    /// asks. A session Telegram already considers dead counts as logged out.
+    async fn log_out_login(&self, logged_in: LoggedIn) -> Result<(), TgError>;
+
     /// Graceful shutdown, once the HTTP server has stopped: close every Live client
     /// and re-seal each Telegram session that changed while it was live. Failures
     /// are logged (Grant ids only), not returned: the process is exiting anyway.
@@ -388,6 +406,9 @@ mod tests {
             unreachable!()
         }
         async fn evict_and_log_out(&self, _: &GrantId) -> Result<bool, TgError> {
+            unreachable!()
+        }
+        async fn log_out_login(&self, _: LoggedIn) -> Result<(), TgError> {
             unreachable!()
         }
         async fn shutdown(&self) {

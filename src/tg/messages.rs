@@ -102,6 +102,10 @@ pub struct ChatMessage {
     /// Only in a `thread_of` chain: its root, a message that replies to nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread_root: bool,
+    /// A channel post with comments on: how many it has (read them with
+    /// `comments_of`). Absent on any other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<u32>,
 }
 
 /// A message in some Chat, as the tools name it.
@@ -137,6 +141,10 @@ pub struct MessagePage {
     /// by Topic id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topics: Option<TopicTitles>,
+    /// Only for `comments_of`: the channel post these are the comments of.
+    /// The page's `chat_id` is then the channel's discussion group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments_of: Option<MessageLink>,
 }
 
 /// What kind of media a message carries.
@@ -187,6 +195,58 @@ pub struct Media {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// A poll's question, options and state (`kind: "poll"` only).
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Poll>,
+}
+
+/// Longest poll question shown, in characters.
+pub const MAX_POLL_QUESTION_CHARS: usize = 300;
+/// Longest poll option shown, in characters.
+pub const MAX_POLL_OPTION_CHARS: usize = 100;
+/// At most this many options of a poll are shown.
+pub const MAX_POLL_OPTIONS: usize = 12;
+
+/// A poll as the message carries it (#62): what it asks and, when Telegram
+/// shows them to this Account, how people voted. Who voted for what is never
+/// fetched. Question and options are written by other people: content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Poll {
+    #[schemars(length(max = MAX_POLL_QUESTION_CHARS))]
+    pub question: String,
+    /// In the poll's order.
+    #[schemars(length(max = MAX_POLL_OPTIONS))]
+    pub options: Vec<PollOption>,
+    /// The poll has more options than `options` shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub options_truncated: bool,
+    /// How many people voted, as Telegram tells this Account (usually also
+    /// before it voted, while the per-option `votes` stay hidden).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_voters: Option<u32>,
+    /// No more votes are taken.
+    pub closed: bool,
+    pub multiple_choice: bool,
+    /// A quiz: one option is the correct answer.
+    pub quiz: bool,
+    /// Voters are not shown to anyone.
+    pub anonymous: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PollOption {
+    #[schemars(length(max = MAX_POLL_OPTION_CHARS))]
+    pub text: String,
+    /// Votes for this option, when Telegram shows the results to this Account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<u32>,
+    /// The Account voted for this option. Absent also when Telegram doesn't
+    /// say (results the same for everyone, without the Account's vote).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chosen: bool,
+    /// Quizzes only, once revealed: the correct answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub correct: bool,
 }
 
 impl MediaKind {
@@ -220,6 +280,7 @@ impl From<MediaKind> for Media {
             file_name: None,
             width: None,
             height: None,
+            poll: None,
         }
     }
 }
@@ -381,6 +442,20 @@ pub struct RawHistoryMessage {
     /// ([`super::topics::topic_of`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<i32>,
+    /// A channel post with a discussion: how many comments it has
+    /// (`replies` with `comments`). `None` for any other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<u32>,
+}
+
+/// What reading the comments of `chat`'s post `post` is when the post has
+/// no discussion: comments off, or a channel without a discussion group.
+pub fn comments_off(chat: ChatId, post: i32) -> TgError {
+    TgError::InvalidInput(format!(
+        "comments are off for this post: message {post} of {chat} has no discussion \
+         (comments disabled, no linked discussion group, no such post, or {chat} is a group: \
+         comments are for channel posts)"
+    ))
 }
 
 /// A message by its Chat and id.
@@ -759,6 +834,7 @@ impl MessagePage {
             continues_in: None,
             broken_at: None,
             topics: None,
+            comments_of: None,
         }
     }
 
@@ -892,6 +968,7 @@ impl<'a> Issuer<'a> {
                 .then(|| topics::topic_of(m.topic)),
             target: false,
             thread_root: false,
+            comments: m.comments,
         }
     }
 }
@@ -971,6 +1048,7 @@ mod tests {
 
     fn msg(id: i32, date: i32) -> RawHistoryMessage {
         RawHistoryMessage {
+            comments: None,
             id,
             date,
             from: None,

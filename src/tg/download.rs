@@ -316,6 +316,7 @@ mod tests {
 
     fn message(id: i32, media: Option<Media>) -> RawHistoryMessage {
         RawHistoryMessage {
+            comments: None,
             id,
             date: 1_700_000_000 + id,
             from: None,

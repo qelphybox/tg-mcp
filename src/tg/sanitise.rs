@@ -32,7 +32,7 @@ use super::{
     folders::ChatFolder,
     mark_read::{MarkRead, MarkedRead},
     members::{Member, MemberPage, MembersQuery},
-    messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
+    messages::{ChatMessage, HistoryQuery, Media, MessagePage, Poll, PollOption, Sender},
     reactions::{NewReaction, Reacted},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
     send::{NewMessage, SentMessage},
@@ -270,9 +270,45 @@ fn clean_media(media: &mut Media) {
         file_name,
         width: _,
         height: _,
+        poll,
     } = media;
     clean_opt_visible(mime_type);
     clean_opt_visible(file_name);
+    if let Some(poll) = poll {
+        clean_poll(poll);
+    }
+}
+
+/// A poll's question and options are written by its author: content, and
+/// one with nothing visible left reads [`NO_VISIBLE_TEXT`]. Its flags and
+/// counts are Telegram's.
+fn clean_poll(poll: &mut Poll) {
+    let Poll {
+        question,
+        options,
+        options_truncated: _,
+        total_voters: _,
+        closed: _,
+        multiple_choice: _,
+        quiz: _,
+        anonymous: _,
+    } = poll;
+    let visible = |field: &mut String| {
+        clean(field);
+        if field.trim().is_empty() {
+            *field = NO_VISIBLE_TEXT.into();
+        }
+    };
+    visible(question);
+    for PollOption {
+        text,
+        votes: _,
+        chosen: _,
+        correct: _,
+    } in options
+    {
+        visible(text);
+    }
 }
 
 impl Untrusted for Account {
@@ -349,6 +385,8 @@ impl Untrusted for MessagePage {
             continues_in: _,
             broken_at: _,
             topics,
+            // Ids this server issues.
+            comments_of: _,
         } = self;
         for title in topics.iter_mut().flat_map(|t| t.0.values_mut()) {
             clean(title);
@@ -373,6 +411,7 @@ impl Untrusted for MessagePage {
                 topic: _,
                 target: _,
                 thread_root: _,
+                comments: _,
             } = message;
             clean_text(text, sanitise, media.is_some());
             if let Some(media) = media {
@@ -670,6 +709,15 @@ impl Telegram for Sanitised {
         query: HistoryQuery,
     ) -> Result<MessagePage, TgError> {
         self.0.get_messages(chat, query).await.map(sanitised)
+    }
+
+    async fn get_comments(
+        &self,
+        chat: ChatRef,
+        post: i32,
+        query: HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        self.0.get_comments(chat, post, query).await.map(sanitised)
     }
 
     async fn get_chat_info(&self, chat: ChatRef) -> Result<ChatInfo, TgError> {
@@ -1093,6 +1141,7 @@ mod tests {
         let mut history = MessagePage::new(
             "user:1".into(),
             vec![ChatMessage {
+                comments: None,
                 id: 1,
                 date: "2026-11-06T00:00:00Z".into(),
                 sender: Some(Sender {
@@ -1172,6 +1221,7 @@ mod tests {
 
     fn message(text: &str) -> ChatMessage {
         ChatMessage {
+            comments: None,
             id: 1,
             date: "2026-11-06T00:00:00Z".into(),
             sender: Some(Sender {

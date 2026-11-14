@@ -28,7 +28,7 @@ Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser op
 | --- | --- |
 | `whoami` | The connected account: id, name, @username, and its Chat folders (`chat_folders`: id, title, emoji, `rules` when a folder is defined by rules rather than a list of chats), in the app's order. |
 | `list_chats` | Chats, most recent first: id, title, type, unread count, `muted` and `marked_unread` flags, last-message preview (text or caption, and the kind of media). Paged by `cursor`; `archived` lists the Archive folder. `unread_only` lists only chats with unread messages or marked as unread ("what did I miss"): Telegram can't filter by unread, so one call reads at most 500 chats and says `unread_scan_truncated` when it stopped there; `next_cursor` reads on. `chat_folder` lists one Chat folder as its tab in the app (folder-pinned first, archived chats included; with `unread_only` too); folders defined by rules aren't supported yet. |
-| `get_messages` | Messages of one chat, newest first: sender, date, text (or caption), `media` (kind: photo, video, video note, voice, audio, document, sticker, GIF, location, contact, poll or other; with duration, size, MIME type, file name and dimensions when Telegram sends them), reply/forward/edit marks, `reactions` (count per emoji, custom emoji summed as `custom`, Stars as `paid`), a `t.me` `link` to the message (channels and supergroups) and `pinned`; in a forum, each message's `topic` and the page's `topics` (id → title of the Topics it mentions), and `topic` reads one Topic only. Paged by `before_id`; `pinned_only` reads only the pinned messages; `since`/`until` narrow by time; `around_id` gives a window around one message (e.g. a search hit), continued with `before_id` / `after_id`; `thread_of` gives the chain of messages one message replies to, up to its root or `depth` ancestors (default 10, max 50), saying where a deleted parent broke it (`broken_at`) or which chat it goes on in (`continues_in`). |
+| `get_messages` | Messages of one chat, newest first: sender, date, text (or caption), `media` (kind: photo, video, video note, voice, audio, document, sticker, GIF, location, contact, poll or other; with duration, size, MIME type, file name and dimensions when Telegram sends them; a poll with its question, options, state and, when Telegram shows them to the account, vote counts and its own vote, never who voted), reply/forward/edit marks, `reactions` (count per emoji, custom emoji summed as `custom`, Stars as `paid`), a `t.me` `link` to the message (channels and supergroups) and `pinned`; in a forum, each message's `topic` and the page's `topics` (id → title of the Topics it mentions), and `topic` reads one Topic only. Paged by `before_id`; `pinned_only` reads only the pinned messages; `since`/`until` narrow by time; `around_id` gives a window around one message (e.g. a search hit), continued with `before_id` / `after_id`; `thread_of` gives the chain of messages one message replies to, up to its root or `depth` ancestors (default 10, max 50), saying where a deleted parent broke it (`broken_at`) or which chat it goes on in (`continues_in`). A channel post with comments on says how many (`comments`); `comments_of` reads a post's comments from the channel's discussion group, newest first, paged by `before_id`. |
 | `get_chat_info` | Title, type, @username of one chat; a group's or channel's description and member count. For a user, the profile Telegram shows the account: bio, last-seen `status` (`online`, `last_seen` with the exact time, or `recently` / `last_week` / `last_month` / `long_ago` when hidden), bot flag and bot description, verified/premium/scam/fake flags, phone and birthday only when shown to the account, and the number of common groups and channels; `common_chats: true` also lists them (at most 20, ids usable with the other tools). A forum lists its `topics` (up to 50: id, title, closed, pinned; `topics_truncated` when there are more). |
 | `get_members` | Members of a group, supergroup or channel: id (usable with the other tools), name, @username, `role` (`creator` / `admin` / `member`), bot flag. `query` filters by name or @username, `admins_only` lists only the creator and admins; Telegram's approximate `total` count. Paged by `cursor`, up to 200 per page (the last page may be empty). The list may be incomplete: Telegram hides members in some groups (`members_hidden`), shows a channel's subscribers only to its admins (an error says so) and stops listing a large group after about 10,000 members. |
 | `search_messages` | Telegram's own search by words (not meaning), newest first: across all chats, or in one with `chat_id`. Each hit: its chat (id, title, type), message id, date, sender, a ~300-character snippet around the match, the kind of media, and the reactions, link, pin and forum `topic` of `get_messages` (titles in the page's `topics`); read it in context with `get_messages` `around_id`. Narrow with `since`/`until` and `media`; across chats with `chat_type` and `archived`, in one chat with `from` (a sender, or `me`) and, in a forum, `topic`. Paged by `cursor`, at most 50 hits per page, no total count. |
@@ -61,6 +61,8 @@ End the **Unofficial MCP Server** session in Telegram → **Settings → Devices
 
 Removing the server in your AI client alone is **not** enough: e.g. Disconnect in claude.ai's connector settings only forgets the tokens on its side, and without a token the server can't decrypt (or log out) your session — by design, see below. Clients that call the OAuth revocation endpoint (`/revoke`, RFC 7009) do log the session out.
 
+**Delete everything the server holds for your account**, even without the app or its tokens: open [`https://connector.tgmcp.dev/forget`](https://connector.tgmcp.dev/forget) (`/forget` on a self-hosted server), log in with the QR code, and press **Delete**. Every connection of that account goes, with its tokens and its encrypted session; the login made for the check is ended right after. Sessions left in Telegram → Settings → Devices can't be used by anyone any more; end them there.
+
 ## Security model
 
 - **A database dump is useless.** Your Telegram session is encrypted (XChaCha20-Poly1305) with a per-login key. That key is never stored: each OAuth token your client holds carries the secret needed to unwrap it, and the server keeps only a verifier and a wrapped copy per token. Without one of your tokens, nobody, including the operator, can decrypt the session. ([ADR-0003](docs/adr/0003-session-key-lives-only-in-tokens.md))
@@ -77,20 +79,17 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 
 ## Self-hosting
 
-You need a server with HTTPS on a public hostname (OAuth requires it) and your own Telegram app:
-
-1. Register an app at [my.telegram.org/apps](https://my.telegram.org/apps) → note `api_id` and `api_hash`. Please keep "Unofficial" in its title.
-2. Run the image behind a TLS-terminating reverse proxy that forwards the `Host` header:
+You need a server with HTTPS on a public hostname (OAuth requires it). Run the image behind a TLS-terminating reverse proxy that forwards the `Host` header:
 
 ```sh
 docker run -d --name tg-mcp --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -v tg-mcp-data:/data \
   -e TG_MCP_PUBLIC_URL=https://tg.example.com \
-  -e TG_MCP_API_ID=123456 \
-  -e TG_MCP_API_HASH=your_api_hash \
   ghcr.io/qelphybox/tg-mcp:latest
 ```
+
+Release images from v0.3.0 on log in to Telegram through a built-in Telegram app ([ADR-0007](docs/adr/0007-built-in-telegram-app-in-official-images.md)). To use your own instead, register one at [my.telegram.org/apps](https://my.telegram.org/apps) (please keep "Unofficial" in its title) and add `-e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash`. An image you build yourself without the build secrets needs them.
 
 If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's.
 

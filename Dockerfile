@@ -21,9 +21,24 @@ RUN set -eu; \
     rustup target add "$triple"
 WORKDIR /src
 COPY . .
+# The Built-in app (ADR-0007) comes only as BuildKit secrets, never as ARGs
+# (those show in `docker history` and provenance):
+#   --secret id=tg_builtin_api_id,env=... --secret id=tg_builtin_api_hash,env=...
+# Without them the binary has no Built-in app, as with `cargo build`.
+# Pass TG_MCP_BUILTIN_APP=required with them (release builds do): it fails the
+# build without them, and keeps layers cached with and without the secrets
+# apart (secrets are not part of the cache key).
+ARG TG_MCP_BUILTIN_APP=optional
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
+    --mount=type=secret,id=tg_builtin_api_id,env=TG_MCP_BUILTIN_API_ID \
+    --mount=type=secret,id=tg_builtin_api_hash,env=TG_MCP_BUILTIN_API_HASH \
     set -eu; triple="$(cat /triple)"; \
+    if [ "$TG_MCP_BUILTIN_APP" = required ] \
+       && { [ -z "${TG_MCP_BUILTIN_API_ID:-}" ] || [ -z "${TG_MCP_BUILTIN_API_HASH:-}" ]; }; then \
+      echo "TG_MCP_BUILTIN_APP=required, but the tg_builtin_api_id / tg_builtin_api_hash secrets are missing" >&2; \
+      exit 1; \
+    fi; \
     cargo zigbuild --release --locked --target "$triple" \
     && cp "target/$triple/release/tg-mcp" /tg-mcp \
     && mkdir /data-empty
@@ -35,8 +50,8 @@ COPY --from=build /tg-mcp /usr/local/bin/tg-mcp
 COPY --from=build --chown=65532:65532 /data-empty /data
 # mimalloc commits its arenas eagerly by default: about 11 MB RSS at idle
 # instead of 2. Committing on demand keeps it at glibc's level (#101).
-ENV TG_MCP_BIND=0.0.0.0:8080 \
-    TG_MCP_DB_PATH=/data/tg-mcp.db \
+# No TG_MCP_BIND: the server listens on the platform's PORT, else 8080 (#102).
+ENV TG_MCP_DB_PATH=/data/tg-mcp.db \
     MIMALLOC_ARENA_EAGER_COMMIT=0
 EXPOSE 8080
 USER nonroot

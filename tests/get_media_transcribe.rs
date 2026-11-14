@@ -33,6 +33,7 @@ const SECRET: &str = "пароль от банка 4711-0815";
 
 fn message(id: i32, kind: MediaKind, duration_s: u32) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: 1_793_923_200 + id * 60,
         from: None,
