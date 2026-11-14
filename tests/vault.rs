@@ -484,10 +484,13 @@ async fn purge_drops_grants_left_without_tokens() {
         access: Duration::from_secs(1),
         refresh: Duration::from_secs(1),
     };
-    let (vault, _dir) = vault(short).await;
+    // The vault keeps time in whole seconds: on the system clock a 1 s Token
+    // made just before a second ticks over is already expired after it, so
+    // `kept` could expire before the purge. The test moves the time itself.
+    let (vault, clock, _dir) = paused_vault(short).await;
     let expiring = vault.create_grant("client", 42, SESSION).await.unwrap();
     let opened = vault.open(expiring.access.expose()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    clock.advance(Duration::from_secs(1));
     let kept = vault.create_grant("client", 7, SESSION).await.unwrap();
     let kept_opened = vault.open(kept.access.expose()).await.unwrap();
 
