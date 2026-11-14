@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "acceptance"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "reqwest",
+ "rmcp",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tg-mcp",
+ "tokio",
+ "tokio-util",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

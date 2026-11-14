@@ -1,0 +1,3 @@
+[alias]
+# The acceptance harness (ADR-0009): `cargo accept --list`, `cargo accept --fake login`.
+accept = "run --quiet --package acceptance --bin accept --"
