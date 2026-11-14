@@ -973,6 +973,35 @@ ADR-0008. Needs `telegram-send` of §56, and, for step 4, a send connector made 
 
 7. **Clean up.** Delete the §58 messages in A, and remove the connector kept from 0.2.0 (`claude mcp remove …`, then end its session in Telegram → Settings → Devices).
 
+## 59. The server's icon: our own mark at fixed URLs, in `serverInfo`, and as the Login flow pages' favicon
+
+#61. The mark is `site/favicon.svg` (a speech bubble with an orange dot, not Telegram's paper plane). The boundaries are also covered by fake-backed tests: `cargo test --test icon` (each route's type, pixel size read from the PNG header, caching; `serverInfo.icons` with absolute URLs on the configured host, PNG 128 first), `cargo test --lib icon::` (the embedded SVG is the master) and `cargo test --lib auth::pages::` (the favicon links, CSP unchanged).
+
+1. **The files, unauthenticated and cached.**
+
+   ```sh
+   for p in icon.svg icon.png icon-256.png icon-512.png favicon.ico; do
+     curl -s -D - -o /tmp/tgmcp-$p https://connector.tgmcp.dev/$p | grep -iE '^(HTTP|content-type|cache-control)' | tr -d '\r' | paste -sd' '; done
+   # expect five lines: HTTP/2 200, content-type image/svg+xml for icon.svg and image/png for the others,
+   # cache-control: public, max-age=86400
+   file /tmp/tgmcp-icon.png /tmp/tgmcp-icon-256.png /tmp/tgmcp-icon-512.png /tmp/tgmcp-favicon.ico
+   # expect PNG image data, 128 x 128 / 256 x 256 / 512 x 512 / 32 x 32, RGBA
+   cmp /tmp/tgmcp-icon.svg site/favicon.svg && echo same   # expect same (run from the repo root)
+   ```
+
+   Open `https://connector.tgmcp.dev/icon-512.png` in a browser: the dark rounded square with the light speech bubble and the orange dot, with transparent corners.
+
+2. **`serverInfo` names them.** Run `npx @modelcontextprotocol/inspector`, connect it to `https://connector.tgmcp.dev/mcp` (Streamable HTTP, OAuth: sign in with the QR, read-only is enough), and open the `initialize` response. Expect `serverInfo.websiteUrl` = `https://connector.tgmcp.dev`, and `serverInfo.icons` = `[{src: "https://connector.tgmcp.dev/icon.png", mimeType: "image/png", sizes: ["128x128"]}, {src: ".../icon-256.png", …, sizes: ["256x256"]}, {src: ".../icon.svg", mimeType: "image/svg+xml", sizes: ["any"]}]`, in that order. Then end the Inspector's session in Telegram → Settings → Devices.
+
+3. **The Login flow pages' favicon.** Start a login in a browser (§51's `scripts/scope-check.py - read` prints a link; open it): the browser tab shows the mark. In the developer tools: `<link rel="icon" href="/icon.svg" …>` and `<link rel="icon" href="/favicon.ico" …>` in `<head>`, both loaded with 200, no CSP error in the console, and the page's `content-security-policy` header the same as before (`… img-src 'self' data: …`). Deny the login afterwards.
+
+4. **What the clients show (record it on #61).** Look at the connector in each client and note whether it shows the mark, the domain's favicon or a generic globe:
+   - claude.ai: Settings → Connectors (a custom connector on `https://connector.tgmcp.dev/mcp`);
+   - Claude Code: `/mcp`;
+   - ChatGPT (if available): Settings → Apps & Connectors.
+
+   This is information for the Connectors directory (#57), not a pass/fail check: whether a custom connector shows `serverInfo.icons` is up to each client.
+
 ## 62. list_chats pages through more pinned chats than `limit`, each once
 
 Needs an account with at least 4 pinned chats in the main list (pin some in the app if needed: long-press → Pin), ideally 2 or more pinned in the Archive, and at least one pinned chat with unread messages or marked as unread. Write down from the app the pinned chats' titles, top to bottom, in each list. The paging itself is covered by fake-backed tests: `cargo test --lib tg::chats::` (every chat once, pinned first, in order, for every `limit` from 1 to 9, main list and Archive, with and without `unread_only`; old cursors decode) and `cargo test --lib tg::grammers::tests::listings_name_their_folder_and_later_pages_skip_pinned_chats` (a page inside the pinned chats is one `messages.getDialogs` like a first page). In Claude Code, with the server added as in §1, run:

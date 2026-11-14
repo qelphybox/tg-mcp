@@ -387,8 +387,9 @@ async fn register(State(auth): State<Arc<AuthState>>, body: Json<RegisterRequest
     }
 }
 
-/// The pages' wallpaper pattern and fonts: never change within a release.
-fn static_asset(content_type: &'static str, body: &'static [u8]) -> Response {
+/// A file embedded in the binary (the pages' wallpaper pattern and fonts, the
+/// server's icon): never changes within a release, so cached for a day.
+pub(crate) fn static_asset(content_type: &'static str, body: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
