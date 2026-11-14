@@ -30,13 +30,42 @@ pub struct AuthRequest {
     pub scopes: Scopes,
 }
 
+/// What a Login flow is for.
+#[derive(Debug)]
+pub enum Purpose {
+    /// An OAuth authorization: ends on Consent with an authorization code.
+    Authorize(AuthRequest),
+    /// `/forget` (#63): proves who owns the Account, then deletes its Grants.
+    /// Never ends in a code.
+    Forget,
+}
+
+// `InProgress` reads as the login's state; renaming it helps no reader.
+#[allow(clippy::enum_variant_names)]
 pub enum Progress {
     InProgress(Box<dyn LoginAttempt>),
     LoggedIn(LoggedIn),
+    /// Its session was handed on ([`Progress::take_logged_in`]): `/forget`
+    /// used it and logged it out.
+    Finished,
+}
+
+impl Progress {
+    /// The logged-in session, leaving [`Progress::Finished`]; `None` (and
+    /// nothing changed) when the login isn't finished.
+    pub fn take_logged_in(&mut self) -> Option<LoggedIn> {
+        match std::mem::replace(self, Progress::Finished) {
+            Progress::LoggedIn(logged_in) => Some(logged_in),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
 }
 
 pub struct PendingLogin {
-    pub request: AuthRequest,
+    pub purpose: Purpose,
     pub progress: tokio::sync::Mutex<Progress>,
     /// Only touched while `progress` is locked.
     pub password_gate: Mutex<PasswordGate>,
@@ -167,7 +196,7 @@ impl Flows {
     pub fn start_login(
         &self,
         reservation: Reservation<'_>,
-        request: AuthRequest,
+        purpose: Purpose,
         attempt: Box<dyn LoginAttempt>,
     ) -> String {
         let client = reservation.client;
@@ -176,7 +205,7 @@ impl Flows {
         logins.pending.insert(
             id.clone(),
             Arc::new(PendingLogin {
-                request,
+                purpose,
                 progress: tokio::sync::Mutex::new(Progress::InProgress(attempt)),
                 password_gate: Mutex::default(),
                 send_pickers: tokio::sync::Mutex::default(),
@@ -233,15 +262,21 @@ impl Flows {
         code
     }
 
-    /// Drop expired logins and codes. An abandoned login holds an open Telegram
-    /// connection until it is dropped, so this runs periodically.
-    pub fn sweep(&self) -> usize {
+    /// Drop expired logins and codes, returning the logins dropped (for
+    /// `/forget`'s to be logged out). An abandoned login holds an open
+    /// Telegram connection until it is dropped, so this runs periodically.
+    pub fn sweep(&self) -> Vec<Arc<PendingLogin>> {
         let mut logins = self.logins.lock().expect("flows lock");
-        let before = logins.pending.len();
-        logins
+        let expired: Vec<String> = logins
             .pending
-            .retain(|_, l| l.created.elapsed() < LOGIN_TTL);
-        let swept = before - logins.pending.len();
+            .iter()
+            .filter(|(_, l)| l.created.elapsed() >= LOGIN_TTL)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let swept = expired
+            .iter()
+            .filter_map(|id| logins.pending.remove(id))
+            .collect();
         drop(logins);
         self.codes
             .lock()
@@ -284,7 +319,7 @@ mod tests {
     async fn start(flows: &Flows, from: ClientIp) -> Result<String, Full> {
         let slot = flows.reserve(from)?;
         let attempt = FakeLogin::default().start().await.unwrap();
-        Ok(flows.start_login(slot, request(), attempt))
+        Ok(flows.start_login(slot, Purpose::Authorize(request()), attempt))
     }
 
     #[tokio::test]

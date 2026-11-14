@@ -1,6 +1,6 @@
 //! Per-client-IP limits on the anonymous endpoints (`/register`, `/authorize`,
-//! `/token`, `/revoke`, `/media/{ticket}` for Media links, and the Consent
-//! screen's chat pickers, which reach Telegram before any Token exists): a
+//! `/token`, `/revoke`, `/media/{ticket}` for Media links, `/forget`, and the
+//! Consent screen's chat pickers, which reach Telegram before any Token exists): a
 //! token bucket per endpoint and client, answered with `429 Too Many
 //! Requests` + `Retry-After` when empty. Everything else (`/mcp`, `/healthz`,
 //! `.well-known/*`, the other Login flow pages) is not limited here.
@@ -150,6 +150,8 @@ pub enum Endpoint {
     Revoke,
     Media,
     ConsentChats,
+    /// Starting `/forget`'s Login flow: `/authorize`'s rate, its own bucket.
+    Forget,
 }
 
 impl Endpoint {
@@ -162,6 +164,7 @@ impl Endpoint {
             // Never the ticket: it is a credential. Nor the login id.
             Self::Media => "/media",
             Self::ConsentChats => "/login/consent/chats",
+            Self::Forget => "/forget",
         }
     }
 
@@ -172,6 +175,7 @@ impl Endpoint {
             Self::Token | Self::Revoke => limits.token,
             Self::Media => limits.media,
             Self::ConsentChats => limits.consent_chats,
+            Self::Forget => limits.authorize,
         }
     }
 }
@@ -291,6 +295,11 @@ fn too_many_requests(endpoint: Endpoint, wait: Duration) -> Response {
             StatusCode::TOO_MANY_REQUESTS,
             "Too many requests",
             "Too many sign-in attempts from your network. Wait a minute and start again from your app.",
+        ),
+        Endpoint::Forget => pages::error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "Too many sign-in attempts from your network. Wait a minute and try again.",
         ),
         Endpoint::ConsentChats => pages::error(
             StatusCode::TOO_MANY_REQUESTS,
