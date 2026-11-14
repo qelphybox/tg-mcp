@@ -15,7 +15,10 @@
 use grammers_client::tl;
 
 use super::{
-    messages::{Media, MediaKind},
+    messages::{
+        MAX_POLL_OPTION_CHARS, MAX_POLL_OPTIONS, MAX_POLL_QUESTION_CHARS, Media, MediaKind, Poll,
+        PollOption,
+    },
     view::{Picture, PictureSize, SizeForm},
 };
 
@@ -31,7 +34,7 @@ pub fn describe(media: Option<&tl::enums::MessageMedia>) -> Option<Media> {
         M::Document(d) => Some(document(d)),
         M::Geo(_) | M::GeoLive(_) | M::Venue(_) => Some(MediaKind::Location.into()),
         M::Contact(_) => Some(MediaKind::Contact.into()),
-        M::Poll(_) => Some(MediaKind::Poll.into()),
+        M::Poll(p) => Some(poll_of(p)),
         M::Dice(_) => other(),
         M::Story(_) => other(),
         M::Game(_) => other(),
@@ -45,6 +48,70 @@ pub fn describe(media: Option<&tl::enums::MessageMedia>) -> Option<Media> {
         // Media of a newer layer than this server's.
         M::Unsupported => other(),
     }
+}
+
+/// A poll, from the message alone (#62): its question and options, cut to
+/// size, and the results as far as Telegram shows them to this Account.
+fn poll_of(media: &tl::types::MessageMediaPoll) -> Media {
+    let tl::enums::Poll::Poll(poll) = &media.poll;
+    let tl::enums::PollResults::Results(results) = &media.results;
+    let tl::enums::TextWithEntities::Entities(question) = &poll.question;
+    let shown: Vec<&tl::types::PollAnswerVoters> = results
+        .results
+        .iter()
+        .flatten()
+        .map(|tl::enums::PollAnswerVoters::Voters(v)| v)
+        .collect();
+    let answers: Vec<&tl::types::PollAnswer> = poll
+        .answers
+        .iter()
+        .filter_map(|answer| match answer {
+            tl::enums::PollAnswer::Answer(answer) => Some(answer),
+            // Only sent by clients creating a poll.
+            tl::enums::PollAnswer::InputPollAnswer(_) => None,
+        })
+        .collect();
+    let options = answers
+        .iter()
+        .take(MAX_POLL_OPTIONS)
+        .map(|answer| {
+            let tl::enums::TextWithEntities::Entities(text) = &answer.text;
+            let result = shown.iter().find(|v| v.option == answer.option);
+            PollOption {
+                text: cut(&text.text, MAX_POLL_OPTION_CHARS),
+                votes: result
+                    .and_then(|v| v.voters)
+                    .and_then(|n| u32::try_from(n).ok()),
+                // Results the same for everyone (`min`) carry no one's vote.
+                chosen: result.is_some_and(|v| v.chosen && !results.min),
+                correct: poll.quiz && result.is_some_and(|v| v.correct),
+            }
+        })
+        .collect();
+    Media {
+        poll: Some(Poll {
+            question: cut(&question.text, MAX_POLL_QUESTION_CHARS),
+            options,
+            options_truncated: answers.len() > MAX_POLL_OPTIONS,
+            total_voters: results.total_voters.and_then(|n| u32::try_from(n).ok()),
+            closed: poll.closed,
+            multiple_choice: poll.multiple_choice,
+            quiz: poll.quiz,
+            anonymous: !poll.public_voters,
+        }),
+        ..MediaKind::Poll.into()
+    }
+}
+
+/// At most `max` characters of `text`, the cut marked with `…`. Content is
+/// sanitised later, which only takes characters away.
+fn cut(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// A photo, with its largest size. A self-destructing photo that is gone
@@ -1231,6 +1298,189 @@ mod tests {
             assert_eq!(picture(Some(&media)), None, "{media:?}");
         }
         assert_eq!(picture(None), None);
+    }
+
+    /// Answer `option`'s results: votes (if shown), chosen, correct.
+    fn voters(
+        option: u8,
+        votes: Option<i32>,
+        chosen: bool,
+        correct: bool,
+    ) -> enums::PollAnswerVoters {
+        enums::PollAnswerVoters::Voters(types::PollAnswerVoters {
+            chosen,
+            correct,
+            option: vec![option],
+            voters: votes,
+            recent_voters: None,
+        })
+    }
+
+    /// [`poll`] with `answers`, its results `voters` (none: not shown to
+    /// this Account) and `total`, edited by `edit`.
+    fn poll_media(
+        answers: &[&str],
+        results: Option<Vec<enums::PollAnswerVoters>>,
+        total: Option<i32>,
+        edit: impl FnOnce(&mut types::Poll, &mut types::PollResults),
+    ) -> Media {
+        let enums::MessageMedia::Poll(mut media) = poll(false, false, false) else {
+            unreachable!()
+        };
+        let enums::Poll::Poll(poll) = &mut media.poll;
+        let enums::PollResults::Results(shown) = &mut media.results;
+        poll.multiple_choice = false;
+        poll.answers = answers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                enums::PollAnswer::Answer(types::PollAnswer {
+                    text: text(t),
+                    option: vec![i as u8],
+                    media: None,
+                    added_by: None,
+                    date: None,
+                })
+            })
+            .collect();
+        shown.results = results;
+        shown.total_voters = total;
+        shown.solution = None;
+        edit(poll, shown);
+        describe(Some(&enums::MessageMedia::Poll(media))).unwrap()
+    }
+
+    fn option(text: &str, votes: Option<u32>, chosen: bool, correct: bool) -> PollOption {
+        PollOption {
+            text: text.into(),
+            votes,
+            chosen,
+            correct,
+        }
+    }
+
+    #[test]
+    fn an_open_poll_without_visible_results_has_its_question_and_options_only() {
+        let media = poll_media(&["Here", "There"], None, None, |_, _| {});
+        assert_eq!(media.kind, MediaKind::Poll);
+        assert_eq!(
+            media.poll,
+            Some(Poll {
+                question: "Where do we eat?".into(),
+                options: vec![
+                    option("Here", None, false, false),
+                    option("There", None, false, false)
+                ],
+                options_truncated: false,
+                total_voters: None,
+                closed: false,
+                multiple_choice: false,
+                quiz: false,
+                anonymous: true,
+            })
+        );
+    }
+
+    #[test]
+    fn visible_results_give_votes_per_option_and_the_accounts_choices() {
+        let results = vec![
+            voters(0, Some(5), true, false),
+            voters(1, Some(2), false, false),
+            voters(2, Some(4), true, false),
+        ];
+        let media = poll_media(&["A", "B", "C"], Some(results), Some(9), |poll, _| {
+            poll.multiple_choice = true;
+            poll.public_voters = true;
+        });
+        let poll = media.poll.unwrap();
+        assert_eq!(
+            poll.options,
+            [
+                option("A", Some(5), true, false),
+                option("B", Some(2), false, false),
+                option("C", Some(4), true, false),
+            ]
+        );
+        assert_eq!(poll.total_voters, Some(9));
+        assert!(poll.multiple_choice && !poll.anonymous && !poll.closed && !poll.quiz);
+    }
+
+    #[test]
+    fn a_closed_poll_says_so_and_shows_its_results() {
+        let results = vec![
+            voters(0, Some(1), false, false),
+            voters(1, Some(0), false, false),
+        ];
+        let poll = poll_media(&["Yes", "No"], Some(results), Some(1), |poll, _| {
+            poll.closed = true;
+        })
+        .poll
+        .unwrap();
+        assert!(poll.closed);
+        assert_eq!(poll.options[1], option("No", Some(0), false, false));
+    }
+
+    #[test]
+    fn a_quiz_marks_its_correct_answer_once_revealed() {
+        let revealed = vec![
+            voters(0, Some(3), true, false),
+            voters(1, Some(1), false, true),
+        ];
+        let poll = poll_media(&["2", "4"], Some(revealed), Some(4), |poll, _| {
+            poll.quiz = true;
+        })
+        .poll
+        .unwrap();
+        assert!(poll.quiz);
+        assert_eq!(
+            poll.options,
+            [
+                option("2", Some(3), true, false),
+                option("4", Some(1), false, true)
+            ]
+        );
+
+        // Not a quiz: no option is correct, whatever the flag says.
+        let poll = poll_media(
+            &["a"],
+            Some(vec![voters(0, Some(1), false, true)]),
+            Some(1),
+            |_, _| {},
+        )
+        .poll
+        .unwrap();
+        assert!(!poll.options[0].correct);
+    }
+
+    #[test]
+    fn results_the_same_for_everyone_say_nothing_of_the_accounts_choice() {
+        // `min` results come without this Account's own vote.
+        let results = vec![voters(0, Some(2), true, false)];
+        let poll = poll_media(&["a"], Some(results), Some(2), |_, results| {
+            results.min = true;
+        })
+        .poll
+        .unwrap();
+        assert_eq!(poll.options, [option("a", Some(2), false, false)]);
+    }
+
+    #[test]
+    fn long_questions_and_options_and_many_options_are_cut() {
+        let long_option = "o".repeat(150);
+        let many: Vec<&str> = std::iter::repeat_n(long_option.as_str(), 14).collect();
+        let poll = poll_media(&many, None, None, |poll, _| {
+            poll.question = text(&"q".repeat(400));
+        })
+        .poll
+        .unwrap();
+        assert_eq!(poll.question.chars().count(), MAX_POLL_QUESTION_CHARS);
+        assert!(poll.question.ends_with('…'));
+        assert_eq!(poll.options.len(), MAX_POLL_OPTIONS);
+        assert!(poll.options_truncated);
+        for option in &poll.options {
+            assert_eq!(option.text.chars().count(), MAX_POLL_OPTION_CHARS);
+            assert!(option.text.ends_with('…'));
+        }
     }
 
     #[test]

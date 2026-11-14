@@ -77,6 +77,10 @@ const MESSAGE_OVERHEAD_CHARS: usize = 64;
 /// What a media description's kind, numbers and keys take at most, besides
 /// its MIME type and file name.
 const MEDIA_OVERHEAD_CHARS: usize = 160;
+/// What a poll's keys, flags and counts take besides its question and
+/// options, and what one option takes besides its text (#62).
+const POLL_OVERHEAD_CHARS: usize = 160;
+const POLL_OPTION_OVERHEAD_CHARS: usize = 64;
 /// What a `link`, `reactions` or `topic` field's key and punctuation take
 /// (a `topic`'s id included), what one reaction takes besides its emoji
 /// (quotes, colon, count, comma), and what a Topic title takes besides its
@@ -820,8 +824,11 @@ as [service message]; rich posts' tables, lists and collapsible sections as plai
 cells joined by ` | `; cut to 1000 characters), `media` when the message carries any: `kind` \
 (photo, video, video_note, voice, audio, document, sticker, gif, location, contact, poll, \
 other) and, when Telegram sends them, `duration_s`, `size_bytes`, `mime_type`, `file_name` \
-(cut to 128 characters), `width`, `height` (a link preview is not media: the link is in the \
-text), the id it replies to, forwarded/edited flags, `reactions` when it has any (each standard \
+(cut to 128 characters), `width`, `height`; a poll also has `question`, `options` (each \
+`text`, and `votes` when Telegram shows this account the results, `chosen` for its own vote, \
+`correct` on a quiz's revealed answer; at most 12, `options_truncated` if more), \
+`total_voters`, `closed`, `multiple_choice`, `quiz`, `anonymous`, never who voted (a link \
+preview is not media: the link is in the text), the id it replies to, forwarded/edited flags, `reactions` when it has any (each standard \
 emoji with its count, all custom emoji summed under `custom`, paid Telegram Stars reactions \
 under `paid`; not who reacted), `link`: a t.me URL that opens the message in Telegram (in \
 channels and supergroups only; a `t.me/c/…` link opens only for their members) and `pinned: \
@@ -1918,7 +1925,18 @@ fn bound_history(mut page: MessagePage, reach: Reach) -> MessagePage {
 fn message_cost(message: &ChatMessage) -> usize {
     let chars = |name: &Option<String>| name.as_deref().map_or(0, |n| n.chars().count());
     let media = message.media.as_ref().map_or(0, |media| {
-        MEDIA_OVERHEAD_CHARS + chars(&media.file_name) + chars(&media.mime_type)
+        MEDIA_OVERHEAD_CHARS
+            + chars(&media.file_name)
+            + chars(&media.mime_type)
+            + media.poll.as_ref().map_or(0, |poll| {
+                POLL_OVERHEAD_CHARS
+                    + poll.question.chars().count()
+                    + poll
+                        .options
+                        .iter()
+                        .map(|o| POLL_OPTION_OVERHEAD_CHARS + o.text.chars().count())
+                        .sum::<usize>()
+            })
     });
     let link = message
         .link
@@ -2186,7 +2204,10 @@ mod tests {
         WriteLimit, bound_history, shorten, tool_error,
     };
     use crate::tg::{
-        messages::{ChatMessage, MAX_REACTION_EMOJI, Media, MediaKind, Reactions},
+        messages::{
+            ChatMessage, MAX_POLL_OPTION_CHARS, MAX_POLL_OPTIONS, MAX_POLL_QUESTION_CHARS,
+            MAX_REACTION_EMOJI, Media, MediaKind, Poll, PollOption, Reactions,
+        },
         topics::TopicTitles,
     };
 
@@ -2316,6 +2337,52 @@ mod tests {
             assert_eq!(name.chars().count(), MAX_TITLE_CHARS, "{name}");
             assert!(name.ends_with('…') && !name.contains('\n'), "{name}");
         }
+        let json = serde_json::to_string(&page).unwrap();
+        assert!(
+            json.chars().count() <= MESSAGE_PAGE_BUDGET_CHARS,
+            "{}",
+            json.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_polls_question_and_options_count_towards_the_page_budget() {
+        // 100 polls of the largest size don't fit one answer.
+        let option = PollOption {
+            text: "o".repeat(MAX_POLL_OPTION_CHARS),
+            votes: Some(u32::MAX),
+            chosen: true,
+            correct: true,
+        };
+        let media = Media {
+            poll: Some(Poll {
+                question: "q".repeat(MAX_POLL_QUESTION_CHARS),
+                options: vec![option; MAX_POLL_OPTIONS],
+                options_truncated: true,
+                total_voters: Some(u32::MAX),
+                closed: true,
+                multiple_choice: true,
+                quiz: true,
+                anonymous: true,
+            }),
+            ..Media::from(MediaKind::Poll)
+        };
+        let page = MessagePage {
+            next_before_id: Some(1),
+            ..MessagePage::new(
+                "channel:1".into(),
+                (1..=100)
+                    .rev()
+                    .map(|id| ChatMessage {
+                        text: String::new(),
+                        media: Some(media.clone()),
+                        ..window(id, id, 0).messages.remove(0)
+                    })
+                    .collect(),
+            )
+        };
+        let page = bound_history(page, Reach::Older);
+        assert!(page.messages.len() < 100, "{}", page.messages.len());
         let json = serde_json::to_string(&page).unwrap();
         assert!(
             json.chars().count() <= MESSAGE_PAGE_BUDGET_CHARS,

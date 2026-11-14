@@ -1035,6 +1035,21 @@ Needs nothing beyond §1. The mechanism is covered by fake-backed tests over eve
 
 Then in claude.ai, in a chat with the connector (Settings → Connectors, `https://connector.tgmcp.dev/mcp`), ask "list my 3 most recent Telegram chats" and "what did I miss on Telegram?": both answer without an `unknown parameter` error. Record on #60 that Claude Code and claude.ai calls still succeed, i.e. no client puts keys of its own into `arguments`.
 
+## 64. A poll in `media` shows its question, options, state and the results the account may see
+
+Needs, in chats of the account (replace the `<…>`; create them yourself in a group or a channel of yours if needed: attach → Poll): an open poll `<P1>` the account has not voted in, ideally one whose results are hidden until you vote; a multiple-choice poll `<P2>` the account voted in for two options; a closed quiz `<Q>` with its correct answer revealed; if possible a poll with hidden characters or a very long question. Write down from the app the question, the options, the vote counts and percentages shown, and your own vote, for each. The extraction is covered by tests: `cargo test --lib tg::media::` (open poll with and without visible results, closed poll, quiz with a revealed answer, multiple choice with the account's choices, results the same for everyone carrying no own vote, the caps), `cargo test --test media` (sanitised through `/mcp`, the output schemas) and `cargo test --lib mcp::tests::a_polls_question_and_options_count_towards_the_page_budget`. In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи. 1) get_messages для чата с <P1>, around_id=<id сообщения с P1>, limit=1: выведи media (JSON как есть). 2) То же для <P2>. 3) То же для <Q>. 4) search_messages с chat_id=<чат P1> и query=<слово из вопроса P1>: выведи media хита. Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: `kind: "poll"`, `question` and the options' `text` as in the app (hidden characters gone, no line breaks), `closed: false`, the right `multiple_choice` / `quiz` / `anonymous`; no `votes`, no `total_voters` and no `chosen` while the app hides the results from you (otherwise the counts the app shows).
+2. Step 2: `votes` on every option and `total_voters` matching the app, `chosen: true` on exactly your two options, `multiple_choice: true`.
+3. Step 3: `closed: true`, `quiz: true`, `correct: true` on the right answer only, `chosen: true` on yours.
+4. Step 4: the hit's `media` is `{ "kind": "poll" }` only. A hit's text is the matched text: a poll's question is not message text, so if the search finds nothing, that is expected; record it.
+
+No log line carries a question or an option: `kamal app logs | grep -F '<a word of the question of P1>'` finds nothing.
+
 ## 67. The official image is a static binary of about 15 MB that runs with only a volume, and holds no more memory than before
 
 Needs Docker on your machine (amd64, or arm64 for step 2) and a clone. The image checks also run in CI on every push (`docker` job: `scripts/container-smoke-test.sh`; `docker-arm64` job: the arm64 cross build).

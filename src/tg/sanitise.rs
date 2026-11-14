@@ -32,7 +32,7 @@ use super::{
     folders::ChatFolder,
     mark_read::{MarkRead, MarkedRead},
     members::{Member, MemberPage, MembersQuery},
-    messages::{ChatMessage, HistoryQuery, Media, MessagePage, Sender},
+    messages::{ChatMessage, HistoryQuery, Media, MessagePage, Poll, PollOption, Sender},
     reactions::{NewReaction, Reacted},
     search::{HitChat, SearchHit, SearchPage, SearchQuery},
     send::{NewMessage, SentMessage},
@@ -270,9 +270,38 @@ fn clean_media(media: &mut Media) {
         file_name,
         width: _,
         height: _,
+        poll,
     } = media;
     clean_opt_visible(mime_type);
     clean_opt_visible(file_name);
+    if let Some(poll) = poll {
+        clean_poll(poll);
+    }
+}
+
+/// A poll's question and options are written by its author: content. Its
+/// flags and counts are Telegram's.
+fn clean_poll(poll: &mut Poll) {
+    let Poll {
+        question,
+        options,
+        options_truncated: _,
+        total_voters: _,
+        closed: _,
+        multiple_choice: _,
+        quiz: _,
+        anonymous: _,
+    } = poll;
+    clean(question);
+    for PollOption {
+        text,
+        votes: _,
+        chosen: _,
+        correct: _,
+    } in options
+    {
+        clean(text);
+    }
 }
 
 impl Untrusted for Account {
