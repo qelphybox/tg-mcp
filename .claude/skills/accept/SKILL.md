@@ -5,7 +5,7 @@ description: Acceptance on the Test account (ADR-0009). Use once a feature's own
 
 # Accept
 
-Prove the feature against real Telegram on the Test account, then hand the maintainer only the Human checks. Vocabulary: GLOSSARY → Acceptance (Test account, Driver, Peer, Acceptance app, Human check).
+Prove the feature against real Telegram on the Test account, then hand the maintainer only the Human checks. The Test account is the only Account a feature is checked on, through `cargo accept`; a Telegram connector attached to your session is the maintainer's own. Vocabulary: GLOSSARY → Acceptance (Test account, Driver, Peer, Acceptance app, Human check).
 
 ## 1. Pick the scenario
 
@@ -25,8 +25,8 @@ Pick by where you run:
 Done when the run ends in one of its three outcomes:
 
 - **PASS**: go on.
-- **FAIL**: a bug in the feature or the scenario. Fix it, back to step 2.
-- **BLOCKED**: Telegram limited the Test account (`FLOOD_WAIT`, a freeze, a refused login, a lease another run holds past its wait). It says nothing about the code: report the reason and the wait to the maintainer, change nothing, and run again only after the wait.
+- **FAIL**: a bug in the feature or the scenario; fix it, back to step 2. Two failures are no bug: an interlock (a login that isn't the Test account: the setup is wrong, tell the maintainer) and a lease held by another run (wait for it, then run again).
+- **BLOCKED**: Telegram limited the Test account (`FLOOD_WAIT`, a freeze, a refused login). It says nothing about the code: report the reason and the wait to the maintainer, change nothing, and run again only after the wait.
 
 ## 4. Commit and open the PR
 

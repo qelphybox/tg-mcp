@@ -114,6 +114,7 @@ impl Report {
             .iter()
             .filter_map(|(name, c)| match c {
                 Check::Fail(why) => Some(Outcome::Fail(format!("{name}: {why}"))),
+                Check::Blocked(why) => Some(Outcome::Blocked(why.clone())),
                 _ => None,
             })
             .collect();
@@ -195,6 +196,7 @@ impl fmt::Display for Report {
                 Check::Pass => "✅".to_string(),
                 Check::Fail(why) => format!("❌ {}", one_line(why)),
                 Check::Skipped(why) => format!("skipped: {}", one_line(why)),
+                Check::Blocked(why) => format!("⛔ {}", one_line(why)),
             };
             writeln!(f, "| {check} | {result} | — |")?;
         }
@@ -289,6 +291,19 @@ impl Run {
         marked
     }
 
+    /// How a report names a text without showing it (CLAUDE.md: never log
+    /// message content): its length and whose it is.
+    pub fn describe(&self, text: &str) -> String {
+        let whose = if is_from_run(text, &self.run_id) {
+            "this run's"
+        } else if is_from_any_run(text) {
+            "another run's"
+        } else {
+            "not from a run"
+        };
+        format!("a {}-character text, {whose}", text.chars().count())
+    }
+
     /// Of `texts`, those this run wrote.
     pub fn ours<'t>(&self, texts: impl IntoIterator<Item = &'t str>) -> Vec<&'t str> {
         texts
@@ -314,12 +329,12 @@ impl Run {
 
     /// Logs the Test account in with `scopes` ticked, opens an MCP session and
     /// checks its `whoami` before anything else.
-    pub async fn login(&mut self, scopes: &[&str]) -> Result<Session> {
+    pub async fn login(&mut self, scopes: &[&str]) -> Result<McpSession> {
         self.login_as(Who::TestAccount, scopes).await
     }
 
     /// [`Run::login`] for `who`.
-    pub async fn login_as(&mut self, who: Who, scopes: &[&str]) -> Result<Session> {
+    pub async fn login_as(&mut self, who: Who, scopes: &[&str]) -> Result<McpSession> {
         self.login_sending(who, scopes, &[]).await
     }
 
@@ -330,18 +345,23 @@ impl Run {
         who: Who,
         scopes: &[&str],
         send_to: &[&str],
-    ) -> Result<Session> {
+    ) -> Result<McpSession> {
         let grant = login::login_sending(&self.world, who, scopes, send_to).await?;
         self.grants.push(grant.clone());
         let by = match who {
             Who::TestAccount => "the Driver",
             Who::Peer => "the Peer",
         };
+        let password = if grant.password_typed {
+            ", the Cloud password typed"
+        } else {
+            ", no Cloud password asked"
+        };
         self.passed(format!(
-            "Login flow: {by} accepted the QR, Consent granted `{}`",
+            "Login flow: {by} accepted the QR{password}, Consent granted `{}`",
             grant.scope
         ));
-        let session = Session::open(&self.world, grant).await?;
+        let session = McpSession::open(&self.world, grant).await?;
         let me = session
             .call("whoami", Value::Object(Default::default()))
             .await?;
@@ -397,12 +417,12 @@ impl Run {
 }
 
 /// An MCP session of one Grant.
-pub struct Session {
+pub struct McpSession {
     pub grant: Grant,
     client: RunningService<RoleClient, ClientConfig>,
 }
 
-impl Session {
+impl McpSession {
     async fn open(world: &World, grant: Grant) -> Result<Self> {
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(world.server.url("/mcp"))
@@ -532,11 +552,18 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
             human: Vec::new(),
             grants: Vec::new(),
         };
-        let outcome = match (scenario.run)(&mut run).await {
+        let result = (scenario.run)(&mut run).await;
+        // An interlock means the world isn't the Test account: nothing more
+        // may run in it. Blocked means Telegram limited it: same.
+        let interlocked = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.chain().any(|c| c.downcast_ref::<Interlock>().is_some()));
+        let outcome = match &result {
             Ok(()) => Outcome::Pass,
-            Err(e) => outcome_of(&e),
+            Err(e) => outcome_of(e),
         };
-        stopped = matches!(outcome, Outcome::Blocked(_));
+        stopped = interlocked || matches!(outcome, Outcome::Blocked(_));
         let teardown = run.teardown().await;
         report.scenarios.push(ScenarioReport {
             id: scenario.id,
@@ -561,7 +588,13 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
         ));
     }
     if let Err(e) = held.release().await {
-        notes.push(format!("releasing the lease: {e:#}"));
+        let check = match blocked::find(&e) {
+            Some(b) => Check::Blocked(b.reason.clone()),
+            None => Check::Fail(format!("{e:#}")),
+        };
+        report
+            .checks
+            .push(("the lease, held for the whole run".into(), check));
     }
     if let Some(last) = report.scenarios.last_mut() {
         last.teardown.extend(notes);

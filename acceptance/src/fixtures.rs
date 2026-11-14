@@ -1,12 +1,12 @@
 //! The Test account's test Chats (ADR-0009), recognised by a title prefix:
 //! created and repaired by `cargo accept fixtures`, found by role by scenarios.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use grammers_client::tl;
 use serde_json::{Value, json};
 
 use crate::{
-    run::Session,
+    run::McpSession,
     telegram::{TgClient, telegram},
 };
 
@@ -20,6 +20,15 @@ pub const WORK: &str = "tgmcp-accept · Work";
 pub const RELEASES: &str = "Releases";
 /// The one reaction G allows.
 pub const G_REACTION: &str = "👍";
+/// What the Peer first writes in A.
+pub const A_HELLO: &str = "tgmcp-accept · fixture A";
+/// The message in the forum's Releases Topic.
+pub const RELEASE_NOTES: &str = "tgmcp-accept · release notes";
+
+/// G's `n`th message.
+pub fn g_message(n: i32) -> String {
+    format!("tgmcp-accept · G message {n}")
+}
 
 /// The fixtures by role, as the server names them.
 #[derive(Debug, Clone)]
@@ -42,7 +51,7 @@ pub struct Fixtures {
 
 impl Fixtures {
     /// Finds every fixture through the server, as a scenario sees them.
-    pub async fn resolve(session: &Session, peer: i64) -> Result<Fixtures> {
+    pub async fn resolve(session: &McpSession, peer: i64) -> Result<Fixtures> {
         let mut a = None;
         let mut saved = None;
         let mut by_title = std::collections::HashMap::new();
@@ -108,8 +117,8 @@ impl Fixtures {
 
 // ── Creating and repairing them on real Telegram ───────────────────────────
 
-/// A chat in the Test account's dialogs.
-struct Found {
+/// A group or supergroup among the Test account's dialogs.
+struct FixtureChat {
     title: String,
     peer: tl::enums::InputPeer,
     forum: bool,
@@ -121,8 +130,8 @@ struct Found {
 /// (empty: nothing to do).
 pub async fn ensure(driver: &TgClient, peer: &TgClient) -> Result<Vec<String>> {
     let mut done = Vec::new();
-    let me = self_user(driver, "Test account").await?;
-    let them = self_user(peer, "Peer").await?;
+    let me = driver.self_user().await?;
+    let them = peer.self_user().await?;
     let me_name = me.username.clone().context(
         "the Test account has no username: set one in Telegram → Settings → Username (the Peer finds it by name)",
     )?;
@@ -136,8 +145,7 @@ pub async fn ensure(driver: &TgClient, peer: &TgClient) -> Result<Vec<String>> {
     // A: the Peer writes first, so the Test account never writes to a stranger.
     if !has_dialog_with(driver, them.id).await? {
         let me_from_peer = resolve_user(peer, &me_name).await?;
-        send(
-            peer,
+        peer.send_text(
             input_peer_of(&me_from_peer),
             "tgmcp-accept · fixture A",
             None,
@@ -182,20 +190,6 @@ pub async fn ensure(driver: &TgClient, peer: &TgClient) -> Result<Vec<String>> {
     Ok(done)
 }
 
-async fn self_user(client: &TgClient, who: &str) -> Result<tl::types::User> {
-    let users = client
-        .client
-        .invoke(&tl::functions::users::GetUsers {
-            id: vec![tl::enums::InputUser::UserSelf],
-        })
-        .await
-        .map_err(|e| telegram(e, &format!("the {who}'s own account")))?;
-    match users.into_iter().next() {
-        Some(tl::enums::User::User(u)) => Ok(u),
-        _ => bail!("Telegram didn't describe the {who}"),
-    }
-}
-
 async fn resolve_user(client: &TgClient, username: &str) -> Result<tl::types::User> {
     let tl::enums::contacts::ResolvedPeer::Peer(found) = client
         .client
@@ -230,8 +224,7 @@ fn input_user_of(user: &tl::types::User) -> tl::enums::InputUser {
 }
 
 async fn has_dialog_with(client: &TgClient, user_id: i64) -> Result<bool> {
-    let (dialogs, ..) = dialogs_page(client).await?;
-    Ok(dialogs.iter().any(|d| match d {
+    Ok(client.dialogs().await?.dialogs.iter().any(|d| match d {
         tl::enums::Dialog::Dialog(d) => {
             matches!(&d.peer, tl::enums::Peer::User(u) if u.user_id == user_id)
         }
@@ -239,44 +232,21 @@ async fn has_dialog_with(client: &TgClient, user_id: i64) -> Result<bool> {
     }))
 }
 
-type DialogsPage = (Vec<tl::enums::Dialog>, Vec<tl::enums::Chat>);
-
-/// The Test account's first 100 dialogs: plenty for an account that holds
-/// only its fixtures.
-async fn dialogs_page(client: &TgClient) -> Result<DialogsPage> {
-    let answer = client
-        .client
-        .invoke(&tl::functions::messages::GetDialogs {
-            exclude_pinned: false,
-            folder_id: None,
-            offset_date: 0,
-            offset_id: 0,
-            offset_peer: tl::enums::InputPeer::Empty,
-            limit: 100,
-            hash: 0,
-        })
-        .await
-        .map_err(|e| telegram(e, "messages.getDialogs"))?;
-    Ok(match answer {
-        tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.chats),
-        tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.chats),
-        tl::enums::messages::Dialogs::NotModified(_) => (Vec::new(), Vec::new()),
-    })
-}
-
 /// The groups and supergroups among the dialogs, with their titles.
-async fn dialogs(client: &TgClient) -> Result<Vec<Found>> {
-    let (_, chats) = dialogs_page(client).await?;
-    Ok(chats
+async fn dialogs(client: &TgClient) -> Result<Vec<FixtureChat>> {
+    Ok(client
+        .dialogs()
+        .await?
+        .chats
         .into_iter()
         .filter_map(|c| match c {
-            tl::enums::Chat::Chat(c) if !c.deactivated => Some(Found {
+            tl::enums::Chat::Chat(c) if !c.deactivated => Some(FixtureChat {
                 title: c.title,
                 peer: tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: c.id }),
                 forum: false,
                 chat_id: Some(c.id),
             }),
-            tl::enums::Chat::Channel(c) if !c.left => Some(Found {
+            tl::enums::Chat::Channel(c) if !c.left => Some(FixtureChat {
                 title: c.title,
                 peer: tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
                     channel_id: c.id,
@@ -288,61 +258,6 @@ async fn dialogs(client: &TgClient) -> Result<Vec<Found>> {
             _ => None,
         })
         .collect())
-}
-
-fn random_id() -> i64 {
-    let mut b = [0u8; 8];
-    getrandom::fill(&mut b).expect("the OS has randomness");
-    i64::from_le_bytes(b)
-}
-
-async fn send(
-    client: &TgClient,
-    peer: tl::enums::InputPeer,
-    text: &str,
-    topic: Option<i32>,
-) -> Result<()> {
-    client
-        .client
-        .invoke(&tl::functions::messages::SendMessage {
-            no_webpage: true,
-            silent: true,
-            background: false,
-            clear_draft: false,
-            noforwards: false,
-            update_stickersets_order: false,
-            invert_media: false,
-            allow_paid_floodskip: false,
-            peer,
-            reply_to: topic.map(|top| {
-                tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
-                    reply_to_msg_id: top,
-                    top_msg_id: Some(top),
-                    reply_to_peer_id: None,
-                    quote_text: None,
-                    quote_entities: None,
-                    quote_offset: None,
-                    monoforum_peer_id: None,
-                    todo_item_id: None,
-                    poll_option: None,
-                })
-            }),
-            message: text.to_string(),
-            random_id: random_id(),
-            reply_markup: None,
-            entities: None,
-            schedule_date: None,
-            schedule_repeat_period: None,
-            send_as: None,
-            quick_reply_shortcut: None,
-            effect: None,
-            allow_paid_stars: None,
-            suggested_post: None,
-            rich_message: None,
-        })
-        .await
-        .map_err(|e| telegram(e, "messages.sendMessage"))?;
-    Ok(())
 }
 
 async fn create_group(client: &TgClient, title: &str, with: tl::enums::InputUser) -> Result<()> {
@@ -379,14 +294,11 @@ async fn create_forum(client: &TgClient, with: tl::enums::InputUser) -> Result<(
         .into_iter()
         .find(|c| c.title == FORUM)
         .context("the new forum is not among the dialogs")?;
-    if let tl::enums::InputPeer::Channel(c) = forum.peer {
+    if let Some(channel) = crate::telegram::input_channel(&forum.peer) {
         client
             .client
             .invoke(&tl::functions::channels::InviteToChannel {
-                channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
-                    channel_id: c.channel_id,
-                    access_hash: c.access_hash,
-                }),
+                channel,
                 users: vec![with],
             })
             .await
@@ -396,7 +308,7 @@ async fn create_forum(client: &TgClient, with: tl::enums::InputUser) -> Result<(
 }
 
 /// G allows 👍 only and has a few messages.
-async fn repair_g(client: &TgClient, g: &Found) -> Result<Vec<String>> {
+async fn repair_g(client: &TgClient, g: &FixtureChat) -> Result<Vec<String>> {
     let mut done = Vec::new();
     let chat_id = g.chat_id.context("G is not a basic group")?;
     let tl::enums::messages::ChatFull::Full(full) = client
@@ -433,13 +345,9 @@ async fn repair_g(client: &TgClient, g: &Found) -> Result<Vec<String>> {
     }
     let count = history_count(client, g.peer.clone()).await?;
     for n in count..3 {
-        send(
-            client,
-            g.peer.clone(),
-            &format!("tgmcp-accept · G message {}", n + 1),
-            None,
-        )
-        .await?;
+        client
+            .send_text(g.peer.clone(), &g_message(n as i32 + 1), None)
+            .await?;
         done.push(format!("{G}: posted message {}", n + 1));
     }
     Ok(done)
@@ -447,27 +355,9 @@ async fn repair_g(client: &TgClient, g: &Found) -> Result<Vec<String>> {
 
 /// How many messages a chat has, up to 10 (service messages count).
 async fn history_count(client: &TgClient, peer: tl::enums::InputPeer) -> Result<usize> {
-    let history = client
-        .client
-        .invoke(&tl::functions::messages::GetHistory {
-            peer,
-            offset_id: 0,
-            offset_date: 0,
-            add_offset: 0,
-            limit: 10,
-            max_id: 0,
-            min_id: 0,
-            hash: 0,
-        })
-        .await
-        .map_err(|e| telegram(e, "messages.getHistory"))?;
-    let messages = match history {
-        tl::enums::messages::Messages::Messages(m) => m.messages,
-        tl::enums::messages::Messages::Slice(m) => m.messages,
-        tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
-        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
-    };
-    Ok(messages
+    Ok(client
+        .history(peer, 10)
+        .await?
         .iter()
         .filter(|m| matches!(m, tl::enums::Message::Message(_)))
         .count())
@@ -475,26 +365,12 @@ async fn history_count(client: &TgClient, peer: tl::enums::InputPeer) -> Result<
 
 /// The forum has a Topic "Releases" (the first Topic besides General, renamed
 /// back if someone renamed it) with a message in it.
-async fn repair_forum(client: &TgClient, forum: &Found) -> Result<Vec<String>> {
-    let tl::enums::messages::ForumTopics::Topics(topics) = client
-        .client
-        .invoke(&tl::functions::messages::GetForumTopics {
-            peer: forum.peer.clone(),
-            q: None,
-            offset_date: 0,
-            offset_id: 0,
-            offset_topic: 0,
-            limit: 100,
-        })
-        .await
-        .map_err(|e| telegram(e, "messages.getForumTopics"))?;
-    let other = topics
-        .topics
+async fn repair_forum(client: &TgClient, forum: &FixtureChat) -> Result<Vec<String>> {
+    let other = client
+        .forum_topics(forum.peer.clone())
+        .await?
         .into_iter()
-        .filter_map(|t| match t {
-            tl::enums::ForumTopic::Topic(t) if t.id != 1 => Some(t),
-            _ => None,
-        })
+        .filter(|t| t.id != 1)
         .min_by_key(|t| t.id);
     match other {
         Some(t) if t.title == RELEASES => Ok(Vec::new()),
@@ -522,19 +398,15 @@ async fn repair_forum(client: &TgClient, forum: &Found) -> Result<Vec<String>> {
                     title: RELEASES.into(),
                     icon_color: None,
                     icon_emoji_id: None,
-                    random_id: random_id(),
+                    random_id: crate::telegram::random_id(),
                     send_as: None,
                 })
                 .await
                 .map_err(|e| telegram(e, "messages.createForumTopic"))?;
             let created = repair_forum_topic_id(client, forum).await?;
-            send(
-                client,
-                forum.peer.clone(),
-                "tgmcp-accept · release notes",
-                Some(created),
-            )
-            .await?;
+            client
+                .send_text(forum.peer.clone(), RELEASE_NOTES, Some(created))
+                .await?;
             Ok(vec![format!(
                 "{FORUM}: created Topic {RELEASES} with a message"
             )])
@@ -542,26 +414,13 @@ async fn repair_forum(client: &TgClient, forum: &Found) -> Result<Vec<String>> {
     }
 }
 
-async fn repair_forum_topic_id(client: &TgClient, forum: &Found) -> Result<i32> {
-    let tl::enums::messages::ForumTopics::Topics(topics) = client
-        .client
-        .invoke(&tl::functions::messages::GetForumTopics {
-            peer: forum.peer.clone(),
-            q: None,
-            offset_date: 0,
-            offset_id: 0,
-            offset_topic: 0,
-            limit: 100,
-        })
-        .await
-        .map_err(|e| telegram(e, "messages.getForumTopics"))?;
-    topics
-        .topics
+async fn repair_forum_topic_id(client: &TgClient, forum: &FixtureChat) -> Result<i32> {
+    client
+        .forum_topics(forum.peer.clone())
+        .await?
         .into_iter()
-        .find_map(|t| match t {
-            tl::enums::ForumTopic::Topic(t) if t.title == RELEASES => Some(t.id),
-            _ => None,
-        })
+        .find(|t| t.title == RELEASES)
+        .map(|t| t.id)
         .context("the new Topic is not listed")
 }
 

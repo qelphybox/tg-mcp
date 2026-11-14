@@ -28,6 +28,8 @@ pub struct Grant {
     /// The Scopes the token response names, e.g. `read draft`.
     pub scope: String,
     pub refresh_token: Option<String>,
+    /// Whether the Login flow went through the Cloud password step.
+    pub password_typed: bool,
 }
 
 impl std::fmt::Debug for Grant {
@@ -56,6 +58,10 @@ pub async fn login_sending(
 ) -> Result<Grant> {
     let mut flow = LoginFlow::start(world, scopes).await?;
     flow.wait_logged_in(world, who).await?;
+    ensure!(
+        who != Who::TestAccount || world.cloud_password.is_none() || flow.password_typed,
+        "the login never asked for the Test account's Cloud password: is two-step verification still on?"
+    );
     let html = flow.consent_page().await?;
     let code = if send_to.is_empty() {
         flow.allow(&html, scopes).await?
@@ -78,6 +84,8 @@ pub struct LoginFlow {
     pub login_path: String,
     /// `/login/<id>/consent`, once the QR login finished.
     consent_path: Option<String>,
+    /// Whether the login page asked for the Cloud password (and got it).
+    pub password_typed: bool,
 }
 
 impl LoginFlow {
@@ -150,6 +158,7 @@ impl LoginFlow {
             cookie,
             login_path,
             consent_path: None,
+            password_typed: false,
         })
     }
 
@@ -195,6 +204,7 @@ impl LoginFlow {
                         ),
                     };
                     self.submit_password(&next, password).await?;
+                    self.password_typed = true;
                 }
                 Some("logged_in") => {
                     let next = body["next"]
@@ -383,6 +393,7 @@ impl LoginFlow {
                 .to_string(),
             scope: body["scope"].as_str().unwrap_or_default().to_string(),
             refresh_token: body["refresh_token"].as_str().map(str::to_string),
+            password_typed: self.password_typed,
         })
     }
 

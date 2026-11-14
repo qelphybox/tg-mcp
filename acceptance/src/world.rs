@@ -7,8 +7,9 @@
 
 use std::{any::Any, sync::Arc, time::Duration};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
+use tg_mcp::tg::chats::ChatRef;
 use zeroize::Zeroizing;
 
 /// Where the server under test answers.
@@ -45,11 +46,22 @@ pub struct SeenDraft {
     pub reply_to: Option<i32>,
 }
 
-/// A formatting entity: `kind` as the server's Markdown names it (`bold`,
-/// `italic`, `code`, `pre`, `text_url`), offsets in UTF-16 code units.
+/// What a formatting entity does: the kinds the server's Markdown makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Bold,
+    Italic,
+    Code,
+    Pre,
+    TextUrl,
+    /// Any other kind Telegram holds.
+    Other,
+}
+
+/// A formatting entity, offsets in UTF-16 code units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeenEntity {
-    pub kind: String,
+    pub kind: EntityKind,
     pub offset: usize,
     pub length: usize,
     pub url: Option<String>,
@@ -181,5 +193,40 @@ impl World {
             bail!("interlock: the Peer and the Test account are the same account {peer}");
         }
         Ok(())
+    }
+}
+
+/// The token of a `tg://login?token=…` URL, as Telegram's apps read it.
+pub fn login_token(qr_url: &str) -> Result<String> {
+    // The URL carries a login token: errors never quote it.
+    let url = url::Url::parse(qr_url).context("the QR login is not a URL")?;
+    ensure!(
+        url.scheme() == "tg" && url.host_str() == Some("login"),
+        "not a tg://login URL"
+    );
+    url.query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+        .filter(|t| !t.is_empty())
+        .context("tg://login URL without a token")
+}
+
+/// A chat id as the server issues it (`user:N~hash`), parsed.
+pub fn chat_ref(chat: &str) -> Result<ChatRef> {
+    use std::str::FromStr;
+    ChatRef::from_str(chat).map_err(|e| anyhow::anyhow!("{chat}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_token_of_a_login_url() {
+        assert_eq!(login_token("tg://login?token=AbC-_9").unwrap(), "AbC-_9");
+        assert!(login_token("tg://resolve?domain=x").is_err());
+        assert!(login_token("tg://login?token=").is_err());
+        let err = login_token("nonsense secret-token").unwrap_err();
+        assert!(!format!("{err:#}").contains("secret-token"), "{err:#}");
     }
 }

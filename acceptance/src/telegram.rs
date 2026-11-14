@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 use crate::{
     blocked,
     config::{self, App},
-    world::{Driver, Party, Peer, SeenDraft, SeenEntity},
+    world::{Driver, EntityKind, Party, Peer, SeenDraft, SeenEntity},
 };
 
 /// The device the server's sessions show as in Telegram's Active sessions.
@@ -106,6 +106,23 @@ impl TgClient {
 
     /// The logged-in account's user id.
     pub async fn me(&self) -> Result<i64> {
+        Ok(self.self_user().await?.id)
+    }
+
+    /// The account's first and last name and username, as Telegram has them.
+    pub async fn names(&self) -> Result<Vec<String>> {
+        let u = self.self_user().await?;
+        Ok([u.first_name, u.last_name, u.username]
+            .into_iter()
+            .flatten()
+            .filter(|n| !n.is_empty())
+            .collect())
+    }
+
+    // ── The MTProto calls the harness makes, each in one place ─────────────
+
+    /// The logged-in account itself.
+    pub(crate) async fn self_user(&self) -> Result<tl::types::User> {
         let users = self
             .client
             .invoke(&tl::functions::users::GetUsers {
@@ -114,31 +131,235 @@ impl TgClient {
             .await
             .map_err(|e| telegram(e, &format!("the {}'s own account", self.role.name())))?;
         match users.into_iter().next() {
-            Some(tl::enums::User::User(u)) => Ok(u.id),
-            _ => bail!("Telegram didn't name the {}'s account", self.role.name()),
+            Some(tl::enums::User::User(u)) => Ok(u),
+            _ => bail!(
+                "Telegram didn't describe the {}'s account",
+                self.role.name()
+            ),
         }
+    }
+
+    /// The first 100 dialogs: plenty for accounts that hold only fixtures.
+    pub(crate) async fn dialogs(&self) -> Result<Dialogs> {
+        let answer = self
+            .client
+            .invoke(&tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: None,
+                offset_date: 0,
+                offset_id: 0,
+                offset_peer: tl::enums::InputPeer::Empty,
+                limit: 100,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getDialogs"))?;
+        Ok(match answer {
+            tl::enums::messages::Dialogs::Dialogs(d) => Dialogs {
+                dialogs: d.dialogs,
+                chats: d.chats,
+                users: d.users,
+            },
+            tl::enums::messages::Dialogs::Slice(d) => Dialogs {
+                dialogs: d.dialogs,
+                chats: d.chats,
+                users: d.users,
+            },
+            tl::enums::messages::Dialogs::NotModified(_) => Dialogs::default(),
+        })
+    }
+
+    /// The latest `limit` messages of `peer`, newest first.
+    pub(crate) async fn history(
+        &self,
+        peer: tl::enums::InputPeer,
+        limit: i32,
+    ) -> Result<Vec<tl::enums::Message>> {
+        let history = self
+            .client
+            .invoke(&tl::functions::messages::GetHistory {
+                peer,
+                offset_id: 0,
+                offset_date: 0,
+                add_offset: 0,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getHistory"))?;
+        Ok(match history {
+            tl::enums::messages::Messages::Messages(m) => m.messages,
+            tl::enums::messages::Messages::Slice(m) => m.messages,
+            tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
+            tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+        })
+    }
+
+    /// Sends plain `text` to `peer`, in forum Topic `topic` if given.
+    pub(crate) async fn send_text(
+        &self,
+        peer: tl::enums::InputPeer,
+        text: &str,
+        topic: Option<i32>,
+    ) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::messages::SendMessage {
+                no_webpage: true,
+                silent: true,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer,
+                reply_to: topic.map(|top| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id: top,
+                        top_msg_id: Some(top),
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                    })
+                }),
+                message: text.to_string(),
+                random_id: random_id(),
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.sendMessage"))?;
+        Ok(())
+    }
+
+    /// Replaces `peer`'s Draft with plain `text` (`""` clears it).
+    async fn save_draft(&self, peer: tl::enums::InputPeer, text: &str) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::messages::SaveDraft {
+                no_webpage: true,
+                invert_media: false,
+                reply_to: None,
+                peer,
+                message: text.to_string(),
+                entities: None,
+                media: None,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.saveDraft"))?;
+        Ok(())
+    }
+
+    /// The Draft of `peer`'s dialog.
+    async fn dialog_draft(&self, peer: tl::enums::InputPeer) -> Result<Option<SeenDraft>> {
+        let tl::enums::messages::PeerDialogs::Dialogs(found) = self
+            .client
+            .invoke(&tl::functions::messages::GetPeerDialogs {
+                peers: vec![tl::enums::InputDialogPeer::Peer(
+                    tl::types::InputDialogPeer { peer },
+                )],
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getPeerDialogs"))?;
+        Ok(found.dialogs.into_iter().find_map(|d| match d {
+            tl::enums::Dialog::Dialog(d) => d.draft.and_then(|draft| seen(draft, None)),
+            _ => None,
+        }))
+    }
+
+    /// A forum's Topics.
+    pub(crate) async fn forum_topics(
+        &self,
+        peer: tl::enums::InputPeer,
+    ) -> Result<Vec<tl::types::ForumTopic>> {
+        let tl::enums::messages::ForumTopics::Topics(topics) = self
+            .client
+            .invoke(&tl::functions::messages::GetForumTopics {
+                peer,
+                q: None,
+                offset_date: 0,
+                offset_id: 0,
+                offset_topic: 0,
+                limit: 100,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getForumTopics"))?;
+        Ok(topics
+            .topics
+            .into_iter()
+            .filter_map(|t| match t {
+                tl::enums::ForumTopic::Topic(t) => Some(t),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The server's Telegram sessions on this account created since `since`.
+    async fn server_authorizations(&self, since: i64) -> Result<Vec<tl::types::Authorization>> {
+        let tl::enums::account::Authorizations::Authorizations(all) = self
+            .client
+            .invoke(&tl::functions::account::GetAuthorizations {})
+            .await
+            .map_err(|e| telegram(e, "account.getAuthorizations"))?;
+        Ok(all
+            .authorizations
+            .into_iter()
+            .map(|tl::enums::Authorization::Authorization(a)| a)
+            .filter(|a| {
+                !a.current && a.device_model == SERVER_DEVICE && i64::from(a.date_created) >= since
+            })
+            .collect())
+    }
+
+    /// The Test account as the Peer addresses it: their chat (fixture A) puts
+    /// its user, with the access hash, among the Peer's dialogs.
+    async fn test_account_peer(&self, test_account: i64) -> Result<tl::enums::InputPeer> {
+        let access_hash = self
+            .dialogs()
+            .await?
+            .users
+            .into_iter()
+            .find_map(|u| match u {
+                tl::enums::User::User(u) if u.id == test_account => u.access_hash,
+                _ => None,
+            })
+            .context("the Peer has no chat with the Test account: run `cargo accept fixtures`")?;
+        Ok(tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: test_account,
+            access_hash,
+        }))
     }
 }
 
-impl TgClient {
-    /// The account's first and last name and username, as Telegram has them.
-    pub async fn names(&self) -> Result<Vec<String>> {
-        let users = self
-            .client
-            .invoke(&tl::functions::users::GetUsers {
-                id: vec![tl::enums::InputUser::UserSelf],
-            })
-            .await
-            .map_err(|e| telegram(e, &format!("the {}'s own account", self.role.name())))?;
-        Ok(match users.into_iter().next() {
-            Some(tl::enums::User::User(u)) => [u.first_name, u.last_name, u.username]
-                .into_iter()
-                .flatten()
-                .filter(|n| !n.is_empty())
-                .collect(),
-            _ => Vec::new(),
-        })
-    }
+/// A page of dialogs and the chats and users they name.
+#[derive(Default)]
+pub(crate) struct Dialogs {
+    pub dialogs: Vec<tl::enums::Dialog>,
+    pub chats: Vec<tl::enums::Chat>,
+    pub users: Vec<tl::enums::User>,
+}
+
+/// A fresh `random_id` for a message or a Topic.
+pub(crate) fn random_id() -> i64 {
+    let mut b = [0u8; 8];
+    getrandom::fill(&mut b).expect("the OS has randomness");
+    i64::from_le_bytes(b)
 }
 
 #[async_trait]
@@ -148,7 +369,7 @@ impl Party for TgClient {
     }
 
     async fn accept_login(&self, qr_url: &str) -> Result<()> {
-        let token = crate::fake::login_token(qr_url)?;
+        let token = crate::world::login_token(qr_url)?;
         let token = URL_SAFE_NO_PAD
             .decode(token.trim_end_matches('='))
             .context("the QR's token is not base64url")?;
@@ -163,9 +384,8 @@ impl Party for TgClient {
 /// A chat id as the server issues it (`user:N~hash`), as Telegram's input peer:
 /// the server and the Driver are the same account, so the hash is valid for both.
 pub(crate) fn input_peer(chat: &str) -> Result<tl::enums::InputPeer> {
-    use std::str::FromStr;
-    use tg_mcp::tg::chats::{ChatId, ChatRef};
-    let parsed = ChatRef::from_str(chat).map_err(|e| anyhow::anyhow!("{chat}: {e}"))?;
+    use tg_mcp::tg::chats::ChatId;
+    let parsed = crate::world::chat_ref(chat)?;
     let hash = parsed.access_hash().unwrap_or(0);
     Ok(match parsed.chat() {
         ChatId::User(user_id) => tl::enums::InputPeer::User(tl::types::InputPeerUser {
@@ -178,6 +398,19 @@ pub(crate) fn input_peer(chat: &str) -> Result<tl::enums::InputPeer> {
             access_hash: hash,
         }),
     })
+}
+
+/// A channel's input peer as the input channel channel methods take.
+pub(crate) fn input_channel(peer: &tl::enums::InputPeer) -> Option<tl::enums::InputChannel> {
+    match peer {
+        tl::enums::InputPeer::Channel(c) => {
+            Some(tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                channel_id: c.channel_id,
+                access_hash: c.access_hash,
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn seen(draft: tl::enums::DraftMessage, topic: Option<i32>) -> Option<SeenDraft> {
@@ -193,17 +426,19 @@ fn seen(draft: tl::enums::DraftMessage, topic: Option<i32>) -> Option<SeenDraft>
         .into_iter()
         .map(|e| {
             let (kind, offset, length, url) = match e {
-                tl::enums::MessageEntity::Bold(e) => ("bold", e.offset, e.length, None),
-                tl::enums::MessageEntity::Italic(e) => ("italic", e.offset, e.length, None),
-                tl::enums::MessageEntity::Code(e) => ("code", e.offset, e.length, None),
-                tl::enums::MessageEntity::Pre(e) => ("pre", e.offset, e.length, None),
-                tl::enums::MessageEntity::TextUrl(e) => {
-                    ("text_url", e.offset, e.length, Some(e.url))
+                tl::enums::MessageEntity::Bold(e) => (EntityKind::Bold, e.offset, e.length, None),
+                tl::enums::MessageEntity::Italic(e) => {
+                    (EntityKind::Italic, e.offset, e.length, None)
                 }
-                _ => ("other", 0, 0, None),
+                tl::enums::MessageEntity::Code(e) => (EntityKind::Code, e.offset, e.length, None),
+                tl::enums::MessageEntity::Pre(e) => (EntityKind::Pre, e.offset, e.length, None),
+                tl::enums::MessageEntity::TextUrl(e) => {
+                    (EntityKind::TextUrl, e.offset, e.length, Some(e.url))
+                }
+                _ => (EntityKind::Other, 0, 0, None),
             };
             SeenEntity {
-                kind: kind.into(),
+                kind,
                 offset: offset.max(0) as usize,
                 length: length.max(0) as usize,
                 url,
@@ -223,44 +458,30 @@ fn seen(draft: tl::enums::DraftMessage, topic: Option<i32>) -> Option<SeenDraft>
     })
 }
 
-impl TgClient {
-    async fn dialog_draft(&self, peer: tl::enums::InputPeer) -> Result<Option<SeenDraft>> {
-        let tl::enums::messages::PeerDialogs::Dialogs(found) = self
-            .client
-            .invoke(&tl::functions::messages::GetPeerDialogs {
-                peers: vec![tl::enums::InputDialogPeer::Peer(
-                    tl::types::InputDialogPeer { peer },
-                )],
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.getPeerDialogs"))?;
-        Ok(found.dialogs.into_iter().find_map(|d| match d {
-            tl::enums::Dialog::Dialog(d) => d.draft.and_then(|draft| seen(draft, None)),
-            _ => None,
-        }))
+#[async_trait]
+impl Driver for TgClient {
+    async fn saved_draft(&self) -> Result<Option<String>> {
+        Ok(self
+            .dialog_draft(tl::enums::InputPeer::PeerSelf)
+            .await?
+            .map(|d| d.text))
     }
 
-    async fn topic_draft(
-        &self,
-        peer: tl::enums::InputPeer,
-        topic: i32,
-    ) -> Result<Option<SeenDraft>> {
-        let tl::enums::messages::ForumTopics::Topics(topics) = self
-            .client
-            .invoke(&tl::functions::messages::GetForumTopics {
-                peer: peer.clone(),
-                q: None,
-                offset_date: 0,
-                offset_id: 0,
-                offset_topic: 0,
-                limit: 100,
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.getForumTopics"))?;
-        let draft = topics.topics.into_iter().find_map(|t| match t {
-            tl::enums::ForumTopic::Topic(t) if t.id == topic => Some(t.draft),
-            _ => None,
-        });
+    async fn set_saved_draft(&self, text: &str) -> Result<()> {
+        self.save_draft(tl::enums::InputPeer::PeerSelf, text).await
+    }
+
+    async fn draft(&self, chat: &str, topic: Option<i32>) -> Result<Option<SeenDraft>> {
+        let peer = input_peer(chat)?;
+        let Some(topic) = topic else {
+            return self.dialog_draft(peer).await;
+        };
+        let draft = self
+            .forum_topics(peer.clone())
+            .await?
+            .into_iter()
+            .find(|t| t.id == topic)
+            .map(|t| t.draft);
         match draft {
             Some(Some(d)) => Ok(seen(d, Some(topic))),
             // General's Draft may be the chat's own.
@@ -268,34 +489,25 @@ impl TgClient {
             _ => Ok(None),
         }
     }
-}
 
-#[async_trait]
-impl Driver for TgClient {
-    async fn draft(&self, chat: &str, topic: Option<i32>) -> Result<Option<SeenDraft>> {
-        let peer = input_peer(chat)?;
-        match topic {
-            None => self.dialog_draft(peer).await,
-            Some(t) => self.topic_draft(peer, t).await,
-        }
+    async fn type_draft(&self, chat: &str, text: &str) -> Result<()> {
+        self.save_draft(input_peer(chat)?, text).await
     }
 
     async fn delete_message(&self, chat: &str, id: i64) -> Result<()> {
         let id = i32::try_from(id).context("a message id out of range")?;
-        match input_peer(chat)? {
-            tl::enums::InputPeer::Channel(c) => {
+        let peer = input_peer(chat)?;
+        match input_channel(&peer) {
+            Some(channel) => {
                 self.client
                     .invoke(&tl::functions::channels::DeleteMessages {
-                        channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
-                            channel_id: c.channel_id,
-                            access_hash: c.access_hash,
-                        }),
+                        channel,
                         id: vec![id],
                     })
                     .await
                     .map_err(|e| telegram(e, "channels.deleteMessages"))?;
             }
-            _ => {
+            None => {
                 self.client
                     .invoke(&tl::functions::messages::DeleteMessages {
                         revoke: true,
@@ -309,91 +521,12 @@ impl Driver for TgClient {
     }
 
     async fn server_sessions_since(&self, since: i64) -> Result<usize> {
-        let tl::enums::account::Authorizations::Authorizations(all) = self
-            .client
-            .invoke(&tl::functions::account::GetAuthorizations {})
-            .await
-            .map_err(|e| telegram(e, "account.getAuthorizations"))?;
-        Ok(all
-            .authorizations
-            .into_iter()
-            .filter(|tl::enums::Authorization::Authorization(a)| {
-                !a.current && a.device_model == SERVER_DEVICE && i64::from(a.date_created) >= since
-            })
-            .count())
-    }
-
-    async fn type_draft(&self, chat: &str, text: &str) -> Result<()> {
-        self.client
-            .invoke(&tl::functions::messages::SaveDraft {
-                no_webpage: true,
-                invert_media: false,
-                reply_to: None,
-                peer: input_peer(chat)?,
-                message: text.to_string(),
-                entities: None,
-                media: None,
-                effect: None,
-                suggested_post: None,
-                rich_message: None,
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.saveDraft"))?;
-        Ok(())
-    }
-    async fn saved_draft(&self) -> Result<Option<String>> {
-        let tl::enums::messages::PeerDialogs::Dialogs(found) = self
-            .client
-            .invoke(&tl::functions::messages::GetPeerDialogs {
-                peers: vec![tl::enums::InputDialogPeer::Peer(
-                    tl::types::InputDialogPeer {
-                        peer: tl::enums::InputPeer::PeerSelf,
-                    },
-                )],
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.getPeerDialogs"))?;
-        Ok(found.dialogs.into_iter().find_map(|d| match d {
-            tl::enums::Dialog::Dialog(d) => match d.draft {
-                Some(tl::enums::DraftMessage::Message(m)) if !m.message.is_empty() => {
-                    Some(m.message)
-                }
-                _ => None,
-            },
-            _ => None,
-        }))
-    }
-
-    async fn set_saved_draft(&self, text: &str) -> Result<()> {
-        self.client
-            .invoke(&tl::functions::messages::SaveDraft {
-                no_webpage: true,
-                invert_media: false,
-                reply_to: None,
-                peer: tl::enums::InputPeer::PeerSelf,
-                message: text.to_string(),
-                entities: None,
-                media: None,
-                effect: None,
-                suggested_post: None,
-                rich_message: None,
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.saveDraft"))?;
-        Ok(())
+        Ok(self.server_authorizations(since).await?.len())
     }
 
     async fn end_server_sessions(&self, since: i64) -> Result<usize> {
-        let tl::enums::account::Authorizations::Authorizations(all) = self
-            .client
-            .invoke(&tl::functions::account::GetAuthorizations {})
-            .await
-            .map_err(|e| telegram(e, "account.getAuthorizations"))?;
         let mut ended = 0;
-        for tl::enums::Authorization::Authorization(a) in all.authorizations {
-            if a.current || a.device_model != SERVER_DEVICE || i64::from(a.date_created) < since {
-                continue;
-            }
+        for a in self.server_authorizations(since).await? {
             match self
                 .client
                 .invoke(&tl::functions::account::ResetAuthorization { hash: a.hash })
@@ -411,105 +544,19 @@ impl Driver for TgClient {
     }
 }
 
-impl TgClient {
-    /// The Test account as the Peer addresses it: their chat (fixture A) puts
-    /// its user, with the access hash, among the Peer's dialogs.
-    async fn test_account_peer(&self, test_account: i64) -> Result<tl::enums::InputPeer> {
-        let answer = self
-            .client
-            .invoke(&tl::functions::messages::GetDialogs {
-                exclude_pinned: false,
-                folder_id: None,
-                offset_date: 0,
-                offset_id: 0,
-                offset_peer: tl::enums::InputPeer::Empty,
-                limit: 100,
-                hash: 0,
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.getDialogs"))?;
-        let users = match answer {
-            tl::enums::messages::Dialogs::Dialogs(d) => d.users,
-            tl::enums::messages::Dialogs::Slice(d) => d.users,
-            tl::enums::messages::Dialogs::NotModified(_) => Vec::new(),
-        };
-        let access_hash = users
-            .into_iter()
-            .find_map(|u| match u {
-                tl::enums::User::User(u) if u.id == test_account => u.access_hash,
-                _ => None,
-            })
-            .context("the Peer has no chat with the Test account: run `cargo accept fixtures`")?;
-        Ok(tl::enums::InputPeer::User(tl::types::InputPeerUser {
-            user_id: test_account,
-            access_hash,
-        }))
-    }
-}
-
 #[async_trait]
 impl Peer for TgClient {
+    async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()> {
+        let peer = self.test_account_peer(test_account).await?;
+        self.send_text(peer, text, None).await
+    }
+
     async fn received_from_test_account(&self, test_account: i64, text: &str) -> Result<bool> {
-        let history = self
-            .client
-            .invoke(&tl::functions::messages::GetHistory {
-                peer: self.test_account_peer(test_account).await?,
-                offset_id: 0,
-                offset_date: 0,
-                add_offset: 0,
-                limit: 20,
-                max_id: 0,
-                min_id: 0,
-                hash: 0,
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.getHistory"))?;
-        let messages = match history {
-            tl::enums::messages::Messages::Messages(m) => m.messages,
-            tl::enums::messages::Messages::Slice(m) => m.messages,
-            tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
-            tl::enums::messages::Messages::NotModified(_) => Vec::new(),
-        };
-        Ok(messages.iter().any(|m| match m {
+        let peer = self.test_account_peer(test_account).await?;
+        Ok(self.history(peer, 20).await?.iter().any(|m| match m {
             tl::enums::Message::Message(m) => !m.out && m.message == text,
             _ => false,
         }))
-    }
-
-    async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()> {
-        let peer = self.test_account_peer(test_account).await?;
-        self.client
-            .invoke(&tl::functions::messages::SendMessage {
-                no_webpage: true,
-                silent: true,
-                background: false,
-                clear_draft: false,
-                noforwards: false,
-                update_stickersets_order: false,
-                invert_media: false,
-                allow_paid_floodskip: false,
-                peer,
-                reply_to: None,
-                message: text.to_string(),
-                random_id: {
-                    let mut b = [0u8; 8];
-                    getrandom::fill(&mut b).expect("the OS has randomness");
-                    i64::from_le_bytes(b)
-                },
-                reply_markup: None,
-                entities: None,
-                schedule_date: None,
-                schedule_repeat_period: None,
-                send_as: None,
-                quick_reply_shortcut: None,
-                effect: None,
-                allow_paid_stars: None,
-                suggested_post: None,
-                rich_message: None,
-            })
-            .await
-            .map_err(|e| telegram(e, "messages.sendMessage"))?;
-        Ok(())
     }
 }
 
@@ -547,6 +594,20 @@ pub async fn sign_in(role: Role) -> Result<()> {
         Err(e) => bail!("signing in failed: {e}"),
     };
     let id = user.raw.id();
+    if let Some(configured) = config::get(role.id_key())?
+        && configured.as_str() != id.to_string()
+    {
+        client.disconnect();
+        bail!(
+            "that phone logged in as account {id}, but {} is {}: nothing was saved. \
+             To use another account, remove {} and {} from {} first.",
+            role.id_key(),
+            configured.as_str(),
+            role.id_key(),
+            role.session_key(),
+            config::file_path()?.display()
+        );
+    }
     let snapshot = store
         .snapshot()
         .map_err(|e| anyhow::anyhow!("the new login can't be saved: {e}"))?;

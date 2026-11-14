@@ -9,15 +9,48 @@ use serde_json::{Value, json};
 
 use crate::{
     fixtures::Fixtures,
-    run::{Run, Scenario, Session},
-    world::SeenDraft,
+    run::{McpSession, Run, Scenario},
+    world::{EntityKind, SeenDraft},
 };
 
 pub const SCENARIO: Scenario = Scenario {
     id: "s53",
     title: "Drafts: formatted, replaced, cleared, in Topics, only with `draft`",
-    run: |run| Box::pin(s53(run)),
+    run: |run| Box::pin(s53_cleaning_up(run)),
 };
+
+/// The scenario, then its cleanup whatever happened: on a failure the Drafts
+/// kept for the Human checks go too, since nobody will be asked about them.
+async fn s53_cleaning_up(run: &mut Run) -> Result<()> {
+    let result = s53(run).await;
+    // Not after a limit or an interlock: no more calls into that account.
+    if let Err(e) = &result
+        && crate::blocked::find(e).is_none()
+        && !e
+            .chain()
+            .any(|c| c.downcast_ref::<crate::run::Interlock>().is_some())
+    {
+        let _ = clear_everywhere(run).await;
+    }
+    result
+}
+
+/// Clears every Draft s53 may have written, through the Driver.
+async fn clear_everywhere(run: &mut Run) -> Result<()> {
+    let session = run.login(&["draft"]).await?;
+    let fixtures = Fixtures::resolve(&session, run.world.peer_account).await?;
+    for chat in [&fixtures.a, &fixtures.b, &fixtures.g] {
+        save(&session, json!({ "chat_id": chat, "text": "" })).await?;
+    }
+    for topic in [fixtures.releases, 1] {
+        save(
+            &session,
+            json!({ "chat_id": fixtures.forum, "topic": topic, "text": "" }),
+        )
+        .await?;
+    }
+    Ok(())
+}
 
 /// The Markdown of §53 step 2: every kind of entity, after an emoji (two
 /// UTF-16 units) that must not shift them.
@@ -88,7 +121,9 @@ async fn s53(run: &mut Run) -> Result<()> {
     let seen = held(run, &fixtures.b, None).await?;
     ensure!(
         seen.text == plain && seen.entities.is_empty(),
-        "plain: Telegram holds {seen:?}"
+        "plain: Telegram holds {} with {} entities",
+        run.describe(&seen.text),
+        seen.entities.len()
     );
     run.passed("format plain: the asterisks and underscores stay as typed, no formatting");
 
@@ -103,8 +138,8 @@ async fn s53(run: &mut Run) -> Result<()> {
     let seen = held(run, &fixtures.b, None).await?;
     ensure!(
         seen.text.starts_with("second "),
-        "after first then second, B holds {:?}",
-        seen.text
+        "after first then second, B holds {}",
+        run.describe(&seen.text)
     );
     let listed = drafts(&drafter).await?;
     let in_b: Vec<_> = listed
@@ -117,7 +152,8 @@ async fn s53(run: &mut Run) -> Result<()> {
                 .as_str()
                 .unwrap_or("")
                 .starts_with("second "),
-        "get_drafts lists for B: {in_b:?}"
+        "get_drafts lists {} Drafts for B, not the one \"second\"",
+        in_b.len()
     );
     let cleared = save(&drafter, json!({ "chat_id": fixtures.b, "text": "" })).await?;
     ensure!(
@@ -160,7 +196,8 @@ async fn s53(run: &mut Run) -> Result<()> {
         listed
             .iter()
             .any(|d| d["chat"]["id"] == json!(fixtures.a) && d["reply_to"] == json!(peer_says)),
-        "get_drafts doesn't show A's reply_to {peer_says}: {listed:?}"
+        "get_drafts doesn't show A's reply_to {peer_says}: {}",
+        summary(run, &listed)
     );
     run.passed("reply_to: Telegram holds the reply, get_drafts shows it");
     run.human(
@@ -202,9 +239,9 @@ async fn s53(run: &mut Run) -> Result<()> {
     let g = held(run, forum, Some(1)).await?;
     ensure!(
         r.text == in_releases && g.text == in_general,
-        "Releases holds {:?}, General {:?}",
-        r.text,
-        g.text
+        "Releases holds {}, General {}",
+        run.describe(&r.text),
+        run.describe(&g.text)
     );
     run.passed("topic: each Topic holds its own Draft");
 
@@ -220,7 +257,11 @@ async fn s53(run: &mut Run) -> Result<()> {
         "reply_to alone answered {saved}"
     );
     let r = held(run, forum, Some(releases as i32)).await?;
-    ensure!(r.text == a_reply, "Releases holds {:?}", r.text);
+    ensure!(
+        r.text == a_reply,
+        "Releases holds {}",
+        run.describe(&r.text)
+    );
     run.passed("reply_to alone picks the reply's Topic");
 
     let in_general_msg = newest_in_topic(&drafter, forum, 1).await?;
@@ -265,7 +306,7 @@ async fn s53(run: &mut Run) -> Result<()> {
         )
         .await?;
     match long {
-        Err(m) if m.contains("4096") && m.contains("not split") => {}
+        Err(m) if m.contains("not split") && named_length(&m).is_some_and(|n| n > 4096) => {}
         other => bail!("a 5400-character Draft: {other:?}"),
     }
     ensure!(
@@ -280,7 +321,8 @@ async fn s53(run: &mut Run) -> Result<()> {
     let listed = drafts(&drafter).await?;
     ensure!(
         listed.first().and_then(|d| d["text"].as_str()) == Some(typed.as_str()),
-        "the newest Draft (typed elsewhere) is not first: {listed:?}"
+        "the newest Draft (typed elsewhere) is not first: {}",
+        summary(run, &listed)
     );
     let dates: Vec<&str> = listed.iter().filter_map(|d| d["date"].as_str()).collect();
     ensure!(
@@ -293,7 +335,8 @@ async fn s53(run: &mut Run) -> Result<()> {
                 .as_str()
                 .unwrap_or("")
                 .starts_with("tgmcp-accept lease ")),
-        "Saved Messages (holding the lease) is not listed with is_self: {listed:?}"
+        "Saved Messages (holding the lease) is not listed with is_self: {}",
+        summary(run, &listed)
     );
     run.passed(
         "get_drafts: newest first, a Draft typed elsewhere included, Saved Messages marked is_self",
@@ -303,11 +346,41 @@ async fn s53(run: &mut Run) -> Result<()> {
     clean_up(run, &drafter, &fixtures).await
 }
 
-async fn save(session: &Session, args: Value) -> Result<Value> {
+async fn save(session: &McpSession, args: Value) -> Result<Value> {
     session.call("save_draft", args).await
 }
 
-async fn drafts(session: &Session) -> Result<Vec<Value>> {
+/// The length the server's "text is N characters once formatted" names.
+fn named_length(message: &str) -> Option<usize> {
+    message
+        .split("text is ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// get_drafts' answer as a report may show it: chat, Topic, length, whose.
+fn summary(run: &Run, drafts: &[Value]) -> String {
+    let lines: Vec<String> = drafts
+        .iter()
+        .map(|d| {
+            format!(
+                "{}{} ({})",
+                d["chat"]["id"].as_str().unwrap_or("?"),
+                d["topic"]
+                    .as_i64()
+                    .map(|t| format!(" topic {t}"))
+                    .unwrap_or_default(),
+                run.describe(d["text"].as_str().unwrap_or_default())
+            )
+        })
+        .collect();
+    format!("[{}]", lines.join("; "))
+}
+
+async fn drafts(session: &McpSession) -> Result<Vec<Value>> {
     let answer = session.call("get_drafts", json!({})).await?;
     Ok(answer["drafts"].as_array().cloned().unwrap_or_default())
 }
@@ -323,40 +396,49 @@ async fn held(run: &Run, chat: &str, topic: Option<i32>) -> Result<SeenDraft> {
 
 fn check_markdown(seen: &SeenDraft) -> Result<()> {
     let want = [
-        ("bold", "Release"),
-        ("italic", "notes"),
-        ("code", "cargo test"),
-        ("text_url", "the PR"),
-        ("pre", "fn main() {}"),
+        (EntityKind::Bold, "Release"),
+        (EntityKind::Italic, "notes"),
+        (EntityKind::Code, "cargo test"),
+        (EntityKind::TextUrl, "the PR"),
+        (EntityKind::Pre, "fn main() {}"),
     ];
     for (kind, words) in want {
         let entity = seen
             .entities
             .iter()
             .find(|e| e.kind == kind)
-            .with_context(|| format!("Telegram holds no {kind} entity ({:?})", seen.entities))?;
+            .with_context(|| {
+                let kinds: Vec<_> = seen.entities.iter().map(|e| e.kind).collect();
+                format!("Telegram holds no {kind:?} entity (it holds {kinds:?})")
+            })?;
         let covered = entity.covers(&seen.text);
         ensure!(
             covered.trim_end_matches('\n') == words,
-            "the {kind} entity covers {covered:?}, not {words:?}"
+            "the {kind:?} entity (offset {}, length {}) doesn't cover {words:?}",
+            entity.offset,
+            entity.length
         );
     }
-    let link = seen.entities.iter().find(|e| e.kind == "text_url");
+    let link = seen.entities.iter().find(|e| e.kind == EntityKind::TextUrl);
     ensure!(
         link.and_then(|l| l.url.as_deref()) == Some("https://github.com/qelphybox/tg-mcp"),
-        "the link goes to {:?}",
+        "the link goes elsewhere: {:?}",
         link.and_then(|l| l.url.clone())
     );
     ensure!(
         !seen.text.contains("**") && !seen.text.contains("```"),
-        "Markdown marks left in the text: {:?}",
-        seen.text
+        "Markdown marks are left in the text Telegram holds"
     );
     Ok(())
 }
 
 /// The newest message `from` sent in `chat`.
-async fn newest_from(session: &Session, chat: &str, from: i64, topic: Option<i64>) -> Result<i64> {
+async fn newest_from(
+    session: &McpSession,
+    chat: &str,
+    from: i64,
+    topic: Option<i64>,
+) -> Result<i64> {
     let mut args = json!({ "chat_id": chat, "limit": 20 });
     if let Some(t) = topic {
         args["topic"] = json!(t);
@@ -376,7 +458,7 @@ async fn newest_from(session: &Session, chat: &str, from: i64, topic: Option<i64
 }
 
 /// The newest message in a forum Topic (1: General).
-async fn newest_in_topic(session: &Session, forum: &str, topic: i64) -> Result<i64> {
+async fn newest_in_topic(session: &McpSession, forum: &str, topic: i64) -> Result<i64> {
     let page = session
         .call(
             "get_messages",
@@ -395,7 +477,7 @@ async fn newest_in_topic(session: &Session, forum: &str, topic: i64) -> Result<i
 /// Clears the Drafts in B and the forum. The Human checks are asked at the
 /// end of the run, so the formatted Draft in G and the reply in A stay until
 /// the person has looked at them.
-async fn clean_up(run: &mut Run, drafter: &Session, fixtures: &Fixtures) -> Result<()> {
+async fn clean_up(run: &mut Run, drafter: &McpSession, fixtures: &Fixtures) -> Result<()> {
     save(drafter, json!({ "chat_id": fixtures.b, "text": "" })).await?;
     for topic in [fixtures.releases, 1] {
         save(

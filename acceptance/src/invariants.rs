@@ -1,4 +1,4 @@
-//! "Never log message content, Tokens, Session keys or Telegram sessions",
+//! "Never log message content, Tokens, McpSession keys or Telegram sessions",
 //! checked after every local and CI run (ADR-0009): nothing the run wrote may
 //! appear in the server's logs or database, no `tgm_` value in its logs, no
 //! Test account name in its database. A hit is never printed, only located.
@@ -149,6 +149,8 @@ pub enum Check {
     Pass,
     Fail(String),
     Skipped(String),
+    /// Telegram limited the account while the run held its lease.
+    Blocked(String),
 }
 
 /// Every invariant over what the harness saw of the server, or each one

@@ -387,7 +387,7 @@ async fn s53_notices_a_lost_entity_and_names_it() {
     let Outcome::Fail(why) = report.outcome() else {
         panic!("a lost bold entity passed: {report}");
     };
-    assert!(why.contains("no bold entity"), "{why}");
+    assert!(why.contains("no Bold entity"), "{why}");
 }
 
 #[tokio::test]
@@ -425,4 +425,26 @@ async fn smoke_names_a_broken_send() {
         panic!("a broken send passed the smoke: {report}");
     };
     assert!(why.contains("send_message"), "{why}");
+}
+
+#[tokio::test]
+async fn an_interlock_stops_every_scenario_after_it() {
+    let stranger = Account {
+        id: 42,
+        first_name: "Not".into(),
+        last_name: None,
+        username: Some("not_the_test_account".into()),
+    };
+    let world = FakeWorld::builder()
+        .login_as(FakeData::new(stranger))
+        .start()
+        .await
+        .unwrap();
+    let report = run::run(
+        world.world.clone(),
+        &[&WRITES, scenarios::find("login").unwrap()],
+    )
+    .await;
+    assert_eq!(report.scenarios.len(), 1, "{report}");
+    assert_eq!(report.not_run, vec!["login"]);
 }

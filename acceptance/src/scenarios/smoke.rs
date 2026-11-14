@@ -53,7 +53,10 @@ async fn smoke(run: &mut Run) -> Result<()> {
     let held = run.world.driver.draft(&a, None).await?;
     ensure!(
         held.as_ref().map(|d| d.text.as_str()) == Some(draft.as_str()),
-        "Telegram holds {held:?} in A"
+        "Telegram holds {} in A",
+        held.as_ref()
+            .map(|d| run.describe(&d.text))
+            .unwrap_or_else(|| "no Draft".into())
     );
     session
         .call("save_draft", json!({ "chat_id": a, "text": "" }))

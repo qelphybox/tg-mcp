@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Result;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use tg_mcp::{
@@ -34,9 +34,9 @@ use zeroize::Zeroizing;
 use crate::{
     fixtures,
     invariants::{LogSource, Observed},
-    world::{Driver, Party, Peer, SeenDraft, SeenEntity, Server, World},
+    world::{Driver, EntityKind, Party, Peer, SeenDraft, SeenEntity, Server, World},
 };
-use tg_mcp::tg::markdown::EntityKind;
+use tg_mcp::tg::markdown::EntityKind as Markdown;
 
 /// The fake Test account's id.
 pub const TEST_ACCOUNT: i64 = 7_000_001;
@@ -146,10 +146,7 @@ pub fn test_account_with_fixtures() -> FakeData {
             summary(FAKE_FORUM, fixtures::FORUM, ChatKind::Supergroup),
             summary(FAKE_G, fixtures::G, ChatKind::Group),
         ])
-        .with_messages(
-            peer,
-            vec![message(1, "tgmcp-accept · fixture A", None, Some(peer))],
-        )
+        .with_messages(peer, vec![message(1, fixtures::A_HELLO, None, Some(peer))])
         .with_messages(FAKE_B, vec![message(2, "hello B", None, None)])
         .with_messages(
             FAKE_FORUM,
@@ -179,7 +176,7 @@ pub fn test_account_with_fixtures() -> FakeData {
         .with_messages(
             FAKE_G,
             (1..=3)
-                .map(|n| message(2 + n, &format!("tgmcp-accept · G message {n}"), None, None))
+                .map(|n| message(2 + n, &fixtures::g_message(n), None, None))
                 .collect(),
         )
         .with_allowed_reactions(FAKE_G, &[fixtures::G_REACTION])
@@ -500,7 +497,7 @@ impl Party for FakeParty {
     }
 
     async fn accept_login(&self, qr_url: &str) -> Result<()> {
-        let token = login_token(qr_url)?;
+        let token = crate::world::login_token(qr_url)?;
         if self.accepts {
             self.accepted
                 .lock()
@@ -530,14 +527,14 @@ impl Driver for FakeParty {
                 .iter()
                 .map(|e| {
                     let (kind, url) = match &e.kind {
-                        EntityKind::Bold => ("bold", None),
-                        EntityKind::Italic => ("italic", None),
-                        EntityKind::Code => ("code", None),
-                        EntityKind::Pre { .. } => ("pre", None),
-                        EntityKind::TextUrl { url } => ("text_url", Some(url.clone())),
+                        Markdown::Bold => (EntityKind::Bold, None),
+                        Markdown::Italic => (EntityKind::Italic, None),
+                        Markdown::Code => (EntityKind::Code, None),
+                        Markdown::Pre { .. } => (EntityKind::Pre, None),
+                        Markdown::TextUrl { url } => (EntityKind::TextUrl, Some(url.clone())),
                     };
                     SeenEntity {
-                        kind: kind.into(),
+                        kind,
                         offset: e.offset as usize,
                         length: e.length as usize,
                         url,
@@ -545,7 +542,7 @@ impl Driver for FakeParty {
                 })
                 .collect();
             if self.misses_bold
-                && let Some(i) = entities.iter().position(|e| e.kind == "bold")
+                && let Some(i) = entities.iter().position(|e| e.kind == EntityKind::Bold)
             {
                 entities.remove(i);
             }
@@ -618,35 +615,5 @@ impl Peer for FakeParty {
 
 /// A chat id as the server issues it, as the fake Telegram names it.
 fn parse_chat(chat: &str) -> Result<ChatId> {
-    use std::str::FromStr;
-    let parsed =
-        tg_mcp::tg::chats::ChatRef::from_str(chat).map_err(|e| anyhow::anyhow!("{chat}: {e}"))?;
-    Ok(parsed.chat())
-}
-
-/// The token of a `tg://login?token=…` URL, as Telegram's apps read it.
-pub fn login_token(qr_url: &str) -> Result<String> {
-    let url = url::Url::parse(qr_url).with_context(|| format!("not a URL: {qr_url}"))?;
-    ensure!(
-        url.scheme() == "tg" && url.host_str() == Some("login"),
-        "not a tg://login URL"
-    );
-    url.query_pairs()
-        .find(|(k, _)| k == "token")
-        .map(|(_, v)| v.into_owned())
-        .filter(|t| !t.is_empty())
-        .context("tg://login URL without a token")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_the_token_of_a_login_url() {
-        assert_eq!(login_token("tg://login?token=AbC-_9").unwrap(), "AbC-_9");
-        assert!(login_token("tg://resolve?domain=x").is_err());
-        assert!(login_token("tg://login?token=").is_err());
-        assert!(login_token("nonsense").is_err());
-    }
+    Ok(crate::world::chat_ref(chat)?.chat())
 }

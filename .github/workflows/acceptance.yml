@@ -2,8 +2,9 @@
 # Telegram, with the server started on the runner through the Acceptance app.
 # Cloud agent sessions can't reach Telegram, so they run it here.
 #
-# Runs only when asked: a dispatch (scenario ids as input) or a PR labelled
-# `accept`. Each run logs the Test account in, so never on every push.
+# Runs only when asked: a dispatch (scenario ids as input), or labelling a PR
+# `accept` (remove and add the label to run it again). Each run logs the Test
+# account in, so never on a push.
 name: acceptance
 
 on:
@@ -14,11 +15,11 @@ on:
         required: false
         default: ""
   pull_request:
-    types: [labeled, synchronize, reopened]
+    types: [labeled]
 
 jobs:
   accept:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'accept')
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'accept'
     runs-on: ubuntu-latest
     # The Test account's and the Peer's logins live only in this environment;
     # a fork's PR gets none of them.

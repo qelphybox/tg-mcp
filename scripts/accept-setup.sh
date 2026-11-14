@@ -251,20 +251,30 @@ pause "Both accounts exist and have usernames? Press Enter"
 stage "The Acceptance app"
 say "A Telegram app of its own, on the Test account's number: if Telegram limits it,"
 say "production's app and the Built-in app are untouched (ADR-0007, ADR-0009)."
-open_url "https://my.telegram.org/apps"
-step "Log in with the Test account's phone number (the code arrives in Telegram)."
-step "API development tools → create an application (title e.g. 'tg-mcp acceptance')."
-step "Copy App api_id and App api_hash."
-ask TG_ACCEPT_API_ID "App api_id:"
-ask_secret TG_ACCEPT_API_HASH "App api_hash (hidden):"
-write_env TG_ACCEPT_API_ID "$TG_ACCEPT_API_ID"
-write_env TG_ACCEPT_API_HASH "$TG_ACCEPT_API_HASH"
+if done_key TG_ACCEPT_API_ID && done_key TG_ACCEPT_API_HASH && ! confirm "The Acceptance app is saved already. Enter it again?"; then
+  note "kept the Acceptance app"
+else
+  open_url "https://my.telegram.org/apps"
+  step "Log in with the Test account's phone number (the code arrives in Telegram)."
+  step "API development tools → create an application (title e.g. 'tg-mcp acceptance')."
+  step "Copy App api_id and App api_hash."
+  ask TG_ACCEPT_API_ID "App api_id:"
+  ask_secret TG_ACCEPT_API_HASH "App api_hash (hidden):"
+  write_env TG_ACCEPT_API_ID "$TG_ACCEPT_API_ID"
+  write_env TG_ACCEPT_API_HASH "$TG_ACCEPT_API_HASH"
+fi
+pause "Press Enter to continue"
 
 stage "The Test account's Cloud password"
 say "Every run types it on the login page, so two-step verification is always checked."
-step "Test account: Settings → Privacy and Security → Two-Step Verification → set a password."
-ask_secret TG_ACCEPT_CLOUD_PASSWORD "That password (hidden):"
-write_env TG_ACCEPT_CLOUD_PASSWORD "$TG_ACCEPT_CLOUD_PASSWORD"
+if done_key TG_ACCEPT_CLOUD_PASSWORD && ! confirm "The Cloud password is saved already. Enter it again?"; then
+  note "kept the Cloud password (stage 7 checks it with a login)"
+else
+  step "Test account: Settings → Privacy and Security → Two-Step Verification → set a password."
+  ask_secret TG_ACCEPT_CLOUD_PASSWORD "That password (hidden):"
+  write_env TG_ACCEPT_CLOUD_PASSWORD "$TG_ACCEPT_CLOUD_PASSWORD"
+fi
+pause "Press Enter to continue"
 
 stage "The Driver: the harness's login to the Test account"
 say "It stands in for your phone: it accepts QR logins and reads what Telegram holds."

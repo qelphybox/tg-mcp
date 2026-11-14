@@ -104,6 +104,9 @@ pub struct Held {
     driver: Arc<dyn Driver>,
     run_id: String,
     renewer: JoinHandle<()>,
+    /// Why renewing stopped, if it did: renewal never retries around a
+    /// failure (a FLOOD_WAIT above all), it stops and the run reports it.
+    failed: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
 }
 
 /// Takes the lease for `run_id`, waiting for another run's to end or expire.
@@ -125,13 +128,18 @@ pub async fn take(driver: Arc<dyn Driver>, run_id: &str, terms: Terms) -> Result
             Decision::Held(other) => wait_or_give_up(started, terms, &other).await?,
         }
     }
+    let failed = Arc::new(std::sync::Mutex::new(None));
     let renewer = {
         let driver = driver.clone();
         let run_id = run_id.to_string();
+        let failed = failed.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(terms.renew_every()).await;
-                let _ = write(driver.as_ref(), &run_id, terms).await;
+                if let Err(e) = write(driver.as_ref(), &run_id, terms).await {
+                    *failed.lock().unwrap() = Some(e.context("renewing the lease"));
+                    return;
+                }
             }
         })
     };
@@ -139,6 +147,7 @@ pub async fn take(driver: Arc<dyn Driver>, run_id: &str, terms: Terms) -> Result
         driver,
         run_id: run_id.to_string(),
         renewer,
+        failed,
     })
 }
 
@@ -167,9 +176,13 @@ impl Held {
         &self.run_id
     }
 
-    /// Stops renewing and clears the lease if it is still ours.
+    /// Stops renewing and clears the lease if it is still ours. Fails with
+    /// why renewing stopped, if it did.
     pub async fn release(self) -> Result<()> {
         self.renewer.abort();
+        if let Some(e) = self.failed.lock().unwrap().take() {
+            return Err(e);
+        }
         let draft = self.driver.saved_draft().await?;
         if draft
             .as_deref()
@@ -235,6 +248,64 @@ mod tests {
         );
         assert_eq!(decide(None, "mine", 100), Decision::Take);
         assert_eq!(decide(Some("a note"), "mine", 100), Decision::Take);
+    }
+
+    /// A Driver whose Saved Messages takes one write, then Telegram floods.
+    struct FloodsAfterOne(std::sync::Mutex<(u32, Option<String>)>);
+
+    #[async_trait::async_trait]
+    impl crate::world::Party for FloodsAfterOne {
+        async fn account_id(&self) -> Result<i64> {
+            Ok(1)
+        }
+        async fn accept_login(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for FloodsAfterOne {
+        async fn saved_draft(&self) -> Result<Option<String>> {
+            Ok(self.0.lock().unwrap().1.clone())
+        }
+        async fn set_saved_draft(&self, text: &str) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.0 += 1;
+            if state.0 > 1 {
+                return Err(crate::blocked::rpc(420, "FLOOD_WAIT", Some(9))
+                    .unwrap()
+                    .into());
+            }
+            state.1 = Some(text.to_string());
+            Ok(())
+        }
+        async fn draft(&self, _: &str, _: Option<i32>) -> Result<Option<crate::world::SeenDraft>> {
+            Ok(None)
+        }
+        async fn type_draft(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str, _: i64) -> Result<()> {
+            Ok(())
+        }
+        async fn server_sessions_since(&self, _: i64) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_while_renewing_stops_renewal_and_is_reported() {
+        let driver = Arc::new(FloodsAfterOne(std::sync::Mutex::new((0, None))));
+        let terms = Terms {
+            ttl: Duration::from_millis(30),
+            wait: Duration::from_millis(10),
+            poll: Duration::from_millis(5),
+        };
+        let held = take(driver.clone(), "mine", terms).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let err = held.release().await.unwrap_err();
+        assert!(crate::blocked::find(&err).is_some(), "{err:#}");
+        assert_eq!(driver.0.lock().unwrap().0, 2, "no retry after the flood");
     }
 
     #[test]

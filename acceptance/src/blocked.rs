@@ -42,7 +42,7 @@ pub fn rpc(code: i32, name: &str, value: Option<u32>) -> Option<Blocked> {
         ),
         "USER_RESTRICTED" => "Telegram restricted the account (USER_RESTRICTED)".into(),
         _ if code == 401 => format!(
-            "the harness's own login is no longer valid ({name}): log in again with `cargo accept login driver|peer`"
+            "the harness's own login is no longer valid ({name}): log in again with `cargo accept sign-in driver|peer`"
         ),
         _ => return None,
     };
