@@ -150,7 +150,7 @@ summary:hover{color:#FFFFFF}
      "name": "Это бесплатно? Нужен API-ключ или бот?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "Бесплатно: без регистрации, без оплаты и без API-ключа. Сервер входит в ваш собственный аккаунт по QR-коду, как Telegram Desktop, и работает с вашими настоящими чатами, а не с чатами бота. Свой app id с my.telegram.org нужен, только если вы запускаете собственную копию."
+      "text": "Бесплатно: без регистрации, без оплаты и без API-ключа. Сервер входит в ваш собственный аккаунт по QR-коду, как Telegram Desktop, и работает с вашими настоящими чатами, а не с чатами бота."
      }
     },
     {
@@ -437,16 +437,12 @@ GitHub
 </div>
 <ul style="margin: 56px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 0 48px">
 <li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Открытый код, MIT.</strong><span style="color: #B4A9C4">Бесплатно и навсегда. Код можно читать, форкать и запускать.</span><a href="https://github.com/qelphybox/tg-mcp" style="align-self: flex-start; padding: 8px 0">github.com/qelphybox/tg-mcp</a></li>
-<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Своя копия одной командой.</strong><span style="color: #B4A9C4">Готовые образы для amd64 и arm64 собираются из каждого релизного тега. Ничего не нужно компилировать.</span></li>
-<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Деплой на виду.</strong><span style="color: #B4A9C4">Публичный сервер разворачивается из публичной ветки main через GitHub Actions, логи сборки открыты. Доказать, что именно запущено на сервере, не может никто; ответ на это — своя копия.</span><a href="https://github.com/qelphybox/tg-mcp/actions" style="align-self: flex-start; padding: 8px 0">Смотреть деплои</a></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Своя копия одной командой.</strong><span style="color: #B4A9C4">Образ на 15 МБ для amd64 и arm64 на Docker Hub, собирается из каждого релизного тега. Без настройки и без app id: он входит через встроенное Telegram-приложение.</span></li>
+<li style="padding: 22px 0; border-top: 1px solid rgba(241,236,247,.1); display: flex; flex-direction: column; gap: 6px"><strong style="font-size: 18px">Деплой на виду.</strong><span style="color: #B4A9C4">Публичный сервер разворачивается из публичной ветки main через GitHub Actions, логи сборки открыты. Он собирается из того же Dockerfile, что и образ, который запускаете вы. Доказать, что именно запущено на сервере, не может никто; ответ на это — своя копия.</span><a href="https://github.com/qelphybox/tg-mcp/actions" style="align-self: flex-start; padding: 8px 0">Смотреть деплои</a></li>
 </ul>
-<pre style="margin: 32px 0 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 14px; padding: 20px 22px; font-size: 13.5px; line-height: 1.75; color: #F1ECF7; white-space: pre-wrap; word-break: break-word">docker run -d --name tg-mcp --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data \
-  -e TG_MCP_PUBLIC_URL=https://tg.example.com \
-  -e TG_MCP_DB_PATH=/data/tg-mcp.db \
-  -e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash \
-  ghcr.io/qelphybox/tg-mcp:latest</pre>
-<p style="margin: 14px 0 0; font-size: 14.5px; color: #8C809E">Нужен HTTPS на публичном домене и свой app id с <a href="https://my.telegram.org/apps">my.telegram.org</a>. <a href="https://github.com/qelphybox/tg-mcp#self-hosting" hreflang="en">Полное руководство (на английском)</a></p>
+<pre style="margin: 32px 0 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 14px; padding: 20px 22px; font-size: 13.5px; line-height: 1.75; color: #F1ECF7; white-space: pre-wrap; word-break: break-word">docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data qelphybox/tg-mcp
+claude mcp add --transport http telegram http://localhost:8080/mcp</pre>
+<p style="margin: 14px 0 0; font-size: 14.5px; color: #8C809E">Для Claude Code и Cursor хватит localhost. claude.ai и Claude desktop нужен HTTPS на публичном домене: профиль <code>https</code> из <code>compose.yaml</code> в репозитории включает его на VPS с доменом. <a href="https://github.com/qelphybox/tg-mcp#self-hosting" hreflang="en">Полное руководство (на английском)</a></p>
 </section>
 
 <section id="faq" style="max-width: 1240px; margin: 0 auto; padding: 104px 32px 104px; display: flex; flex-wrap: wrap; gap: 24px 64px">
@@ -462,7 +458,7 @@ GitHub
 </details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
 <summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Это бесплатно? Нужен API-ключ или бот?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
-<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Бесплатно: без регистрации, без оплаты и без API-ключа. Сервер входит в ваш собственный аккаунт по QR-коду, как Telegram Desktop, и работает с вашими настоящими чатами, а не с чатами бота. Свой app id с my.telegram.org нужен, только если вы запускаете собственную копию.</p>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Бесплатно: без регистрации, без оплаты и без API-ключа. Сервер входит в ваш собственный аккаунт по QR-коду, как Telegram Desktop, и работает с вашими настоящими чатами, а не с чатами бота.</p>
 </details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
 <summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Чем он отличается от других MCP-серверов для Telegram?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>

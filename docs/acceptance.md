@@ -1330,6 +1330,6 @@ Needs Docker, Claude Code, a Telegram account, and for step 3 a VPS with a domai
 
 4. **Your own app.** With the container of step 1 removed, the step 1 `docker run` with `-e TG_MCP_API_ID=<yours> -e TG_MCP_API_HASH=<yours>` added: the log says `source=env api_id=<yours>`, and a new login shows your app's title in Telegram → Settings → Devices.
 
-5. **The landing page.** On `https://tgmcp.dev`, the "Don't trust. Verify." section shows the one-line `docker run` and `claude mcp add`, says localhost is enough for Claude Code and Cursor and that claude.ai needs HTTPS (compose), and nowhere asks for an app id from my.telegram.org (the FAQ included); at 320 px wide nothing scrolls sideways (`node tests/site/landing-check.cjs` passes). Once the Russian page is live (#121, which got the matching changes as a review comment), `/ru/` says the same.
+5. **The landing page.** On `https://tgmcp.dev`, the "Don't trust. Verify." section shows the one-line `docker run` and `claude mcp add`, says localhost is enough for Claude Code and Cursor and that claude.ai needs HTTPS (compose), and nowhere asks for an app id from my.telegram.org (the FAQ included); at 320 px wide nothing scrolls sideways (`node tests/site/landing-check.cjs` passes). The Russian page (`/ru/`) says the same (`node tests/site/landing-check.cjs site /ru/` passes too).
 
 6. **No stale instruction.** `grep -rn -i "app id\|my.telegram" README.md site/ docs/deploy.md .env.example` finds the own-app option, other servers' setup (FAQ) and production's own secrets only, never "required".
