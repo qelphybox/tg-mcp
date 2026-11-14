@@ -21,6 +21,7 @@ Rust (latest stable), tokio, axum, rmcp (MCP), grammers (Telegram, version pinne
 - Telegram's `FLOOD_WAIT` is honoured, never retried around.
 - The Session key is never persisted in plaintext (ADR-0003). Anything that would need it without a Token is a design bug.
 - Repo artifacts (code, comments, issues, docs) are in English.
+- Acceptance runs only against the Test account (ADR-0009). Never use a Telegram connector attached to your own session (e.g. `mcp__Telegram__*`) to check a feature: it is the maintainer's real Account.
 
 ## Agent skills
 
