@@ -77,20 +77,17 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 
 ## Self-hosting
 
-You need a server with HTTPS on a public hostname (OAuth requires it) and your own Telegram app:
-
-1. Register an app at [my.telegram.org/apps](https://my.telegram.org/apps) → note `api_id` and `api_hash`. Please keep "Unofficial" in its title.
-2. Run the image behind a TLS-terminating reverse proxy that forwards the `Host` header:
+You need a server with HTTPS on a public hostname (OAuth requires it). Run the image behind a TLS-terminating reverse proxy that forwards the `Host` header:
 
 ```sh
 docker run -d --name tg-mcp --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -v tg-mcp-data:/data \
   -e TG_MCP_PUBLIC_URL=https://tg.example.com \
-  -e TG_MCP_API_ID=123456 \
-  -e TG_MCP_API_HASH=your_api_hash \
   ghcr.io/qelphybox/tg-mcp:latest
 ```
+
+Release images from v0.3.0 on log in to Telegram through a built-in Telegram app ([ADR-0007](docs/adr/0007-built-in-telegram-app-in-official-images.md)). To use your own instead, register one at [my.telegram.org/apps](https://my.telegram.org/apps) (please keep "Unofficial" in its title) and add `-e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash`. An image you build yourself without the build secrets needs them.
 
 If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's.
 

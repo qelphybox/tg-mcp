@@ -23,8 +23,9 @@ pub struct Config {
     pub fake_telegram: bool,
     /// SQLite database file of the Session vault.
     pub db_path: PathBuf,
-    /// Our Telegram app (my.telegram.org). Required unless `fake_telegram`.
-    pub telegram_app: Option<AppCredentials>,
+    /// The Telegram app logins go through: from env, else the Built-in app.
+    /// Required unless `fake_telegram`.
+    pub telegram_app: Option<TelegramApp>,
     /// How long an unused Live client stays connected.
     pub live_client_idle_ttl: Duration,
     /// Per-Account request budget and FLOOD_WAIT handling.
@@ -34,6 +35,75 @@ pub struct Config {
     /// Experimental, off by default (#58 prototype): get_media takes mode
     /// `document` and lists it in its schema and description.
     pub experimental_documents: bool,
+}
+
+/// Where the Telegram app came from (ADR-0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAppSource {
+    /// `TG_MCP_API_ID` and `TG_MCP_API_HASH`.
+    Env,
+    /// Compiled into the binary: the Built-in app of the official images.
+    Builtin,
+}
+
+impl fmt::Display for TelegramAppSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Env => "env",
+            Self::Builtin => "builtin",
+        })
+    }
+}
+
+/// A Telegram app and where it came from.
+#[derive(Debug, Clone)]
+pub struct TelegramApp {
+    pub credentials: AppCredentials,
+    pub source: TelegramAppSource,
+}
+
+/// The Built-in app's api_id (ADR-0007), read at compile time from the optional
+/// build variable `TG_MCP_BUILTIN_API_ID`; the official images get it (and
+/// `TG_MCP_BUILTIN_API_HASH`) from CI secrets through a BuildKit secret mount.
+/// A value that isn't a number fails the build, not the server's start.
+const BUILTIN_API_ID: Option<i32> = match option_env!("TG_MCP_BUILTIN_API_ID") {
+    Some(id) => parse_builtin_api_id(id),
+    None => None,
+};
+
+/// Digits, ignoring surrounding whitespace; empty is none.
+const fn parse_builtin_api_id(id: &str) -> Option<i32> {
+    let bytes = id.as_bytes();
+    let (mut i, mut value, mut digits) = (0, 0i32, 0);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            value = match value.checked_mul(10) {
+                Some(v) => match v.checked_add((b - b'0') as i32) {
+                    Some(v) => v,
+                    None => panic!("TG_MCP_BUILTIN_API_ID is too large"),
+                },
+                None => panic!("TG_MCP_BUILTIN_API_ID is too large"),
+            };
+            digits += 1;
+        } else if !b.is_ascii_whitespace()
+            || digits > 0 && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit()
+        {
+            panic!("TG_MCP_BUILTIN_API_ID must be a number");
+        }
+        i += 1;
+    }
+    if digits == 0 { None } else { Some(value) }
+}
+
+/// The Built-in app, if this build has one. `cargo build` and forks don't.
+fn builtin_app() -> Option<AppCredentials> {
+    let api_id = BUILTIN_API_ID?;
+    let hash = option_env!("TG_MCP_BUILTIN_API_HASH")?.trim();
+    (!hash.is_empty()).then(|| AppCredentials {
+        api_id,
+        api_hash: hash.to_string(),
+    })
 }
 
 /// Where the public URL came from.
@@ -176,11 +246,15 @@ fn resolve_public_url(
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        Self::from_lookup(|key| std::env::var(key).ok(), builtin_app())
     }
 
-    /// Same as [`Config::from_env`], with an injectable variable source for tests.
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+    /// Same as [`Config::from_env`], with an injectable variable source and
+    /// Built-in app for tests.
+    pub fn from_lookup(
+        get: impl Fn(&str) -> Option<String>,
+        builtin: Option<AppCredentials>,
+    ) -> anyhow::Result<Self> {
         // Set but empty (or blank) is unset: platforms and compose files fill these in.
         let get_nonempty = |key: &str| {
             get(key)
@@ -195,17 +269,30 @@ impl Config {
             .unwrap_or_else(|| "tg-mcp.db".into())
             .into();
 
-        let telegram_app = match (get("TG_MCP_API_ID"), get("TG_MCP_API_HASH")) {
-            (Some(id), Some(hash)) if !id.is_empty() && !hash.is_empty() => Some(AppCredentials {
-                api_id: id
-                    .trim()
-                    .parse()
-                    .context("TG_MCP_API_ID must be a number")?,
-                api_hash: hash.trim().to_string(),
+        let env_id = get_nonempty("TG_MCP_API_ID");
+        let env_hash = get_nonempty("TG_MCP_API_HASH");
+        if env_id.is_some() != env_hash.is_some() {
+            tracing::warn!(
+                "only one of TG_MCP_API_ID and TG_MCP_API_HASH is set: both are needed, so it is ignored"
+            );
+        }
+        let telegram_app = match (env_id, env_hash, builtin) {
+            (Some(id), Some(hash), _) => Some(TelegramApp {
+                credentials: AppCredentials {
+                    api_id: id.parse().context("TG_MCP_API_ID must be a number")?,
+                    api_hash: hash,
+                },
+                source: TelegramAppSource::Env,
+            }),
+            (_, _, Some(credentials)) => Some(TelegramApp {
+                credentials,
+                source: TelegramAppSource::Builtin,
             }),
             _ if fake_telegram => None,
             _ => bail!(
-                "TG_MCP_API_ID and TG_MCP_API_HASH are required (or TG_MCP_FAKE_TELEGRAM=1 for development)"
+                "no Telegram app: set TG_MCP_API_ID and TG_MCP_API_HASH (register one at \
+                 https://my.telegram.org/apps), or run the official image, which has a \
+                 built-in one (TG_MCP_FAKE_TELEGRAM=1 for development)"
             ),
         };
         let live_client_idle_ttl = Duration::from_secs(
@@ -333,50 +420,60 @@ mod tests {
 
     #[test]
     fn telegram_credentials_are_required_unless_faked() {
-        assert!(Config::from_lookup(env(&[])).is_err());
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_API_ID", "12345"),
-            ("TG_MCP_API_HASH", "abcdef"),
-        ]))
+        assert!(Config::from_lookup(env(&[]), None).is_err());
+        let config = Config::from_lookup(
+            env(&[("TG_MCP_API_ID", "12345"), ("TG_MCP_API_HASH", "abcdef")]),
+            None,
+        )
         .unwrap();
-        assert_eq!(config.telegram_app.unwrap().api_id, 12345);
+        assert_eq!(config.telegram_app.unwrap().credentials.api_id, 12345);
         assert!(
-            Config::from_lookup(env(&[("TG_MCP_API_ID", "x"), ("TG_MCP_API_HASH", "y")])).is_err()
+            Config::from_lookup(
+                env(&[("TG_MCP_API_ID", "x"), ("TG_MCP_API_HASH", "y")]),
+                None
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn limits_come_from_env_and_reject_zero() {
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("TG_MCP_ACCOUNT_REQUESTS_PER_MINUTE", "30"),
-        ]))
+        let config = Config::from_lookup(
+            env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_ACCOUNT_REQUESTS_PER_MINUTE", "30"),
+            ]),
+            None,
+        )
         .unwrap();
         assert_eq!(config.limits.per_minute, 30);
         assert_eq!(config.limits.burst, LimitsConfig::default().burst);
         assert!(
-            Config::from_lookup(env(&[
-                ("TG_MCP_FAKE_TELEGRAM", "1"),
-                ("TG_MCP_ACCOUNT_BURST", "0")
-            ]))
+            Config::from_lookup(
+                env(&[("TG_MCP_FAKE_TELEGRAM", "1"), ("TG_MCP_ACCOUNT_BURST", "0")]),
+                None
+            )
             .is_err()
         );
     }
 
     #[test]
     fn write_limits_default_to_adr_0005_and_come_from_env() {
-        let limits = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]))
+        let limits = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]), None)
             .unwrap()
             .limits;
         assert_eq!(
             (limits.writes_per_10_min, limits.sends_per_chat_per_minute),
             (20, 5)
         );
-        let limits = Config::from_lookup(env(&[
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("TG_MCP_ACCOUNT_WRITES_PER_10_MIN", "40"),
-            ("TG_MCP_CHAT_SENDS_PER_MINUTE", "2"),
-        ]))
+        let limits = Config::from_lookup(
+            env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_ACCOUNT_WRITES_PER_10_MIN", "40"),
+                ("TG_MCP_CHAT_SENDS_PER_MINUTE", "2"),
+            ]),
+            None,
+        )
         .unwrap()
         .limits;
         assert_eq!(
@@ -389,7 +486,8 @@ mod tests {
         ] {
             for bad in ["0", "-1", "five"] {
                 assert!(
-                    Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, bad)])).is_err(),
+                    Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, bad)]), None)
+                        .is_err(),
                     "{key}={bad}"
                 );
             }
@@ -398,7 +496,7 @@ mod tests {
 
     #[test]
     fn oauth_limits_default_to_the_brief_and_come_from_env() {
-        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")])).unwrap();
+        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]), None).unwrap();
         let limits = config.oauth_limits;
         assert!(!limits.trust_forwarded_for);
         assert_eq!(
@@ -411,15 +509,18 @@ mod tests {
         assert_eq!(limits.max_pending_logins, 50);
         assert_eq!(limits.max_pending_logins_per_client, 3);
 
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("TG_MCP_TRUST_FORWARDED_FOR", "1"),
-            ("TG_MCP_AUTHORIZE_PER_MINUTE", "20"),
-            ("TG_MCP_TOKEN_BURST", "3"),
-            ("TG_MCP_MEDIA_PER_MINUTE", "12"),
-            ("TG_MCP_MAX_PENDING_LOGINS", "7"),
-            ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "2"),
-        ]))
+        let config = Config::from_lookup(
+            env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_TRUST_FORWARDED_FOR", "1"),
+                ("TG_MCP_AUTHORIZE_PER_MINUTE", "20"),
+                ("TG_MCP_TOKEN_BURST", "3"),
+                ("TG_MCP_MEDIA_PER_MINUTE", "12"),
+                ("TG_MCP_MAX_PENDING_LOGINS", "7"),
+                ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "2"),
+            ]),
+            None,
+        )
         .unwrap();
         let limits = config.oauth_limits;
         assert!(limits.trust_forwarded_for);
@@ -429,17 +530,20 @@ mod tests {
         assert_eq!(limits.max_pending_logins, 7);
         assert_eq!(limits.max_pending_logins_per_client, 2);
         assert!(
-            Config::from_lookup(env(&[
-                ("TG_MCP_FAKE_TELEGRAM", "1"),
-                ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "0")
-            ]))
+            Config::from_lookup(
+                env(&[
+                    ("TG_MCP_FAKE_TELEGRAM", "1"),
+                    ("TG_MCP_MAX_PENDING_LOGINS_PER_IP", "0")
+                ]),
+                None
+            )
             .is_err()
         );
     }
 
     #[test]
     fn defaults_are_local() {
-        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")])).unwrap();
+        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]), None).unwrap();
         assert_eq!(config.bind.to_string(), "0.0.0.0:8080");
         assert_eq!(config.public_url.to_string(), "http://localhost:8080/");
         assert!(config.fake_telegram);
@@ -450,10 +554,13 @@ mod tests {
     #[test]
     fn experimental_documents_are_off_unless_set() {
         let on = |value: &str| {
-            Config::from_lookup(env(&[
-                ("TG_MCP_FAKE_TELEGRAM", "1"),
-                ("TG_MCP_EXPERIMENTAL_DOCUMENTS", value),
-            ]))
+            Config::from_lookup(
+                env(&[
+                    ("TG_MCP_FAKE_TELEGRAM", "1"),
+                    ("TG_MCP_EXPERIMENTAL_DOCUMENTS", value),
+                ]),
+                None,
+            )
             .unwrap()
             .experimental_documents
         };
@@ -465,10 +572,13 @@ mod tests {
 
     #[test]
     fn public_host_is_allowed() {
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_PUBLIC_URL", "https://tg.example.com"),
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-        ]))
+        let config = Config::from_lookup(
+            env(&[
+                ("TG_MCP_PUBLIC_URL", "https://tg.example.com"),
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+            ]),
+            None,
+        )
         .unwrap();
         assert!(
             config
@@ -480,10 +590,10 @@ mod tests {
     #[test]
     fn relative_public_url_is_rejected() {
         assert!(
-            Config::from_lookup(env(&[
-                ("TG_MCP_PUBLIC_URL", "/mcp"),
-                ("TG_MCP_FAKE_TELEGRAM", "1")
-            ]))
+            Config::from_lookup(
+                env(&[("TG_MCP_PUBLIC_URL", "/mcp"), ("TG_MCP_FAKE_TELEGRAM", "1")]),
+                None
+            )
             .is_err()
         );
     }
@@ -493,7 +603,10 @@ mod tests {
         let bind = |pairs: &[(&str, &str)]| {
             let mut all = vec![("TG_MCP_FAKE_TELEGRAM", "1")];
             all.extend_from_slice(pairs);
-            Config::from_lookup(env(&all)).unwrap().bind.to_string()
+            Config::from_lookup(env(&all), None)
+                .unwrap()
+                .bind
+                .to_string()
         };
         assert_eq!(bind(&[]), "0.0.0.0:8080");
         assert_eq!(bind(&[("PORT", "9000")]), "0.0.0.0:9000");
@@ -507,8 +620,9 @@ mod tests {
     #[test]
     fn a_port_that_is_not_a_port_number_is_rejected() {
         for bad in ["http", "0", "65536", "-1", "+9000", "80 80"] {
-            let err = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), ("PORT", bad)]))
-                .unwrap_err();
+            let err =
+                Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), ("PORT", bad)]), None)
+                    .unwrap_err();
             assert!(format!("{err:#}").contains("PORT"), "PORT={bad}: {err:#}");
         }
     }
@@ -543,7 +657,8 @@ mod tests {
         ];
         for (key, value, url, platform) in cases {
             let config =
-                Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, value)])).unwrap();
+                Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, value)]), None)
+                    .unwrap();
             assert_eq!(config.base_url(), url, "{key}");
             assert_eq!(
                 config.public_url_source,
@@ -553,25 +668,29 @@ mod tests {
             let host = url.trim_start_matches("https://").to_string();
             assert!(config.allowed_hosts().contains(&host), "{key}");
 
-            let config = Config::from_lookup(env(&[
-                ("TG_MCP_FAKE_TELEGRAM", "1"),
-                ("TG_MCP_PUBLIC_URL", "https://tg.example.com"),
-                (key, value),
-            ]))
+            let config = Config::from_lookup(
+                env(&[
+                    ("TG_MCP_FAKE_TELEGRAM", "1"),
+                    ("TG_MCP_PUBLIC_URL", "https://tg.example.com"),
+                    (key, value),
+                ]),
+                None,
+            )
             .unwrap();
             assert_eq!(config.base_url(), "https://tg.example.com", "{key}");
             assert_eq!(config.public_url_source, PublicUrlSource::Explicit);
             assert!(!config.allowed_hosts().contains(&host), "{key}");
 
             let config =
-                Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, "")])).unwrap();
+                Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1"), (key, "")]), None)
+                    .unwrap();
             assert_eq!(config.public_url_source, PublicUrlSource::Default, "{key}");
         }
     }
 
     #[test]
     fn without_any_the_public_url_is_localhost() {
-        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")])).unwrap();
+        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]), None).unwrap();
         assert_eq!(config.base_url(), "http://localhost:8080");
         assert_eq!(config.public_url_source, PublicUrlSource::Default);
         assert_eq!(
@@ -594,10 +713,13 @@ mod tests {
             "[::1]",
             "x..up.railway.app",
         ] {
-            let err = Config::from_lookup(env(&[
-                ("TG_MCP_FAKE_TELEGRAM", "1"),
-                ("RAILWAY_PUBLIC_DOMAIN", bad),
-            ]))
+            let err = Config::from_lookup(
+                env(&[
+                    ("TG_MCP_FAKE_TELEGRAM", "1"),
+                    ("RAILWAY_PUBLIC_DOMAIN", bad),
+                ]),
+                None,
+            )
             .unwrap_err();
             assert!(
                 format!("{err:#}").contains("RAILWAY_PUBLIC_DOMAIN"),
@@ -608,38 +730,119 @@ mod tests {
 
     #[test]
     fn with_several_platforms_the_first_in_documented_order_wins() {
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("KOYEB_PUBLIC_DOMAIN", "t-me.koyeb.app"),
-            ("FLY_APP_NAME", "t"),
-            ("RENDER_EXTERNAL_HOSTNAME", "t.onrender.com"),
-            ("RAILWAY_PUBLIC_DOMAIN", "t.up.railway.app"),
-        ]))
+        let config = Config::from_lookup(
+            env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("KOYEB_PUBLIC_DOMAIN", "t-me.koyeb.app"),
+                ("FLY_APP_NAME", "t"),
+                ("RENDER_EXTERNAL_HOSTNAME", "t.onrender.com"),
+                ("RAILWAY_PUBLIC_DOMAIN", "t.up.railway.app"),
+            ]),
+            None,
+        )
         .unwrap();
         assert_eq!(config.base_url(), "https://t.up.railway.app");
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("KOYEB_PUBLIC_DOMAIN", "t-me.koyeb.app"),
-            ("FLY_APP_NAME", "t"),
-        ]))
+        let config = Config::from_lookup(
+            env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("KOYEB_PUBLIC_DOMAIN", "t-me.koyeb.app"),
+                ("FLY_APP_NAME", "t"),
+            ]),
+            None,
+        )
         .unwrap();
         assert_eq!(config.base_url(), "https://t.fly.dev");
     }
 
     #[test]
     fn empty_bind_and_public_url_are_unset() {
-        let config = Config::from_lookup(env(&[
-            ("TG_MCP_FAKE_TELEGRAM", "1"),
-            ("TG_MCP_BIND", ""),
-            ("TG_MCP_PUBLIC_URL", " "),
-            ("PORT", "9000"),
-            ("FLY_APP_NAME", "t"),
-        ]))
+        let config = Config::from_lookup(
+            env(&[
+                ("TG_MCP_FAKE_TELEGRAM", "1"),
+                ("TG_MCP_BIND", ""),
+                ("TG_MCP_PUBLIC_URL", " "),
+                ("PORT", "9000"),
+                ("FLY_APP_NAME", "t"),
+            ]),
+            None,
+        )
         .unwrap();
         assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
         assert_eq!(
             config.public_url_source,
             PublicUrlSource::Platform(Platform::Fly)
         );
+    }
+
+    fn builtin() -> Option<AppCredentials> {
+        Some(AppCredentials {
+            api_id: 777,
+            api_hash: "builtin-hash".into(),
+        })
+    }
+
+    #[test]
+    fn env_credentials_beat_the_builtin_app() {
+        let config = Config::from_lookup(
+            env(&[("TG_MCP_API_ID", "12345"), ("TG_MCP_API_HASH", "abcdef")]),
+            builtin(),
+        )
+        .unwrap();
+        let app = config.telegram_app.unwrap();
+        let credentials = &app.credentials;
+        assert_eq!(
+            (credentials.api_id, credentials.api_hash.as_str()),
+            (12345, "abcdef")
+        );
+        assert_eq!(app.source, TelegramAppSource::Env);
+    }
+
+    #[test]
+    fn the_builtin_app_is_used_when_env_is_absent_or_empty() {
+        for pairs in [
+            &[][..],
+            &[("TG_MCP_API_ID", ""), ("TG_MCP_API_HASH", "")][..],
+            &[("TG_MCP_API_ID", "12345")][..],
+        ] {
+            let app = Config::from_lookup(env(pairs), builtin())
+                .unwrap()
+                .telegram_app
+                .unwrap();
+            assert_eq!(app.credentials.api_id, 777, "{pairs:?}");
+            assert_eq!(app.source, TelegramAppSource::Builtin, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn fake_telegram_needs_no_telegram_app() {
+        let config = Config::from_lookup(env(&[("TG_MCP_FAKE_TELEGRAM", "1")]), None).unwrap();
+        assert!(config.telegram_app.is_none());
+    }
+
+    #[test]
+    fn without_any_telegram_app_the_error_names_both_ways_out() {
+        let err = format!("{:#}", Config::from_lookup(env(&[]), None).unwrap_err());
+        assert!(err.contains("TG_MCP_API_ID and TG_MCP_API_HASH"), "{err}");
+        assert!(err.contains("official image"), "{err}");
+    }
+
+    #[test]
+    fn a_builtin_api_id_is_digits_or_nothing() {
+        assert_eq!(parse_builtin_api_id("424242"), Some(424242));
+        assert_eq!(parse_builtin_api_id(" 424242\n"), Some(424242));
+        assert_eq!(parse_builtin_api_id(""), None);
+        assert_eq!(parse_builtin_api_id("  "), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a number")]
+    fn a_builtin_api_id_that_is_not_a_number_fails() {
+        parse_builtin_api_id("42x");
+    }
+
+    #[test]
+    fn the_telegram_app_source_reads_as_env_or_builtin() {
+        assert_eq!(TelegramAppSource::Env.to_string(), "env");
+        assert_eq!(TelegramAppSource::Builtin.to_string(), "builtin");
     }
 }

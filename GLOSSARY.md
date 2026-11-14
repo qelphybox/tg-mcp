@@ -44,6 +44,14 @@ Telegram login by scanning a `tg://login` QR code (`auth.exportLoginToken` / `up
 The Account's Telegram two-step verification password. Asked for on the login page after QR login when the Account has one, checked once via SRP (`account.getPassword` + `auth.checkPassword`), never stored or logged.
 _Avoid_: 2FA code, PIN
 
+**Telegram app**:
+The api_id/api_hash pair, registered at my.telegram.org, that the server's Login flows and Telegram sessions go through. From `TG_MCP_API_ID` / `TG_MCP_API_HASH`, else the Built-in app.
+_Avoid_: API key, client id, credentials (unqualified)
+
+**Built-in app**:
+The Telegram app compiled into official images from CI secrets (ADR-0007): a separate app, on its own phone number, from the one production uses. Extractable from the binary, so it is not a secret.
+_Avoid_: default app, shared credentials
+
 **Consent**:
 The screen where the user chooses the Grant's Scopes (and, with `send`, its Send allow-list) before a Grant is created.
 
