@@ -650,6 +650,7 @@ mod tests {
 
     fn fake(size: u64) -> Arc<FakeTelegram> {
         let message = RawHistoryMessage {
+            comments: None,
             id: 1,
             date: 1_700_000_000,
             from: None,

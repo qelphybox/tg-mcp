@@ -267,6 +267,7 @@ mod tests {
 
     fn message(id: i32, topic: Option<i32>) -> ChatMessage {
         ChatMessage {
+            comments: None,
             id,
             date: String::new(),
             sender: None,

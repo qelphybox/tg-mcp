@@ -102,6 +102,10 @@ _Avoid_: folder (unqualified), filter, tab
 A separate message stream inside a forum supergroup, with its own title. Every message of a forum belongs to exactly one Topic; the tools name it by its id, which is the id of the message that created it, and General, every forum's first Topic, is 1.
 _Avoid_: thread (a thread is a chain of replies), subchat
 
+**Comment**:
+A message under a channel post. It lives in the channel's discussion group (the supergroup linked to the channel) and replies, directly or through another comment, to the group's copy of the post. The tools count a post's comments (`comments`) and read them with get_messages `comments_of`.
+_Avoid_: reply (any message can be replied to), thread
+
 **Rich message**:
 A message whose content is page blocks (paragraphs, lists, tables, collapsible sections, photos: Telegram's Instant View blocks, `message.rich_message`) rather than, or besides, its plain text. The tools read it as plain lines after the plain text.
 _Avoid_: Instant View (that is a web page's preview), formatted message

@@ -133,6 +133,19 @@ pub trait Telegram: Send + Sync + 'static {
         query: messages::HistoryQuery,
     ) -> Result<messages::MessagePage, TgError>;
 
+    /// The comments of channel `chat`'s post `post`: the replies to its copy
+    /// in the channel's discussion group (`messages.getDiscussionMessage`), paged
+    /// newest first like a history with `query`'s `limit` and `before_id`
+    /// (`messages.getReplies`). The page is the group's, with `comments_of`
+    /// naming the post. A post without a discussion is
+    /// [`TgError::InvalidInput`].
+    async fn get_comments(
+        &self,
+        chat: chats::ChatRef,
+        post: i32,
+        query: messages::HistoryQuery,
+    ) -> Result<messages::MessagePage, TgError>;
+
     /// Details of one Chat: title, type, @username, description, member count;
     /// for a user, the profile Telegram shows the Account
     /// ([`chats::user_info`]), without `common_chats`.

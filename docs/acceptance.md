@@ -1097,6 +1097,24 @@ Needs, in chats of the account (replace the `<…>`; create them yourself in a g
 
 No log line carries a question or an option: `kamal app logs | grep -F '<a word of the question of P1>'` finds nothing.
 
+## 65. A channel post says how many comments it has, and `comments_of` reads them from the discussion group
+
+Needs, among the account's chats (replace the `<…>`): a channel `<C>` with comments on (it has a linked discussion group: Channel info → Discussion) and a recent post `<P>` with at least 5 comments, one of them a reply to another comment; a post `<Q>` of a channel with comments off (or of a channel without a discussion group); if possible a post `<E>` with comments on that nobody commented on. Write down from the app `<P>`'s comment count and its newest three comments' authors. The behaviour is covered by fake-backed tests: `cargo test --test comments` (the count on posts; reading and paging comments; the answer's `chat_id` is the discussion group; comments off; an empty discussion; the parameters it refuses) and `cargo test --lib tg::grammers::topic_tests` (the first call is `messages.getDiscussionMessage` through the limiter; the discussion is the post's copy in another chat; `MSG_ID_INVALID` is comments off). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+
+```text
+Через Telegram MCP. Текст сообщений не выводи и не пересказывай. 1) get_messages для <C> с limit=10: для каждого сообщения id и comments. 2) get_messages для <C> с comments_of=<id P> и limit=3: выведи chat_id, comments_of, next_before_id и для каждого сообщения id, sender.name, reply_to. 3) Ещё страница: comments_of=<id P>, limit=3, before_id=<next_before_id>. 4) get_messages с chat_id=<chat_id из шага 2> и around_id=<id самого нового комментария>, limit=5: выведи id. 5) get_messages для канала <Q> с comments_of=<id Q>. 6) Если есть <E>: comments_of=<id E>. 7) Ошибки, выведи тексты: comments_of=<id P> вместе с around_id=<id P>; с since="2026-01-01"; comments_of=<id P> для chat_id личного чата. Для каждого шага напиши: совпало с ожиданием / нет (и чем отличается).
+```
+
+1. Step 1: `<P>` has `comments` equal to the app's count; posts of a channel without comments have no `comments`.
+2. Step 2: `chat_id` is the discussion group's id (a `channel:` id other than `<C>`'s), `comments_of` = `{ "chat_id": "<C's id>", "message_id": <P> }`, the newest three comments, newest first, with their authors as in the app; the reply to a comment has `reply_to` = that comment's id; `next_before_id` is set.
+3. Step 3: the next three older comments, no repeats, no gap.
+4. Step 4: a window in the discussion group around that comment: the conversation continues there.
+5. Step 5: an error "comments are off for this post: …".
+6. Step 6: an empty `messages` list without `next_before_id`.
+7. Step 7: `comments_of can't be combined with around_id`, `comments_of can't be combined with since`, `comments_of is for channel posts: user:… is no channel …`.
+
+Telegram calls, each through the account's limiter: one `messages.getDiscussionMessage` and one `messages.getReplies` per page. If a `FLOOD_WAIT` comes, `kamal app logs | grep FLOOD_WAIT` names its `method`: record it. `kamal app logs | grep -F '<a word of a comment>'` finds nothing.
+
 ## 66. Once an hour one `stats` line with numbers only, and an external monitor on `/healthz`
 
 What the line holds and how the monitor is set up: [deploy.md](deploy.md#is-it-up-the-stats-line-and-the-healthz-monitor). The counting and the reset are also covered by tests: `cargo test --test stats` (with a paused clock, the line after an hour carries the expected counts, the next one starts from zero, and shutdown logs a last one; through `/mcp`, tool calls are counted by name, and the line names no chat, Account or Grant and no unknown tool) and `cargo test --lib stats`.

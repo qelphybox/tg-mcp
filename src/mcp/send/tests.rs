@@ -52,6 +52,7 @@ const QUIET: ChatId = ChatId::Chat(507);
 
 fn raw(id: i32, topic: Option<i32>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: 1_793_923_200 + id,
         from: None,

@@ -30,6 +30,7 @@ const BOB: ChatId = ChatId::User(202);
 
 fn message(id: i32, media: Option<Media>) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: 1_793_923_200 + id * 60,
         from: None,

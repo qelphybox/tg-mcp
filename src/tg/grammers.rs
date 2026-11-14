@@ -34,8 +34,9 @@ use super::{
         ParticipantsAnswer, ParticipantsFilter, ParticipantsRequest, RawMember, Role,
     },
     messages::{
-        HistoryAnswer, HistoryQuery, HistoryRequest, MessageAnswer, MessageAt, MessagePage,
-        MessageRequest, RawHistoryMessage, RawReaction, Reaction, read_history,
+        HistoryAnswer, HistoryQuery, HistoryRequest, MessageAnswer, MessageAt, MessageLink,
+        MessagePage, MessageRequest, RawHistoryMessage, RawReaction, Reaction, comments_off,
+        read_history,
     },
     pool::{Evicted, Live, Pool},
     reactions::{self, NewReaction, Reacted},
@@ -650,6 +651,62 @@ impl Telegram for LiveClient {
             .await;
         }
         chats::list_chats(&query, |request| self.get_dialogs(request)).await
+    }
+
+    async fn get_comments(
+        &self,
+        id: ChatRef,
+        post: i32,
+        query: HistoryQuery,
+    ) -> Result<MessagePage, TgError> {
+        let peer = self.resolve(id).await?;
+        let chat = id.chat();
+        let tl::enums::messages::DiscussionMessage::Message(answer) = self
+            .call_refusing(
+                &tl::functions::messages::GetDiscussionMessage { peer, msg_id: post },
+                Some(chat),
+                |err| discussion_refusal(chat, post, err),
+            )
+            .await?;
+        let MessageAt {
+            chat: group,
+            id: top,
+        } = discussion_of(&answer, chat, post)?;
+        // The group's access hash comes with the answer: the account needn't
+        // be a member, so there is no dialog to look it up in.
+        self.described(answer.users, answer.chats);
+        let hash = self.cached(group).ok_or_else(|| {
+            TgError::Upstream(format!(
+                "Telegram didn't describe the discussion group {group}"
+            ))
+        })?;
+        let group_ref = ChatRef::new(group, Some(hash));
+        let group_peer = &input_peer(group, Some(hash));
+        // The replies to the group's copy of the post, read as a Topic is.
+        let discussion = HistoryQuery {
+            topic: Some(top),
+            ..query
+        };
+        let mut page = read_history(
+            group_ref,
+            &discussion,
+            &|chat| self.cached(chat),
+            |request| self.get_history(group_peer, group, request),
+            |request| self.get_message(group_peer, group, request),
+        )
+        .await
+        // With only limit and before_id, the one refusal left is getReplies
+        // not knowing the post's copy (deleted since): no Topic is involved.
+        .map_err(|err| match err {
+            TgError::InvalidInput(_) => comments_off(chat, post),
+            other => other,
+        })?;
+        topics::complete(&mut page, |ids| self.topics_by_id(group_peer, group, ids)).await?;
+        page.comments_of = Some(MessageLink {
+            chat_id: ChatRef::new(chat, self.cached(chat).or(id.access_hash())).to_string(),
+            message_id: post,
+        });
+        Ok(page)
     }
 
     async fn get_messages(&self, id: ChatRef, query: HistoryQuery) -> Result<MessagePage, TgError> {
@@ -2150,6 +2207,45 @@ fn raw_chat_member(participant: tl::enums::ChatParticipant) -> RawMember {
     RawMember { user, role }
 }
 
+/// Where the comments of `chat`'s post `post` are, from its
+/// `messages.getDiscussionMessage` answer: the group's copy of the post in
+/// the discussion group, which the comments reply to (the first copy, for an
+/// album; a service message counts too). No message in another chat: `chat`
+/// is a group, not a channel.
+fn discussion_of(
+    answer: &tl::types::messages::DiscussionMessage,
+    chat: ChatId,
+    post: i32,
+) -> Result<MessageAt, TgError> {
+    let mut in_chat = false;
+    let mut top: Option<(ChatId, i32)> = None;
+    for message in &answer.messages {
+        let (at, id) = match message {
+            tl::enums::Message::Message(m) => (chat_id(&m.peer_id), m.id),
+            tl::enums::Message::Service(m) => (chat_id(&m.peer_id), m.id),
+            tl::enums::Message::Empty(_) => continue,
+        };
+        if at == chat {
+            in_chat = true;
+        } else if top.is_none_or(|(_, first)| id < first) {
+            top = Some((at, id));
+        }
+    }
+    match top {
+        Some((chat, id)) => Ok(MessageAt { chat, id }),
+        None if in_chat => Err(TgError::InvalidInput(format!(
+            "comments_of is for channel posts: {chat} is a group; read a message's replies \
+             there with around_id or thread_of"
+        ))),
+        None => Err(comments_off(chat, post)),
+    }
+}
+
+/// Telegram's answer for a post without a discussion.
+fn discussion_refusal(chat: ChatId, post: i32, err: &InvocationError) -> Option<TgError> {
+    err.is("MSG_ID_INVALID").then(|| comments_off(chat, post))
+}
+
 /// A request for one Topic refused because the forum has no such Topic: the
 /// caller's to fix.
 fn topic_refusal(topic: Option<i32>, err: &InvocationError) -> Option<TgError> {
@@ -2196,6 +2292,14 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
                 _ => (None, None),
             };
             Some(RawHistoryMessage {
+                // A channel post's discussion; a group thread's count is no
+                // comment count.
+                comments: match &m.replies {
+                    Some(tl::enums::MessageReplies::Replies(r)) if r.comments => {
+                        u32::try_from(r.replies).ok()
+                    }
+                    _ => None,
+                },
                 id: m.id,
                 date: m.date,
                 from: m.from_id.as_ref().map(chat_id),
@@ -2215,6 +2319,7 @@ fn raw_history_message(message: tl::enums::Message) -> Option<RawHistoryMessage>
             })
         }
         tl::enums::Message::Service(m) => Some(RawHistoryMessage {
+            comments: None,
             // The message that created a Topic is that Topic's first.
             topic: match m.action {
                 tl::enums::MessageAction::TopicCreate(_) => Some(m.id),
@@ -3512,6 +3617,35 @@ mod tests {
         assert_eq!((hidden.forwarded, hidden.forwarded_from), (true, None));
         let plain = raw_history_message(tl_message(30, user(42), None)).unwrap();
         assert_eq!((plain.forwarded, plain.forwarded_from), (false, None));
+    }
+
+    #[test]
+    fn a_channel_post_counts_its_comments_and_nothing_else_does() {
+        let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 });
+        let with_replies = |comments: bool, replies: i32| {
+            let tl::enums::Message::Message(mut m) = tl_message(30, channel.clone(), None) else {
+                unreachable!()
+            };
+            m.replies = Some(tl::enums::MessageReplies::Replies(
+                tl::types::MessageReplies {
+                    comments,
+                    replies,
+                    replies_pts: 1,
+                    recent_repliers: None,
+                    channel_id: comments.then_some(77),
+                    max_id: None,
+                    read_max_id: None,
+                },
+            ));
+            raw_history_message(tl::enums::Message::Message(m)).unwrap()
+        };
+        assert_eq!(with_replies(true, 12).comments, Some(12));
+        assert_eq!(with_replies(true, 0).comments, Some(0));
+        // Replies to a group's message are no comments.
+        assert_eq!(with_replies(false, 4).comments, None);
+        // Comments off: no replies info at all.
+        let plain = raw_history_message(tl_message(30, channel.clone(), None)).unwrap();
+        assert_eq!(plain.comments, None);
     }
 
     #[test]
@@ -5985,6 +6119,104 @@ mod topic_tests {
                 method_class::<channels::GetChannels>(),
             ],
             [MethodClass::Default; 4]
+        );
+    }
+
+    /// A message `id` of channel `channel` (no optional field).
+    fn in_channel(id: i32, channel: i64) -> tl::enums::Message {
+        let tl::enums::Message::Message(mut m) = message(id, None) else {
+            unreachable!()
+        };
+        m.peer_id = tl::enums::Peer::Channel(tl::types::PeerChannel {
+            channel_id: channel,
+        });
+        tl::enums::Message::Message(m)
+    }
+
+    fn discussion(messages: Vec<tl::enums::Message>) -> tl::types::messages::DiscussionMessage {
+        tl::types::messages::DiscussionMessage {
+            messages,
+            max_id: None,
+            read_inbox_max_id: None,
+            read_outbox_max_id: None,
+            unread_count: 0,
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn comments_start_with_the_posts_discussion_through_the_limiter() {
+        let (live, _dir) = cold_client().await;
+        assert!(live.get_comments(forum(), 10, query(0)).await.is_err());
+        assert_eq!(
+            sent(&live),
+            [tl::functions::messages::GetDiscussionMessage {
+                peer: peer(),
+                msg_id: 10,
+            }
+            .to_bytes()]
+        );
+        assert_eq!(
+            method_class::<tl::functions::messages::GetDiscussionMessage>(),
+            MethodClass::Default
+        );
+    }
+
+    #[test]
+    fn a_posts_discussion_is_its_first_message_in_another_chat() {
+        // The post itself may come along; an album's copies are several.
+        let answer = discussion(vec![
+            in_channel(10, 5),
+            in_channel(301, 9),
+            in_channel(300, 9),
+        ]);
+        assert_eq!(
+            discussion_of(&answer, ChatId::Channel(5), 10).ok(),
+            Some(MessageAt {
+                chat: ChatId::Channel(9),
+                id: 300
+            })
+        );
+        // Nothing in another chat: a supergroup's own message, not a post.
+        let group = discussion(vec![in_channel(10, 5)]);
+        assert!(matches!(
+            discussion_of(&group, ChatId::Channel(5), 10),
+            Err(TgError::InvalidInput(e)) if e.contains("comments_of is for channel posts")
+        ));
+        assert!(matches!(
+            discussion_of(&discussion(Vec::new()), ChatId::Channel(5), 10),
+            Err(TgError::InvalidInput(e)) if e.contains("comments are off for this post")
+        ));
+    }
+
+    #[test]
+    fn a_post_without_a_discussion_is_comments_off() {
+        type Discussion = tl::functions::messages::GetDiscussionMessage;
+        let refused = discussion_refusal(
+            ChatId::Channel(5),
+            10,
+            &rpc::<Discussion>(400, "MSG_ID_INVALID"),
+        );
+        assert!(
+            matches!(&refused, Some(TgError::InvalidInput(e)) if e.contains("comments are off")),
+            "{refused:?}"
+        );
+        assert!(
+            discussion_refusal(
+                ChatId::Channel(5),
+                10,
+                &rpc::<Discussion>(400, "CHANNEL_PRIVATE")
+            )
+            .is_none()
+        );
+        assert!(
+            discussion_refusal(
+                ChatId::Channel(5),
+                10,
+                &rpc::<Discussion>(420, "FLOOD_WAIT_3")
+            )
+            .is_none()
         );
     }
 }

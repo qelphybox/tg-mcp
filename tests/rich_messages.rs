@@ -82,6 +82,7 @@ fn long_listing() -> tl::enums::RichMessage {
 /// in its Rich message.
 fn post(id: i32, rich: &tl::enums::RichMessage) -> RawHistoryMessage {
     RawHistoryMessage {
+        comments: None,
         id,
         date: 1_793_923_200 + id,
         from: None,
