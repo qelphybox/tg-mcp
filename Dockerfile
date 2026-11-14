@@ -35,8 +35,8 @@ COPY --from=build /tg-mcp /usr/local/bin/tg-mcp
 COPY --from=build --chown=65532:65532 /data-empty /data
 # mimalloc commits its arenas eagerly by default: about 11 MB RSS at idle
 # instead of 2. Committing on demand keeps it at glibc's level (#101).
-ENV TG_MCP_BIND=0.0.0.0:8080 \
-    TG_MCP_DB_PATH=/data/tg-mcp.db \
+# No TG_MCP_BIND: the server listens on the platform's PORT, else 8080 (#102).
+ENV TG_MCP_DB_PATH=/data/tg-mcp.db \
     MIMALLOC_ARENA_EAGER_COMMIT=0
 EXPOSE 8080
 USER nonroot
