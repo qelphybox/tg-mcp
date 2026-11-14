@@ -4,9 +4,13 @@
 //! fake Telegram, in-process, in `cargo test`) or the Real world (the Test
 //! account, its Driver and the Peer, through `cargo accept`).
 
+pub mod blocked;
+pub mod config;
 pub mod fake;
 pub mod forms;
 pub mod login;
+pub mod real;
 pub mod run;
 pub mod scenarios;
+pub mod telegram;
 pub mod world;

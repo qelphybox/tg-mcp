@@ -1,5 +1,6 @@
-//! `login`: the Login flow end to end, the Driver accepting the QR, and
-//! `whoami` answering as the Test account (acceptance §1, without the stopwatch).
+//! `login`: the Login flow end to end, the Driver accepting the QR, the Cloud
+//! password typed, and `whoami` answering as the Test account (acceptance §1
+//! without the stopwatch, and §2).
 
 use anyhow::{Result, ensure};
 use serde_json::json;
@@ -8,7 +9,7 @@ use crate::run::{Run, Scenario};
 
 pub const SCENARIO: Scenario = Scenario {
     id: "login",
-    title: "Log in through the QR and Consent, whoami is the Test account",
+    title: "Log in through the QR, the Cloud password and Consent; whoami is the Test account",
     run: |run| Box::pin(login(run)),
 };
 

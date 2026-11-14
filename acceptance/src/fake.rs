@@ -4,7 +4,7 @@
 //! so a scenario proves the same hand-off it relies on in the Real world.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -20,17 +20,21 @@ use tg_mcp::{
     db,
     sessions::{TokenTtl, Vault},
     tg::{
-        Account, FakeConnector, FakeLogin, LoggedIn, Login, LoginAttempt, LoginState, TgError,
-        fake::FakeData,
+        Account, FakeConnector, FakeLogin, FakePassword, LoggedIn, Login, LoginAttempt, LoginState,
+        TgError, fake::FakeData,
     },
 };
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-use crate::world::{Driver, Server, World};
+use crate::world::{Driver, Party, Peer, Server, World};
 
 /// The fake Test account's id.
 pub const TEST_ACCOUNT: i64 = 7_000_001;
+/// The fake Peer's id.
+pub const PEER: i64 = 7_000_002;
+/// The fake Test account's Cloud password.
+pub const CLOUD_PASSWORD: &str = "correct horse battery staple";
 
 /// The fake Test account.
 pub fn test_account() -> Account {
@@ -39,6 +43,16 @@ pub fn test_account() -> Account {
         first_name: "Test".into(),
         last_name: None,
         username: Some("tgmcp_test".into()),
+    }
+}
+
+/// The fake Peer.
+pub fn peer() -> Account {
+    Account {
+        id: PEER,
+        first_name: "Peer".into(),
+        last_name: None,
+        username: Some("tgmcp_peer".into()),
     }
 }
 
@@ -51,25 +65,39 @@ pub struct FakeWorld {
 
 /// How to start a Fake world.
 pub struct FakeWorldBuilder {
-    login_as: FakeData,
-    test_account: i64,
+    test_data: FakeData,
+    password: Option<FakePassword>,
     driver_accepts: bool,
+    driver_claims: i64,
 }
 
 impl Default for FakeWorldBuilder {
     fn default() -> Self {
         Self {
-            login_as: FakeData::new(test_account()),
-            test_account: TEST_ACCOUNT,
+            test_data: FakeData::new(test_account()),
+            password: Some(FakePassword {
+                password: CLOUD_PASSWORD.into(),
+                hint: Some("a staple".into()),
+                flood_after: None,
+            }),
             driver_accepts: true,
+            driver_claims: TEST_ACCOUNT,
         }
     }
 }
 
 impl FakeWorldBuilder {
-    /// The account the fake Telegram logs in as (by default the Test account).
+    /// What the Driver's logins come out as (by default the Test account).
+    /// The Driver still says it is the Test account: this is how a Grant
+    /// whose `whoami` is someone else is made, for the interlock.
     pub fn login_as(mut self, data: FakeData) -> Self {
-        self.login_as = data;
+        self.test_data = data;
+        self
+    }
+
+    /// A Driver logged into another account than the Test account.
+    pub fn driver_is(mut self, account: i64) -> Self {
+        self.driver_claims = account;
         self
     }
 
@@ -79,23 +107,45 @@ impl FakeWorldBuilder {
         self
     }
 
+    /// Telegram answers the Test account's first Cloud password with
+    /// `FLOOD_WAIT_30`.
+    pub fn password_flood(mut self) -> Self {
+        if let Some(p) = self.password.as_mut() {
+            p.flood_after = Some(0);
+        }
+        self
+    }
+
     pub async fn start(self) -> Result<FakeWorld> {
-        let accepted = Arc::new(Mutex::new(HashSet::new()));
-        let login = Arc::new(GatedLogin {
-            inner: FakeLogin::new(self.login_as),
+        let accepted: Accepted = Arc::new(Mutex::new(HashMap::new()));
+        let test_login = match self.password {
+            Some(p) => FakeLogin::with_password(self.test_data, p),
+            None => FakeLogin::new(self.test_data),
+        };
+        let driver = Arc::new(FakeParty {
+            account: self.driver_claims,
+            login: test_login,
             accepted: accepted.clone(),
-        });
-        let driver = Arc::new(FakeDriver {
-            accepted,
             accepts: self.driver_accepts,
         });
+        let peer = Arc::new(FakeParty {
+            account: PEER,
+            login: FakeLogin::new(FakeData::new(peer())),
+            accepted: accepted.clone(),
+            accepts: true,
+        });
+        let login = Arc::new(GatedLogin { accepted });
         let connector = FakeConnector::default();
         let (server, keep) = serve(login, connector.clone()).await?;
         Ok(FakeWorld {
             world: Arc::new(World {
+                name: "fake",
                 server,
                 driver,
-                test_account: self.test_account,
+                peer,
+                test_account: TEST_ACCOUNT,
+                peer_account: PEER,
+                cloud_password: Some(Zeroizing::new(CLOUD_PASSWORD.into())),
                 poll_every: Duration::from_millis(10),
                 login_timeout: Duration::from_secs(3),
                 _keep: keep,
@@ -110,7 +160,8 @@ impl FakeWorld {
         FakeWorldBuilder::default()
     }
 
-    /// The default Fake world: the fake Telegram logs in as the Test account.
+    /// The default Fake world: the Test account (with a Cloud password) and
+    /// the Peer (without one).
     pub async fn start() -> Result<Self> {
         Self::builder().start().await
     }
@@ -184,12 +235,12 @@ async fn serve(login: Arc<dyn Login>, connector: FakeConnector) -> Result<(Serve
     ))
 }
 
-/// The QR tokens the fake Driver accepted.
-type Accepted = Arc<Mutex<HashSet<String>>>;
+/// The QR tokens accepted so far, each with the login of whoever accepted it.
+type Accepted = Arc<Mutex<HashMap<String, FakeLogin>>>;
 
-/// A fake Telegram login that waits for the fake Driver.
+/// A fake Telegram login that waits until a fake party accepts its QR, and
+/// then logs in as that party, as Telegram does.
 struct GatedLogin {
-    inner: FakeLogin,
     accepted: Accepted,
 }
 
@@ -200,8 +251,7 @@ impl Login for GatedLogin {
         getrandom::fill(&mut token).expect("the OS has randomness");
         Ok(Box::new(GatedAttempt {
             token: URL_SAFE_NO_PAD.encode(token),
-            inner: self.inner.start().await?,
-            primed: false,
+            inner: None,
             accepted: self.accepted.clone(),
         }))
     }
@@ -209,48 +259,65 @@ impl Login for GatedLogin {
 
 struct GatedAttempt {
     token: String,
-    inner: Box<dyn LoginAttempt>,
-    /// Whether the inner fake showed its own QR already (it does once).
-    primed: bool,
+    /// The login of whoever accepted the QR, once someone did.
+    inner: Option<Box<dyn LoginAttempt>>,
     accepted: Accepted,
 }
 
 #[async_trait]
 impl LoginAttempt for GatedAttempt {
     async fn poll(&mut self) -> Result<LoginState, TgError> {
-        if !self.primed {
-            self.primed = true;
-            self.inner.poll().await?;
+        if self.inner.is_none() {
+            let by = self.accepted.lock().unwrap().get(&self.token).cloned();
+            let Some(login) = by else {
+                return Ok(LoginState::WaitingForScan {
+                    qr_url: format!("tg://login?token={}", self.token),
+                });
+            };
+            let mut inner = login.start().await?;
+            // The fake shows its own QR once first; that was ours.
+            inner.poll().await?;
+            self.inner = Some(inner);
         }
-        if !self.accepted.lock().unwrap().contains(&self.token) {
-            return Ok(LoginState::WaitingForScan {
-                qr_url: format!("tg://login?token={}", self.token),
-            });
-        }
-        self.inner.poll().await
+        self.inner.as_mut().expect("set above").poll().await
     }
 
     async fn submit_password(&mut self, password: Zeroizing<String>) -> Result<LoggedIn, TgError> {
-        self.inner.submit_password(password).await
+        match self.inner.as_mut() {
+            Some(inner) => inner.submit_password(password).await,
+            None => Err(TgError::Upstream("not waiting for a cloud password".into())),
+        }
     }
 }
 
-/// The fake Driver: accepting a QR marks its token accepted.
-struct FakeDriver {
+/// A fake Test account (the Driver) or Peer: accepting a QR logs it in.
+struct FakeParty {
+    account: i64,
+    login: FakeLogin,
     accepted: Accepted,
     accepts: bool,
 }
 
 #[async_trait]
-impl Driver for FakeDriver {
+impl Party for FakeParty {
+    async fn account_id(&self) -> Result<i64> {
+        Ok(self.account)
+    }
+
     async fn accept_login(&self, qr_url: &str) -> Result<()> {
         let token = login_token(qr_url)?;
         if self.accepts {
-            self.accepted.lock().unwrap().insert(token);
+            self.accepted
+                .lock()
+                .unwrap()
+                .insert(token, self.login.clone());
         }
         Ok(())
     }
 }
+
+impl Driver for FakeParty {}
+impl Peer for FakeParty {}
 
 /// The token of a `tg://login?token=…` URL, as Telegram's apps read it.
 pub fn login_token(qr_url: &str) -> Result<String> {

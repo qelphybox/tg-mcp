@@ -11,8 +11,9 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
+    blocked::{self, Blocked},
     forms::Form,
-    world::{Driver, World},
+    world::{Party, Who, World},
 };
 
 /// Where the authorization code would go. Nothing listens there: the harness
@@ -26,6 +27,7 @@ pub struct Grant {
     pub access_token: String,
     /// The Scopes the token response names, e.g. `read draft`.
     pub scope: String,
+    pub refresh_token: Option<String>,
 }
 
 impl std::fmt::Debug for Grant {
@@ -37,11 +39,12 @@ impl std::fmt::Debug for Grant {
     }
 }
 
-/// Logs in with `scopes` (besides `read`, which is always granted) ticked on
-/// Consent, the Driver accepting the QR.
-pub async fn login(world: &World, scopes: &[&str]) -> Result<Grant> {
+/// Logs `who` in with `scopes` (besides `read`, which is always granted)
+/// ticked on Consent: `who`'s own login accepts the QR, and the Test account
+/// types its Cloud password when asked.
+pub async fn login(world: &World, who: Who, scopes: &[&str]) -> Result<Grant> {
     let mut flow = LoginFlow::start(world, scopes).await?;
-    flow.wait_logged_in(world).await?;
+    flow.wait_logged_in(world, who).await?;
     let html = flow.consent_page().await?;
     let code = flow.allow(&html, scopes).await?;
     flow.token(&code).await
@@ -136,9 +139,10 @@ impl LoginFlow {
     }
 
     /// Polls the login page until the QR login finished, handing each new QR
-    /// to the Driver. The server only moves a login on while it is polled, so
-    /// polling goes on after the Driver accepted.
-    pub async fn wait_logged_in(&mut self, world: &World) -> Result<()> {
+    /// to `who`'s login (the Driver for the Test account). The server only
+    /// moves a login on while it is polled, so polling goes on after the QR
+    /// was accepted. Types the Cloud password when the page asks for it.
+    pub async fn wait_logged_in(&mut self, world: &World, who: Who) -> Result<()> {
         let started = Instant::now();
         let mut accepted: Option<String> = None;
         loop {
@@ -157,12 +161,25 @@ impl LoginFlow {
                         .as_str()
                         .context("login status: waiting without a qr_url")?;
                     if accepted.as_deref() != Some(qr_url) {
-                        accept(world.driver.as_ref(), qr_url).await?;
+                        accept(world.party(who), qr_url).await?;
                         accepted = Some(qr_url.to_string());
                     }
                 }
                 Some("password") => {
-                    bail!("the login asks for a Cloud password; this world has none configured")
+                    let next = body["next"]
+                        .as_str()
+                        .context("login status: password without next")?
+                        .to_string();
+                    let password = match (who, &world.cloud_password) {
+                        (Who::TestAccount, Some(p)) => p,
+                        (Who::TestAccount, None) => bail!(
+                            "the login asks for the Test account's Cloud password, and none is configured"
+                        ),
+                        (Who::Peer, _) => bail!(
+                            "the login asks for the Peer's Cloud password: the Peer should have none"
+                        ),
+                    };
+                    self.submit_password(&next, password).await?;
                 }
                 Some("logged_in") => {
                     let next = body["next"]
@@ -171,7 +188,13 @@ impl LoginFlow {
                     self.consent_path = Some(next.to_string());
                     return Ok(());
                 }
-                Some("error") => bail!("the login failed: {}", body["message"]),
+                Some("error") => {
+                    let message = body["message"].as_str().unwrap_or_default();
+                    if let Some(blocked) = blocked::server_message(message) {
+                        return Err(blocked.into());
+                    }
+                    bail!("the login failed: {message}")
+                }
                 _ => bail!("login status: unexpected answer {body}"),
             }
             if started.elapsed() > world.login_timeout {
@@ -277,7 +300,32 @@ impl LoginFlow {
                 .context("/token gave no access_token")?
                 .to_string(),
             scope: body["scope"].as_str().unwrap_or_default().to_string(),
+            refresh_token: body["refresh_token"].as_str().map(str::to_string),
         })
+    }
+
+    /// Posts the Cloud password; the server answers with a redirect to
+    /// Consent, or the page again with what went wrong.
+    async fn submit_password(&self, path: &str, password: &str) -> Result<()> {
+        let res = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, &self.cookie)
+            .body(form_body(&[("password", password)]))
+            .send()
+            .await
+            .context("Cloud password")?;
+        let status = res.status();
+        if status == StatusCode::SEE_OTHER {
+            return Ok(());
+        }
+        let page = res.text().await.unwrap_or_default();
+        let said = page_alert(&page);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(Blocked::new(format!("the server says: {said}")).into());
+        }
+        bail!("the Cloud password was refused ({status}): {said}")
     }
 
     fn consent(&self) -> Result<&str> {
@@ -287,11 +335,21 @@ impl LoginFlow {
     }
 }
 
-async fn accept(driver: &dyn Driver, qr_url: &str) -> Result<()> {
-    driver
+async fn accept(party: &dyn Party, qr_url: &str) -> Result<()> {
+    party
         .accept_login(qr_url)
         .await
-        .context("the Driver couldn't accept the QR login")
+        .context("couldn't accept the QR login")
+}
+
+/// The text of a page's `role="alert"` paragraph (where our pages say what
+/// went wrong), or a note that there is none.
+fn page_alert(html: &str) -> String {
+    html.split("role=\"alert\">")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "(no message on the page)".into())
 }
 
 async fn json_body(res: reqwest::Response) -> Result<(StatusCode, Value)> {

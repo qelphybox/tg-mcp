@@ -1,8 +1,15 @@
 //! A run: scenarios in one world, their steps, Human checks and outcome.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
+use reqwest::header;
 use rmcp::{
     RoleClient, ServiceExt,
     model::{CallToolRequestParams, ClientConfig},
@@ -14,8 +21,9 @@ use rmcp::{
 use serde_json::Value;
 
 use crate::{
+    blocked,
     login::{self, Grant},
-    world::World,
+    world::{Who, World},
 };
 
 /// A scenario's body.
@@ -34,9 +42,11 @@ pub enum Outcome {
     Pass,
     /// What failed, as the report says it.
     Fail(String),
+    /// Telegram limited an account: the run stopped there. Not a code bug.
+    Blocked(String),
 }
 
-/// The Grant's `whoami` is not the Test account: nothing may be written.
+/// The Grant's `whoami` is not the account it must be: nothing may be written.
 #[derive(Debug)]
 pub struct Interlock {
     pub expected: i64,
@@ -47,7 +57,7 @@ impl fmt::Display for Interlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "interlock: whoami is account {}, not the Test account {}; nothing was written",
+            "interlock: whoami is account {}, not the expected account {}; nothing was written",
             self.got, self.expected
         )
     }
@@ -74,24 +84,41 @@ pub struct ScenarioReport {
     /// What it proved, in order.
     pub steps: Vec<String>,
     pub human: Vec<HumanCheck>,
+    /// What cleaning up after it couldn't do (never changes the outcome).
+    pub teardown: Vec<String>,
 }
 
 /// A whole run.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// Which world it ran in, e.g. "fake".
+    /// Which world it ran in: `fake` or `real`.
     pub world: String,
     pub scenarios: Vec<ScenarioReport>,
+    /// Scenarios that never ran because the run was blocked or aborted.
+    pub not_run: Vec<&'static str>,
+    /// Why the run stopped before its first scenario, if it did.
+    pub aborted: Option<Outcome>,
+    /// Checks of the run as a whole (#138's invariants), with their outcome.
+    pub checks: Vec<(String, Outcome)>,
 }
 
 impl Report {
-    /// Pass if every scenario passed, else the first failure.
+    /// Blocked if anything was blocked; else the first failure; else pass.
     pub fn outcome(&self) -> Outcome {
-        self.scenarios
+        let all = self
+            .aborted
             .iter()
-            .map(|s| s.outcome.clone())
-            .find(|o| *o != Outcome::Pass)
-            .unwrap_or(Outcome::Pass)
+            .chain(self.scenarios.iter().map(|s| &s.outcome))
+            .chain(self.checks.iter().map(|(_, o)| o));
+        let mut fail = None;
+        for o in all {
+            match o {
+                Outcome::Blocked(_) => return o.clone(),
+                Outcome::Fail(_) if fail.is_none() => fail = Some(o.clone()),
+                _ => {}
+            }
+        }
+        fail.unwrap_or(Outcome::Pass)
     }
 
     /// Every Human check of the run, in order.
@@ -103,11 +130,23 @@ impl Report {
 impl fmt::Display for Report {
     /// The acceptance table and the Human checks as PR checkboxes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let verdict = match self.outcome() {
-            Outcome::Pass => "PASS".to_string(),
-            Outcome::Fail(_) => "FAIL".to_string(),
-        };
-        writeln!(f, "## Acceptance: {verdict} ({} world)", self.world)?;
+        match self.outcome() {
+            Outcome::Pass => writeln!(f, "## Acceptance: PASS ({} world)", self.world)?,
+            Outcome::Fail(_) => writeln!(f, "## Acceptance: FAIL ({} world)", self.world)?,
+            Outcome::Blocked(why) => {
+                writeln!(f, "## Acceptance: BLOCKED ({} world)", self.world)?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "**BLOCKED:** {} — not a bug in the code; don't change code or retry around it.",
+                    one_line(&why)
+                )?;
+            }
+        }
+        if let Some(Outcome::Fail(why) | Outcome::Blocked(why)) = &self.aborted {
+            writeln!(f)?;
+            writeln!(f, "The run stopped before any scenario: {}", one_line(why))?;
+        }
         writeln!(f)?;
         writeln!(f, "| Scenario | Automated | Human checks |")?;
         writeln!(f, "|---|---|---|")?;
@@ -115,6 +154,7 @@ impl fmt::Display for Report {
             let auto = match &s.outcome {
                 Outcome::Pass => "✅".to_string(),
                 Outcome::Fail(why) => format!("❌ {}", one_line(why)),
+                Outcome::Blocked(why) => format!("⛔ {}", one_line(why)),
             };
             let human = if s.human.is_empty() {
                 "—".to_string()
@@ -123,8 +163,19 @@ impl fmt::Display for Report {
             };
             writeln!(f, "| `{}` {} | {auto} | {human} |", s.id, s.title)?;
         }
+        for id in &self.not_run {
+            writeln!(f, "| `{id}` | not run | — |")?;
+        }
+        for (check, outcome) in &self.checks {
+            let result = match outcome {
+                Outcome::Pass => "✅".to_string(),
+                Outcome::Fail(why) => format!("❌ {}", one_line(why)),
+                Outcome::Blocked(why) => format!("skipped: {}", one_line(why)),
+            };
+            writeln!(f, "| {check} | {result} | — |")?;
+        }
         for s in &self.scenarios {
-            if s.steps.is_empty() {
+            if s.steps.is_empty() && s.teardown.is_empty() {
                 continue;
             }
             writeln!(f)?;
@@ -132,6 +183,9 @@ impl fmt::Display for Report {
             writeln!(f)?;
             for step in &s.steps {
                 writeln!(f, "- {step}")?;
+            }
+            for note in &s.teardown {
+                writeln!(f, "- teardown: {note}")?;
             }
             writeln!(f)?;
             writeln!(f, "</details>")?;
@@ -167,6 +221,8 @@ pub struct Run {
     scenario: &'static str,
     steps: Vec<String>,
     human: Vec<HumanCheck>,
+    /// Every Grant made, revoked when the scenario ends.
+    grants: Vec<Grant>,
 }
 
 impl Run {
@@ -185,27 +241,68 @@ impl Run {
         });
     }
 
-    /// Logs in through the Login flow with `scopes` ticked, opens an MCP
-    /// session and checks it is the Test account before anything else.
+    /// Logs the Test account in with `scopes` ticked, opens an MCP session and
+    /// checks its `whoami` before anything else.
     pub async fn login(&mut self, scopes: &[&str]) -> Result<Session> {
-        let grant = login::login(&self.world, scopes).await?;
+        self.login_as(Who::TestAccount, scopes).await
+    }
+
+    /// [`Run::login`] for `who`.
+    pub async fn login_as(&mut self, who: Who, scopes: &[&str]) -> Result<Session> {
+        let grant = login::login(&self.world, who, scopes).await?;
+        self.grants.push(grant.clone());
+        let by = match who {
+            Who::TestAccount => "the Driver",
+            Who::Peer => "the Peer",
+        };
         self.passed(format!(
-            "Login flow: the Driver accepted the QR, Consent granted `{}`",
+            "Login flow: {by} accepted the QR, Consent granted `{}`",
             grant.scope
         ));
         let session = Session::open(&self.world, grant).await?;
         let me = session
             .call("whoami", Value::Object(Default::default()))
             .await?;
-        if me["id"].as_i64() != Some(self.world.test_account) {
+        let expected = self.world.account_of(who);
+        if me["id"].as_i64() != Some(expected) {
             return Err(Interlock {
-                expected: self.world.test_account,
+                expected,
                 got: me["id"].clone(),
             }
             .into());
         }
-        self.passed("whoami is the Test account");
+        self.passed(match who {
+            Who::TestAccount => "whoami is the Test account",
+            Who::Peer => "whoami is the Peer",
+        });
         Ok(session)
+    }
+
+    /// Revokes every Grant the scenario made; returns what didn't work.
+    async fn teardown(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        let http = reqwest::Client::new();
+        for grant in self.grants.drain(..) {
+            let token = grant
+                .refresh_token
+                .clone()
+                .unwrap_or_else(|| grant.access_token.clone());
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([("token", token.as_str()), ("client_id", &grant.client_id)])
+                .finish();
+            let res = http
+                .post(self.world.server.url("/revoke"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await;
+            match res {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => notes.push(format!("/revoke answered {}", r.status())),
+                Err(e) => notes.push(format!("/revoke failed: {e}")),
+            }
+        }
+        notes
     }
 }
 
@@ -229,31 +326,49 @@ impl Session {
     }
 
     /// Calls `tool` and returns its structured output (or its text, for a
-    /// tool without one). A tool error is an error.
+    /// tool without one). A tool error is an error, and blocks the run when
+    /// it says Telegram limited the account.
     pub async fn call(&self, tool: &str, arguments: Value) -> Result<Value> {
+        self.try_call(tool, arguments).await?.map_err(|message| {
+            match blocked::server_message(&message) {
+                Some(b) => anyhow::Error::new(b).context(tool.to_string()),
+                None => anyhow::anyhow!("{tool} failed: {message}"),
+            }
+        })
+    }
+
+    /// Calls `tool`; an error the tool answered (as opposed to a broken
+    /// connection) comes back as `Err(message)` for the scenario to check.
+    pub async fn try_call(
+        &self,
+        tool: &str,
+        arguments: Value,
+    ) -> Result<std::result::Result<Value, String>> {
         let Value::Object(arguments) = arguments else {
             anyhow::bail!("{tool}: arguments must be an object");
         };
         let result = self
             .client
             .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments))
-            .await
-            .with_context(|| tool.to_string())?;
-        let text = || {
-            result
-                .content
-                .iter()
-                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-                .collect::<Vec<_>>()
-                .join("\n")
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(rmcp::ServiceError::McpError(e)) => return Ok(Err(e.message.to_string())),
+            Err(e) => return Err(anyhow::Error::new(e).context(tool.to_string())),
         };
+        let text = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         if result.is_error == Some(true) {
-            anyhow::bail!("{tool} failed: {}", text());
+            return Ok(Err(text));
         }
-        Ok(result
+        Ok(Ok(result
             .structured_content
             .clone()
-            .unwrap_or_else(|| Value::String(text())))
+            .unwrap_or(Value::String(text))))
     }
 
     /// The tools this Grant lists.
@@ -269,30 +384,72 @@ impl Session {
     }
 }
 
-/// Runs `scenarios` in `world`, one after another, each to its end.
-pub async fn run(world: Arc<World>, world_name: &str, scenarios: &[&Scenario]) -> Report {
-    let mut reports = Vec::new();
+fn outcome_of(err: &anyhow::Error) -> Outcome {
+    match blocked::find(err) {
+        Some(b) => Outcome::Blocked(b.reason.clone()),
+        None => Outcome::Fail(format!("{err:#}")),
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Runs `scenarios` in `world`, one after another. Checks the Driver and the
+/// Peer first; stops at the first blocked scenario. Each scenario's Grants are
+/// revoked when it ends, whatever its outcome, and sessions it left behind are
+/// ended through the Driver at the end.
+pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
+    let started = unix_now();
+    let mut report = Report {
+        world: world.name.to_string(),
+        scenarios: Vec::new(),
+        not_run: Vec::new(),
+        aborted: None,
+        checks: Vec::new(),
+    };
+    if let Err(e) = world.check_parties().await {
+        report.aborted = Some(outcome_of(&e));
+        report.not_run = scenarios.iter().map(|s| s.id).collect();
+        return report;
+    }
+    let mut stopped = false;
     for scenario in scenarios {
+        if stopped {
+            report.not_run.push(scenario.id);
+            continue;
+        }
         let mut run = Run {
             world: world.clone(),
             scenario: scenario.id,
             steps: Vec::new(),
             human: Vec::new(),
+            grants: Vec::new(),
         };
         let outcome = match (scenario.run)(&mut run).await {
             Ok(()) => Outcome::Pass,
-            Err(e) => Outcome::Fail(format!("{e:#}")),
+            Err(e) => outcome_of(&e),
         };
-        reports.push(ScenarioReport {
+        stopped = matches!(outcome, Outcome::Blocked(_));
+        let teardown = run.teardown().await;
+        report.scenarios.push(ScenarioReport {
             id: scenario.id,
             title: scenario.title,
             outcome,
             steps: run.steps,
             human: run.human,
+            teardown,
         });
     }
-    Report {
-        world: world_name.to_string(),
-        scenarios: reports,
+    if let Err(e) = world.driver.end_server_sessions(started - 60).await
+        && let Some(last) = report.scenarios.last_mut()
+    {
+        last.teardown.push(format!(
+            "ending leftover sessions through the Driver: {e:#}"
+        ));
     }
+    report
 }
