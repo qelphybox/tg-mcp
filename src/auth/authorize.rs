@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 use super::{
     AuthState, CONSENT_OFFERS, clients,
-    flows::{AuthRequest, PendingLogin, Progress},
+    flows::{AuthRequest, PendingLogin, Progress, Purpose},
     pages, pkce,
     rate_limit::ClientIp,
     send_list::{self, Picked, Pickers, Refused},
@@ -166,8 +166,15 @@ pub async fn authorize(
         state: q.state.clone(),
         scopes,
     };
-    let login_id = auth.flows.start_login(slot, request, attempt);
+    let login_id = auth
+        .flows
+        .start_login(slot, Purpose::Authorize(request), attempt);
+    to_login_page(&auth, &login_id)
+}
 
+/// The login page of a Login flow just started, with the `tgm_login` cookie
+/// that binds every later step to this browser.
+pub(super) fn to_login_page(auth: &AuthState, login_id: &str) -> Response {
     let mut response = Redirect::to(&format!("/login/{login_id}")).into_response();
     let secure = if auth.is_https() { "; Secure" } else { "" };
     let cookie =
@@ -417,6 +424,10 @@ pub async fn consent_page(
         Ok(login) => login,
         Err(response) => return response,
     };
+    let Purpose::Authorize(request) = &login.purpose else {
+        // Where the login page sends every finished login: `/forget` goes on.
+        return Redirect::to(&format!("/login/{id}/forget")).into_response();
+    };
     let progress = login.progress.lock().await;
     let Progress::LoggedIn(logged_in) = &*progress else {
         return Redirect::to(&format!("/login/{id}")).into_response();
@@ -424,7 +435,7 @@ pub async fn consent_page(
     let pickers = login.send_pickers.lock().await;
     // `send` never starts ticked: it means choosing chats, and clients that ask
     // for every advertised Scope would otherwise open on a list to fill in.
-    let checked = offered(login.request.scopes.iter().filter(|s| *s != Scope::Send));
+    let checked = offered(request.scopes.iter().filter(|s| *s != Scope::Send));
     let send = pages::SendView {
         choices: pickers.as_ref().map(Pickers::choices),
         ..pages::SendView::default()
@@ -441,15 +452,18 @@ fn consent(
     checked: Scopes,
     send: pages::SendView<'_>,
 ) -> Response {
-    let target = redirect_target(&login.request.redirect_uri);
+    let Purpose::Authorize(request) = &login.purpose else {
+        return not_an_authorization();
+    };
+    let target = redirect_target(&request.redirect_uri);
     let account_name = logged_in.account.display_name();
     pages::consent(
         status,
         &pages::ConsentView {
             login_id: id,
-            client_name: &login.request.client_name,
+            client_name: &request.client_name,
             redirect_target: &target,
-            redirect_is_loopback: redirect_is_loopback(&login.request.redirect_uri),
+            redirect_is_loopback: redirect_is_loopback(&request.redirect_uri),
             account_name: &account_name,
             account_username: logged_in.account.username.as_deref(),
             checked,
@@ -540,6 +554,9 @@ pub async fn consent_chats(
         Ok(login) => login,
         Err(response) => return response,
     };
+    if !matches!(login.purpose, Purpose::Authorize(_)) {
+        return not_an_authorization();
+    }
     let progress = login.progress.lock().await;
     let Progress::LoggedIn(logged_in) = &*progress else {
         return Redirect::to(&format!("/login/{id}")).into_response();
@@ -606,6 +623,10 @@ pub async fn consent_submit(
         Ok(login) => login,
         Err(response) => return response,
     };
+    // Checked before the login is taken: a `/forget` login stays usable.
+    if !matches!(login.purpose, Purpose::Authorize(_)) {
+        return not_an_authorization();
+    }
     let scopes = form.scopes();
     // The Send allow-list is settled before the login is taken: a refusal
     // shows the screen again, as it was posted.
@@ -629,7 +650,9 @@ pub async fn consent_submit(
             "This login was already finished.",
         );
     };
-    let request = login.request;
+    let Purpose::Authorize(request) = login.purpose else {
+        return not_an_authorization();
+    };
     let state = request.state.clone();
     match (form.decision.as_str(), login.progress.into_inner()) {
         ("allow", Progress::LoggedIn(logged_in)) => {
@@ -713,7 +736,7 @@ async fn send_allow_list(
 /// The login exists and this browser is the one that started it.
 // The Err is the ready-to-send page; it is built once, on the failure path only.
 #[allow(clippy::result_large_err)]
-fn owned_login(
+pub(super) fn owned_login(
     auth: &AuthState,
     headers: &HeaderMap,
     id: &str,
@@ -735,7 +758,17 @@ fn owned_login(
     auth.flows.login(id).ok_or_else(expired)
 }
 
-fn expired() -> Response {
+/// A step of an OAuth authorization asked of a Login flow that is none
+/// (`/forget`'s), or the reverse.
+pub(super) fn not_an_authorization() -> Response {
+    pages::error(
+        StatusCode::BAD_REQUEST,
+        "Wrong page",
+        "This login is for something else. Start again from where you began.",
+    )
+}
+
+pub(super) fn expired() -> Response {
     pages::error(
         StatusCode::GONE,
         "Login expired",

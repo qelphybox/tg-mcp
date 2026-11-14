@@ -30,13 +30,23 @@ pub struct AuthRequest {
     pub scopes: Scopes,
 }
 
+/// What a Login flow is for.
+#[derive(Debug)]
+pub enum Purpose {
+    /// An OAuth authorization: ends on Consent with an authorization code.
+    Authorize(AuthRequest),
+    /// `/forget` (#63): proves who owns the Account, then deletes its Grants.
+    /// Never ends in a code.
+    Forget,
+}
+
 pub enum Progress {
     InProgress(Box<dyn LoginAttempt>),
     LoggedIn(LoggedIn),
 }
 
 pub struct PendingLogin {
-    pub request: AuthRequest,
+    pub purpose: Purpose,
     pub progress: tokio::sync::Mutex<Progress>,
     /// Only touched while `progress` is locked.
     pub password_gate: Mutex<PasswordGate>,
@@ -167,7 +177,7 @@ impl Flows {
     pub fn start_login(
         &self,
         reservation: Reservation<'_>,
-        request: AuthRequest,
+        purpose: Purpose,
         attempt: Box<dyn LoginAttempt>,
     ) -> String {
         let client = reservation.client;
@@ -176,7 +186,7 @@ impl Flows {
         logins.pending.insert(
             id.clone(),
             Arc::new(PendingLogin {
-                request,
+                purpose,
                 progress: tokio::sync::Mutex::new(Progress::InProgress(attempt)),
                 password_gate: Mutex::default(),
                 send_pickers: tokio::sync::Mutex::default(),
@@ -284,7 +294,7 @@ mod tests {
     async fn start(flows: &Flows, from: ClientIp) -> Result<String, Full> {
         let slot = flows.reserve(from)?;
         let attempt = FakeLogin::default().start().await.unwrap();
-        Ok(flows.start_login(slot, request(), attempt))
+        Ok(flows.start_login(slot, Purpose::Authorize(request()), attempt))
     }
 
     #[tokio::test]

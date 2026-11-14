@@ -292,6 +292,11 @@ pub trait Connector: Send + Sync + 'static {
     /// evicted, the Live client is gone even if logging out fails.
     async fn evict_and_log_out(&self, grant_id: &GrantId) -> Result<bool, TgError>;
 
+    /// End a Telegram session the Login flow just made that no Grant holds
+    /// (`auth.logOut`), such as the one `/forget` logs in with to check who
+    /// asks. A session Telegram already considers dead counts as logged out.
+    async fn log_out_login(&self, logged_in: LoggedIn) -> Result<(), TgError>;
+
     /// Graceful shutdown, once the HTTP server has stopped: close every Live client
     /// and re-seal each Telegram session that changed while it was live. Failures
     /// are logged (Grant ids only), not returned: the process is exiting anyway.
@@ -383,6 +388,9 @@ mod tests {
             unreachable!()
         }
         async fn evict_and_log_out(&self, _: &GrantId) -> Result<bool, TgError> {
+            unreachable!()
+        }
+        async fn log_out_login(&self, _: LoggedIn) -> Result<(), TgError> {
             unreachable!()
         }
         async fn shutdown(&self) {

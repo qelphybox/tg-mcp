@@ -9,6 +9,7 @@
 pub(crate) mod authorize;
 pub mod clients;
 mod flows;
+mod forget;
 pub(crate) mod pages;
 mod pkce;
 mod qr;
@@ -189,6 +190,18 @@ pub fn router(auth: Arc<AuthState>) -> Router {
         .route(
             "/authorize",
             get(authorize::authorize).route_layer(limited(Endpoint::Authorize)),
+        )
+        .route(
+            "/forget",
+            // Only starting is limited (it opens a Telegram connection);
+            // `.get` after `route_layer` stays outside it.
+            post(forget::start)
+                .route_layer(limited(Endpoint::Forget))
+                .get(forget::page),
+        )
+        .route(
+            "/login/{id}/forget",
+            get(forget::review).post(forget::decide),
         )
         .route("/login/{id}", get(authorize::login_page))
         .route("/login/{id}/status", get(authorize::login_status))

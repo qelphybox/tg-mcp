@@ -100,7 +100,7 @@ nav a{display:inline-block;padding:10px 0;color:#D9D0E6;text-decoration:none}
 
 <h2>Disconnecting and deletion</h2>
 <p>In Telegram, open Settings → Devices and end the <strong>Unofficial MCP Server</strong> session. That logs the server out for real, and the encrypted session left in the database can no longer be used. Removing tg-mcp from your AI app alone is not always enough: some apps only forget their keys.</p>
-<p>To have the records above deleted, write to <span class="todo">[CONTACT EMAIL]</span>.</p>
+<p>To delete the records above yourself, even without your AI app or its keys, open <a href="https://connector.tgmcp.dev/forget">connector.tgmcp.dev/forget</a>, log in with Telegram and press <strong>Delete</strong>: every connection of your account is deleted, with its sign-in tokens and its encrypted session, and the login made for the check is ended right after. You can also write to <span class="todo">[CONTACT EMAIL]</span>.</p>
 
 <h2>Changes</h2>
 <p>This page lives in the <a href="https://github.com/qelphybox/tg-mcp">public repository</a>, so every change to it is in the history. How the session key lives only in tokens is explained in <a href="https://github.com/qelphybox/tg-mcp/blob/main/docs/adr/0003-session-key-lives-only-in-tokens.md">ADR-0003</a>.</p>
