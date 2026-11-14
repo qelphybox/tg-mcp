@@ -129,6 +129,11 @@ pub struct MediaLinks {
 }
 
 impl MediaLinks {
+    /// The public `scheme://host[:port]`, no trailing slash.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),

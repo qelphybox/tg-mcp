@@ -1968,7 +1968,7 @@ impl ServerHandler for TgMcp {
     /// As for a Grant that may only read; `initialize` and `discover` answer with
     /// the caller's own Scopes.
     fn get_info(&self) -> ServerConfig {
-        server_info(Scopes::READ_ONLY)
+        server_info(self.links.base_url(), Scopes::READ_ONLY)
     }
 
     async fn initialize(
@@ -1988,7 +1988,10 @@ impl ServerHandler for TgMcp {
     ) -> Result<DiscoverResult, ErrorData> {
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
-            server_info(self.tools.usable(caller_scopes(&context))),
+            server_info(
+                self.links.base_url(),
+                self.tools.usable(caller_scopes(&context)),
+            ),
         ))
     }
 
@@ -2044,14 +2047,19 @@ impl ServerHandler for TgMcp {
     }
 }
 
-fn server_info(scopes: Scopes) -> ServerConfig {
+/// What the server says of itself, with its icon and website on `base_url`.
+fn server_info(base_url: &str, scopes: Scopes) -> ServerConfig {
     ServerConfig::new(
         ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
             .build(),
     )
-    .with_server_info(Implementation::new("tg-mcp", env!("CARGO_PKG_VERSION")))
+    .with_server_info(
+        Implementation::new("tg-mcp", env!("CARGO_PKG_VERSION"))
+            .with_icons(crate::icon::icons(base_url))
+            .with_website_url(base_url),
+    )
     .with_instructions(instructions(scopes))
 }
 

@@ -6,6 +6,7 @@ pub mod allow_list;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod icon;
 pub mod limits;
 pub mod links;
 pub mod mcp;
@@ -96,6 +97,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .merge(mcp)
         .merge(auth::router(auth.clone()))
+        .merge(icon::router())
         .layer(cors)
         // Media links are for curl in an agent's shell, never for a page:
         // merged after the CORS layer, so no browser may read them cross-origin.
