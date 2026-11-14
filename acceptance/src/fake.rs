@@ -122,13 +122,16 @@ impl FakeWorldBuilder {
             Some(p) => FakeLogin::with_password(self.test_data, p),
             None => FakeLogin::new(self.test_data),
         };
+        let saved = Arc::new(Mutex::new(None));
         let driver = Arc::new(FakeParty {
+            saved: saved.clone(),
             account: self.driver_claims,
             login: test_login,
             accepted: accepted.clone(),
             accepts: self.driver_accepts,
         });
         let peer = Arc::new(FakeParty {
+            saved: Arc::new(Mutex::new(None)),
             account: PEER,
             login: FakeLogin::new(FakeData::new(peer())),
             accepted: accepted.clone(),
@@ -148,6 +151,11 @@ impl FakeWorldBuilder {
                 cloud_password: Some(Zeroizing::new(CLOUD_PASSWORD.into())),
                 poll_every: Duration::from_millis(10),
                 login_timeout: Duration::from_secs(3),
+                lease: crate::lease::Terms {
+                    ttl: Duration::from_secs(30),
+                    wait: Duration::from_millis(300),
+                    poll: Duration::from_millis(20),
+                },
                 _keep: keep,
             }),
             connector,
@@ -292,6 +300,8 @@ impl LoginAttempt for GatedAttempt {
 
 /// A fake Test account (the Driver) or Peer: accepting a QR logs it in.
 struct FakeParty {
+    /// The Draft in this account's Saved Messages.
+    saved: Arc<Mutex<Option<String>>>,
     account: i64,
     login: FakeLogin,
     accepted: Accepted,
@@ -316,7 +326,17 @@ impl Party for FakeParty {
     }
 }
 
-impl Driver for FakeParty {}
+#[async_trait]
+impl Driver for FakeParty {
+    async fn saved_draft(&self) -> Result<Option<String>> {
+        Ok(self.saved.lock().unwrap().clone())
+    }
+
+    async fn set_saved_draft(&self, text: &str) -> Result<()> {
+        *self.saved.lock().unwrap() = (!text.is_empty()).then(|| text.to_string());
+        Ok(())
+    }
+}
 impl Peer for FakeParty {}
 
 /// The token of a `tg://login?token=…` URL, as Telegram's apps read it.

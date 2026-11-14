@@ -21,7 +21,7 @@ use rmcp::{
 use serde_json::Value;
 
 use crate::{
-    blocked,
+    blocked, lease,
     login::{self, Grant},
     world::{Who, World},
 };
@@ -93,6 +93,8 @@ pub struct ScenarioReport {
 pub struct Report {
     /// Which world it ran in: `fake` or `real`.
     pub world: String,
+    /// The run's id: in its lease and in every text it wrote.
+    pub run_id: String,
     pub scenarios: Vec<ScenarioReport>,
     /// Scenarios that never ran because the run was blocked or aborted.
     pub not_run: Vec<&'static str>,
@@ -131,10 +133,22 @@ impl fmt::Display for Report {
     /// The acceptance table and the Human checks as PR checkboxes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.outcome() {
-            Outcome::Pass => writeln!(f, "## Acceptance: PASS ({} world)", self.world)?,
-            Outcome::Fail(_) => writeln!(f, "## Acceptance: FAIL ({} world)", self.world)?,
+            Outcome::Pass => writeln!(
+                f,
+                "## Acceptance: PASS ({} world, run {})",
+                self.world, self.run_id
+            )?,
+            Outcome::Fail(_) => writeln!(
+                f,
+                "## Acceptance: FAIL ({} world, run {})",
+                self.world, self.run_id
+            )?,
             Outcome::Blocked(why) => {
-                writeln!(f, "## Acceptance: BLOCKED ({} world)", self.world)?;
+                writeln!(
+                    f,
+                    "## Acceptance: BLOCKED ({} world, run {})",
+                    self.world, self.run_id
+                )?;
                 writeln!(f)?;
                 writeln!(
                     f,
@@ -218,6 +232,8 @@ fn one_line(s: &str) -> String {
 /// What a scenario runs with.
 pub struct Run {
     pub world: Arc<World>,
+    /// Marks everything this run writes (see [`Run::mark`]).
+    pub run_id: String,
     scenario: &'static str,
     steps: Vec<String>,
     human: Vec<HumanCheck>,
@@ -225,7 +241,48 @@ pub struct Run {
     grants: Vec<Grant>,
 }
 
+/// How a run marks the texts it writes.
+fn marker(run_id: &str) -> String {
+    format!("[tgmcp-accept {run_id}]")
+}
+
+/// A fresh run id: 10 characters of base32, short enough to read in a chat.
+pub fn new_run_id() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bytes = [0u8; 10];
+    getrandom::fill(&mut bytes).expect("the OS has randomness");
+    bytes
+        .iter()
+        .map(|b| ALPHABET[usize::from(b % 32)] as char)
+        .collect()
+}
+
+/// Whether `text` was written by run `run_id`.
+pub fn is_from_run(text: &str, run_id: &str) -> bool {
+    text.contains(&marker(run_id))
+}
+
+/// Whether `text` was written by some acceptance run.
+pub fn is_from_any_run(text: &str) -> bool {
+    text.contains("[tgmcp-accept ")
+}
+
 impl Run {
+    /// `text` with this run's marker after it: every text a scenario writes
+    /// goes through this, so a crashed run's leftovers can't pass for the
+    /// next run's.
+    pub fn mark(&self, text: &str) -> String {
+        format!("{text} {}", marker(&self.run_id))
+    }
+
+    /// Of `texts`, those this run wrote.
+    pub fn ours<'t>(&self, texts: impl IntoIterator<Item = &'t str>) -> Vec<&'t str> {
+        texts
+            .into_iter()
+            .filter(|t| is_from_run(t, &self.run_id))
+            .collect()
+    }
+
     /// Records a step the scenario proved.
     pub fn passed(&mut self, step: impl Into<String>) {
         self.steps.push(step.into());
@@ -404,8 +461,10 @@ fn unix_now() -> i64 {
 /// ended through the Driver at the end.
 pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
     let started = unix_now();
+    let run_id = new_run_id();
     let mut report = Report {
         world: world.name.to_string(),
+        run_id: run_id.clone(),
         scenarios: Vec::new(),
         not_run: Vec::new(),
         aborted: None,
@@ -416,6 +475,14 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
         report.not_run = scenarios.iter().map(|s| s.id).collect();
         return report;
     }
+    let held = match lease::take(world.driver.clone(), &run_id, world.lease).await {
+        Ok(held) => held,
+        Err(e) => {
+            report.aborted = Some(outcome_of(&e));
+            report.not_run = scenarios.iter().map(|s| s.id).collect();
+            return report;
+        }
+    };
     let mut stopped = false;
     for scenario in scenarios {
         if stopped {
@@ -424,6 +491,7 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
         }
         let mut run = Run {
             world: world.clone(),
+            run_id: run_id.clone(),
             scenario: scenario.id,
             steps: Vec::new(),
             human: Vec::new(),
@@ -444,12 +512,17 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
             teardown,
         });
     }
-    if let Err(e) = world.driver.end_server_sessions(started - 60).await
-        && let Some(last) = report.scenarios.last_mut()
-    {
-        last.teardown.push(format!(
+    let mut notes = Vec::new();
+    if let Err(e) = world.driver.end_server_sessions(started - 60).await {
+        notes.push(format!(
             "ending leftover sessions through the Driver: {e:#}"
         ));
+    }
+    if let Err(e) = held.release().await {
+        notes.push(format!("releasing the lease: {e:#}"));
+    }
+    if let Some(last) = report.scenarios.last_mut() {
+        last.teardown.extend(notes);
     }
     report
 }

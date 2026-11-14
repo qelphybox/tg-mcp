@@ -141,6 +141,48 @@ impl Party for TgClient {
 
 #[async_trait]
 impl Driver for TgClient {
+    async fn saved_draft(&self) -> Result<Option<String>> {
+        let tl::enums::messages::PeerDialogs::Dialogs(found) = self
+            .client
+            .invoke(&tl::functions::messages::GetPeerDialogs {
+                peers: vec![tl::enums::InputDialogPeer::Peer(
+                    tl::types::InputDialogPeer {
+                        peer: tl::enums::InputPeer::PeerSelf,
+                    },
+                )],
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getPeerDialogs"))?;
+        Ok(found.dialogs.into_iter().find_map(|d| match d {
+            tl::enums::Dialog::Dialog(d) => match d.draft {
+                Some(tl::enums::DraftMessage::Message(m)) if !m.message.is_empty() => {
+                    Some(m.message)
+                }
+                _ => None,
+            },
+            _ => None,
+        }))
+    }
+
+    async fn set_saved_draft(&self, text: &str) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::messages::SaveDraft {
+                no_webpage: true,
+                invert_media: false,
+                reply_to: None,
+                peer: tl::enums::InputPeer::PeerSelf,
+                message: text.to_string(),
+                entities: None,
+                media: None,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.saveDraft"))?;
+        Ok(())
+    }
+
     async fn end_server_sessions(&self, since: i64) -> Result<usize> {
         let tl::enums::account::Authorizations::Authorizations(all) = self
             .client

@@ -39,6 +39,12 @@ pub trait Party: Send + Sync {
 /// The harness's own login to the Test account: it stands in for the phone.
 #[async_trait]
 pub trait Driver: Party {
+    /// The text of the Draft in the Test account's Saved Messages, if any.
+    async fn saved_draft(&self) -> Result<Option<String>>;
+
+    /// Replaces the Draft in Saved Messages (`""` clears it).
+    async fn set_saved_draft(&self, text: &str) -> Result<()>;
+
     /// Ends the Test account's "Unofficial MCP Server" sessions created since
     /// `since` (Unix seconds) that a run left behind; returns how many. Telegram
     /// refuses this for 24 hours after the Driver's own login, which is fine.
@@ -77,6 +83,8 @@ pub struct World {
     pub poll_every: Duration,
     /// How long a QR login may take before the run fails.
     pub login_timeout: Duration,
+    /// How a run takes and keeps the Test account's lease.
+    pub lease: crate::lease::Terms,
     /// Whatever must live as long as the world (e.g. the server under test).
     pub(crate) _keep: Vec<Box<dyn Any + Send + Sync>>,
 }

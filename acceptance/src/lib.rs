@@ -8,6 +8,7 @@ pub mod blocked;
 pub mod config;
 pub mod fake;
 pub mod forms;
+pub mod lease;
 pub mod login;
 pub mod real;
 pub mod run;

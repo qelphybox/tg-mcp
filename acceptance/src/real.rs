@@ -82,6 +82,7 @@ pub async fn start(
         cloud_password: Some(Zeroizing::new(config.cloud_password.to_string())),
         poll_every: Duration::from_millis(1500),
         login_timeout: Duration::from_secs(90),
+        lease: crate::lease::Terms::REAL,
         _keep: keep,
     };
     Ok((Arc::new(world), files))

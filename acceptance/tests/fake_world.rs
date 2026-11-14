@@ -161,3 +161,92 @@ async fn every_grant_is_revoked_when_its_scenario_ends() {
         world.connector.logged_out()
     );
 }
+
+#[tokio::test]
+async fn another_runs_live_lease_keeps_a_run_from_starting() {
+    let world = FakeWorld::start().await.unwrap();
+    let until = acceptance::lease::unix_now() + 600;
+    world
+        .world
+        .driver
+        .set_saved_draft(&format!("tgmcp-accept lease other1 until {until}"))
+        .await
+        .unwrap();
+    let report = run::run(world.world.clone(), &[scenarios::find("login").unwrap()]).await;
+    let Outcome::Fail(why) = report.outcome() else {
+        panic!("a run started under another run's lease: {report}");
+    };
+    assert!(why.contains("lease held by run other1"), "{why}");
+    assert!(why.contains(&until.to_string()), "{why}");
+    assert!(report.scenarios.is_empty());
+    assert_eq!(
+        world.world.driver.saved_draft().await.unwrap(),
+        Some(format!("tgmcp-accept lease other1 until {until}")),
+        "another run's lease is left alone"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_lease_is_taken_over_and_released_at_the_end() {
+    let world = FakeWorld::start().await.unwrap();
+    let past = acceptance::lease::unix_now() - 1;
+    world
+        .world
+        .driver
+        .set_saved_draft(&format!("tgmcp-accept lease crashed until {past}"))
+        .await
+        .unwrap();
+    let report = run::run(world.world.clone(), &[scenarios::find("login").unwrap()]).await;
+    assert_eq!(report.outcome(), Outcome::Pass, "{report}");
+    assert_eq!(
+        world.world.driver.saved_draft().await.unwrap(),
+        None,
+        "the run's own lease is cleared when it ends"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_run_releases_its_lease_too() {
+    let world = FakeWorld::builder().idle_driver().start().await.unwrap();
+    let report = run::run(world.world.clone(), &[scenarios::find("login").unwrap()]).await;
+    assert!(matches!(report.outcome(), Outcome::Fail(_)), "{report}");
+    assert_eq!(world.world.driver.saved_draft().await.unwrap(), None);
+}
+
+/// Writes one marked and one foreign Draft, then finds only its own.
+const MARKS: Scenario = Scenario {
+    id: "marks",
+    title: "marks what it writes",
+    run: |run| {
+        Box::pin(async move {
+            let session = run.login(&["draft"]).await?;
+            let mine = run.mark("hello");
+            anyhow::ensure!(mine.starts_with("hello [tgmcp-accept "), "{mine}");
+            let chat = format!("user:{TEST_ACCOUNT}");
+            session
+                .call(
+                    "save_draft",
+                    json!({ "chat_id": chat, "text": mine, "format": "plain" }),
+                )
+                .await?;
+            let foreign = "left over [tgmcp-accept someoneelse]";
+            let texts = [mine.as_str(), foreign, "typed by hand"];
+            anyhow::ensure!(run.ours(texts) == vec![mine.as_str()], "{texts:?}");
+            Ok(())
+        })
+    },
+};
+
+#[tokio::test]
+async fn a_run_marks_what_it_writes_and_sees_only_its_own() {
+    let world = FakeWorld::start().await.unwrap();
+    let report = run::run(world.world.clone(), &[&MARKS]).await;
+    assert_eq!(report.outcome(), Outcome::Pass, "{report}");
+    let drafts = world.connector.drafts().of(TEST_ACCOUNT);
+    assert!(
+        drafts
+            .iter()
+            .any(|d| acceptance::run::is_from_run(&d.text.text, &report.run_id)),
+        "{drafts:?}"
+    );
+}
