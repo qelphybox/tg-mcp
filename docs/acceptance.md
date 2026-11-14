@@ -973,7 +973,7 @@ ADR-0008. Needs `telegram-send` of §56, and, for step 4, a send connector made 
 
 7. **Clean up.** Delete the §58 messages in A, and remove the connector kept from 0.2.0 (`claude mcp remove …`, then end its session in Telegram → Settings → Devices).
 
-## 59. The server's icon: our own mark at fixed URLs, in `serverInfo`, and as the sign-in pages' favicon
+## 59. The server's icon: our own mark at fixed URLs, in `serverInfo`, and as the Login flow pages' favicon
 
 #61. The mark is `site/favicon.svg` (a speech bubble with an orange dot, not Telegram's paper plane). The boundaries are also covered by fake-backed tests: `cargo test --test icon` (each route's type, pixel size read from the PNG header, caching; `serverInfo.icons` with absolute URLs on the configured host, PNG 128 first), `cargo test --lib icon::` (the embedded SVG is the master) and `cargo test --lib auth::pages::` (the favicon links, CSP unchanged).
 
@@ -993,7 +993,7 @@ ADR-0008. Needs `telegram-send` of §56, and, for step 4, a send connector made 
 
 2. **`serverInfo` names them.** Run `npx @modelcontextprotocol/inspector`, connect it to `https://connector.tgmcp.dev/mcp` (Streamable HTTP, OAuth: sign in with the QR, read-only is enough), and open the `initialize` response. Expect `serverInfo.websiteUrl` = `https://connector.tgmcp.dev`, and `serverInfo.icons` = `[{src: "https://connector.tgmcp.dev/icon.png", mimeType: "image/png", sizes: ["128x128"]}, {src: ".../icon-256.png", …, sizes: ["256x256"]}, {src: ".../icon.svg", mimeType: "image/svg+xml", sizes: ["any"]}]`, in that order. Then end the Inspector's session in Telegram → Settings → Devices.
 
-3. **The sign-in pages' favicon.** Start a login in a browser (§51's `scripts/scope-check.py - read` prints a link; open it): the browser tab shows the mark. In the developer tools: `<link rel="icon" href="/icon.svg" …>` and `<link rel="icon" href="/favicon.ico" …>` in `<head>`, both loaded with 200, no CSP error in the console, and the page's `content-security-policy` header the same as before (`… img-src 'self' data: …`). Deny the login afterwards.
+3. **The Login flow pages' favicon.** Start a login in a browser (§51's `scripts/scope-check.py - read` prints a link; open it): the browser tab shows the mark. In the developer tools: `<link rel="icon" href="/icon.svg" …>` and `<link rel="icon" href="/favicon.ico" …>` in `<head>`, both loaded with 200, no CSP error in the console, and the page's `content-security-policy` header the same as before (`… img-src 'self' data: …`). Deny the login afterwards.
 
 4. **What the clients show (record it on #61).** Look at the connector in each client and note whether it shows the mark, the domain's favicon or a generic globe:
    - claude.ai: Settings → Connectors (a custom connector on `https://connector.tgmcp.dev/mcp`);

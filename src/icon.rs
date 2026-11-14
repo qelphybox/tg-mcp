@@ -6,13 +6,10 @@
 //! rendered from it by `assets/icon/render.cjs` (see its header). Nothing is
 //! drawn at runtime. Public, unauthenticated, cached for a day.
 
-use axum::{
-    Router,
-    http::header,
-    response::{IntoResponse, Response},
-    routing::get,
-};
+use axum::{Router, routing::get};
 use rmcp::model::Icon;
+
+use crate::auth::static_asset as file;
 
 const SVG: &[u8] = include_bytes!("../assets/icon/icon.svg");
 const PNG_32: &[u8] = include_bytes!("../assets/icon/favicon-32.png");
@@ -35,17 +32,6 @@ pub fn router() -> Router {
             get(|| async { file("image/png", PNG_512) }),
         )
         .route("/favicon.ico", get(|| async { file("image/png", PNG_32) }))
-}
-
-fn file(content_type: &'static str, body: &'static [u8]) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        body,
-    )
-        .into_response()
 }
 
 /// `serverInfo.icons` on the public `base_url`: PNG 128 first (some clients
