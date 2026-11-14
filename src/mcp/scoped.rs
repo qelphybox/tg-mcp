@@ -393,7 +393,7 @@ mod tests {
         // As the server serves them, get_media's schema adjusted either way.
         let links = Arc::new(MediaLinks::new("http://127.0.0.1"));
         for documents in [false, true] {
-            let server = TgMcp::new(links.clone(), documents);
+            let server = TgMcp::new(links.clone(), Arc::default(), documents);
             for tool in server.tools.listed(every_scope()) {
                 assert_eq!(
                     tool.input_schema.get("additionalProperties"),
