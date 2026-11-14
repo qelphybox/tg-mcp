@@ -297,6 +297,11 @@ pub trait Connector: Send + Sync + 'static {
     /// are logged (Grant ids only), not returned: the process is exiting anyway.
     /// Call it through [`shut_down`], which bounds how long it may take.
     async fn shutdown(&self);
+
+    /// How many Live clients the Client pool holds now: a number for the `stats` line.
+    fn live_clients(&self) -> usize {
+        0
+    }
 }
 
 /// How long graceful shutdown waits for [`Connector::shutdown`]. Docker gives a
