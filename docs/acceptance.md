@@ -1034,3 +1034,35 @@ Needs nothing beyond §1. The mechanism is covered by fake-backed tests over eve
 5. Step 5: three chats, no error. If Claude corrects the spelling on its own in steps 1–3 (it may, since the schema now forbids other keys), the call succeeds: note it, and that is fine too.
 
 Then in claude.ai, in a chat with the connector (Settings → Connectors, `https://connector.tgmcp.dev/mcp`), ask "list my 3 most recent Telegram chats" and "what did I miss on Telegram?": both answer without an `unknown parameter` error. Record on #60 that Claude Code and claude.ai calls still succeed, i.e. no client puts keys of its own into `arguments`.
+
+## 67. The official image is a static binary of about 15 MB that runs with only a volume, and holds no more memory than before
+
+Needs Docker on your machine (amd64, or arm64 for step 2) and a clone. The image checks also run in CI on every push (`docker` job: `scripts/container-smoke-test.sh`; `docker-arm64` job: the arm64 cross build).
+
+1. **Size, `/healthz`, issuer, non-root, database under `/data`.** Production's image is `ghcr.io/qelphybox/tg-mcp:<sha>` (the commit `main` deployed; `kamal app containers` or the Deploy run names it):
+
+   ```sh
+   docker pull ghcr.io/qelphybox/tg-mcp:<sha>
+   scripts/container-smoke-test.sh ghcr.io/qelphybox/tg-mcp:<sha>
+   # expect five PASS lines: "image is 15.x MB uncompressed (budget 25 MB)", "/healthz answers",
+   # "issuer is http://localhost:8080", "the server runs as uid 65532", "the database is at /data/tg-mcp.db"
+   ```
+
+   It runs the image with `TG_MCP_FAKE_TELEGRAM=1` and a volume at `/data`, nothing else.
+
+2. **Static, both architectures, no emulation.** After the next release tag: `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest` lists `linux/amd64` and `linux/arm64`. On an arm64 machine (Apple silicon, Ampere, a Raspberry Pi 4/5) step 1 passes with that tag too. The release run's log shows no `qemu` / `binfmt` step.
+
+   ```sh
+   c=$(docker create ghcr.io/qelphybox/tg-mcp:<sha>); docker cp $c:/usr/local/bin/tg-mcp /tmp/tg-mcp; docker rm $c
+   file /tmp/tg-mcp                    # expect "statically linked, stripped"
+   strings /tmp/tg-mcp | grep -ci mimalloc   # expect more than 0: mimalloc is linked in
+   ```
+
+3. **Memory on production, before and after the allocator change** (maintainer, needs SSH to the server). Use §6's `mem` and its three steps (baseline right after a deploy, active after one `whoami` per Account, back near baseline 11 minutes later). Run them once on the image of the last commit before #101 merged and once on the current one: there is no migration between them, so `kamal rollback <sha before #101>`, §6, then `kamal rollback <current sha>` (or the next deploy), §6 again. Record both rows in the release notes:
+
+   | Image | Baseline | Active (N Accounts) | 11 min idle |
+   | --- | --- | --- | --- |
+   | before #101 (glibc) | | | |
+   | after #101 (musl + mimalloc) | | | |
+
+   Expect the "after" row within a few MB of the "before" row. For reference, locally with fake Telegram on 2 CPUs (`--cpuset-cpus=0,1`): glibc image 2.2 MB at idle and 2.9 MB after 20,000 requests to `/healthz`, the OAuth metadata and `/register`; musl + mimalloc 2.1 MB and 2.9 MB. Without the image's `MIMALLOC_ARENA_EAGER_COMMIT=0` mimalloc held 11 MB and 13.7 MB: if the "after" row is about 9 MB above the "before" row, check that variable (`docker inspect -f '{{.Config.Env}}' <container>`).

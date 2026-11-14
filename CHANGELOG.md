@@ -15,6 +15,12 @@
 
 - **`list_chats` no longer drops pinned chats beyond `limit`** (#68). With more pinned chats than `limit`, the next page goes on with the next pinned chat instead of starting the unpinned list, so every pinned chat appears once across the pages of one listing: main list, Archive and `unread_only` alike. A page that continues the pinned chats is still one `messages.getDialogs` call. Cursors issued before keep working as they did.
 
+### Self-hosting
+
+- **The image is a static binary on `distroless/static`: about 15 MB uncompressed, down from 45.** It is built for musl (amd64 and arm64, still cross-compiled without emulation) with mimalloc as the allocator, fat LTO and a stripped binary; a panicking task still doesn't take the server down. RSS stays where it was (about 2 MB at idle in a container with fake Telegram).
+- **The database goes to `/data/tg-mcp.db` by default in the image**: mounting a volume at `/data` is enough, `TG_MCP_DB_PATH` is no longer needed. `cargo run` still uses `./tg-mcp.db`. The image declares no `VOLUME`.
+- CI runs the built image the way a self-hoster would (`scripts/container-smoke-test.sh`): `/healthz`, the OAuth issuer, non-root, the database under `/data` and a 25 MB size budget, and builds arm64 on every push.
+
 ## 0.2.0
 
 ### New address
