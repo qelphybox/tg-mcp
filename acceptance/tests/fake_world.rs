@@ -375,3 +375,40 @@ async fn a_clean_run_lists_its_invariants_as_passed() {
         "the server's own log lines are captured, so the check reads something"
     );
 }
+
+#[tokio::test]
+async fn s53_notices_a_lost_entity_and_names_it() {
+    let world = FakeWorld::builder()
+        .driver_misses_bold()
+        .start()
+        .await
+        .unwrap();
+    let report = run::run(world.world.clone(), &[scenarios::find("s53").unwrap()]).await;
+    let Outcome::Fail(why) = report.outcome() else {
+        panic!("a lost bold entity passed: {report}");
+    };
+    assert!(why.contains("no bold entity"), "{why}");
+}
+
+#[tokio::test]
+async fn s53_reports_its_human_checks_as_pr_checkboxes() {
+    let world = FakeWorld::start().await.unwrap();
+    let report = run::run(world.world.clone(), &[scenarios::find("s53").unwrap()]).await;
+    assert_eq!(report.outcome(), Outcome::Pass, "{report}");
+    let checks: Vec<_> = report.human_checks().collect();
+    assert_eq!(checks.len(), 4, "{report}");
+    let shown = report.to_string();
+    assert!(shown.contains("### Human checks"), "{shown}");
+    assert!(shown.contains("- [ ] s53: Group G"), "{shown}");
+    let drafts = world.connector.drafts().of(TEST_ACCOUNT);
+    let left: Vec<_> = drafts
+        .iter()
+        .filter(|d| acceptance::run::is_from_run(&d.text.text, &report.run_id))
+        .map(|d| d.chat.to_string())
+        .collect();
+    assert_eq!(
+        left.len(),
+        2,
+        "only G's and A's Drafts stay, for the Human checks: {left:?}"
+    );
+}

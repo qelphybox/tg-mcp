@@ -6,6 +6,10 @@ Commands assume a local clone with `.env` from `scripts/setup-deploy.sh` loaded 
 
 Run the shell blocks in bash. Interactive zsh (the macOS default) doesn't treat `#` as a comment unless `setopt interactivecomments` is on, so the inline `# expect …` notes fail with a parse error; type `bash` first, or run `setopt interactivecomments`.
 
+## Automated acceptance
+
+Sections that say "Automated" run as code against real Telegram on a Test account (ADR-0009, GLOSSARY → Acceptance): `cargo accept --list` names the scenarios, `cargo accept <id>` runs one with a local server, `cargo accept --target https://connector.tgmcp.dev smoke` against production, `cargo accept --fake <id>` on the fake Telegram. Set it up once with `scripts/accept-setup.sh`. A run ends PASS, FAIL or BLOCKED (Telegram limited the Test account: not a bug in the code) and prints its Human checks as PR checkboxes.
+
 ## 1. From `claude mcp add` to the first `list_chats` in under 2 minutes
 
 With a stopwatch, from a machine where the server was never added:
@@ -723,62 +727,32 @@ Needs four QR scans. `scripts/scope-check.py` logs in with its own OAuth client,
 
 ## 53. Drafts: save_draft writes a formatted Draft that shows on every device, only with `draft`, and get_drafts reads them back
 
-Needs Telegram open on a phone and on Telegram Desktop with the account, a private test chat (Saved Messages works; "Alice" below is any chat of yours where a Draft does no harm), and a forum: a supergroup of yours with Topics on and a Topic "Releases" with a message in it (create one if needed). Note the forum's Topic ids with `get_chat_info` (Releases' id is `R` below; General is 1). Clear any Draft the steps below would replace first. The boundaries are also covered by fake-backed tests: `cargo test --test drafts` (4096 characters pass and 4097 don't, Markdown becomes the exact entities, the forum rule, the Scope).
+Automated (ADR-0009): `cargo accept s53` on the Test account, `cargo accept --fake s53` without Telegram. It logs in through the QR (the Driver accepts it) and checks, reading what Telegram holds through the Driver rather than through the server:
 
-1. **Only a `draft` Grant has `save_draft`.**
+1. A `read` Grant lists `get_drafts` but not `save_draft`, and calling it is refused for the missing Scope without writing; a `read draft` Grant lists both.
+2. The Markdown text below goes to G: `entities: 5`, and Telegram holds bold, italic, code, a link to the repository and a code block on exactly their words (the emoji before **Release** doesn't shift them). With `format: "plain"` B holds the characters as typed and no formatting.
+3. "first" then "second" in B leaves "second", in Telegram and in `get_drafts`; `""` answers `cleared` and leaves nothing.
+4. A Draft in A replying to the Peer's latest message holds that reply, and `get_drafts` shows its `reply_to`.
+5. In the forum: no Topic is an error and writes nothing; `topic: Releases` and `topic: 1` each land in their Topic only; `reply_to` alone picks the reply's Topic; a `reply_to` in another Topic and `topic` outside a forum are errors; `get_drafts` names each Draft's Topic.
+6. About 5400 characters: an error naming the length, "not split", and A's Draft unchanged.
+7. A Draft typed elsewhere (by the Driver) is listed first by `get_drafts`, newest first, and Saved Messages (holding the run's lease) is marked `is_self`.
+8. The run's own checks: no Draft text in the server's logs or database, no `tgm_` in its logs.
 
-   ```sh
-   python3 scripts/scope-check.py - read                    # expect every line [PASS] and exit status 0
-   python3 scripts/scope-check.py "read draft" "read draft" # expect every line [PASS] and exit status 0
-   ```
+~~~text
+😀 **Release** _notes_: run `cargo test`, see [the PR](https://github.com/qelphybox/tg-mcp)
+```rust
+fn main() {}
+```
+~~~
 
-   The first lists `get_drafts` but not `save_draft`, and "calling save_draft is refused for the missing Scope" passes: the error reads "save_draft needs the `draft` Scope, which this connection was not granted (it has: read). …". The second lists both. Then add the connector the steps below use: `claude mcp add --transport http telegram-drafts https://connector.tgmcp.dev/mcp`, `/mcp` → `telegram-drafts` → Authenticate, scan the QR, tick **Write Drafts**, Allow. In a new Claude Code session `/mcp` shows both servers; with only the regular `telegram` connector (a `read` Grant), "save a Telegram draft 'hi' in my Saved Messages" can't be done: no `save_draft` is offered.
+Human checks (the run prints them as PR checkboxes; the Drafts in G and A stay for them):
 
-2. **Markdown becomes formatting, on phone and desktop.** With `telegram-drafts`, ask:
+- Group G on the phone and on Telegram Desktop: **Release** bold, *notes* italic, `cargo test` monospace, "the PR" a link, `fn main() {}` a code block.
+- Sent from the phone, the message keeps it all and "the PR" opens the repository (delete it afterwards).
+- A's message field on the phone shows a reply bar quoting the Peer's message.
+- Afterwards, clear the Drafts in G and A.
 
-   ~~~text
-   Call save_draft in my Saved Messages. Do not pass the format parameter at all (the default is markdown, which turns ** _ ` [..](..) and ``` into Telegram formatting) and do not escape anything. Use this text, from the line after --- to the line before ---:
-   ---
-   😀 **Release** _notes_: run `cargo test`, see [the PR](https://github.com/qelphybox/tg-mcp)
-   ```rust
-   fn main() {}
-   ```
-   ---
-   ~~~
-
-   Expect `status: "saved"`, `entities: 5`. On the phone and on the desktop, Saved Messages' message field shows the Draft: **Release** bold (exactly that word: the emoji before it takes two UTF-16 units and must not shift it), *notes* italic, `cargo test` monospace, "the PR" a link, and `fn main() {}` as a code block. Send it from the phone: the sent message keeps all of it, and "the PR" opens the GitHub page. Then the same text with `format: "plain"`: the field shows the asterisks, underscores and backticks as typed, with no formatting.
-
-3. **A Draft replaces the one there, and `""` clears it.** Ask: "save_draft 'first' in Alice, then 'second' in Alice, then call get_drafts". Both devices show only "second" in Alice's field; `get_drafts` has one Draft for Alice's `chat.id`, text "second". Then "save_draft with text "" in Alice": `status: "cleared"`, the field is empty on both devices, and `get_drafts` no longer lists Alice.
-
-4. **`reply_to`.** Ask: "show the last 3 messages in Alice, then save_draft 'about this' in Alice replying to the oldest of them". The field shows a reply bar quoting that message on both devices; sending it sends a reply to it. `get_drafts` shows that Draft with `reply_to` = that id.
-
-5. **A forum needs a Topic.** In the forum, ask in turn and record each answer:
-   - save_draft "x" with neither `topic` nor `reply_to`: an error "… is a forum: say which Topic to write in with topic (…; General is 1), or give reply_to, a message in that Topic". Nothing appears in any field.
-   - `topic: R`, text "in releases": `status: "saved"`, `topic: R`; the Draft is in the Releases Topic's field only, on both devices.
-   - `topic: 1`, text "in general": the Draft is in General's field only (Releases still holds "in releases").
-   - `reply_to` = the id of a message in Releases, no `topic`, text "a reply": the answer has `topic: R`; Releases' field now holds "a reply" with a reply bar.
-   - `topic: R` with `reply_to` = a message in General: an error "reply_to N is in Topic 1, not in topic R …".
-   - `topic: 1` on Alice (no forum): an error "… is not a forum …".
-
-   `get_drafts` lists the forum's Drafts with their `topic` (R and 1). Clear both (`""` with `topic: R`, then `topic: 1`).
-
-6. **Too long is an error, never split.** Ask: "save_draft in Saved Messages with the word 'lorem ' repeated 900 times (about 5400 characters), format plain". Expect an invalid-params error "text is N characters once formatted; Telegram takes at most 4096. It is not split: …" with N over 4096; the field keeps what was there before, and no message or partial Draft appears anywhere.
-
-7. **`get_drafts` lists them newest first.** Save "draft A" in Alice, then "draft B" in Saved Messages, with a minute between; then on the phone type "draft C" by hand into a third chat's field and leave it. Ask "call get_drafts". Expect C, B, A in that order (dates UTC, newest first), C's text as typed, Saved Messages marked `is_self: true`, and each `chat.id` usable with `get_messages`. Clear the three.
-
-8. **The server's side**, within 15 minutes of the steps:
-
-   ```sh
-   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
-   logs | grep 'draft saved' | tail -5
-   # expect lines with grant_id, chat (e.g. chat=user:N, chat=channel:N), topic, reply_to, chars, entities and cleared: ids and sizes only
-   logs | grep -cE 'Release|lorem|in releases|draft A|about this'   # expect 0: Draft text is never logged
-   logs | grep -c 'tgm_'                                            # expect 0: no Token is ever logged
-   ```
-
-9. **The Writes budget** is §52 step 4, run with `telegram-drafts`.
-
-10. **Clean up.** `claude mcp remove telegram-drafts`, and end its session in Telegram → Settings → Devices.
+Still by hand: the Writes budget run (§52 step 4) and production's `draft saved` log lines (`logs | grep 'draft saved'`: ids and sizes only).
 
 ## 54. Send allow-list: chosen on Consent from folders, recent chats and a search, refused empty, sealed in the database, counted in the logs
 

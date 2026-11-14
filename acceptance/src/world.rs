@@ -36,9 +36,44 @@ pub trait Party: Send + Sync {
     async fn accept_login(&self, qr_url: &str) -> Result<()>;
 }
 
+/// A Draft as Telegram holds it, read by the Driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenDraft {
+    pub text: String,
+    pub entities: Vec<SeenEntity>,
+    /// The message it replies to, if any.
+    pub reply_to: Option<i32>,
+}
+
+/// A formatting entity: `kind` as the server's Markdown names it (`bold`,
+/// `italic`, `code`, `pre`, `text_url`), offsets in UTF-16 code units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenEntity {
+    pub kind: String,
+    pub offset: usize,
+    pub length: usize,
+    pub url: Option<String>,
+}
+
+impl SeenEntity {
+    /// The part of `text` this entity covers.
+    pub fn covers(&self, text: &str) -> String {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let end = (self.offset + self.length).min(units.len());
+        String::from_utf16_lossy(&units[self.offset.min(end)..end])
+    }
+}
+
 /// The harness's own login to the Test account: it stands in for the phone.
 #[async_trait]
 pub trait Driver: Party {
+    /// The Draft in `chat` (a chat id as the server issues it), in `topic`
+    /// for a forum, as Telegram holds it on the Test account.
+    async fn draft(&self, chat: &str, topic: Option<i32>) -> Result<Option<SeenDraft>>;
+
+    /// Types a Draft into `chat` as another app would (plain text).
+    async fn type_draft(&self, chat: &str, text: &str) -> Result<()>;
+
     /// The text of the Draft in the Test account's Saved Messages, if any.
     async fn saved_draft(&self) -> Result<Option<String>>;
 
@@ -55,7 +90,11 @@ pub trait Driver: Party {
 }
 
 /// The second account, the other side of the Test account's Chats.
-pub trait Peer: Party {}
+#[async_trait]
+pub trait Peer: Party {
+    /// Writes `text` to the Test account in their private chat (fixture A).
+    async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()>;
+}
 
 /// Who logs in through the Login flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

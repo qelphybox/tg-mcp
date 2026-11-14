@@ -34,8 +34,9 @@ use zeroize::Zeroizing;
 use crate::{
     fixtures,
     invariants::{LogSource, Observed},
-    world::{Driver, Party, Peer, Server, World},
+    world::{Driver, Party, Peer, SeenDraft, SeenEntity, Server, World},
 };
+use tg_mcp::tg::markdown::EntityKind;
 
 /// The fake Test account's id.
 pub const TEST_ACCOUNT: i64 = 7_000_001;
@@ -77,6 +78,7 @@ pub struct FakeWorldBuilder {
     password: Option<FakePassword>,
     driver_accepts: bool,
     driver_claims: i64,
+    misses_bold: bool,
 }
 
 /// The fake fixtures' chat ids.
@@ -121,6 +123,9 @@ fn message(id: i32, text: &str, topic: Option<i32>, from: Option<ChatId>) -> Raw
     }
 }
 
+/// Message ids of private chats and basic groups are one sequence per
+/// account, as on Telegram: A has 1, B 2, G 3 to 5; the forum (a channel)
+/// counts on its own.
 /// The Test account with the fixtures `cargo accept fixtures` makes on real
 /// Telegram: A (the Peer's chat), B, the forum with Releases, G with 👍 only,
 /// the Chat folder Work, and Saved Messages.
@@ -145,7 +150,7 @@ pub fn test_account_with_fixtures() -> FakeData {
             peer,
             vec![message(1, "tgmcp-accept · fixture A", None, Some(peer))],
         )
-        .with_messages(FAKE_B, vec![message(1, "hello B", None, None)])
+        .with_messages(FAKE_B, vec![message(2, "hello B", None, None)])
         .with_messages(
             FAKE_FORUM,
             vec![
@@ -174,7 +179,7 @@ pub fn test_account_with_fixtures() -> FakeData {
         .with_messages(
             FAKE_G,
             (1..=3)
-                .map(|n| message(n, &format!("tgmcp-accept · G message {n}"), None, None))
+                .map(|n| message(2 + n, &format!("tgmcp-accept · G message {n}"), None, None))
                 .collect(),
         )
         .with_allowed_reactions(FAKE_G, &[fixtures::G_REACTION])
@@ -200,6 +205,7 @@ impl Default for FakeWorldBuilder {
             }),
             driver_accepts: true,
             driver_claims: TEST_ACCOUNT,
+            misses_bold: false,
         }
     }
 }
@@ -216,6 +222,13 @@ impl FakeWorldBuilder {
     /// A Driver logged into another account than the Test account.
     pub fn driver_is(mut self, account: i64) -> Self {
         self.driver_claims = account;
+        self
+    }
+
+    /// A Driver that reads Drafts without their first bold entity, as if
+    /// Telegram had lost it.
+    pub fn driver_misses_bold(mut self) -> Self {
+        self.misses_bold = true;
         self
     }
 
@@ -248,23 +261,24 @@ impl FakeWorldBuilder {
             Some(p) => FakeLogin::with_password(self.test_data, p),
             None => FakeLogin::new(self.test_data),
         };
-        let saved = Arc::new(Mutex::new(None));
+        let connector = FakeConnector::default();
         let driver = Arc::new(FakeParty {
-            saved: saved.clone(),
+            connector: connector.clone(),
+            misses_bold: self.misses_bold,
             account: self.driver_claims,
             login: test_login,
             accepted: accepted.clone(),
             accepts: self.driver_accepts,
         });
         let peer = Arc::new(FakeParty {
-            saved: Arc::new(Mutex::new(None)),
+            connector: connector.clone(),
+            misses_bold: false,
             account: PEER,
             login: FakeLogin::new(FakeData::new(peer())),
             accepted: accepted.clone(),
             accepts: true,
         });
         let login = Arc::new(GatedLogin { accepted });
-        let connector = FakeConnector::default();
         let (server, keep, observed) = serve(login, connector.clone()).await?;
         Ok(FakeWorld {
             world: Arc::new(World {
@@ -468,8 +482,11 @@ impl LoginAttempt for GatedAttempt {
 
 /// A fake Test account (the Driver) or Peer: accepting a QR logs it in.
 struct FakeParty {
-    /// The Draft in this account's Saved Messages.
-    saved: Arc<Mutex<Option<String>>>,
+    /// The fake Telegram's records (Drafts), as this account sees them.
+    connector: FakeConnector,
+    /// Reads Drafts without their first bold entity (to prove a scenario
+    /// notices a lost entity).
+    misses_bold: bool,
     account: i64,
     login: FakeLogin,
     accepted: Accepted,
@@ -496,16 +513,95 @@ impl Party for FakeParty {
 
 #[async_trait]
 impl Driver for FakeParty {
+    async fn draft(&self, chat: &str, topic: Option<i32>) -> Result<Option<SeenDraft>> {
+        let chat = parse_chat(chat)?;
+        // The server stores a General Draft without a Topic.
+        let topic = topic.filter(|t| *t != 1);
+        let found = self
+            .connector
+            .drafts()
+            .of(self.account)
+            .into_iter()
+            .find(|d| d.chat == chat && d.topic == topic);
+        Ok(found.map(|d| {
+            let mut entities: Vec<SeenEntity> = d
+                .text
+                .entities
+                .iter()
+                .map(|e| {
+                    let (kind, url) = match &e.kind {
+                        EntityKind::Bold => ("bold", None),
+                        EntityKind::Italic => ("italic", None),
+                        EntityKind::Code => ("code", None),
+                        EntityKind::Pre { .. } => ("pre", None),
+                        EntityKind::TextUrl { url } => ("text_url", Some(url.clone())),
+                    };
+                    SeenEntity {
+                        kind: kind.into(),
+                        offset: e.offset as usize,
+                        length: e.length as usize,
+                        url,
+                    }
+                })
+                .collect();
+            if self.misses_bold
+                && let Some(i) = entities.iter().position(|e| e.kind == "bold")
+            {
+                entities.remove(i);
+            }
+            SeenDraft {
+                text: d.text.text,
+                entities,
+                reply_to: d.reply_to,
+            }
+        }))
+    }
+
+    async fn type_draft(&self, chat: &str, text: &str) -> Result<()> {
+        let chat = parse_chat(chat)?;
+        self.connector
+            .drafts()
+            .type_elsewhere(self.account, chat, None, text);
+        Ok(())
+    }
+
     async fn saved_draft(&self) -> Result<Option<String>> {
-        Ok(self.saved.lock().unwrap().clone())
+        let me = ChatId::User(self.account);
+        Ok(self
+            .connector
+            .drafts()
+            .of(self.account)
+            .into_iter()
+            .find(|d| d.chat == me && d.topic.is_none())
+            .map(|d| d.text.text))
     }
 
     async fn set_saved_draft(&self, text: &str) -> Result<()> {
-        *self.saved.lock().unwrap() = (!text.is_empty()).then(|| text.to_string());
+        self.connector.drafts().type_elsewhere(
+            self.account,
+            ChatId::User(self.account),
+            None,
+            text,
+        );
         Ok(())
     }
 }
-impl Peer for FakeParty {}
+#[async_trait]
+impl Peer for FakeParty {
+    /// The fake Telegram takes no messages at run time: the Peer's message in
+    /// A is the one the fixtures seed.
+    async fn say_to_test_account(&self, _test_account: i64, _text: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A chat id as the server issues it, as the fake Telegram names it.
+fn parse_chat(chat: &str) -> Result<ChatId> {
+    use std::str::FromStr;
+    let parsed =
+        tg_mcp::tg::chats::ChatRef::from_str(chat).map_err(|e| anyhow::anyhow!("{chat}: {e}"))?;
+    Ok(parsed.chat())
+}
 
 /// The token of a `tg://login?token=…` URL, as Telegram's apps read it.
 pub fn login_token(qr_url: &str) -> Result<String> {

@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 use crate::{
     blocked,
     config::{self, App},
-    world::{Driver, Party, Peer},
+    world::{Driver, Party, Peer, SeenDraft, SeenEntity},
 };
 
 /// The device the server's sessions show as in Telegram's Active sessions.
@@ -160,8 +160,144 @@ impl Party for TgClient {
     }
 }
 
+/// A chat id as the server issues it (`user:N~hash`), as Telegram's input peer:
+/// the server and the Driver are the same account, so the hash is valid for both.
+pub(crate) fn input_peer(chat: &str) -> Result<tl::enums::InputPeer> {
+    use std::str::FromStr;
+    use tg_mcp::tg::chats::{ChatId, ChatRef};
+    let parsed = ChatRef::from_str(chat).map_err(|e| anyhow::anyhow!("{chat}: {e}"))?;
+    let hash = parsed.access_hash().unwrap_or(0);
+    Ok(match parsed.chat() {
+        ChatId::User(user_id) => tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id,
+            access_hash: hash,
+        }),
+        ChatId::Chat(chat_id) => tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id }),
+        ChatId::Channel(channel_id) => tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id,
+            access_hash: hash,
+        }),
+    })
+}
+
+fn seen(draft: tl::enums::DraftMessage, topic: Option<i32>) -> Option<SeenDraft> {
+    let tl::enums::DraftMessage::Message(m) = draft else {
+        return None;
+    };
+    if m.message.is_empty() {
+        return None;
+    }
+    let entities = m
+        .entities
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| {
+            let (kind, offset, length, url) = match e {
+                tl::enums::MessageEntity::Bold(e) => ("bold", e.offset, e.length, None),
+                tl::enums::MessageEntity::Italic(e) => ("italic", e.offset, e.length, None),
+                tl::enums::MessageEntity::Code(e) => ("code", e.offset, e.length, None),
+                tl::enums::MessageEntity::Pre(e) => ("pre", e.offset, e.length, None),
+                tl::enums::MessageEntity::TextUrl(e) => {
+                    ("text_url", e.offset, e.length, Some(e.url))
+                }
+                _ => ("other", 0, 0, None),
+            };
+            SeenEntity {
+                kind: kind.into(),
+                offset: offset.max(0) as usize,
+                length: length.max(0) as usize,
+                url,
+            }
+        })
+        .collect();
+    let reply_to = match m.reply_to {
+        Some(tl::enums::InputReplyTo::Message(r)) if Some(r.reply_to_msg_id) != topic => {
+            Some(r.reply_to_msg_id)
+        }
+        _ => None,
+    };
+    Some(SeenDraft {
+        text: m.message,
+        entities,
+        reply_to,
+    })
+}
+
+impl TgClient {
+    async fn dialog_draft(&self, peer: tl::enums::InputPeer) -> Result<Option<SeenDraft>> {
+        let tl::enums::messages::PeerDialogs::Dialogs(found) = self
+            .client
+            .invoke(&tl::functions::messages::GetPeerDialogs {
+                peers: vec![tl::enums::InputDialogPeer::Peer(
+                    tl::types::InputDialogPeer { peer },
+                )],
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getPeerDialogs"))?;
+        Ok(found.dialogs.into_iter().find_map(|d| match d {
+            tl::enums::Dialog::Dialog(d) => d.draft.and_then(|draft| seen(draft, None)),
+            _ => None,
+        }))
+    }
+
+    async fn topic_draft(
+        &self,
+        peer: tl::enums::InputPeer,
+        topic: i32,
+    ) -> Result<Option<SeenDraft>> {
+        let tl::enums::messages::ForumTopics::Topics(topics) = self
+            .client
+            .invoke(&tl::functions::messages::GetForumTopics {
+                peer: peer.clone(),
+                q: None,
+                offset_date: 0,
+                offset_id: 0,
+                offset_topic: 0,
+                limit: 100,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getForumTopics"))?;
+        let draft = topics.topics.into_iter().find_map(|t| match t {
+            tl::enums::ForumTopic::Topic(t) if t.id == topic => Some(t.draft),
+            _ => None,
+        });
+        match draft {
+            Some(Some(d)) => Ok(seen(d, Some(topic))),
+            // General's Draft may be the chat's own.
+            _ if topic == 1 => self.dialog_draft(peer).await,
+            _ => Ok(None),
+        }
+    }
+}
+
 #[async_trait]
 impl Driver for TgClient {
+    async fn draft(&self, chat: &str, topic: Option<i32>) -> Result<Option<SeenDraft>> {
+        let peer = input_peer(chat)?;
+        match topic {
+            None => self.dialog_draft(peer).await,
+            Some(t) => self.topic_draft(peer, t).await,
+        }
+    }
+
+    async fn type_draft(&self, chat: &str, text: &str) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::messages::SaveDraft {
+                no_webpage: true,
+                invert_media: false,
+                reply_to: None,
+                peer: input_peer(chat)?,
+                message: text.to_string(),
+                entities: None,
+                media: None,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.saveDraft"))?;
+        Ok(())
+    }
     async fn saved_draft(&self) -> Result<Option<String>> {
         let tl::enums::messages::PeerDialogs::Dialogs(found) = self
             .client
@@ -232,7 +368,73 @@ impl Driver for TgClient {
     }
 }
 
-impl Peer for TgClient {}
+#[async_trait]
+impl Peer for TgClient {
+    async fn say_to_test_account(&self, test_account: i64, text: &str) -> Result<()> {
+        // The Peer has a dialog with the Test account (fixture A): its user,
+        // with the access hash, is in the Peer's dialogs.
+        let answer = self
+            .client
+            .invoke(&tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: None,
+                offset_date: 0,
+                offset_id: 0,
+                offset_peer: tl::enums::InputPeer::Empty,
+                limit: 100,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.getDialogs"))?;
+        let users = match answer {
+            tl::enums::messages::Dialogs::Dialogs(d) => d.users,
+            tl::enums::messages::Dialogs::Slice(d) => d.users,
+            tl::enums::messages::Dialogs::NotModified(_) => Vec::new(),
+        };
+        let access_hash = users
+            .into_iter()
+            .find_map(|u| match u {
+                tl::enums::User::User(u) if u.id == test_account => u.access_hash,
+                _ => None,
+            })
+            .context("the Peer has no chat with the Test account: run `cargo accept fixtures`")?;
+        self.client
+            .invoke(&tl::functions::messages::SendMessage {
+                no_webpage: true,
+                silent: true,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                    user_id: test_account,
+                    access_hash,
+                }),
+                reply_to: None,
+                message: text.to_string(),
+                random_id: {
+                    let mut b = [0u8; 8];
+                    getrandom::fill(&mut b).expect("the OS has randomness");
+                    i64::from_le_bytes(b)
+                },
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map_err(|e| telegram(e, "messages.sendMessage"))?;
+        Ok(())
+    }
+}
 
 /// `cargo accept sign-in driver|peer`: the first login of the Test account
 /// (Driver) or the Peer, by the code Telegram sends, typed by a person. Stores
