@@ -28,7 +28,7 @@ In Russian: https://tgmcp.dev/ru/ (the same page, the same server).
 - [README](https://github.com/qelphybox/tg-mcp/blob/main/README.md): quick start, full tool reference, prompts, security model, self-hosting
 - [Tools](https://github.com/qelphybox/tg-mcp#tools): every tool with its inputs and outputs
 - [Security model](https://github.com/qelphybox/tg-mcp#security-model): the Telegram session is stored encrypted with a key that only the AI app's tokens carry; message content is never stored or logged
-- [Self-hosting](https://github.com/qelphybox/tg-mcp#self-hosting): one Docker image for amd64 and arm64 (`ghcr.io/qelphybox/tg-mcp`), your own app id from my.telegram.org, HTTPS on a public hostname
+- [Self-hosting](https://github.com/qelphybox/tg-mcp#self-hosting): one Docker image for amd64 and arm64 (`qelphybox/tg-mcp` on Docker Hub) that runs with no configuration and a built-in Telegram app; `compose.yaml` adds HTTPS through Caddy for claude.ai and Claude desktop
 - [Privacy policy](https://tgmcp.dev/privacy.html): what the public server stores and what it never stores
 
 ## Optional
