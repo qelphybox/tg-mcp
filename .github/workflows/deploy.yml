@@ -1,8 +1,20 @@
 name: Deploy
 
+# Production runs the image Publish pushed for this commit (#105):
+# ghcr.io/qelphybox/tg-mcp:<sha>, by digest. Kamal builds nothing and pushes
+# nothing (`--skip-push`), so `latest` moves only on releases. A push to main
+# runs this from publish.yml once its `edge` job is green; a manual run deploys
+# main's head, or an earlier published <sha> (a rollback).
+
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    inputs:
+      command:
+        type: string
+        default: deploy
+      version:
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       command:
@@ -10,15 +22,15 @@ on:
         type: choice
         options: [deploy, setup]
         default: deploy
+      version:
+        description: "Full commit sha of a published image to deploy (empty = the head of the chosen branch)"
+        type: string
+        default: ""
 
-# One rollout at a time; a newer push waits instead of racing the older one.
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
+# Read-only: the job's GITHUB_TOKEN is the server's registry login, and it can't push.
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   deploy:
@@ -26,17 +38,40 @@ jobs:
     # a manual run always goes ahead (and fails loudly if it's not set up).
     if: github.event_name == 'workflow_dispatch' || vars.KAMAL_HOST != ''
     runs-on: ubuntu-latest
+    # One rollout at a time; a newer one waits instead of racing the older one.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     environment:
       name: production
       url: https://connector.tgmcp.dev
+    # -eo pipefail: a failed `imagetools inspect` must fail its step, not hide behind `tr`.
+    defaults:
+      run:
+        shell: bash
     env:
+      IMAGE: ghcr.io/qelphybox/tg-mcp
+      COMMAND: ${{ inputs.command || 'deploy' }}
+      VERSION: ${{ inputs.version || github.sha }}
       KAMAL_HOST: ${{ vars.KAMAL_HOST }}
       KAMAL_SSH_USER: ${{ vars.KAMAL_SSH_USER }}
+      # Kamal 2 always runs `docker login` on the server before it pulls. This
+      # token has `packages: read` only and expires when the job ends.
       KAMAL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       TG_MCP_API_ID: ${{ secrets.TG_MCP_API_ID }}
       TG_MCP_API_HASH: ${{ secrets.TG_MCP_API_HASH }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: The image of ${{ env.VERSION }} is published
+        id: published
+        run: |
+          [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full commit sha, got: $VERSION" >&2; exit 1; }
+          digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')" || {
+            echo "::error::$IMAGE:$VERSION is not published: wait for (or re-run) that commit's Publish run" >&2; exit 1; }
+          [[ "$digest" == sha256:* ]] || { echo "::error::no digest for $IMAGE:$VERSION (got '$digest')" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Deploying $IMAGE:$VERSION = $digest" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -57,10 +92,19 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
 
-      - uses: docker/setup-buildx-action@v3
+      # --skip-push: pull the published image on the server instead of building one.
+      - name: kamal ${{ env.COMMAND }} --skip-push --version ${{ env.VERSION }}
+        run: kamal "$COMMAND" --skip-push --version "$VERSION"
 
-      - name: kamal ${{ inputs.command || 'deploy' }}
-        run: kamal ${{ inputs.command || 'deploy' }}
+      - name: The server runs the published digest
+        env:
+          DIGEST: ${{ steps.published.outputs.digest }}
+        run: |
+          [[ "$DIGEST" == sha256:* ]] || { echo "::error::no published digest to compare with" >&2; exit 1; }
+          out="$(kamal server exec "docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' $IMAGE:$VERSION")"
+          printf '%s\n' "$out"
+          grep -qF "$IMAGE@$DIGEST" <<<"$out" || { echo "::error::the server's $IMAGE:$VERSION is not $DIGEST" >&2; exit 1; }
+          echo "The server runs $IMAGE@$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Smoke test
         run: |
@@ -78,7 +122,8 @@ jobs:
   # acceptance environment and the repository variable ACCEPTANCE_SMOKE=on.
   acceptance-smoke:
     needs: deploy
-    if: vars.ACCEPTANCE_SMOKE == 'on' && (github.event_name == 'push' || inputs.command == 'deploy')
+    # A rollout (from publish.yml or by hand), not a server setup.
+    if: vars.ACCEPTANCE_SMOKE == 'on' && (inputs.command || 'deploy') == 'deploy'
     runs-on: ubuntu-latest
     environment: acceptance
     concurrency:

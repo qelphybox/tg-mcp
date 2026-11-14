@@ -15,9 +15,9 @@
 
 services:
   tg-mcp:
-    # TG_MCP_IMAGE picks another image or tag (e.g. qelphybox/tg-mcp:0.3.0, or
+    # TG_MCP_IMAGE picks another image or tag (e.g. ghcr.io/qelphybox/tg-mcp:0.3.0, or
     # one you built); default: the latest release.
-    image: ${TG_MCP_IMAGE:-qelphybox/tg-mcp:latest}
+    image: ${TG_MCP_IMAGE:-ghcr.io/qelphybox/tg-mcp:latest}
     restart: unless-stopped
     # Loopback only, in both modes: from outside the host, tg-mcp is reachable
     # only through Caddy (https profile), whose 80 and 443 are the open ports.

@@ -82,7 +82,7 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 One command, no configuration:
 
 ```sh
-docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data qelphybox/tg-mcp
+docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data ghcr.io/qelphybox/tg-mcp
 claude mcp add --transport http telegram http://localhost:8080/mcp
 ```
 
@@ -101,11 +101,9 @@ docker compose up -d                                                # or without
 
 **Behind your own reverse proxy:** terminate TLS there, forward the `Host` header, and add `-e TG_MCP_PUBLIC_URL=https://tg.example.com`. If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's. Every setting is in [`.env.example`](.env.example).
 
-**Moving from GHCR:** `ghcr.io/qelphybox/tg-mcp` gets the same releases through 0.3.x only. Switch to `qelphybox/tg-mcp`, keeping the same `/data` volume.
-
 No backups needed: refresh Tokens rotate, so an old copy of `/data` couldn't serve today's clients anyway (losing it means users connect again), and without Tokens it opens nothing. Logs carry ids and sizes only ([docs/deploy.md](docs/deploy.md), Logs and Backups).
 
-The hosted instance is deployed in public from `main` by GitHub Actions to one VPS with [Kamal](https://kamal-deploy.org) ([docs/deploy.md](docs/deploy.md)); `scripts/setup-deploy.sh` sets up a server like it, hardening included.
+The hosted instance is deployed in public from `main` by GitHub Actions to one VPS with [Kamal](https://kamal-deploy.org), running the very image published for each commit (`ghcr.io/qelphybox/tg-mcp:<sha>`, checked by digest; [docs/deploy.md](docs/deploy.md)); `scripts/setup-deploy.sh` sets up a server like it, hardening included.
 
 ## Development
 
