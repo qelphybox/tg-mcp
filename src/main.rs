@@ -79,7 +79,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
-    tracing::info!(bind = %config.bind, public_url = %config.public_url, "listening");
+    tracing::info!(
+        bind = %config.bind,
+        public_url = %config.public_url,
+        public_url_source = %config.public_url_source,
+        "listening"
+    );
 
     axum::serve(
         listener,
