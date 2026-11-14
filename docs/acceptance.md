@@ -1189,7 +1189,7 @@ Needs Docker on your machine (amd64, or arm64 for step 2) and a clone. The image
 
    It runs the image with `TG_MCP_FAKE_TELEGRAM=1` and a volume at `/data`, nothing else.
 
-2. **Static, both architectures, no emulation.** Right after a release tag (until #105, a production deploy moves `latest` to its amd64-only image): `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest` lists `linux/amd64` and `linux/arm64`. On an arm64 machine (Apple silicon, Ampere, a Raspberry Pi 4/5) step 1 passes with that tag too. The release run's log shows no `qemu` / `binfmt` step.
+2. **Static, both architectures, no emulation.** After a release tag: `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest` lists `linux/amd64` and `linux/arm64`. On an arm64 machine (Apple silicon, Ampere, a Raspberry Pi 4/5) step 1 passes with that tag too. The release run's log shows no `qemu` / `binfmt` step.
 
    ```sh
    c=$(docker create ghcr.io/qelphybox/tg-mcp:<sha>); docker cp $c:/usr/local/bin/tg-mcp /tmp/tg-mcp; docker rm $c
@@ -1259,7 +1259,7 @@ Needs the repository secrets `TG_MCP_BUILTIN_API_ID` / `TG_MCP_BUILTIN_API_HASH`
 
 Needs Docker with `buildx` and `jq`. No login: the package `ghcr.io/qelphybox/tg-mcp` is public. The arm64 checks also run in CI on every push and PR (`docker-arm64` cross-builds the image as the releases do, `docker-arm64-smoke` runs `scripts/container-smoke-test.sh` on it on a native `ubuntu-24.04-arm` runner).
 
-1. **A push to `main` publishes `<sha>` and `edge`, one digest, both architectures.** Push any commit to `main` (note its full sha `S`). When the Publish run's `edge` job is green (its summary names the digest). Until production deploys the published image (#105), Kamal's deploy of the same push also pushes an amd64-only `<sha>` and `latest`, and whichever finishes last owns `<sha>`: run this after #105.
+1. **A push to `main` publishes `<sha>` and `edge`, one digest, both architectures.** Push any commit to `main` (note its full sha `S`). When the Publish run's `edge` job is green (its summary names the digest):
 
    ```sh
    I=ghcr.io/qelphybox/tg-mcp
@@ -1268,7 +1268,7 @@ Needs Docker with `buildx` and `jq`. No login: the package `ghcr.io/qelphybox/tg
    docker buildx imagetools inspect $I:$S   --format '{{json .Manifest.Digest}}'   # expect the same digest as edge's
    ```
 
-2. **`latest` doesn't move on a push to `main`.** Note `docker buildx imagetools inspect $I:latest --format '{{json .Manifest.Digest}}'` before the push of step 1 and again after its Publish and Deploy runs: the same digest, the last release's. (Passes once production deploys the published image, #105; until then Kamal's own push for production moves `latest`.)
+2. **`latest` doesn't move on a push to `main`.** Note `docker buildx imagetools inspect $I:latest --format '{{json .Manifest.Digest}}'` before the push of step 1 and again after its Publish and Deploy runs: the same digest, the last release's (§73).
 
 3. **A release publishes one digest under three tags.** After tagging `vX.Y.Z`:
 
@@ -1282,7 +1282,7 @@ Needs Docker with `buildx` and `jq`. No login: the package `ghcr.io/qelphybox/tg
 
 4. **Labels.** `docker buildx imagetools inspect $I:X.Y.Z --format '{{json .Image}}' | jq '."linux/amd64".config.Labels'` (and the same on `$S`) shows `org.opencontainers.image.description` = "Unofficial Telegram MCP server: read, search, sum up chats; draft and send where you allow." (no "read-only"), `title` tg-mcp, `licenses` MIT. The GitHub Release body names `ghcr.io/qelphybox/tg-mcp:X.Y.Z`.
 
-5. **No write token outside CI.** `git grep -niE 'docker ?hub|docker\.io' -- ':!CHANGELOG.md'` finds only two lines of `scripts/harden-server.sh` (the name of Debian's own Docker package, not a registry). Both `publish.yml` and `release.yml` log in to `ghcr.io` with `secrets.GITHUB_TOKEN` and no other registry credential; Settings → Secrets holds no registry token.
+5. **No write token outside CI.** `git grep -niE 'docker ?hub|docker\.io' -- ':!CHANGELOG.md'` finds only two lines of `scripts/harden-server.sh` (the name of Debian's own Docker package, not a registry). Both `publish.yml` and `release.yml` log in to `ghcr.io` with `secrets.GITHUB_TOKEN` and no other registry credential; Settings → Secrets holds no registry token. The production deploy pulls with its job's read-only token; Kamal from a laptop uses the maintainer's classic token with `read:packages` only (§73 step 3).
 
 6. **Forks skip cleanly.** In a public fork, a push to its `main` shows the Publish run's `edge` job as skipped (`if: github.repository == 'qelphybox/tg-mcp'`) and CI green, the arm64 smoke job included.
 
@@ -1333,3 +1333,24 @@ Needs Docker, Claude Code, a Telegram account, and for step 3 a VPS with a domai
 5. **The landing page.** On `https://tgmcp.dev`, the "Don't trust. Verify." section shows the one-line `docker run` and `claude mcp add`, says localhost is enough for Claude Code and Cursor and that claude.ai needs HTTPS (compose), and nowhere asks for an app id from my.telegram.org (the FAQ included); at 320 px wide nothing scrolls sideways (`node tests/site/landing-check.cjs` passes). The Russian page (`/ru/`) says the same (`node tests/site/landing-check.cjs site /ru/` passes too).
 
 6. **No stale instruction.** `grep -rn -i "app id\|my.telegram" README.md site/ docs/deploy.md .env.example` finds the own-app option, other servers' setup (FAQ) and production's own secrets only, never "required".
+
+## 73. Production runs the published image by digest; Kamal never builds or pushes; `latest` moves only on releases
+
+Needs Docker with `buildx`, `gh`, and for steps 4–5 a clone with the deploy variables (`docs/deploy.md`, Day-to-day) and a `read:packages`-only token. Don't run `setup` against production.
+
+1. **One build, then that image.** Push a commit to `main` (full sha `S`). The Publish run has two jobs, `edge` then `deploy`; `edge`'s summary names the digest `D` of `ghcr.io/qelphybox/tg-mcp:$S`. In `deploy`'s log: the step `kamal deploy --skip-push --version S` says `Pull app image...` and shows no `docker buildx build` and no `docker push`; the step "The server runs the published digest" prints `ghcr.io/qelphybox/tg-mcp@D` and passes. Check it independently:
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:$S --format '{{json .Manifest.Digest}}'   # D
+   kamal server exec "docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' ghcr.io/qelphybox/tg-mcp:$S"   # ghcr.io/qelphybox/tg-mcp@D
+   ```
+
+2. **`latest` stays on the release.** `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest --format '{{json .Manifest.Digest}}'` is the same before and after the push of step 1, and equals `:X.Y.Z` of the last release, not `D`.
+
+3. **No token that can push, in the deploy or on the server.** `deploy.yml` asks for `packages: read` (workflow and caller job in `publish.yml`); only `publish.yml`'s `edge` job and `release.yml`'s jobs have `packages: write`. On the server, `~/.docker/config.json` of the `deploy` user holds a `ghcr.io` login from the last deploy: that job's token, read-only and expired once the job ended (`docker logout ghcr.io` loses nothing). No registry token exists in GitHub Secrets. Kamal run from a laptop has no job token: its `KAMAL_REGISTRY_PASSWORD` is the maintainer's classic token with `read:packages` only, never `write:packages` (`docs/deploy.md`, Day-to-day).
+
+4. **Rollback to an earlier `<sha>`** (the preferred way). Actions → Deploy → Run workflow, `version` = the full sha `P` of an earlier `main` commit with no migration since (`git diff --stat P..main -- migrations/` is empty): the run is green, `/healthz` answers, and `kamal app details` shows `ghcr.io/qelphybox/tg-mcp:P`. Run the workflow again with `version` empty (or push to `main`) to come back. A version that was never published fails at the first step ("is not published") without touching the server.
+
+5. **`latest` restored without a rebuild.** Actions → Release → Run workflow, `version` = `0.2.0`: the run's summary shows `0.2.0`, `0.2` and `latest` with one digest and `linux/amd64` and `linux/arm64`. Then `docker buildx imagetools inspect ghcr.io/qelphybox/tg-mcp:latest` lists both platforms, and on Apple silicon `docker pull ghcr.io/qelphybox/tg-mcp` works without `--platform`.
+
+6. **Health after the switch.** `curl -fsS https://connector.tgmcp.dev/healthz` → `ok`; `curl -fsS https://connector.tgmcp.dev/.well-known/oauth-authorization-server | jq -r .issuer` → `https://connector.tgmcp.dev` (unchanged). The `setup` path (`kamal setup --skip-push --version <sha>`: Docker bootstrap, then the same pull) is read through, not run.

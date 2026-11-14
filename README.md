@@ -103,7 +103,7 @@ docker compose up -d                                                # or without
 
 No backups needed: refresh Tokens rotate, so an old copy of `/data` couldn't serve today's clients anyway (losing it means users connect again), and without Tokens it opens nothing. Logs carry ids and sizes only ([docs/deploy.md](docs/deploy.md), Logs and Backups).
 
-The hosted instance is deployed in public from `main` by GitHub Actions to one VPS with [Kamal](https://kamal-deploy.org) ([docs/deploy.md](docs/deploy.md)); `scripts/setup-deploy.sh` sets up a server like it, hardening included.
+The hosted instance is deployed in public from `main` by GitHub Actions to one VPS with [Kamal](https://kamal-deploy.org), running the very image published for each commit (`ghcr.io/qelphybox/tg-mcp:<sha>`, checked by digest; [docs/deploy.md](docs/deploy.md)); `scripts/setup-deploy.sh` sets up a server like it, hardening included.
 
 ## Development
 
