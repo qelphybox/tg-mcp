@@ -23,6 +23,10 @@ jobs:
           crate="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           test "v$crate" = "$GITHUB_REF_NAME" || {
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2; exit 1; }
+          # server.json is what the MCP Registry lists; it must name the same release.
+          listed="$(python3 -c 'import json; print(json.load(open("server.json"))["version"])')"
+          test "$listed" = "$crate" || {
+            echo "server.json version $listed does not match Cargo.toml version $crate" >&2; exit 1; }
 
       - uses: docker/setup-buildx-action@v3
 

@@ -6,6 +6,8 @@
 <title>Telegram MCP server for Claude, ChatGPT and Gemini · tg-mcp</title>
 <meta name="description" content="Open-source Telegram MCP server. Connect your Telegram account to Claude, ChatGPT, Gemini or Cursor: read and search chats, write drafts. QR login, no API keys.">
 <link rel="canonical" href="https://tgmcp.dev/">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<link rel="alternate" type="text/markdown" href="https://tgmcp.dev/llms.txt" title="tg-mcp for AI agents (llms.txt)">
 <meta name="theme-color" content="#000000">
 <meta property="og:site_name" content="tg-mcp">
 <meta property="og:title" content="tg-mcp: Telegram MCP server for Claude, ChatGPT and Gemini">
@@ -79,15 +81,11 @@ summary:hover{color:#FFFFFF}
    "@type": "SoftwareApplication",
    "@id": "https://tgmcp.dev/#app",
    "name": "tg-mcp",
-   "alternateName": [
-    "Telegram MCP server",
-    "tg-mcp Telegram MCP"
-   ],
-   "description": "Unofficial, open-source remote MCP (Model Context Protocol) server that connects a personal Telegram account to Claude, ChatGPT, Gemini, Cursor and other MCP clients.",
+   "description": "Free, open-source remote MCP (Model Context Protocol) server for a personal Telegram account. Works with Claude, ChatGPT, Gemini, Claude Code, Cursor and other MCP clients; QR-code login, no API key.",
    "url": "https://tgmcp.dev/",
    "applicationCategory": "DeveloperApplication",
-   "operatingSystem": "Web, Linux, Docker",
-   "offers": {
+   "operatingSystem": "Web, Docker (linux/amd64, linux/arm64)",
+    "offers": {
     "@type": "Offer",
     "price": "0",
     "priceCurrency": "USD"
@@ -127,10 +125,18 @@ summary:hover{color:#FFFFFF}
     },
     {
      "@type": "Question",
-     "name": "Do I need a Telegram API key or a bot?",
+     "name": "Is it free? Do I need an API key or a bot?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "No. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy."
+      "text": "It's free: no sign-up, no payment and no API key. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How is it different from other Telegram MCP servers?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Most Telegram MCP servers run on your own computer: you install Python or Node, get an API id and hash from my.telegram.org, and keep a session file on disk. tg-mcp is a remote server you add by URL, so it also works in Claude, ChatGPT and Gemini on the web and on your phone. Your session is stored encrypted with a key only your AI app holds, and you can still run your own copy with Docker."
      }
     },
     {
@@ -194,10 +200,12 @@ GitHub
 </nav>
 </header>
 
+<main>
 <section id="top" style="max-width: 1240px; margin: 0 auto; padding: 40px 24px 0; display: flex; flex-wrap: wrap; gap: 48px 72px; align-items: center">
 <div style="flex: 1 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 22px">
 <p class="halo" style="margin: 0 0 -8px; font-size: 15px; font-weight: 600; letter-spacing: 0.02em; color: #E4B2EA">Telegram MCP server · open source</p>
 <h1 style="margin: 0; font-family: Unbounded, sans-serif; font-weight: 600; font-size: clamp(36px, 5vw, 66px); line-height: 1.04; letter-spacing: -0.03em; text-wrap: balance">Tell your AI what to do in Telegram.</h1>
+<p class="halo" style="margin: 0; max-width: 56ch; font-size: 18px; line-height: 1.5; color: #D9D0E6">tg-mcp is a free, open-source remote MCP server for your personal Telegram account. Add one link to Claude, ChatGPT or Gemini, scan a QR code, and your AI can read, search and sum up your chats; it writes only where you allow it.</p>
 <ul aria-label="Things you can ask" style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; font-size: 17px">
 <li style="background: rgba(30,25,40,.6); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(241,236,247,.08); border-radius: 18px 18px 18px 6px; padding: 9px 16px; color: #F1ECF7">“What did I miss in my work chats?”</li>
 <li style="background: rgba(30,25,40,.6); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(241,236,247,.08); border-radius: 18px 18px 18px 6px; padding: 9px 16px; color: #F1ECF7">“Find the restaurant in Tbilisi someone recommended me.”</li>
@@ -435,8 +443,12 @@ GitHub
 <p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Add <code>https://connector.tgmcp.dev/mcp</code> as a custom connector. In Claude: Settings → Connectors → Add custom connector. In ChatGPT (paid plans): Settings → Apps &amp; Connectors → Advanced → Developer mode, then Create. In Gemini: Settings → Connected apps → Add a custom app. Then scan the QR code with Telegram on your phone. In Claude Code: <code>claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</code>. Cursor and other MCP clients take the same URL as a streamable-HTTP server.</p>
 </details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
-<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Do I need a Telegram API key or a bot?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
-<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">No. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy.</p>
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Is it free? Do I need an API key or a bot?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">It's free: no sign-up, no payment and no API key. It logs in to your own account with a QR code, like Telegram Desktop does, and works with your real chats, not a bot's. You need your own app id from my.telegram.org only to run your own copy.</p>
+</details>
+<details style="border-top: 1px solid rgba(241,236,247,.1)">
+<summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">How is it different from other Telegram MCP servers?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
+<p style="margin: 0 0 24px; max-width: 64ch; color: #D9D0E6">Most Telegram MCP servers run on your own computer: you install Python or Node, get an API id and hash from my.telegram.org, and keep a session file on disk. tg-mcp is a remote server you add by URL, so it also works in Claude, ChatGPT and Gemini on the web and on your phone. Your session is stored encrypted with a key only your AI app holds, and you can still run your own copy with Docker.</p>
 </details>
 <details style="border-top: 1px solid rgba(241,236,247,.1)">
 <summary style="display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 64px; cursor: pointer; font-weight: 600; font-size: 18px; list-style: none">Can Telegram block my account for this?<svg class="chev" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B4A9C4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="m6 9 6 6 6-6"></path></svg></summary>
@@ -464,12 +476,13 @@ GitHub
 </div>
 <div style="flex: 2 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 10px">
 <span style="font-weight: 600; font-size: 15px">For developers</span>
-<pre style="margin: 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; color: #D9D0E6; white-space: pre-wrap; word-break: break-all">claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</pre>
+<pre style="margin: 0; background: rgba(0,0,0,.28); border: 1px solid rgba(241,236,247,.08); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; color: #D9D0E6; white-space: pre-wrap; word-break: break-all"><code class="language-bash">claude mcp add --transport http telegram https://connector.tgmcp.dev/mcp</code></pre>
 <p style="margin: 0; font-size: 14.5px; color: #B4A9C4">Any client that speaks streamable HTTP discovers OAuth on its own. Written in Rust: tokio, axum, rmcp, grammers, SQLite.</p>
 <div style="display: flex; flex-wrap: wrap; gap: 0 24px; font-size: 14.5px">
 <a href="https://github.com/qelphybox/tg-mcp#tools" style="padding: 10px 0">Tools and prompts</a>
 <a href="https://github.com/qelphybox/tg-mcp/tree/main/docs/adr" style="padding: 10px 0">Architecture decisions</a>
 <a href="https://github.com/qelphybox/tg-mcp#security-model" style="padding: 10px 0">Security model</a>
+<a href="llms.txt" style="padding: 10px 0">llms.txt</a>
 </div>
 </div>
 <div style="flex: 1 1 160px; display: flex; flex-direction: column; font-size: 14.5px">
@@ -482,6 +495,7 @@ GitHub
 </div>
 </footer>
 </div>
+</main>
 
 </div>
 <script>

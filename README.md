@@ -1,6 +1,6 @@
 # tg-mcp
 
-**Unofficial** remote [MCP](https://modelcontextprotocol.io) server that gives AI clients (Claude Code, Claude, Cursor, …) **read** access to your personal Telegram account and, only if you allow it, lets them write **Drafts** that you send yourself, or **send messages** to chats you choose, each confirmed by you, and react and mark as read there. You add a URL, log in by scanning a QR code, and you're done.
+**Unofficial** remote [MCP](https://modelcontextprotocol.io) server that gives AI clients (Claude, ChatGPT, Gemini, Claude Code, Cursor, …) **read** access to your personal Telegram account and, only if you allow it, lets them write **Drafts** that you send yourself, or **send messages** to chats you choose, each confirmed by you, and react and mark as read there. You add a URL, log in by scanning a QR code, and you're done.
 
 > Not affiliated with or endorsed by Telegram. It uses the Telegram API through its own registered app ("Unofficial MCP Server"). Nothing is ever edited or deleted, and nothing is forwarded. A connection writes only what you ticked for it: **Write Drafts**, text in a chat's message field that you send yourself; **Send messages**, messages to the chats you chose, each one confirmed by you in your browser unless you ticked "without asking me", plus reactions and read marks in those chats (never confirmed). Without either, nothing is ever written.
 
@@ -20,7 +20,7 @@ Then run `/mcp` in Claude Code → `telegram` → **Authenticate**. A browser op
 2. If your account has a cloud password (two-step verification), type it on the same page. It goes only to this server's login page, never through the AI client or the chat.
 3. **Allow** on the consent screen. Reading is always included; leave **Write Drafts** and **Send messages** unticked to keep the connection read-only. **Write Drafts** ticked, the AI can also put text into a chat's message field on all your devices (`save_draft`), replacing the Draft there; only you can send it. **Send messages** ticked, you choose the chats it may send to (Chat folders, your 100 most recent chats, or a chat found by name: only chats you already have), and whether it may send there without asking you each time (off unless you tick it). Then each message the AI sends (`send_message`) waits for you on this server's confirmation page, opened in this same browser: Claude Code opens it for you, other clients hand you the link. In those chats it may also react to messages (`react`) and mark them as read (`mark_read`) without asking.
 
-**Claude (web/desktop):** Settings → Connectors → Add custom connector → the same URL. **Other MCP clients:** add it as a streamable-HTTP server; they discover OAuth on their own.
+**Claude (web/desktop/mobile, free plan too):** Settings → Connectors → Add custom connector → the same URL. **ChatGPT (paid plans):** Settings → Apps & Connectors → Advanced → turn on Developer mode, then Create → the same URL. **Gemini (personal Google accounts, add it on the web):** Settings → Connected apps → Add a custom app → the same URL. **Other MCP clients:** add it as a streamable-HTTP server; they discover OAuth on their own.
 
 ## Tools
 
