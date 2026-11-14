@@ -2,12 +2,10 @@
 //! declared in: [`super::TgMcp::scoped_tools`] puts each `#[tool_router(router = …)]`
 //! block under one Scope, so a new tool gets its Scope from the block it is
 //! written in and is never listed or called without it.
-//!
-//! Every tool also takes only the parameters its input schema lists (#60): the
-//! schema says so (`additionalProperties: false`), and a call naming another
-//! one is `invalid_params` before the tool runs, with the closest known name.
+//! It also holds every tool to the parameters its input schema lists
+//! ([`super::arguments`]).
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use rmcp::{
     ErrorData,
@@ -15,6 +13,7 @@ use rmcp::{
     model::{JsonObject, Tool},
 };
 
+use super::arguments;
 use crate::scope::{Scope, Scopes};
 
 /// Every tool, with the Scope a Grant needs to see it in `tools/list` and to call it.
@@ -31,9 +30,13 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
         }
     }
 
-    /// Add every tool of `router` under `scope`. Panics on a tool name that is
-    /// already there: one tool, one Scope.
-    pub fn with(mut self, scope: Scope, router: ToolRouter<S>) -> Self {
+    /// Add every tool of `router` under `scope`, each input schema closed to
+    /// other parameters ([`arguments::forbid_others`]). Panics on a tool name
+    /// that is already there: one tool, one Scope.
+    pub fn with(mut self, scope: Scope, mut router: ToolRouter<S>) -> Self {
+        for route in router.map.values_mut() {
+            arguments::forbid_others(&mut route.attr);
+        }
         for tool in router.list_all() {
             let name = tool.name.to_string();
             assert!(
@@ -42,10 +45,6 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
             );
         }
         self.router.merge(router);
-        for route in self.router.map.values_mut() {
-            Arc::make_mut(&mut route.attr.input_schema)
-                .insert("additionalProperties".into(), false.into());
-        }
         self
     }
 
@@ -98,26 +97,10 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
         name: &str,
         arguments: Option<&JsonObject>,
     ) -> Result<(), ErrorData> {
-        let Some(route) = self.router.map.get(name) else {
-            return Ok(());
-        };
-        let known: Vec<&str> = route
-            .attr
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .map(|p| p.keys().map(String::as_str).collect())
-            .unwrap_or_default();
-        match arguments
-            .into_iter()
-            .flat_map(|a| a.keys())
-            .find(|key| !known.contains(&key.as_str()))
-        {
+        match self.router.map.get(name) {
+            Some(route) => arguments::check(&route.attr, arguments)
+                .map_err(|refusal| ErrorData::invalid_params(refusal, None)),
             None => Ok(()),
-            Some(unknown) => Err(ErrorData::invalid_params(
-                unknown_parameter(unknown, &known),
-                None,
-            )),
         }
     }
 
@@ -132,67 +115,6 @@ impl<S: Send + Sync + 'static> ScopedTools<S> {
     pub fn router(&self) -> &ToolRouter<S> {
         &self.router
     }
-}
-
-/// Longest unknown parameter name an error repeats.
-const MAX_SHOWN_PARAMETER_CHARS: usize = 40;
-
-/// What a call with parameter `unknown` is told, given the `known` ones.
-fn unknown_parameter(unknown: &str, known: &[&str]) -> String {
-    let shown: String = if unknown.chars().count() > MAX_SHOWN_PARAMETER_CHARS {
-        let head: String = unknown.chars().take(MAX_SHOWN_PARAMETER_CHARS).collect();
-        format!("{head}…")
-    } else {
-        unknown.to_string()
-    };
-    match closest(unknown, known) {
-        Some(meant) => format!("unknown parameter `{shown}`; did you mean `{meant}`?"),
-        None if known.is_empty() => {
-            format!("unknown parameter `{shown}`; this tool takes no parameters")
-        }
-        None => format!(
-            "unknown parameter `{shown}`; this tool takes: {}",
-            known.join(", ")
-        ),
-    }
-}
-
-/// The known parameter `unknown` most likely means: the same letters and
-/// digits whatever the case and `_` (`pinnedOnly`, `PINNED_ONLY`), or a few
-/// edits away (`archive`, `chat` for `chat_id`).
-fn closest<'a>(unknown: &str, known: &[&'a str]) -> Option<&'a str> {
-    let letters = |s: &str| -> Vec<char> {
-        s.chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect()
-    };
-    let unknown = letters(unknown);
-    known
-        .iter()
-        .map(|&name| {
-            let name_letters = letters(name);
-            let allowed = (unknown.len().max(name_letters.len()) / 3).max(1);
-            (edit_distance(&unknown, &name_letters), allowed, name)
-        })
-        .filter(|(distance, allowed, _)| distance <= allowed)
-        .min_by_key(|&(distance, _, name)| (distance, name))
-        .map(|(_, _, name)| name)
-}
-
-/// Levenshtein distance.
-fn edit_distance(a: &[char], b: &[char]) -> usize {
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut diagonal = row[0];
-        row[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let substituted = diagonal + usize::from(ca != cb);
-            diagonal = row[j + 1];
-            row[j + 1] = substituted.min(row[j] + 1).min(row[j + 1] + 1);
-        }
-    }
-    row[b.len()]
 }
 
 impl<S: Send + Sync + 'static> Default for ScopedTools<S> {
@@ -441,11 +363,13 @@ mod tests {
 
     /// A tool's parameters as its published input schema lists them.
     fn parameters(tool: &Tool) -> Vec<String> {
-        tool.input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .map(|p| p.keys().cloned().collect())
-            .unwrap_or_default()
+        arguments::parameters(&tool.input_schema)
+            .map(String::from)
+            .collect()
+    }
+
+    fn every_scope() -> Scopes {
+        Scope::ALL.into_iter().collect()
     }
 
     fn call(tool: &str, arguments: serde_json::Value) -> CallToolRequestParams {
@@ -466,20 +390,41 @@ mod tests {
 
     #[test]
     fn every_published_input_schema_forbids_other_parameters() {
-        for tool in tools().router().list_all() {
-            assert_eq!(
-                tool.input_schema.get("additionalProperties"),
-                Some(&serde_json::Value::Bool(false)),
+        // As the server serves them, get_media's schema adjusted either way.
+        let links = Arc::new(MediaLinks::new("http://127.0.0.1"));
+        for documents in [false, true] {
+            let server = TgMcp::new(links.clone(), documents);
+            for tool in server.tools.listed(every_scope()) {
+                assert_eq!(
+                    tool.input_schema.get("additionalProperties"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "{}",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_tool_takes_each_parameter_its_schema_lists() {
+        let tools = tools();
+        for tool in tools.router().list_all() {
+            let all: JsonObject = parameters(&tool)
+                .into_iter()
+                .map(|name| (name, serde_json::Value::Null))
+                .collect();
+            assert!(
+                tools.check_arguments(&tool.name, Some(&all)).is_ok(),
                 "{}",
                 tool.name
             );
+            assert!(tools.check_arguments(&tool.name, None).is_ok());
         }
     }
 
     #[tokio::test]
     async fn every_tool_refuses_an_unknown_parameter_and_names_it() {
-        let all: Scopes = Scope::ALL.into_iter().collect();
-        let (client, _guard) = serve(all).await;
+        let (client, _guard) = serve(every_scope()).await;
         let listed = client.list_all_tools().await.unwrap();
         assert_eq!(listed.len(), tools().router().list_all().len());
         for tool in &listed {
@@ -502,9 +447,12 @@ mod tests {
                 let camel = name
                     .split('_')
                     .enumerate()
-                    .map(|(i, part)| match i {
-                        0 => part.to_string(),
-                        _ => part[..1].to_uppercase() + &part[1..],
+                    .map(|(i, part)| {
+                        let mut chars = part.chars();
+                        match (i, chars.next()) {
+                            (0, _) | (_, None) => part.to_string(),
+                            (_, Some(first)) => first.to_uppercase().chain(chars).collect(),
+                        }
                     })
                     .collect::<String>();
                 let miss = if camel != *name {
@@ -526,8 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_misspellings_seen_in_use_get_the_right_suggestion() {
-        let all: Scopes = Scope::ALL.into_iter().collect();
-        let (client, _guard) = serve(all).await;
+        let (client, _guard) = serve(every_scope()).await;
         for (tool, miss, meant) in [
             ("get_messages", "pinnedOnly", "pinned_only"),
             ("list_chats", "archive", "archived"),
@@ -554,8 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn known_parameters_still_work() {
-        let all: Scopes = Scope::ALL.into_iter().collect();
-        let (client, _guard) = serve(all).await;
+        let (client, _guard) = serve(every_scope()).await;
         let saved_messages = crate::tg::fake::fake_issued_id(crate::tg::chats::ChatId::User(42));
         for (tool, arguments) in [
             ("whoami", serde_json::json!({})),
@@ -580,8 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_parameter_is_shown_shortened() {
-        let all: Scopes = Scope::ALL.into_iter().collect();
-        let (client, _guard) = serve(all).await;
+        let (client, _guard) = serve(every_scope()).await;
         let long = "x".repeat(10_000);
         let message = refusal(&client, "whoami", serde_json::json!({ long: 1 })).await;
         assert!(message.len() < 200, "{}", message.len());

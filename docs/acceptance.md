@@ -1048,7 +1048,7 @@ Positions are counted per page: pinning, unpinning or reordering pinned chats in
 
 ## 63. A misspelt or unknown tool parameter is an error that names it and suggests the right one
 
-Needs nothing beyond §1. The mechanism is covered by fake-backed tests over every tool: `cargo test --lib mcp::scoped::` (each tool's published input schema has `additionalProperties: false`; through `/mcp`, each tool refuses `foo` with its list of parameters, and a camelCase or upper-case spelling of each of its parameters with the right suggestion; the known parameters still work; a long unknown name is shortened). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
+Needs nothing beyond §1. The mechanism is covered by fake-backed tests over every tool: `cargo test --lib mcp::scoped::` (each tool's published input schema has `additionalProperties: false`; through `/mcp`, each tool refuses `foo` with its list of parameters, and a camelCase or upper-case spelling of each of its parameters with the right suggestion; the known parameters still work; a long unknown name is shortened) and `cargo test --lib mcp::arguments::` (when a suggestion is made, and when not). In Claude Code, with the server added as in §1 (a fresh session, so it loads the current tool list), run:
 
 ```text
 Через Telegram MCP, аргументы передавай ровно как я пишу, ничего не исправляй. Текст сообщений не выводи. 1) get_messages с chat_id=<id любого чата из list_chats> и pinnedOnly=true. 2) list_chats с archive=true. 3) search_messages с query="привет" и chat=<тот же id>. 4) whoami с foo=1. 5) list_chats с limit=3. Для каждого шага выведи: ошибка или нет, код и текст ошибки.
