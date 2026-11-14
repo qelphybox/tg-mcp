@@ -3196,6 +3196,9 @@ struct FakeTelegramSide {
     dead: Mutex<HashSet<i64>>,
     /// Accounts `auth.logOut` was called for, in order.
     logged_out: Mutex<Vec<i64>>,
+    /// Accounts whose fresh Login flow session was logged out, in order
+    /// ([`Connector::log_out_login`]). Their other sessions live on.
+    logins_logged_out: Mutex<Vec<i64>>,
     /// The Account of each Grant with a Live client, as the Client pool holds
     /// them: from its first connect until it is logged out or shut down.
     live: Mutex<std::collections::HashMap<String, i64>>,
@@ -3234,6 +3237,12 @@ impl FakeConnector {
     /// Accounts whose session was logged out through [`Connector::log_out`].
     pub fn logged_out(&self) -> Vec<i64> {
         self.telegram.logged_out.lock().unwrap().clone()
+    }
+
+    /// Accounts whose Login flow session was logged out through
+    /// [`Connector::log_out_login`], in order.
+    pub fn logins_logged_out(&self) -> Vec<i64> {
+        self.telegram.logins_logged_out.lock().unwrap().clone()
     }
 
     /// How many Grants have a Live client.
@@ -3433,6 +3442,17 @@ impl Connector for FakeConnector {
             return Ok(false);
         };
         self.end_session(account_id).map(|()| true)
+    }
+
+    /// Only that session ends: the Account's Grants keep theirs.
+    async fn log_out_login(&self, logged_in: LoggedIn) -> Result<(), TgError> {
+        self.reachable()?;
+        self.telegram
+            .logins_logged_out
+            .lock()
+            .unwrap()
+            .push(logged_in.account.id);
+        Ok(())
     }
 
     /// Nothing is held open; the peer caches go, as with the Live clients.

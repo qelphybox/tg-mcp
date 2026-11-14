@@ -61,6 +61,8 @@ End the **Unofficial MCP Server** session in Telegram → **Settings → Devices
 
 Removing the server in your AI client alone is **not** enough: e.g. Disconnect in claude.ai's connector settings only forgets the tokens on its side, and without a token the server can't decrypt (or log out) your session — by design, see below. Clients that call the OAuth revocation endpoint (`/revoke`, RFC 7009) do log the session out.
 
+**Delete everything the server holds for your account**, even without the app or its tokens: open [`https://connector.tgmcp.dev/forget`](https://connector.tgmcp.dev/forget) (`/forget` on a self-hosted server), log in with the QR code, and press **Delete**. Every connection of that account goes, with its tokens and its encrypted session; the login made for the check is ended right after. Sessions left in Telegram → Settings → Devices can't be used by anyone any more; end them there.
+
 ## Security model
 
 - **A database dump is useless.** Your Telegram session is encrypted (XChaCha20-Poly1305) with a per-login key. That key is never stored: each OAuth token your client holds carries the secret needed to unwrap it, and the server keeps only a verifier and a wrapped copy per token. Without one of your tokens, nobody, including the operator, can decrypt the session. ([ADR-0003](docs/adr/0003-session-key-lives-only-in-tokens.md))

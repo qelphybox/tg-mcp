@@ -9,6 +9,7 @@
 pub(crate) mod authorize;
 pub mod clients;
 mod flows;
+mod forget;
 pub(crate) mod pages;
 mod pkce;
 mod qr;
@@ -128,8 +129,11 @@ pub fn spawn_flow_sweeper(auth: &Arc<AuthState>) {
             every.tick().await;
             let Some(auth) = auth.upgrade() else { return };
             let swept = auth.flows.sweep();
-            if swept > 0 {
-                tracing::info!(swept, "abandoned logins dropped");
+            if !swept.is_empty() {
+                tracing::info!(swept = swept.len(), "abandoned logins dropped");
+            }
+            for login in swept {
+                forget::log_out_abandoned(&auth, &login).await;
             }
             let links = auth.links.sweep();
             if links > 0 {
@@ -194,6 +198,18 @@ pub fn router(auth: Arc<AuthState>) -> Router {
         .route(
             "/authorize",
             get(authorize::authorize).route_layer(limited(Endpoint::Authorize)),
+        )
+        .route(
+            "/forget",
+            // Only starting is limited (it opens a Telegram connection);
+            // `.get` after `route_layer` stays outside it.
+            post(forget::start)
+                .route_layer(limited(Endpoint::Forget))
+                .get(forget::page),
+        )
+        .route(
+            "/login/{id}/forget",
+            get(forget::review).post(forget::decide),
         )
         .route("/login/{id}", get(authorize::login_page))
         .route("/login/{id}/status", get(authorize::login_status))

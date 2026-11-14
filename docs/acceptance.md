@@ -1002,6 +1002,53 @@ ADR-0008. Needs `telegram-send` of §56, and, for step 4, a send connector made 
 
    This is information for the Connectors directory (#57), not a pass/fail check: whether a custom connector shows `serverInfo.icons` is up to each client.
 
+## 60. `/forget` deletes every connection of an Account without a Token, and only after the user presses Delete
+
+#63. Needs two clients connected to your main account (e.g. the regular `telegram` connector in Claude Code and a claude.ai connector, or §51's `scripts/scope-check.py - read` left running twice), a second account connected once (a second phone, or a friend's account through §51's script), and a desktop browser. The boundaries are also covered by fake-backed tests: `cargo test --test forget` (Delete removes exactly that Account's Grants and another's survive, their Tokens get 401; Cancel deletes nothing; both log the check's session out; the cookie binds every step; a `/forget` login never yields a code and an OAuth login never reaches the forget page; the per-IP limit; the Consent screen links it).
+
+1. **Before.** In Claude Code with `telegram`: "Call whoami" works. In claude.ai, ask anything of the connector: it works. The second account's connector works too.
+
+2. **The page explains first.** Open `https://connector.tgmcp.dev/forget`: "Delete my data", what it deletes, and a **Log in with Telegram** button. Nothing has started yet: `logs | grep -c 'forget'` (step 7's `logs`) is 0.
+
+3. **Log in, see what would go.** Press the button: the usual QR page (in the developer tools, the POST to `/forget` answers 303 to `/login/<id>` and sets `tgm_login`). Scan it with the **main** account's phone (and type the cloud password if it has one). The page that follows says "Delete all?", "This server holds **N connections** for **<your name>**", with N the number of connections of that account (2 or more), and the apps by name in quotes, "(the names they gave themselves, not verified)", with **Cancel** and **Delete**. Nothing is deleted yet: whoami in Claude Code still works.
+
+4. **Cancel deletes nothing.** Press **Cancel**: "Nothing deleted". Claude Code's whoami still works. In Telegram → Settings → Devices, the session this check made ("Unofficial MCP Server", just now) disappears within seconds; the connectors' own sessions stay.
+
+5. **Delete deletes exactly that account's connections.** Repeat steps 3 and press **Delete**: "Deleted N connections", plus the note about old sessions in Settings → Devices. Then:
+   - Claude Code: the next `telegram` tool call fails with 401, and `/mcp` shows it needs authentication again. claude.ai's connector does the same.
+   - The second account's connector still works.
+   - Telegram → Settings → Devices on the main phone: the check's session is gone. The connectors' sessions are gone too if their Live clients were in memory (used within the last few minutes); otherwise they are still listed and can be ended there.
+   - The back button and **Delete** again: "Login expired" (410), nothing more happens.
+
+6. **Bound to its browser and rate-limited.**
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST -d decision=delete https://connector.tgmcp.dev/login/AAAAAAAAAAAAAAAAAAAAAA/forget   # expect 403: no login cookie
+   for i in $(seq 1 8); do curl -s -o /dev/null -w '%{http_code} ' -X POST https://connector.tgmcp.dev/forget; done; echo
+   # expect 303 three times (at most 3 logins in progress per client IP), then 503 until the burst of 5
+   # (/authorize's rate, 10 a minute, its own bucket) is spent, then 429
+   ```
+
+   Each 303 above started a Telegram login that nobody scans: they expire after 10 minutes. Wait a minute before using `/authorize` or `/forget` again from the same network.
+
+7. **The server's side**, within 15 minutes of the steps:
+
+   ```sh
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 15m $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   logs | grep -E 'forget'
+   # expect "forget: cancelled, nothing deleted" (account_id) for step 4,
+   # and "forget: grants deleted" (account_id, grants=N, logged_out=M) for step 5: ids and counts only
+   logs | grep -c 'tgm_'   # expect 0: neither the login cookie nor a Token
+   ```
+
+8. **The links.** The footer of every sign-in page (QR, cloud password, Consent) has **Delete my data** → `/forget`; so do the README ("Disconnecting") and `https://tgmcp.dev/privacy.html` ("Disconnecting and deletion"):
+
+   ```sh
+   curl -s https://tgmcp.dev/privacy.html | grep -c 'connector.tgmcp.dev/forget'   # expect 1 (after the Pages deploy)
+   ```
+
+9. **Clean up.** Connect the main account again where you want it (Claude Code: `/mcp` → `telegram` → Authenticate), and end any leftover "Unofficial MCP Server" sessions in Settings → Devices.
+
 ## 62. list_chats pages through more pinned chats than `limit`, each once
 
 Needs an account with at least 4 pinned chats in the main list (pin some in the app if needed: long-press → Pin), ideally 2 or more pinned in the Archive, and at least one pinned chat with unread messages or marked as unread. Write down from the app the pinned chats' titles, top to bottom, in each list. The paging itself is covered by fake-backed tests: `cargo test --lib tg::chats::` (every chat once, pinned first, in order, for every `limit` from 1 to 9, main list and Archive, with and without `unread_only`; old cursors decode) and `cargo test --lib tg::grammers::tests::listings_name_their_folder_and_later_pages_skip_pinned_chats` (a page inside the pinned chats is one `messages.getDialogs` like a first page). In Claude Code, with the server added as in §1, run:
