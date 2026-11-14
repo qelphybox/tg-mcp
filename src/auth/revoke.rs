@@ -77,6 +77,7 @@ pub async fn revoke(State(auth): State<Arc<AuthState>>, Form(form): Form<RevokeF
             json!({ "error": "server_error" }),
         );
     }
+    crate::stats::global().revocation();
     match auth.connector.log_out(grant).await {
         Ok(()) => {
             tracing::info!(grant_id = %grant_id, "grant revoked, telegram session logged out")

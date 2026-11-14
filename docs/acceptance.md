@@ -1036,7 +1036,8 @@ What the line holds and how the monitor is set up: [deploy.md](deploy.md#is-it-u
 1. **One line an hour.** At least an hour and a quarter after a deploy:
 
    ```sh
-   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 3h $(docker ps -qf label=service=tg-mcp) 2>&1'; }
+   # docker logs keeps the ANSI colours around field names: strip them before matching fields
+   logs() { ssh -i ~/.ssh/tg-mcp-deploy deploy@$KAMAL_HOST 'docker logs --since 3h $(docker ps -qf label=service=tg-mcp) 2>&1' | sed 's/\x1b\[[0-9;]*m//g'; }
    logs | grep 'tg_mcp::stats'
    # expect one line an hour since the deploy, each with reason="hourly", grants=, live_clients=,
    # login_flows=, media_links=, tool_calls=, tool_errors=, flood_waits=, refused=, logins= and revocations=
@@ -1056,7 +1057,7 @@ What the line holds and how the monitor is set up: [deploy.md](deploy.md#is-it-u
 
    And none of the chat titles or names you saw in step 2 appears: `logs | grep 'tg_mcp::stats' | grep -ci '<a chat title from step 2>'` gives 0.
 
-4. **A deploy logs a last line.** Deploy (push to `main`, or `kamal deploy`); in the old container's logs, its last `stats` line has `reason="shutdown"` (`kamal app logs` shows both containers' lines around the switch).
+4. **A deploy logs a last line.** Deploy (push to `main`, or `kamal deploy`); the old container's last `stats` line has `reason="shutdown"`: `kamal app logs --since 15m | sed 's/\x1b\[[0-9;]*m//g' | grep 'reason="shutdown"'` shows it, around the switch.
 
 5. **The monitor.** In UptimeRobot (or the service named on #64), the `/healthz` monitor shows "Up", with the interval and the alert e-mail as in deploy.md; the check of deploy.md step 6 sent a "Down" and an "Up" e-mail.
 

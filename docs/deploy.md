@@ -83,16 +83,20 @@ INFO tg_mcp::stats: stats reason="hourly" grants=12 live_clients=3 login_flows=0
 | `media_links` | live Media links now |
 | `tool_calls` | over the hour: tool calls by tool name |
 | `tool_errors` | over the hour: failed tool calls by kind: `scope` (outside the Grant's Scopes), `invalid_params`, `internal` (Telegram, our limits or the server), `unknown_tool`, `other` |
-| `flood_waits` | over the hour: Telegram's `FLOOD_WAIT`s per method class (`default`, `search`, `files`, `transcribe`, `writes`) as `count/longest wait` |
-| `refused` | over the hour: requests our own limits refused: `account` (request budget), `writes` (Writes budget), `chat_sends` (a Chat's Send cap), `oauth` (`429` from an OAuth endpoint) |
+| `flood_waits` | over the hour: Telegram's `FLOOD_WAIT`s to Live clients' requests per method class (`default`, `search`, `files`, `transcribe`, `writes`) as `count/longest wait`; the Login flow's aren't counted |
+| `refused` | over the hour: requests our own limits refused: `request_budget` (the Account's request budget), `writes_budget` (its Writes budget), `send_cap` (a Chat's Send cap), `oauth` (`429` from an OAuth endpoint) |
 | `logins` | over the hour: Login flows that ended in a new Grant |
-| `revocations` | over the hour: Grants revoked, by their client or for a reused refresh Token |
+| `revocations` | over the hour: Grants revoked, by their client (`/revoke`) or for a reused refresh Token; a Grant deleted because its Telegram session was ended elsewhere doesn't count |
 
 `-` means none. The counters live in memory: they reset with each line, and a restart (every deploy) loses them, so the first line after a deploy covers less than an hour. The line names no user, Account, Grant, chat or message and carries no titles: only our tool names, error kinds, method classes and limits.
 
+The logs are coloured (ANSI escapes around field names), so strip them before matching a field:
+
 ```sh
-kamal app logs --since 24h | grep 'tg_mcp::stats'    # the last day, one line an hour
-kamal app logs -f | grep 'tg_mcp::stats'             # wait for the next one
+nocolor() { sed 's/\x1b\[[0-9;]*m//g'; }
+kamal app logs --since 24h | nocolor | grep 'tg_mcp::stats'          # the last day, one line an hour
+kamal app logs -f | nocolor | grep 'tg_mcp::stats'                   # wait for the next one
+kamal app logs --since 24h | nocolor | grep 'reason="shutdown"'      # the last line of each stopped container
 ```
 
 ### The external monitor (maintainer, once)

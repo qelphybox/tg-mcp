@@ -58,7 +58,7 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
     ));
     let confirmations = auth.confirmations.clone();
     auth::spawn_flow_sweeper(&auth);
-    spawn_stats(&auth, shutdown.clone());
+    spawn_stats(&auth);
 
     let experimental_documents = config.experimental_documents;
     let mcp = StreamableHttpService::new(
@@ -102,27 +102,25 @@ pub fn app(config: &Config, deps: Deps, shutdown: CancellationToken) -> Router {
 }
 
 /// The hourly `stats` line ([`stats`]), with what exists right now read from `auth`.
-fn spawn_stats(auth: &Arc<AuthState>, shutdown: CancellationToken) {
+/// Its last line comes from [`stats::finish`], once the server has drained.
+fn spawn_stats(auth: &Arc<AuthState>) {
     let auth = auth.clone();
-    stats::spawn(
-        move || {
-            let auth = auth.clone();
-            async move {
-                let grants = match auth.vault.count_grants().await {
-                    Ok(n) => Some(n),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "counting grants for stats failed");
-                        None
-                    }
-                };
-                stats::Gauges {
-                    grants,
-                    live_clients: auth.connector.live_clients(),
-                    login_flows: auth.pending_logins(),
-                    media_links: auth.links.len(),
+    stats::spawn(move || {
+        let auth = auth.clone();
+        async move {
+            let grants = match auth.vault.count_grants().await {
+                Ok(n) => Some(n),
+                Err(err) => {
+                    tracing::warn!(error = %err, "counting grants for stats failed");
+                    None
                 }
+            };
+            stats::Gauges {
+                grants,
+                live_clients: auth.connector.live_clients(),
+                login_flows: auth.pending_logins(),
+                media_links: auth.links.len(),
             }
-        },
-        shutdown,
-    );
+        }
+    });
 }

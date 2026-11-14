@@ -11,12 +11,15 @@
 //!   errors by kind (`tool_errors`), Telegram's `FLOOD_WAIT`s per method class with
 //!   the longest wait (`flood_waits`, `class:count/max_s`), our own limits' refusals
 //!   by limit (`refused`), Logins completed (`logins`) and Grants revoked
-//!   (`revocations`).
+//!   (`revocations`: by their client, or for a reused refresh Token; a Grant
+//!   deleted because Telegram ended its session doesn't count). `FLOOD_WAIT`s
+//!   are those of Live clients' requests; the Login flow's aren't counted.
 //!
 //! The counters live in memory, reset with each line and are lost on restart: the
 //! first line after a deploy covers less than an hour. No user, Account, Grant, chat
 //! or message identifiers and no titles: tool names, error kinds, method classes and
-//! limits are fixed names of ours, and an unknown tool counts as `unknown`.
+//! limits are fixed names of ours. A call of a tool we don't have is counted only as
+//! the error `unknown_tool`, never by the name it asked for.
 
 use std::{collections::BTreeMap, fmt::Write as _, future::Future, sync::Mutex, time::Duration};
 
@@ -58,12 +61,12 @@ impl ToolError {
 /// Which of our own limits refused a request (ADR-0005 and the OAuth endpoints').
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Refusal {
-    /// The Account's request budget.
-    Account,
+    /// The Account's request budget (all requests to Telegram).
+    RequestBudget,
     /// The Account's Writes budget.
-    Writes,
+    WritesBudget,
     /// A Chat's Send cap.
-    ChatSends,
+    SendCap,
     /// The per-client limit of an OAuth endpoint (`429`).
     OAuth,
 }
@@ -71,9 +74,9 @@ pub enum Refusal {
 impl Refusal {
     pub fn name(self) -> &'static str {
         match self {
-            Refusal::Account => "account",
-            Refusal::Writes => "writes",
-            Refusal::ChatSends => "chat_sends",
+            Refusal::RequestBudget => "request_budget",
+            Refusal::WritesBudget => "writes_budget",
+            Refusal::SendCap => "send_cap",
             Refusal::OAuth => "oauth",
         }
     }
@@ -199,7 +202,7 @@ impl Stats {
     /// Telegram answered a request of `class` with `FLOOD_WAIT` of `seconds`.
     pub fn flood_wait(&self, class: MethodClass, seconds: u32) {
         self.with(|h| {
-            let f = &mut h.flood_waits[class as usize];
+            let f = &mut h.flood_waits[class.index()];
             f.count += 1;
             f.max_seconds = f.max_seconds.max(seconds);
         });
@@ -262,9 +265,9 @@ pub fn log(hour: &Hour, gauges: &Gauges, reason: &'static str) {
     );
 }
 
-/// Every `period`, log the line for `stats` and reset it; once more when `shutdown`
-/// is cancelled, then return.
-pub async fn report<F, Fut>(stats: &Stats, period: Duration, gauges: F, shutdown: CancellationToken)
+/// Every `period`, log the line for `stats` and reset it; once more when `last` is
+/// cancelled, then return.
+pub async fn report<F, Fut>(stats: &Stats, period: Duration, gauges: F, last: CancellationToken)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Gauges>,
@@ -274,7 +277,7 @@ where
     loop {
         tokio::select! {
             _ = every.tick() => log(&stats.take(), &gauges().await, "hourly"),
-            () = shutdown.cancelled() => {
+            () = last.cancelled() => {
                 log(&stats.take(), &gauges().await, "shutdown");
                 return;
             }
@@ -282,33 +285,40 @@ where
     }
 }
 
-static REPORTER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// The running reporter: its task, and the token that asks it for its last line.
+static REPORTER: Mutex<Option<(JoinHandle<()>, CancellationToken)>> = Mutex::new(None);
 
-/// Run [`report`] on the [`global`] counters in the background, until `shutdown`.
-/// [`finish`] waits for its last line.
-pub fn spawn<F, Fut>(gauges: F, shutdown: CancellationToken)
+/// Run [`report`] on the [`global`] counters in the background, until [`finish`].
+/// A process runs one; spawning another (tests build several servers) replaces it.
+pub fn spawn<F, Fut>(gauges: F)
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = Gauges> + Send,
 {
-    let handle = tokio::spawn(async move { report(global(), PERIOD, gauges, shutdown).await });
+    let last = CancellationToken::new();
+    let token = last.clone();
+    let handle = tokio::spawn(async move { report(global(), PERIOD, gauges, token).await });
     let previous = REPORTER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .replace(handle);
-    if let Some(previous) = previous {
+        .replace((handle, last));
+    if let Some((previous, _)) = previous {
         previous.abort();
     }
 }
 
-/// After the server's `shutdown` token was cancelled: wait, at most `timeout`, for
-/// the last `stats` line, so it is logged before the process exits.
+/// On graceful shutdown, once the HTTP server has drained: log the last `stats`
+/// line, waiting for it at most `timeout`.
 pub async fn finish(timeout: Duration) {
-    let handle = REPORTER.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(handle) = handle
-        && tokio::time::timeout(timeout, handle).await.is_err()
-    {
-        tracing::warn!("the last stats line didn't make it before shutdown");
+    let reporter = REPORTER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some((handle, last)) = reporter else {
+        return;
+    };
+    last.cancel();
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(error = %err, "the stats reporter failed"),
+        Err(_) => tracing::warn!("the last stats line didn't make it before shutdown"),
     }
 }
 
@@ -352,7 +362,7 @@ mod tests {
         }
         let hour = stats.take();
         for (i, class) in MethodClass::ALL.iter().enumerate() {
-            assert_eq!(hour.flood_waits[*class as usize].max_seconds, i as u32 + 1);
+            assert_eq!(hour.flood_waits[class.index()].max_seconds, i as u32 + 1);
         }
     }
 }

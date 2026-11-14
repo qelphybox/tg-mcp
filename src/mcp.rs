@@ -2044,11 +2044,16 @@ impl ServerHandler for TgMcp {
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(call).await;
         if let Err(err) = &result {
-            stats.tool_error(match err.code {
-                _ if !known => crate::stats::ToolError::UnknownTool,
-                rmcp::model::ErrorCode::INVALID_PARAMS => crate::stats::ToolError::InvalidParams,
-                rmcp::model::ErrorCode::INTERNAL_ERROR => crate::stats::ToolError::Internal,
-                _ => crate::stats::ToolError::Other,
+            stats.tool_error(if !known {
+                crate::stats::ToolError::UnknownTool
+            } else {
+                match err.code {
+                    rmcp::model::ErrorCode::INVALID_PARAMS => {
+                        crate::stats::ToolError::InvalidParams
+                    }
+                    rmcp::model::ErrorCode::INTERNAL_ERROR => crate::stats::ToolError::Internal,
+                    _ => crate::stats::ToolError::Other,
+                }
             });
         }
         result

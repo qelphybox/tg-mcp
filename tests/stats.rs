@@ -96,7 +96,7 @@ async fn after_an_hour_the_line_carries_the_counts_then_they_reset() {
     stats.flood_wait(MethodClass::Search, 30);
     stats.flood_wait(MethodClass::Search, 12);
     stats.flood_wait(MethodClass::Files, 4);
-    stats.refused(Refusal::Account);
+    stats.refused(Refusal::RequestBudget);
     stats.refused(Refusal::OAuth);
     stats.refused(Refusal::OAuth);
     stats.login();
@@ -120,7 +120,7 @@ async fn after_an_hour_the_line_carries_the_counts_then_they_reset() {
         "tool_calls=get_messages:1 list_chats:2",
         "tool_errors=scope:1 internal:1",
         "flood_waits=search:2/30s files:1/4s",
-        "refused=account:1 oauth:2",
+        "refused=request_budget:1 oauth:2",
         "logins=1",
         "revocations=1",
     ] {
@@ -184,7 +184,7 @@ async fn the_line_counts_tool_calls_by_name_and_names_no_chat_account_or_grant()
         FakeData::new(account(ACCOUNT_ID, OWNER)).with_chats(vec![chat()]),
     ])
     .await;
-    let (_, tokens) = server.login().await;
+    let (client_id, tokens) = server.login().await;
     let access = tokens["access_token"].as_str().unwrap().to_string();
     let client = server.mcp(&access).await;
 
@@ -207,6 +207,20 @@ async fn the_line_counts_tool_calls_by_name_and_names_no_chat_account_or_grant()
         .await;
     assert!(unknown.is_err());
 
+    // Revoked by its client: one revocation.
+    let revoked = server
+        .post_form(
+            "/revoke",
+            &[
+                ("token", tokens["refresh_token"].as_str().unwrap()),
+                ("token_type_hint", "refresh_token"),
+                ("client_id", &client_id),
+            ],
+            None,
+        )
+        .await;
+    assert!(revoked.status().is_success(), "{}", revoked.status());
+
     // This binary's other test counts into its own Stats, so the global ones
     // hold this test's calls only.
     stats::log(&stats::global().take(), &Gauges::default(), "hourly");
@@ -216,6 +230,7 @@ async fn the_line_counts_tool_calls_by_name_and_names_no_chat_account_or_grant()
     assert!(line.contains("tool_calls=list_chats:2"), "{line}");
     assert!(line.contains("unknown_tool:1"), "{line}");
     assert!(line.contains("logins=1"), "{line}");
+    assert!(line.contains("revocations=1"), "{line}");
     let lower = line.to_lowercase();
     for needle in [
         "zebrafinch",
