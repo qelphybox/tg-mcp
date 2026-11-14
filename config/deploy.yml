@@ -41,6 +41,14 @@ proxy:
   buffering:
     requests: true
     responses: false
+  # kamal-proxy's access log records request paths (Media link tickets, see
+  # docs/deploy.md): journald, 14 days, like the app. Takes effect on
+  # `kamal proxy reboot`.
+  run:
+    log_max_size: ""
+    options:
+      log-driver: journald
+      log-opt: tag=kamal-proxy
 
 env:
   clear:
@@ -66,7 +74,9 @@ drain_timeout: 30
 # for proxied roles); shutdown re-seals changed Telegram sessions in this window.
 stop_timeout: 30
 
+# journald on the host keeps logs 14 days (scripts/harden-server.sh); read
+# them with `kamal app logs` or, on the server, `journalctl -t tg-mcp`.
 logging:
+  driver: journald
   options:
-    max-size: 20m
-    max-file: "5"
+    tag: tg-mcp
