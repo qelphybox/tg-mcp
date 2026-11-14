@@ -1098,3 +1098,29 @@ Needs Docker on your machine (amd64, or arm64 for step 2) and a clone. The image
    | after #101 (musl + mimalloc) | | | |
 
    Expect the "after" row within a few MB of the "before" row. For reference, locally with fake Telegram on 2 CPUs (`--cpuset-cpus=0,1`): glibc image 2.2 MB at idle and 2.9 MB after 20,000 requests to `/healthz`, the OAuth metadata and `/register`; musl + mimalloc 2.1 MB and 2.9 MB. Without the image's `MIMALLOC_ARENA_EAGER_COMMIT=0` mimalloc held 11 MB and 13.7 MB: if the "after" row is about 9 MB above the "before" row, check that variable (`docker inspect -f '{{.Config.Env}}' <container>`).
+
+## 68. On a hosting platform the server listens on its `PORT` and names its public domain as the issuer; an explicit URL still wins
+
+The precedence is covered by `cargo test --lib config::` (`TG_MCP_BIND` over `PORT` over 8080, a bad `PORT` refused, `TG_MCP_PUBLIC_URL` over each platform's variable over localhost, the allowed hosts and the reported source), and the CI `docker` job runs the image with `PORT=9000` and `RAILWAY_PUBLIC_DOMAIN` (`scripts/container-smoke-test.sh`, the last two PASS lines). Needs Docker and an image built from this commit or later (production's `ghcr.io/qelphybox/tg-mcp:<sha>`).
+
+1. **Each platform's variable, with the platform's `PORT`.** For each pair, run, check, and remove:
+
+   ```sh
+   img=ghcr.io/qelphybox/tg-mcp:<sha>
+   for v in RAILWAY_PUBLIC_DOMAIN=t.up.railway.app RENDER_EXTERNAL_HOSTNAME=t.onrender.com FLY_APP_NAME=t KOYEB_PUBLIC_DOMAIN=t-me.koyeb.app; do
+     docker run -d --name p68 -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=9000 -e "$v" -p 127.0.0.1:9000:9000 "$img" >/dev/null; sleep 2
+     curl -fsS http://127.0.0.1:9000/.well-known/oauth-authorization-server | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'
+     docker logs p68 2>&1 | grep listening; docker rm -f p68 >/dev/null
+   done
+   # expect the issuers https://t.up.railway.app, https://t.onrender.com, https://t.fly.dev and https://t-me.koyeb.app,
+   # each with a "listening" line: bind=0.0.0.0:9000 public_url=https://…/ public_url_source=Railway (RAILWAY_PUBLIC_DOMAIN)
+   # (then Render (RENDER_EXTERNAL_HOSTNAME), Fly.io (FLY_APP_NAME), Koyeb (KOYEB_PUBLIC_DOMAIN))
+   ```
+
+2. **An explicit URL wins, `TG_MCP_BIND` wins, nothing changes the proxy trust.** `docker run -d --name p68 -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=9000 -e TG_MCP_BIND=0.0.0.0:8080 -e TG_MCP_PUBLIC_URL=https://tg.example.com -e RAILWAY_PUBLIC_DOMAIN=t.up.railway.app -p 127.0.0.1:8080:8080 $img`: the issuer is `https://tg.example.com`, the log says `bind=0.0.0.0:8080 … public_url_source=TG_MCP_PUBLIC_URL`. Send `curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'X-Forwarded-For: 203.0.113.9' -H 'Content-Type: application/json' -d '{"redirect_uris":["http://localhost:9/cb"]}' http://127.0.0.1:8080/register` six times: the sixth is `429` whatever address the header claims, so the limit counts the real peer (`TG_MCP_TRUST_FORWARDED_FOR` stayed off). `docker rm -f p68`.
+
+3. **Nothing set.** `docker run --rm -e TG_MCP_FAKE_TELEGRAM=1 $img` logs `bind=0.0.0.0:8080 public_url=http://localhost:8080/ public_url_source=default (TG_MCP_PUBLIC_URL unset, no hosting platform detected)` (Ctrl-C to stop).
+
+4. **A bad `PORT` stops it at once.** `docker run --rm -e TG_MCP_FAKE_TELEGRAM=1 -e PORT=http $img` exits with `Error: PORT must be a port number (1-65535), not "http"`.
+
+5. **Production is unchanged.** `curl -s https://connector.tgmcp.dev/.well-known/oauth-authorization-server | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'` prints `https://connector.tgmcp.dev`, and the server's `listening` line says `public_url_source=TG_MCP_PUBLIC_URL` (`config/deploy.yml` sets both variables).
