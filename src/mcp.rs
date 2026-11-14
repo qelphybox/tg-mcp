@@ -22,6 +22,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+mod arguments;
 mod drafts;
 mod prompts;
 mod scoped;
@@ -2026,6 +2027,18 @@ impl ServerHandler for TgMcp {
                 tool = %request.name,
                 scopes = %caller.scopes,
                 "tool call outside the grant's scopes refused"
+            );
+            return Err(err);
+        }
+        if let Err(err) = self
+            .tools
+            .check_arguments(&request.name, request.arguments.as_ref())
+        {
+            tracing::warn!(
+                grant_id = %caller.grant_id,
+                tool = %request.name,
+                arguments = request.arguments.as_ref().map_or(0, |a| a.len()),
+                "tool call with a parameter the tool doesn't take refused"
             );
             return Err(err);
         }
