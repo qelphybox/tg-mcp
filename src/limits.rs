@@ -91,7 +91,7 @@ impl MethodClass {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         self as usize
     }
 }
@@ -395,6 +395,7 @@ impl AccountLimiter {
             let budget_wait = state.refill(&self.config, now);
             let wait = budget_wait.max(flood_left);
             if wait > self.config.max_wait {
+                crate::stats::global().refused(crate::stats::Refusal::RequestBudget);
                 return Err(TgError::RateLimited {
                     seconds: ceil_secs(budget_wait),
                 });
@@ -443,7 +444,7 @@ impl AccountLimiter {
         let longest = chat_wait.max(account_wait).max(bucket_wait);
         if !longest.is_zero() {
             let seconds = ceil_secs(longest);
-            return Err(if longest == chat_wait {
+            let refused = if longest == chat_wait {
                 TgError::WritesLimited {
                     seconds,
                     limit: WriteLimit::Chat,
@@ -455,7 +456,16 @@ impl AccountLimiter {
                 }
             } else {
                 TgError::RateLimited { seconds }
+            };
+            crate::stats::global().refused(match &refused {
+                TgError::WritesLimited {
+                    limit: WriteLimit::Chat,
+                    ..
+                } => crate::stats::Refusal::SendCap,
+                TgError::WritesLimited { .. } => crate::stats::Refusal::WritesBudget,
+                _ => crate::stats::Refusal::RequestBudget,
             });
+            return Err(refused);
         }
 
         state.tokens -= 1.0;
@@ -467,6 +477,7 @@ impl AccountLimiter {
     }
 
     fn block(&self, class: MethodClass, seconds: u32) {
+        crate::stats::global().flood_wait(class, seconds);
         let until = Instant::now() + Duration::from_secs(seconds.into());
         let mut state = self.state.lock().expect("limiter lock");
         let blocked_until = &mut state.blocked_until[class.index()];

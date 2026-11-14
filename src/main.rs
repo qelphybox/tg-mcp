@@ -96,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
 
+    // The last `stats` line: after the HTTP drain, before the pool it counts is drained.
+    tg_mcp::stats::finish(Duration::from_secs(5)).await;
     // Every connection is closed by now, so no request can open a Live client
     // while the pool is drained.
     tg::shut_down(connector.as_ref(), tg::SHUTDOWN_TIMEOUT).await;
