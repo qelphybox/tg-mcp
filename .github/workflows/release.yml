@@ -1,28 +1,29 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish qelphybox/tg-mcp:{0.1.0,0.1,latest} on
-# Docker Hub and the same tags (same build, same digest) on the GHCR mirror,
-# for linux/amd64 and linux/arm64, sync the Docker Hub description from the
-# README, and create a GitHub Release with generated notes. Without the
-# DOCKERHUB_USERNAME variable (forks) the Docker Hub steps are skipped.
-# Production deploys are separate (push to main, see deploy.yml).
+# Push a tag like v0.1.0 to publish ghcr.io/qelphybox/tg-mcp:{0.1.0,0.1,latest}
+# (one build, one digest) for linux/amd64 and linux/arm64, and create a GitHub
+# Release with generated notes. GHCR is the image's only home (#131); the push
+# uses the job's own GITHUB_TOKEN. Production deploys are separate (push to
+# main: publish.yml, deploy.yml).
 
 on:
   push:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
-  DOCKERHUB_IMAGE: qelphybox/tg-mcp
-  # The image's label; Docker Hub's short description is the same text, set by hand.
+  IMAGE: ghcr.io/qelphybox/tg-mcp
+  # Same as publish.yml's.
   DESCRIPTION: "Unofficial Telegram MCP server: read, search, sum up chats; draft and send where you allow."
 
 jobs:
   image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -54,31 +55,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Docker Hub is used when the DOCKERHUB_USERNAME variable and the
-      # DOCKERHUB_TOKEN secret are both set; otherwise only GHCR (forks).
-      - id: dockerhub
-        env:
-          USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          DESCRIPTION_TOKEN: ${{ secrets.DOCKERHUB_DESCRIPTION_TOKEN }}
-        run: |
-          if [ -n "$USERNAME" ] && [ -n "$TOKEN" ]; then echo "push=true" >> "$GITHUB_OUTPUT"
-          else echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN not set: publishing to GHCR only"; echo "push=false" >> "$GITHUB_OUTPUT"; fi
-          if [ -n "$USERNAME" ] && [ -n "$DESCRIPTION_TOKEN" ]; then echo "describe=true" >> "$GITHUB_OUTPUT"
-          else echo "describe=false" >> "$GITHUB_OUTPUT"; fi
-
-      - uses: docker/login-action@v3
-        if: steps.dockerhub.outputs.push == 'true'
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            name=docker.io/${{ env.DOCKERHUB_IMAGE }},enable=${{ steps.dockerhub.outputs.push == 'true' }}
-            ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -108,22 +88,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Docker Hub's API needs a token with Delete access to change the
-      # description, so it is a separate, optional secret; DOCKERHUB_TOKEN
-      # (Read & Write) only pushes.
-      - name: Docker Hub description from the README
-        if: steps.dockerhub.outputs.describe == 'true'
-        uses: peter-evans/dockerhub-description@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_DESCRIPTION_TOKEN }}
-          repository: ${{ env.DOCKERHUB_IMAGE }}
-          readme-filepath: README.md
-          enable-url-completion: true
-
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           body: |
-            Image: `${{ env.DOCKERHUB_IMAGE }}:${{ steps.meta.outputs.version }}` on Docker Hub, mirrored as `ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}` through the 0.3.x releases (linux/amd64, linux/arm64, same digest).
+            Image: `${{ env.IMAGE }}:${{ steps.meta.outputs.version }}` for linux/amd64 and linux/arm64, the same digest as this release's `X.Y` tag and `latest`.
             Self-hosting: see the README. What changed: see CHANGELOG.md.

@@ -82,7 +82,7 @@ Removing the server in your AI client alone is **not** enough: e.g. Disconnect i
 One command, no configuration:
 
 ```sh
-docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data qelphybox/tg-mcp
+docker run -d -p 127.0.0.1:8080:8080 -v tg-mcp-data:/data ghcr.io/qelphybox/tg-mcp
 claude mcp add --transport http telegram http://localhost:8080/mcp
 ```
 
@@ -100,8 +100,6 @@ docker compose up -d                                                # or without
 **Your own Telegram app (optional).** Register one at [my.telegram.org/apps](https://my.telegram.org/apps) (please keep "Unofficial" in its title) and pass `-e TG_MCP_API_ID=123456 -e TG_MCP_API_HASH=your_api_hash` (with compose: set them in the shell or in `.env`). That gives your logins their own quota and keeps them independent of the built-in app ([ADR-0007](docs/adr/0007-built-in-telegram-app-in-official-images.md)). The startup log says which app is in use. An image you build yourself has no built-in app and needs them.
 
 **Behind your own reverse proxy:** terminate TLS there, forward the `Host` header, and add `-e TG_MCP_PUBLIC_URL=https://tg.example.com`. If the proxy sets or appends `X-Forwarded-For` from the address it accepted the connection from (Caddy and kamal-proxy do; nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), also pass `-e TG_MCP_TRUST_FORWARDED_FOR=1`, so the per-IP rate limits of the OAuth endpoints see real client addresses instead of the proxy's. Every setting is in [`.env.example`](.env.example).
-
-**Moving from GHCR:** `ghcr.io/qelphybox/tg-mcp` gets the same releases through 0.3.x only. Switch to `qelphybox/tg-mcp`, keeping the same `/data` volume.
 
 No backups needed: refresh Tokens rotate, so an old copy of `/data` couldn't serve today's clients anyway (losing it means users connect again), and without Tokens it opens nothing. Logs carry ids and sizes only ([docs/deploy.md](docs/deploy.md), Logs and Backups).
 
