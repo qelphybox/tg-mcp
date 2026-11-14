@@ -1285,3 +1285,26 @@ Needs the maintainer's Docker Hub setup (`docs/deploy.md`, Releases: the public 
 4. **Labels and descriptions.** `docker buildx imagetools inspect qelphybox/tg-mcp:X.Y.Z --format '{{json .Image}}' | jq '."linux/amd64".config.Labels'` shows `org.opencontainers.image.description` = "Unofficial Telegram MCP server: read, search, sum up chats; draft and send where you allow." (no "read-only"). On `https://hub.docker.com/r/qelphybox/tg-mcp` the short description is the same sentence (set by hand) and the overview is the README of the tagged commit, its links pointing to GitHub. The GitHub Release body names `qelphybox/tg-mcp:X.Y.Z` and the GHCR mirror.
 
 5. **The write token stays in CI.** The Docker Hub token is only in GitHub Secrets (Settings → Secrets → `DOCKERHUB_TOKEN`); `grep -rln 'DOCKERHUB_.*TOKEN' .github/` lists only `publish.yml` and `release.yml`, and `config/deploy.yml` doesn't mention Docker Hub (production's switch to a read-only token is #105).
+
+## 71. `compose.yaml`: local by default, HTTPS through Caddy with one variable, tg-mcp reachable from outside only through Caddy
+
+Needs Docker with Compose 2.23.1 or later and a clone; for steps 3–5 a VPS with a domain whose A/AAAA record points at it and ports 80/443 open. Until the first Docker Hub release, add `TG_MCP_IMAGE=<an image you built>` to each command. All of it was run against a local build, with Caddy's internal CA for `tg.localhost` instead of Let's Encrypt.
+
+1. **Local, and the database survives.** `TG_MCP_FAKE_TELEGRAM=1 docker compose up -d`, then `curl -fsS http://127.0.0.1:8080/healthz` → `ok`. Register a client: `curl -s -X POST -H 'Content-Type: application/json' -d '{"redirect_uris":["http://localhost:9/cb"],"client_name":"s71"}' http://127.0.0.1:8080/register` → 201. `docker compose down && TG_MCP_FAKE_TELEGRAM=1 docker compose up -d`; then `docker cp $(docker compose ps -q tg-mcp):/data /tmp/s71 && sqlite3 /tmp/s71/tg-mcp.db 'select count(*) from oauth_clients'` → 1 (the named volume kept it). `docker compose down`.
+
+2. **No domain, no HTTPS.** `docker compose --profile https up -d; echo $?` → `service "domain-check" didn't complete successfully: exit 1` and `1`; `docker compose logs domain-check` says `TG_MCP_DOMAIN is not set: run TG_MCP_DOMAIN=tg.example.com docker compose --profile https up -d (or put it in .env)`. Caddy isn't running (`docker compose --profile https ps`); tg-mcp is, on loopback, as without the profile. `docker compose --profile https down`.
+
+3. **HTTPS, the issuer and the proxy trust.** On the VPS: `echo TG_MCP_DOMAIN=<your domain> > .env && docker compose --profile https up -d`. From anywhere:
+
+   ```sh
+   curl -fsS https://<your domain>/healthz                      # ok, with a valid Let's Encrypt certificate
+   curl -fsS https://<your domain>/.well-known/oauth-authorization-server | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'   # https://<your domain>
+   for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w '%{http_code} ' -X POST -H "X-Forwarded-For: 203.0.113.$i" -H 'Content-Type: application/json' -d '{"redirect_uris":["http://localhost:9/cb"]}' https://<your domain>/register; done
+   # 201 201 201 201 201 429: Caddy replaced the forged X-Forwarded-For with the real address, one bucket
+   ```
+
+4. **Only Caddy is reachable from outside.** On the VPS, `ss -ltn | grep -E ':(80|443|8080) '` shows 80 and 443 on all addresses and 8080 only on `127.0.0.1`; from another machine, `curl -m 5 http://<your domain>:8080/healthz` fails to connect. (A process on the VPS itself can reach 127.0.0.1:8080 and set its own `X-Forwarded-For`; accepted on a single-tenant VPS, as `compose.yaml` says.)
+
+5. **Streams aren't buffered.** `docker compose exec caddy caddy adapt --config /etc/caddy/Caddyfile` shows `"flush_interval": -1` on the `reverse_proxy` to `tg-mcp:8080`. Then connect claude.ai to `https://<your domain>/mcp` (Settings → Connectors), log in, and ask for `get_media` `download` of a video of a few MB: `curl -sS -o /dev/null -w '%{time_starttransfer} %{time_total}\n' <the link>` shows the first byte well before the end (streamed, not held whole).
+
+6. **Your own Telegram app.** With `TG_MCP_API_ID=… TG_MCP_API_HASH=…` added to `.env`, `docker compose --profile https up -d` recreates tg-mcp and `docker compose logs tg-mcp | grep 'using Telegram app'` shows `source=env`; without them, `source=builtin` (official image) as in §69.
