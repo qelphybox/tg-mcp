@@ -114,3 +114,46 @@ jobs:
           done
           echo "healthz did not answer over HTTPS" >&2
           exit 1
+
+  # The deployed server end to end on the Test account (ADR-0009): login,
+  # Consent, a Draft and a message in A, revoke. A failure is the alert;
+  # nothing rolls back on its own (rolling back is a human step:
+  # docs/deploy.md). Runs once scripts/accept-setup.sh has set up the
+  # acceptance environment and the repository variable ACCEPTANCE_SMOKE=on.
+  acceptance-smoke:
+    needs: deploy
+    # A rollout (from publish.yml or by hand), not a server setup.
+    if: vars.ACCEPTANCE_SMOKE == 'on' && (inputs.command || 'deploy') == 'deploy'
+    runs-on: ubuntu-latest
+    environment: acceptance
+    concurrency:
+      group: acceptance
+      cancel-in-progress: false
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      TG_ACCEPT_API_ID: ${{ secrets.TG_ACCEPT_API_ID }}
+      TG_ACCEPT_API_HASH: ${{ secrets.TG_ACCEPT_API_HASH }}
+      TG_ACCEPT_ACCOUNT_ID: ${{ secrets.TG_ACCEPT_ACCOUNT_ID }}
+      TG_ACCEPT_PEER_ID: ${{ secrets.TG_ACCEPT_PEER_ID }}
+      TG_ACCEPT_CLOUD_PASSWORD: ${{ secrets.TG_ACCEPT_CLOUD_PASSWORD }}
+      TG_ACCEPT_DRIVER_SESSION: ${{ secrets.TG_ACCEPT_DRIVER_SESSION }}
+      TG_ACCEPT_PEER_SESSION: ${{ secrets.TG_ACCEPT_PEER_SESSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo accept smoke against production
+        run: |
+          set +e
+          cargo accept --target https://connector.tgmcp.dev smoke > report.md
+          status=$?
+          set -e
+          {
+            if [ "$status" = 3 ]; then
+              echo "# BLOCKED: Telegram limited the Test account. The deploy may be fine: run the smoke again after the wait."
+              echo
+            fi
+            cat report.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$status"

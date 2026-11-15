@@ -8,7 +8,7 @@ Rust (latest stable), tokio, axum, rmcp (MCP), grammers (Telegram, version pinne
 
 ## Commands
 
-- `cargo fmt --all` / `cargo clippy --all-targets -- -D warnings` / `cargo test`: all three must pass before a commit.
+- `cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace`: all three must pass before a commit. The workspace is the server and `acceptance/`, the acceptance harness (ADR-0009): `cargo accept --list`.
 - `cargo run`: starts the server; config comes from env vars (see `.env.example`).
 - Deploy: push to `main` → Kamal rollout to `https://connector.tgmcp.dev`. Setup, rollback and what a deploy loses: `docs/deploy.md`.
 - Landing page: `site/` (static files, no build) → GitHub Pages at `https://tgmcp.dev` on push to `main` (`.github/workflows/pages.yml`). Check it with `node tests/site/landing-check.cjs` (Playwright: widths, requests, buttons, demo, dictionary fallback, no JS); `node tests/site/landing-check.cjs site /ru/` for another language page.
@@ -21,10 +21,11 @@ Rust (latest stable), tokio, axum, rmcp (MCP), grammers (Telegram, version pinne
 - Telegram's `FLOOD_WAIT` is honoured, never retried around.
 - The Session key is never persisted in plaintext (ADR-0003). Anything that would need it without a Token is a design bug.
 - Repo artifacts (code, comments, issues, docs) are in English.
+- Acceptance runs only against the Test account (ADR-0009). Never use a Telegram connector attached to your own session (e.g. `mcp__Telegram__*`) to check a feature: it is the maintainer's real Account.
 
 ## Agent skills
 
-Matt Pocock's skills are vendored in `.claude/skills/` (engineering + productivity, MIT). Start a change with `/grill-with-docs`, then `/to-spec` → `/to-tickets` → `/implement` (which drives `/tdd` and `/code-review`).
+Matt Pocock's skills are vendored in `.claude/skills/` (engineering + productivity, MIT). Start a change with `/grill-with-docs`, then `/to-spec` → `/to-tickets` → `/implement` (which drives `/tdd` and `/code-review`) → `/accept` (the feature on the Test account, ADR-0009).
 
 ### Issue tracker
 

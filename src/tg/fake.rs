@@ -261,6 +261,21 @@ impl FakeDrafts {
 
     /// `messages.saveDraft`: replace the Draft of `chat` / `topic`, or clear
     /// it with empty text.
+    /// A Draft typed in another app (the phone, for the acceptance harness's
+    /// fake Driver): Telegram syncs it like one `messages.saveDraft` saved.
+    pub fn type_elsewhere(&self, account: i64, chat: ChatId, topic: Option<i32>, text: &str) {
+        self.save(
+            account,
+            chat,
+            topic,
+            None,
+            FormattedText {
+                text: text.into(),
+                entities: Vec::new(),
+            },
+        );
+    }
+
     fn save(
         &self,
         account: i64,

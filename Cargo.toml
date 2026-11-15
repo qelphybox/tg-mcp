@@ -59,3 +59,8 @@ tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "test-util"] }
 tokio-util = "0.7.20"
 url = "2.5.8"
+
+# The acceptance harness (ADR-0009) is its own crate, so the server binary and
+# its image gain none of its dependencies. `cargo accept` runs it.
+[workspace]
+members = [".", "acceptance"]

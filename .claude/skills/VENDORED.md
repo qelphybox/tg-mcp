@@ -5,3 +5,5 @@ Copied from https://github.com/mattpocock/skills at commit `4ae2317ddb22b046e264
 Vendored rather than installed as a plugin so cloud sessions get them from the checkout. To update: re-copy those two folders from a newer commit and bump the hash above.
 
 Note: `/code-review` shares its name with a Claude Code built-in. `/implement` refers to this repo's copy.
+
+`accept/` is this repo's own skill, not vendored: keep it when re-copying.

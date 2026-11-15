@@ -29,7 +29,9 @@ pub mod rich;
 pub mod sanitise;
 pub mod search;
 pub mod send;
-mod session;
+/// Public for the acceptance harness, whose Driver and Peer keep their logins in
+/// the same snapshot format (ADR-0009).
+pub mod session;
 pub mod topics;
 pub mod transcribe;
 pub mod view;

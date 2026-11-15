@@ -154,6 +154,25 @@ DNS for `tgmcp.dev`, at its registrar:
 
 `.dev` is on the HSTS preload list, so browsers only ever use HTTPS: the site and the connector open once their certificates are issued (Pages: after the domain check in Settings → Pages; kamal-proxy: on the first HTTPS request).
 
+## Acceptance on the Test account
+
+`cargo accept` (ADR-0009) runs scenarios against real Telegram on a Test account set aside for it, never a real user's. Locally it reads its secrets from the environment, else from `~/.config/tg-mcp-accept/env` (mode 600). `scripts/accept-setup.sh` sets both up.
+
+In CI, `.github/workflows/acceptance.yml` runs it on dispatch (scenario ids as input) or on a PR labelled `accept`, never on every push. It uses the GitHub environment **`acceptance`**, whose secrets are:
+
+| Secret | What it is |
+|---|---|
+| `TG_ACCEPT_API_ID`, `TG_ACCEPT_API_HASH` | The Acceptance app, registered at my.telegram.org from the Test account's number. It is not production's app and not the Built-in app. |
+| `TG_ACCEPT_ACCOUNT_ID`, `TG_ACCEPT_PEER_ID` | The Test account's and the Peer's user ids. A run refuses to write anywhere else. |
+| `TG_ACCEPT_CLOUD_PASSWORD` | The Test account's Cloud password. |
+| `TG_ACCEPT_DRIVER_SESSION`, `TG_ACCEPT_PEER_SESSION` | The Driver's and the Peer's logins (base64 snapshots): full access to those two accounts. |
+
+A fork's PR gets none of them.
+
+**After every deploy**, `deploy.yml`'s job `acceptance-smoke` runs `cargo accept --target https://connector.tgmcp.dev smoke`. It logs the Test account in through the QR, the Cloud password and Consent (`draft` and `send`, with A as the Send allow-list), checks that `list_chats` answers, that a Draft in A reaches Telegram and that a message there reaches the Peer, then revokes the Grant and checks that its Telegram session is gone. It runs once the repository variable `ACCEPTANCE_SMOKE` is `on`, which `scripts/accept-setup.sh` sets. A red smoke is the alert. **Nothing rolls back on its own**: roll back by hand as **Rollback** above says (Actions → Deploy with an earlier `version`), after reading the report (a BLOCKED smoke means Telegram limited the Test account; the deploy may be fine). Each deploy leaves the Test account as an Account in production's database: one login and one revoke, with its sent message and Draft removed again.
+
+Runs queue one at a time. Logins come from GitHub's datacenter IPs; if Telegram restricts the Test account, runs report BLOCKED. The fix then is a self-hosted runner or test DCs, not a change to the code.
+
 ## Releases
 
 Production follows `main`; releases are for self-hosters. Bump `version` in `Cargo.toml`, merge, then tag:
