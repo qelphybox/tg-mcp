@@ -93,7 +93,7 @@ pub struct ScenarioReport {
 /// A whole run.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// Which world it ran in: `fake` or `real`.
+    /// The world and its server, e.g. `real world, image ghcr.io/…:<sha>`.
     pub world: String,
     /// The run's id: in its lease and in every text it wrote.
     pub run_id: String,
@@ -146,18 +146,18 @@ impl fmt::Display for Report {
         match self.outcome() {
             Outcome::Pass => writeln!(
                 f,
-                "## Acceptance: PASS ({} world, run {})",
+                "## Acceptance: PASS ({}, run {})",
                 self.world, self.run_id
             )?,
             Outcome::Fail(_) => writeln!(
                 f,
-                "## Acceptance: FAIL ({} world, run {})",
+                "## Acceptance: FAIL ({}, run {})",
                 self.world, self.run_id
             )?,
             Outcome::Blocked(why) => {
                 writeln!(
                     f,
-                    "## Acceptance: BLOCKED ({} world, run {})",
+                    "## Acceptance: BLOCKED ({}, run {})",
                     self.world, self.run_id
                 )?;
                 writeln!(f)?;
@@ -516,7 +516,7 @@ pub async fn run(world: Arc<World>, scenarios: &[&Scenario]) -> Report {
     let started = unix_now();
     let run_id = new_run_id();
     let mut report = Report {
-        world: world.name.to_string(),
+        world: world.label.clone(),
         run_id: run_id.clone(),
         scenarios: Vec::new(),
         not_run: Vec::new(),

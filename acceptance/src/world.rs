@@ -131,8 +131,10 @@ pub enum Who {
 
 /// One world a run happens in.
 pub struct World {
-    /// `fake` or `real`, for the report.
+    /// `fake` or `real`.
     pub name: &'static str,
+    /// How the report names the world and its server, e.g. `real world, image …`.
+    pub label: String,
     pub server: Server,
     pub driver: Arc<dyn Driver>,
     pub peer: Arc<dyn Peer>,

@@ -14,6 +14,10 @@ on:
         description: "Scenario ids, space-separated (empty: every one but smoke)"
         required: false
         default: ""
+      image:
+        description: "Release acceptance: the image to test, e.g. ghcr.io/qelphybox/tg-mcp:<full sha> (empty: cargo run)"
+        required: false
+        default: ""
   pull_request:
     types: [labeled]
 
@@ -21,6 +25,9 @@ jobs:
   accept:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'accept'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     # The Test account's and the Peer's logins live only in this environment;
     # a fork's PR gets none of them.
     environment: acceptance
@@ -43,15 +50,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Built before the run, so the server starts at once when cargo accept asks.
       - run: cargo build --locked --package tg-mcp --package acceptance
+      - name: Log in to GHCR (release acceptance of a published image)
+        if: inputs.image != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: cargo accept
         env:
           SCENARIOS: ${{ inputs.scenarios }}
+          IMAGE: ${{ inputs.image }}
         run: |
           case "$SCENARIOS" in *[!a-z0-9\ -]*)
             echo "::error::scenario ids are lower-case letters, digits and dashes"; exit 2;; esac
+          case "$IMAGE" in *[!a-z0-9./:@_-]*)
+            echo "::error::an image reference is lower-case letters, digits and ./:@_-"; exit 2;; esac
+          image_args=()
+          if [ -n "$IMAGE" ]; then image_args=(--image "$IMAGE"); fi
           set +e
           # shellcheck disable=SC2086 # the ids are meant to split
-          cargo accept $SCENARIOS > report.md
+          cargo accept "${image_args[@]}" $SCENARIOS > report.md
           status=$?
           set -e
           {

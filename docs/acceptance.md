@@ -8,7 +8,9 @@ Run the shell blocks in bash. Interactive zsh (the macOS default) doesn't treat 
 
 ## Automated acceptance
 
-Sections that say "Automated" run as code against real Telegram on a Test account (ADR-0009, GLOSSARY → Acceptance): `cargo accept --list` names the scenarios, `cargo accept <id>` runs one with a local server, `cargo accept --target https://connector.tgmcp.dev smoke` against production, `cargo accept --fake <id>` on the fake Telegram. Set it up once with `scripts/accept-setup.sh`. A run ends PASS, FAIL or BLOCKED (Telegram limited the Test account: not a bug in the code) and prints its Human checks as PR checkboxes.
+Sections that say "Automated" run as code against real Telegram on a Test account (ADR-0009, GLOSSARY → Acceptance): `cargo accept --list` names the scenarios, `cargo accept <id>` runs one with a local server, `cargo accept --target https://connector.tgmcp.dev smoke` against production, `cargo accept --fake <id>` on the fake Telegram. Set it up once with `scripts/accept-setup.sh`.
+
+**Release acceptance** tests the artifact that ships rather than a debug build. A release candidate is the image Publish pushed for its commit: `cargo accept --image ghcr.io/qelphybox/tg-mcp:<full sha>` runs the scenarios against it in a local container. The container gets the Acceptance app through `TG_MCP_API_ID`/`TG_MCP_API_HASH`, as production gets its own, so the image's Built-in app is not involved. `--image local` builds the working copy's image first. In CI: **Actions → acceptance → Run workflow** with `image` set. A run ends PASS, FAIL or BLOCKED (Telegram limited the Test account: not a bug in the code) and prints its Human checks as PR checkboxes.
 
 ## 1. From `claude mcp add` to the first `list_chats` in under 2 minutes
 

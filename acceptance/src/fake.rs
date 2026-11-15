@@ -280,6 +280,7 @@ impl FakeWorldBuilder {
         Ok(FakeWorld {
             world: Arc::new(World {
                 name: "fake",
+                label: "fake world".into(),
                 server,
                 driver,
                 peer,

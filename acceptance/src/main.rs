@@ -13,6 +13,8 @@ use acceptance::{
 
 const USAGE: &str = "\
 usage: cargo accept [<scenario>...]              on the Test account, with a local server
+       cargo accept --image <ref> <scenario>...  on the Test account, the server from a Docker image
+                                                 (ghcr.io/qelphybox/tg-mcp:<sha>; `local` builds the working copy)
        cargo accept --target <url> <scenario>... on the Test account, against a running server
        cargo accept --fake [<scenario>...]       on the Fake world (no Telegram, no secrets)
        cargo accept --list                       the scenarios
@@ -84,6 +86,7 @@ async fn go(args: &[String]) -> anyhow::Result<ExitCode> {
 
     let mut fake = false;
     let mut target = None;
+    let mut image = None;
     let mut ids = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -94,6 +97,13 @@ async fn go(args: &[String]) -> anyhow::Result<ExitCode> {
                     rest.next()
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("--target needs a URL"))?,
+                )
+            }
+            "--image" => {
+                image = Some(
+                    rest.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--image needs an image (or `local`)"))?,
                 )
             }
             flag if flag.starts_with("--") => anyhow::bail!("unknown option {flag}\n\n{USAGE}"),
@@ -107,7 +117,13 @@ async fn go(args: &[String]) -> anyhow::Result<ExitCode> {
         run::run(world.world.clone(), &chosen).await
     } else {
         let config = AcceptConfig::load()?;
-        let world = real::start(&config, target.as_deref()).await?;
+        let sut = match (target, image) {
+            (Some(_), Some(_)) => anyhow::bail!("--target and --image exclude each other"),
+            (Some(url), None) => real::ServerUnderTest::Target(url),
+            (None, Some(image)) => real::ServerUnderTest::Image(image),
+            (None, None) => real::ServerUnderTest::CargoRun,
+        };
+        let world = real::start(&config, &sut).await?;
         run::run(world, &chosen).await
     };
     Ok(finish(&report))
